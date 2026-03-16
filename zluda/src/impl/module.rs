@@ -25,25 +25,51 @@ fn get_best_ptx_and_compile(
     global_state: &GlobalState,
     image: CodeLibraryRef<'_>,
 ) -> Result<hipModule_t, CUerror> {
+    super::driver::zluda_log("[ZLUDA]   get_best_ptx_and_compile: iterating modules");
     let mut ptx_modules = Vec::new();
+    let mut module_count = 0u32;
     unsafe {
-        CodeLibraryRef::iterate_modules(image, |_, module| match module {
-            Ok(CodeModuleRef::Text(ptx)) => {
-                ptx_modules.push(Cow::Borrowed(ptx));
-            }
-            Ok(CodeModuleRef::File(file)) => {
-                if file.header.kind != FatbinFileHeader::HEADER_KIND_PTX {
-                    return;
+        CodeLibraryRef::iterate_modules(image, |_idx, module| {
+            module_count += 1;
+            match module {
+                Ok(CodeModuleRef::Text(ptx)) => {
+                    super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: Text PTX ({} bytes)", module_count, ptx.len()));
+                    ptx_modules.push(Cow::Borrowed(ptx));
                 }
-                if let Ok(text) = file.get_or_decompress_content() {
-                    if let Some(text) = cow_bytes_to_str(text) {
-                        ptx_modules.push(text);
+                Ok(CodeModuleRef::File(file)) => {
+                    let kind = if file.header.kind == FatbinFileHeader::HEADER_KIND_PTX { "PTX" } else { "non-PTX" };
+                    super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: File kind={} sm={} payload_size={} compressed_size={} uncompressed_payload={} flags={:?}", module_count, kind, file.header.sm_version, file.header.payload_size, file.header.compressed_size, file.header.uncompressed_payload, file.header.flags));
+                    if file.header.kind != FatbinFileHeader::HEADER_KIND_PTX {
+                        return;
+                    }
+                    match file.get_or_decompress_content() {
+                        Ok(text) => {
+                            super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: decompressed OK, {} bytes", module_count, text.len()));
+                            match cow_bytes_to_str(text) {
+                                Some(text) => {
+                                    super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: PTX text extracted ({} bytes), first 100 chars: {}", module_count, text.len(), &text[..text.len().min(100)]));
+                                    ptx_modules.push(text);
+                                }
+                                None => {
+                                    super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: cow_bytes_to_str FAILED (not valid UTF-8)", module_count));
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: get_or_decompress_content FAILED", module_count));
+                        }
                     }
                 }
+                _ => {
+                    super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: other format (ELF/Archive/Error)", module_count));
+                }
             }
-            _ => {}
         })
     };
+    super::driver::zluda_log(&format!("[ZLUDA]   found {} total modules, {} PTX candidates", module_count, ptx_modules.len()));
+    if ptx_modules.is_empty() {
+        super::driver::zluda_log("[ZLUDA]   NO PTX modules found!");
+    }
     let maybe_module = ptx_modules
         .iter()
         .rev() // TODO: actually sort by SM
@@ -56,8 +82,12 @@ fn get_best_ptx_and_compile(
                     Ok(ptx_parser::parse_module_unchecked(src))
                 };
                 match maybe_ast {
-                    Err(_) => ControlFlow::Continue(acc),
+                    Err(_) => {
+                        super::driver::zluda_log("[ZLUDA]   PTX parse FAILED");
+                        ControlFlow::Continue(acc)
+                    }
                     Ok(ast) => {
+                        super::driver::zluda_log(&format!("[ZLUDA]   PTX parsed OK, invalid_directives={}, directives={}", ast.invalid_directives, ast.directives.len()));
                         if ast.invalid_directives == 0 {
                             return ControlFlow::Break((src, ast));
                         } else {
@@ -78,9 +108,13 @@ fn get_best_ptx_and_compile(
         );
     let (text, module) = match maybe_module {
         ControlFlow::Break((ast, module)) | ControlFlow::Continue(Some((ast, module))) => {
+            super::driver::zluda_log("[ZLUDA]   selected PTX module for compilation");
+            // Dump PTX for offline debugging
+            let _ = std::fs::write("/tmp/zluda_physx.ptx", ast.as_bytes());
             (Some(ast), module)
         }
         ControlFlow::Continue(None) => {
+            super::driver::zluda_log("[ZLUDA]   no valid PTX module found, using empty module");
             if cfg!(debug_assertions) {
                 return Err(CUerror::NO_BINARY_FOR_GPU);
             }
@@ -95,8 +129,10 @@ fn get_best_ptx_and_compile(
         }
     };
     // TODO: get this information on initialization
+    super::driver::zluda_log("[ZLUDA]   getting HIP properties");
     let hip_properties = get_hip_properties()?;
     let gcn_arch = get_gcn_arch(&hip_properties)?;
+    super::driver::zluda_log(&format!("[ZLUDA]   gcn_arch={}", gcn_arch));
     let attributes = ExtraCacheAttributes {
         clock_rate: hip_properties.clockRate as u32,
         is_debug: cfg!(debug_assertions),
@@ -110,11 +146,18 @@ fn get_best_ptx_and_compile(
         _ => None,
     };
     let cached_binary = load_cached_binary(&mut cache_with_key);
+    let from_cache = cached_binary.is_some();
     let elf_module = cached_binary
         .ok_or(CUerror::UNKNOWN)
-        .or_else(|_| compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key))?;
+        .or_else(|_| {
+            super::driver::zluda_log("[ZLUDA]   no cache hit, compiling PTX -> AMDGPU");
+            compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key)
+        })?;
+    super::driver::zluda_log(&format!("[ZLUDA]   ELF module ready ({} bytes, from_cache={})", elf_module.len(), from_cache));
     let mut hip_module = unsafe { mem::zeroed() };
+    super::driver::zluda_log("[ZLUDA]   calling hipModuleLoadData");
     unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) }?;
+    super::driver::zluda_log("[ZLUDA]   hipModuleLoadData OK");
     Ok(hip_module)
 }
 
@@ -183,6 +226,8 @@ fn compile_and_cache(
     ast: ptx_parser::Module,
     cache_with_key: &mut Option<(zluda_cache::ModuleCache, zluda_cache::ModuleKey)>,
 ) -> Result<Vec<u8>, CUerror> {
+    let compile_start = std::time::Instant::now();
+    super::driver::zluda_log("[ZLUDA]   ptx::to_llvm_module starting");
     let llvm_module = ptx::to_llvm_module(
         ast,
         ptx::Attributes {
@@ -190,7 +235,11 @@ fn compile_and_cache(
         },
         |_| {},
     )
-    .map_err(|_| CUerror::UNKNOWN)?;
+    .map_err(|e| {
+        super::driver::zluda_log(&format!("[ZLUDA]   ptx::to_llvm_module FAILED: {:?}", e));
+        CUerror::UNKNOWN
+    })?;
+    super::driver::zluda_log(&format!("[ZLUDA]   ptx::to_llvm_module OK in {:?}, starting llvm_zluda::compile", compile_start.elapsed()));
     let ptx_impl = llvm_module.linked_bitcode();
     let elf_module = llvm_zluda::compile(
         &llvm_module.context,
@@ -200,10 +249,85 @@ fn compile_and_cache(
         llvm_module.attributes_ir,
         None,
     )
-    .map_err(|_| CUerror::UNKNOWN)?;
+    .map_err(|e| {
+        super::driver::zluda_log(&format!("[ZLUDA]   llvm_zluda::compile FAILED: {}", e));
+        CUerror::UNKNOWN
+    })?;
+    super::driver::zluda_log(&format!("[ZLUDA]   llvm_zluda::compile OK in {:?}, {} bytes ELF", compile_start.elapsed(), elf_module.len()));
     if let Some((cache, key)) = cache_with_key {
         key.last_access = zluda_cache::ModuleCache::time_now();
         cache.insert_module(key, &elf_module);
+    }
+    Ok(elf_module)
+}
+
+fn compile_in_subprocess(
+    gcn_arch: &str,
+    llvm_module: ptx::Module,
+) -> Result<Vec<u8>, CUerror> {
+    use std::io::Write;
+    // Create a temp file for the output
+    let output_path = format!("/tmp/zluda_compile_{}.elf", std::process::id());
+    let ptx_impl = llvm_module.linked_bitcode();
+
+    // Use fork to compile in a child process
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        super::driver::zluda_log("[ZLUDA]   fork() failed");
+        return Err(CUerror::UNKNOWN);
+    }
+    if pid == 0 {
+        // Child process — do the compilation
+        let result = llvm_zluda::compile(
+            &llvm_module.context,
+            gcn_arch,
+            llvm_module.llvm_ir,
+            ptx_impl,
+            llvm_module.attributes_ir,
+            None,
+        );
+        match result {
+            Ok(elf_module) => {
+                if let Ok(mut f) = std::fs::File::create(&output_path) {
+                    let _ = f.write_all(&elf_module);
+                }
+                unsafe { libc::_exit(0) };
+            }
+            Err(e) => {
+                let _ = std::fs::write(&output_path, format!("ERROR: {:?}", e));
+                unsafe { libc::_exit(1) };
+            }
+        }
+    }
+    // Parent process — wait for child
+    super::driver::zluda_log(&format!("[ZLUDA]   waiting for compile subprocess pid={}", pid));
+    let mut status: i32 = 0;
+    let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if wait_result < 0 {
+        super::driver::zluda_log("[ZLUDA]   waitpid failed");
+        let _ = std::fs::remove_file(&output_path);
+        return Err(CUerror::UNKNOWN);
+    }
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
+        let signal = if libc::WIFSIGNALED(status) { libc::WTERMSIG(status) } else { 0 };
+        super::driver::zluda_log(&format!("[ZLUDA]   compile subprocess failed: exit={}, signal={}", exit_code, signal));
+        // Try to read error message
+        if let Ok(msg) = std::fs::read_to_string(&output_path) {
+            super::driver::zluda_log(&format!("[ZLUDA]   compile error: {}", msg));
+        }
+        let _ = std::fs::remove_file(&output_path);
+        return Err(CUerror::UNKNOWN);
+    }
+    // Read the ELF output
+    let elf_module = std::fs::read(&output_path).map_err(|e| {
+        super::driver::zluda_log(&format!("[ZLUDA]   failed to read compiled ELF: {:?}", e));
+        CUerror::UNKNOWN
+    })?;
+    let _ = std::fs::remove_file(&output_path);
+    if elf_module.starts_with(b"ERROR:") {
+        super::driver::zluda_log(&format!("[ZLUDA]   compile error: {}", String::from_utf8_lossy(&elf_module)));
+        return Err(CUerror::UNKNOWN);
     }
     Ok(elf_module)
 }
@@ -221,10 +345,23 @@ pub(crate) fn load(module: &mut CUmodule, fname: &CStr) -> CUresult {
 }
 
 pub(crate) fn load_data(module: &mut CUmodule, image: &std::ffi::c_void) -> CUresult {
+    super::driver::zluda_log("[ZLUDA] cuModuleLoadData: entering");
     let library =
-        unsafe { CodeLibraryRef::try_load(image) }.map_err(|_| CUerror::NO_BINARY_FOR_GPU)?;
+        unsafe { CodeLibraryRef::try_load(image) }.map_err(|e| {
+            super::driver::zluda_log(&format!("[ZLUDA] cuModuleLoadData -> NO_BINARY_FOR_GPU (try_load failed: {:?})", e));
+            CUerror::NO_BINARY_FOR_GPU
+        })?;
+    let format = match library {
+        CodeLibraryRef::FatbincWrapper(_) => "FatbincWrapper",
+        CodeLibraryRef::FatbinHeader(_) => "FatbinHeader",
+        CodeLibraryRef::Text(_) => "Text",
+        CodeLibraryRef::Elf(_) => "Elf",
+        CodeLibraryRef::Archive(_) => "Archive",
+    };
+    super::driver::zluda_log(&format!("[ZLUDA] cuModuleLoadData: try_load OK, format={}", format));
     let hip_module = load_hip_module(library)?;
     *module = Module { base: hip_module }.wrap();
+    super::driver::zluda_log("[ZLUDA] cuModuleLoadData -> SUCCESS");
     Ok(())
 }
 

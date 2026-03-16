@@ -101,6 +101,7 @@ cuda_macros::cuda_function_declarations!(
             cuDevicePrimaryCtxRetain,
             cuDevicePrimaryCtxSetFlags_v2,
             cuDevicePrimaryCtxSetFlags,
+            cuDeviceTotalMem,
             cuDeviceTotalMem_v2,
             cuDriverGetVersion,
             cuEventCreate,

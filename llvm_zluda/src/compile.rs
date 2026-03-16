@@ -88,6 +88,13 @@ fn create_oclc_constants(ctx: &Context, gcn_arch: &str) -> Result<Module, String
     Ok(module)
 }
 
+fn compile_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_compile.log") {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 pub fn compile(
     ctx: &Context,
     gcn_arch: &str,
@@ -96,24 +103,43 @@ pub fn compile(
     attributes: Module,
     compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
 ) -> Result<Vec<u8>, String> {
+    compile_log("compile: init_globals");
     init_globals()?;
 
+    compile_log("compile: Module::new linked");
     let linked = Module::new(ctx, c"llvm-link");
 
-    let ptx_impl = load_module(ctx, ptx_impl, c"ptx_impl.bc")?;
+    compile_log(&format!("compile: load ptx_impl.bc ({} bytes)", ptx_impl.len()));
+    let ptx_impl_mod = Module::try_from_bitcode(ctx, ptx_impl, Some(c"ptx_impl.bc"))
+        .ok_or("Failed to parse ptx_impl bitcode".to_string())?;
+    compile_log("compile: ptx_impl parsed, verifying");
+    ptx_impl_mod.verify()?;
+    compile_log("compile: ptx_impl verified");
+    let ptx_impl = ptx_impl_mod;
+    compile_log("compile: load ockl.bc");
     let ockl = load_module(ctx, OCKL_MODULE, c"ockl.bc")?;
+    compile_log("compile: load ocml.bc");
     let ocml = load_module(ctx, OCML_MODULE, c"ocml.bc")?;
 
+    compile_log("compile: create oclc_constants");
     let oclc_constants = create_oclc_constants(ctx, gcn_arch)?;
 
+    compile_log("compile: linking main");
     linked.link(main)?;
+    compile_log("compile: linking attributes");
     linked.link(attributes)?;
+    compile_log("compile: linking oclc_constants");
     linked.link(oclc_constants)?;
+    compile_log("compile: linking ptx_impl");
     linked.link(ptx_impl)?;
+    compile_log("compile: linking ockl");
     linked.link(ockl)?;
+    compile_log("compile: linking ocml");
     linked.link(ocml)?;
 
+    compile_log("compile: verify");
     linked.verify()?;
+    compile_log("compile: verify OK");
 
     if let Some(hook) = compiler_hook {
         // Run compiler hook on human-readable LLVM IR
@@ -122,6 +148,7 @@ pub fn compile(
         hook(&data, String::from("linked.ll"));
     }
 
+    compile_log("compile: setting up target machine");
     let triple = c"amdgcn-amd-amdhsa";
     let cpu = std::ffi::CString::new(gcn_arch).map_err(|_| ("invalid gcn_arch").to_string())?;
     let features = c"-wavefrontsize64,+cumode";
@@ -133,6 +160,7 @@ pub fn compile(
         let message = Message::new(unsafe { CStr::from_ptr(err) });
         return Err(message.to_str().to_string());
     }
+    compile_log("compile: target found, creating target machine");
 
     let target_machine = TargetMachine::new(
         target,
@@ -144,6 +172,7 @@ pub fn compile(
         LLVMCodeModel::LLVMCodeModelDefault,
     );
 
+    compile_log("compile: running LLVMRunPasses (default<O3>)");
     let pb_options = PassBuilderOptions::new();
     let error = unsafe {
         LLVMRunPasses(
@@ -157,8 +186,10 @@ pub fn compile(
     if !error.is_null() {
         let err_msg = unsafe { llvm_sys::error::LLVMGetErrorMessage(error) };
         let message = Message::new(unsafe { CStr::from_ptr(err_msg) });
+        compile_log(&format!("compile: LLVMRunPasses FAILED: {}", message.to_str()));
         return Err(message.to_str().to_string());
     }
+    compile_log("compile: LLVMRunPasses OK");
 
     if let Some(hook) = compiler_hook {
         // Run compiler hook on optimized human-readable LLVM IR
@@ -173,9 +204,11 @@ pub fn compile(
         hook(&assembly, String::from("asm"))
     }
 
+    compile_log("compile: emitting object file");
     let object_file = target_machine
         .emit_to_memory_buffer(&linked, LLVMCodeGenFileType::LLVMObjectFile)?
         .to_vec();
+    compile_log(&format!("compile: object file {} bytes", object_file.len()));
 
     if let Some(hook) = compiler_hook {
         // Run compiler hook for object file
@@ -195,6 +228,7 @@ pub fn compile(
     let object_path_cstr = path_to_cstring(&object_path)?;
     let executable_path_cstr = path_to_cstring(&executable_path)?;
 
+    compile_log("compile: linking with LLD");
     let mut err = std::ptr::null_mut();
     let result = unsafe {
         LLVMZludaLinkWithLLD(
@@ -208,8 +242,10 @@ pub fn compile(
         return Err(message.to_str().to_string());
     }
 
+    compile_log("compile: LLD link OK, reading executable");
     let executable =
         fs::read(&executable_path).map_err(|_| ("Failed to read executable file").to_string())?;
+    compile_log(&format!("compile: DONE, executable {} bytes", executable.len()));
 
     if let Some(hook) = compiler_hook {
         // Run compiler hook for final executable

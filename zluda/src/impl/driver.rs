@@ -127,9 +127,22 @@ fn should_zero_allocations() -> Option<bool> {
     )
 }
 
+pub(crate) fn zluda_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/zluda_debug.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
+    zluda_log(&format!("[ZLUDA] cuInit({})", flags));
     unsafe { hipInit(flags) }?;
     global_state()?;
+    zluda_log("[ZLUDA] cuInit -> SUCCESS");
     Ok(())
 }
 
@@ -185,6 +198,33 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         Ok(())
     }
 
+    // PhysX uses these dark API functions - indices 4 and 5 in CUDART_INTERFACE
+    // set_device_flags: configures scheduling behavior for CUDA on the specified device
+    // set_device: makes the specified device active (like cudaSetDevice)
+    unsafe extern "system" fn set_device_flags(
+        dev: hipDevice_t,
+        flags: std::ffi::c_uint,
+    ) -> cuda_types::cuda::CUresult {
+        let mut active_dev = 0i32;
+        hipGetDevice(&mut active_dev)?;
+        if dev != active_dev {
+            hipSetDevice(dev)?;
+        }
+        let result = hipSetDeviceFlags(flags);
+        if dev != active_dev {
+            let _ = hipSetDevice(active_dev);
+        }
+        result?;
+        Ok(())
+    }
+
+    unsafe extern "system" fn set_device(
+        dev: hipDevice_t,
+    ) -> cuda_types::cuda::CUresult {
+        hipSetDevice(dev)?;
+        Ok(())
+    }
+
     unsafe extern "system" fn get_module_from_cubin_ext1(
         result: *mut cuda_types::cuda::CUmodule,
         fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper,
@@ -192,7 +232,9 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         arg4: *mut std::ffi::c_void,
         arg5: u32,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log("[ZLUDA] dark_api::get_module_from_cubin_ext1");
         if arg3 != ptr::null_mut() || arg4 != ptr::null_mut() || arg5 != 0 {
+            zluda_log("[ZLUDA] dark_api::get_module_from_cubin_ext1 -> NOT_SUPPORTED (non-null args)");
             return CUresult::ERROR_NOT_SUPPORTED;
         }
         let result = match result.as_mut() {
@@ -203,7 +245,9 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             .cast::<c_void>()
             .as_ref()
             .ok_or(CUerror::INVALID_VALUE)?;
-        module::load_data(result, data)
+        let r = module::load_data(result, data);
+        zluda_log(&format!("[ZLUDA] dark_api::get_module_from_cubin_ext1 -> {:?}", r));
+        r
     }
 
     unsafe extern "system" fn cudart_interface_fn7(_arg1: usize) -> () {
@@ -314,6 +358,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _flags: ::std::os::raw::c_uint,
         _dev: cuda_types::cuda::CUdevice,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log(&format!("[ZLUDA] dark_api::ctx_create_v2_bypass(dev={})", _dev));
         Err(r#impl::unimplemented())
     }
 
@@ -484,16 +529,27 @@ pub(crate) fn get_export_table(
     pp_export_table: &mut *const ::core::ffi::c_void,
     p_export_table_id: &CUuuid,
 ) -> CUresult {
+    let guid_str = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        p_export_table_id.bytes[0], p_export_table_id.bytes[1], p_export_table_id.bytes[2], p_export_table_id.bytes[3],
+        p_export_table_id.bytes[4], p_export_table_id.bytes[5],
+        p_export_table_id.bytes[6], p_export_table_id.bytes[7],
+        p_export_table_id.bytes[8], p_export_table_id.bytes[9],
+        p_export_table_id.bytes[10], p_export_table_id.bytes[11],
+        p_export_table_id.bytes[12], p_export_table_id.bytes[13],
+        p_export_table_id.bytes[14], p_export_table_id.bytes[15]);
     if let Some(table) = EXPORT_TABLE.get(p_export_table_id) {
         *pp_export_table = table.start();
+        zluda_log(&format!("[ZLUDA] cuGetExportTable({}) -> SUCCESS", guid_str));
         cuda_types::cuda::CUresult::SUCCESS
     } else {
+        zluda_log(&format!("[ZLUDA] cuGetExportTable({}) -> ERROR_INVALID_VALUE (unknown GUID!)", guid_str));
         cuda_types::cuda::CUresult::ERROR_INVALID_VALUE
     }
 }
 
 pub(crate) fn get_version(version: &mut ::core::ffi::c_int) -> CUresult {
     *version = cuda_types::cuda::CUDA_VERSION as i32;
+    zluda_log(&format!("[ZLUDA] cuDriverGetVersion -> {}", *version));
     Ok(())
 }
 

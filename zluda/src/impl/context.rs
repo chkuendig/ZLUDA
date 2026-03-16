@@ -269,10 +269,12 @@ pub(crate) unsafe fn create_v2(
     _flags: ::core::ffi::c_uint,
     dev: cuda_types::cuda::CUdevice,
 ) -> CUresult {
+    super::driver::zluda_log(&format!("[ZLUDA] cuCtxCreate_v2(dev={})", dev));
     let handle = Context::wrap(Context::new(dev));
     // TODO: optimize
     set_current(handle)?;
     *ctx = handle;
+    super::driver::zluda_log("[ZLUDA] cuCtxCreate_v2 -> SUCCESS");
     Ok(())
 }
 
