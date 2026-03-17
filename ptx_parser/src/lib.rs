@@ -571,7 +571,8 @@ fn directive<'a, 'input>(
                 function.map(|(linking, func)| Some(ast::Directive::Method(linking, func))),
                 file.map(|_| None),
                 section.map(|_| None),
-                texref_surfref.map(|_| None),
+                texref_surfref
+                    .map(|(linking, var)| Some(ast::Directive::Variable(linking, var))),
                 (module_variable, Token::Semicolon)
                     .map(|((linking, var), _)| Some(ast::Directive::Variable(linking, var))),
             )),
@@ -634,20 +635,39 @@ fn file<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
     .parse_next(stream)
 }
 
-/// Parse and skip .texref/.surfref global declarations
+/// Parse .texref/.surfref global declarations as .global .u64 variables.
+/// These are opaque texture/surface handles used by tex/sust/suld instructions.
 /// Format: [.extern] .global .texref name;
 ///         [.extern] .global .surfref name;
-fn texref_surfref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
+fn texref_surfref<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<(ast::LinkingDirective, ast::Variable<&'input str>)> {
     trace(
         "texref_surfref",
         (
             opt(Token::DotExtern),
             Token::DotGlobal,
             alt((Token::DotTexref.void(), Token::DotSurfref.void())),
-            ident.void(),
+            ident,
             Token::Semicolon,
         )
-            .void(),
+            .map(|(is_extern, _, _, name, _)| {
+                let linking = if is_extern.is_some() {
+                    ast::LinkingDirective::EXTERN
+                } else {
+                    ast::LinkingDirective::NONE
+                };
+                let var = ast::Variable {
+                    info: ast::VariableInfo {
+                        align: None,
+                        v_type: ast::Type::Scalar(ScalarType::U64),
+                        state_space: StateSpace::Global,
+                        array_init: Vec::new(),
+                    },
+                    name,
+                };
+                (linking, var)
+            }),
     )
     .parse_next(stream)
 }
