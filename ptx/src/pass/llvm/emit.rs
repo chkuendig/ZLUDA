@@ -3628,8 +3628,26 @@ fn get_type(context: LLVMContextRef, type_: &ast::Type) -> Result<LLVMTypeRef, T
                 })
         }
         ast::Type::Texref | ast::Type::Surfref => {
-            // Texture/surface references are pointer-sized handles (u64 on 64-bit)
-            unsafe { LLVMInt64TypeInContext(context) }
+            // Texture/surface references must be sizeof(textureReference) = 88 bytes
+            // to match HIP's expectation for hipModuleGetTexRef to find them.
+            // Use a named struct type so LLD/HIP recognizes it.
+            unsafe {
+                let existing =
+                    LLVMGetTypeByName2(context, TEXREF_UNDERLYING.as_ptr() as *const _);
+                if !existing.is_null() {
+                    existing
+                } else {
+                    let s = LLVMStructCreateNamed(
+                        context,
+                        TEXREF_UNDERLYING.as_ptr() as *const _,
+                    );
+                    // 11 x i64 = 88 bytes = sizeof(textureReference)
+                    let i64_ty = LLVMInt64TypeInContext(context);
+                    let mut fields = [i64_ty; 11];
+                    LLVMStructSetBody(s, fields.as_mut_ptr(), 11, 0);
+                    s
+                }
+            }
         }
     })
 }

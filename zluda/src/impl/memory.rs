@@ -150,7 +150,12 @@ pub(crate) unsafe fn host_alloc(
     flags: ::std::os::raw::c_uint,
 ) -> CUresult {
     let context = context::get_current_context()?;
-    hipHostMalloc(pp, bytesize, flags)?;
+    // In CUDA, all page-locked host memory is implicitly device-mapped.
+    // In HIP, hipHostMallocMapped must be set explicitly for
+    // hipHostGetDevicePointer to work. PhysX requires this for its
+    // GPU→CPU signaling pattern (pinned memory spinWait).
+    let hip_flags = flags | 0x02; // hipHostMallocMapped
+    hipHostMalloc(pp, bytesize, hip_flags)?;
     add_allocation(*pp, bytesize, context)?;
     Ok(())
 }

@@ -152,6 +152,17 @@ pub(crate) fn zluda_log(msg: &str) {
     }
 }
 
+pub(crate) fn zluda_log_err(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/zluda_tex.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log(&format!("[ZLUDA] cuInit({})", flags));
     unsafe { hipInit(flags) }?;

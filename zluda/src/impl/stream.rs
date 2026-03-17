@@ -85,8 +85,19 @@ pub(crate) fn get_capture_info_v3(
     }
 }
 
+static QUERY_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub(crate) fn query(stream: hipStream_t) -> hipError_t {
-    unsafe { hipStreamQuery(stream) }
+    let result = unsafe { hipStreamQuery(stream) };
+    // Log the first 20 queries with stream pointer to identify which streams PhysX polls
+    let count = QUERY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < 20 {
+        super::driver::zluda_log_err(&format!(
+            "cuStreamQuery(stream={:?}) -> {:?}",
+            stream, result
+        ));
+    }
+    result
 }
 
 pub(crate) fn wait_event(
