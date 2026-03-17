@@ -103,6 +103,59 @@ pub fn compile(
     attributes: Module,
     compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
 ) -> Result<Vec<u8>, String> {
+    // Wine threads typically have 1MB stacks, but LLVM's bitcode parser
+    // and optimization passes need much more. Spawn a native thread with
+    // a 64MB stack to avoid SIGSEGV during compilation.
+    compile_log("compile: spawning large-stack thread (64MB) for LLVM");
+    let stack_size = 64 * 1024 * 1024; // 64MB
+
+    // Pack raw pointers to move across thread boundary.
+    // SAFETY: LLVM contexts/modules are not thread-safe, but we block
+    // the calling thread (join) so there's no concurrent access.
+    struct SendPtrs {
+        ctx: usize,
+        main: usize,
+        attr: usize,
+        ptx_impl: Vec<u8>,
+        gcn_arch: String,
+    }
+    unsafe impl Send for SendPtrs {}
+
+    let ptrs = SendPtrs {
+        ctx: ctx as *const Context as usize,
+        main: main.get() as usize,
+        attr: attributes.get() as usize,
+        ptx_impl: ptx_impl.to_vec(),
+        gcn_arch: gcn_arch.to_string(),
+    };
+
+    // Prevent the caller's Modules from calling LLVMDisposeModule —
+    // ownership transfers to the thread.
+    std::mem::forget(main);
+    std::mem::forget(attributes);
+
+    std::thread::Builder::new()
+        .name("zluda-llvm-compile".into())
+        .stack_size(stack_size)
+        .spawn(move || {
+            let ctx = unsafe { &*(ptrs.ctx as *const Context) };
+            let main = unsafe { Module::from_raw(ptrs.main as *mut _) };
+            let attributes = unsafe { Module::from_raw(ptrs.attr as *mut _) };
+            compile_inner(ctx, &ptrs.gcn_arch, main, &ptrs.ptx_impl, attributes, None)
+        })
+        .map_err(|e| format!("Failed to spawn compile thread: {}", e))?
+        .join()
+        .map_err(|e| format!("Compile thread panicked: {:?}", e))?
+}
+
+fn compile_inner(
+    ctx: &Context,
+    gcn_arch: &str,
+    main: Module,
+    ptx_impl: &[u8],
+    attributes: Module,
+    compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
+) -> Result<Vec<u8>, String> {
     compile_log("compile: init_globals");
     init_globals()?;
 

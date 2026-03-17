@@ -68,6 +68,12 @@ impl Module {
         Self(unsafe { LLVMCloneModule(self.0) })
     }
 
+    /// Wrap a raw LLVMModuleRef. Caller must ensure the pointer is valid
+    /// and that no other Module owns this reference.
+    pub unsafe fn from_raw(ptr: LLVMModuleRef) -> Self {
+        Self(ptr)
+    }
+
     pub fn get(&self) -> LLVMModuleRef {
         self.0
     }
