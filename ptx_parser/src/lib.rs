@@ -571,6 +571,7 @@ fn directive<'a, 'input>(
                 function.map(|(linking, func)| Some(ast::Directive::Method(linking, func))),
                 file.map(|_| None),
                 section.map(|_| None),
+                texref_surfref.map(|_| None),
                 (module_variable, Token::Semicolon)
                     .map(|((linking, var), _)| Some(ast::Directive::Variable(linking, var))),
             )),
@@ -584,7 +585,9 @@ fn directive<'a, 'input>(
             // module variables
             | Token::DotGlobal | Token::DotConst | Token::DotShared
             // other sections
-            | Token::DotFile | Token::DotSection => true,
+            | Token::DotFile | Token::DotSection
+            // texture/surface references (skip)
+            | Token::DotTexref | Token::DotSurfref => true,
             _ => false,
         }),
             )
@@ -625,6 +628,24 @@ fn file<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
             u32,
             Token::String,
             opt((Token::Comma, u32, Token::Comma, u32)),
+        )
+            .void(),
+    )
+    .parse_next(stream)
+}
+
+/// Parse and skip .texref/.surfref global declarations
+/// Format: [.extern] .global .texref name;
+///         [.extern] .global .surfref name;
+fn texref_surfref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
+    trace(
+        "texref_surfref",
+        (
+            opt(Token::DotExtern),
+            Token::DotGlobal,
+            alt((Token::DotTexref.void(), Token::DotSurfref.void())),
+            ident.void(),
+            Token::Semicolon,
         )
             .void(),
     )
@@ -1891,7 +1912,11 @@ derive_parser!(
         #[token(".ptr")]
         DotPtr,
         #[token(".noreturn")]
-        DotNoreturn
+        DotNoreturn,
+        #[token(".texref")]
+        DotTexref,
+        #[token(".surfref")]
+        DotSurfref
     }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
@@ -3838,6 +3863,13 @@ derive_parser!(
         Instruction::ShflSync  {
             data: ast::ShflSyncDetails { mode },
             arguments: ShflSyncArgs { dst: d, dst_pred: p, src: a, src_lane: b, src_opts: c, src_membermask: membermask }
+        }
+    }
+    // Pre-sm_70 shfl without .sync (no membermask argument)
+    shfl.mode.b32  d[|p], a, b, c => {
+        Instruction::Shfl  {
+            data: ast::ShflSyncDetails { mode },
+            arguments: ShflArgs { dst: d, dst_pred: p, src: a, src_lane: b, src_opts: c }
         }
     }
     .mode: ShuffleMode = { .up, .down, .bfly, .idx };

@@ -664,6 +664,21 @@ ptx_parser_macros::generate_instruction_type!(
                 src_membermask: T
             }
         },
+        // Pre-sm_70 shfl without .sync and without membermask
+        Shfl {
+            data: ShflSyncDetails,
+            type: Type::Scalar(ScalarType::B32),
+            arguments<T>: {
+                dst: T,
+                dst_pred: {
+                    repr: Option<T>,
+                    type: Type::from(ScalarType::Pred)
+                },
+                src: T,
+                src_lane: T,
+                src_opts: T
+            }
+        },
         Shf {
             data: ShfDetails,
             type: Type::Scalar(ScalarType::B32),

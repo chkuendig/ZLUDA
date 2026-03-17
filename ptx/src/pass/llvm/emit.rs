@@ -645,6 +645,7 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::Bmsk { .. }
             | ast::Instruction::Activemask { .. }
             | ast::Instruction::ShflSync { .. }
+            | ast::Instruction::Shfl { .. }
             | ast::Instruction::Vote { .. }
             | ast::Instruction::Nanosleep { .. }
             | ast::Instruction::ReduxSync { .. }
