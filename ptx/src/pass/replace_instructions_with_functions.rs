@@ -264,7 +264,7 @@ fn run_statements<'input>(
                 // Handled here (not in run_instruction) because it expands to multiple statements
                 Statement::Instruction(ptx_parser::Instruction::Shfl {
                     data,
-                    arguments: ast::ShflArgs { dst, dst_pred: _, src, src_lane, src_opts },
+                    arguments: ast::ShflArgs { dst, dst_pred, src, src_lane, src_opts },
                 }) => {
                     let membermask = resolver.register_unnamed(Some((
                         ast::Type::Scalar(ast::ScalarType::U32),
@@ -276,15 +276,117 @@ fn run_statements<'input>(
                         ptx_parser::ShuffleMode::BFly => "bfly",
                         ptx_parser::ShuffleMode::Idx => "idx",
                     };
-                    let shfl_sync_inst = ptx_parser::Instruction::ShflSync {
+                    let mut result: SmallVec<[_; 3]> = smallvec![
+                        Statement::Constant(ConstantDefinition {
+                            dst: membermask,
+                            typ: ast::ScalarType::U32,
+                            value: ast::ImmediateValue::U64(0xFFFFFFFF),
+                        }),
+                    ];
+                    if let Some(dst_pred) = dst_pred {
+                        // With predicate output: use _pred variant that returns v2.u32
+                        let packed_var = resolver.register_unnamed(Some((
+                            ast::Type::Vector(2, ast::ScalarType::U32),
+                            ptx_parser::StateSpace::Reg,
+                        )));
+                        let dst_pred_wide = resolver.register_unnamed(Some((
+                            ast::Type::Scalar(ast::ScalarType::U32),
+                            ptx_parser::StateSpace::Reg,
+                        )));
+                        let name = ["shfl_sync_", mode, "_b32_pred"].concat();
+                        let return_arguments = vec![(
+                            ast::Type::Vector(2, ast::ScalarType::U32),
+                            ptx_parser::StateSpace::Reg,
+                        )];
+                        let input_arguments = vec![
+                            (ast::Type::Scalar(ast::ScalarType::U32), ptx_parser::StateSpace::Reg),
+                            (ast::Type::Scalar(ast::ScalarType::U32), ptx_parser::StateSpace::Reg),
+                            (ast::Type::Scalar(ast::ScalarType::U32), ptx_parser::StateSpace::Reg),
+                            (ast::Type::Scalar(ast::ScalarType::U32), ptx_parser::StateSpace::Reg),
+                        ];
+                        let func = get_or_declare_function(
+                            resolver,
+                            fn_declarations,
+                            name,
+                            &return_arguments,
+                            &input_arguments,
+                        );
+                        result.push(Statement::Instruction(ast::Instruction::Call {
+                            data: ptx_parser::CallDetails {
+                                uniform: false,
+                                return_arguments,
+                                input_arguments,
+                            },
+                            arguments: ptx_parser::CallArgs {
+                                return_arguments: vec![packed_var],
+                                func,
+                                input_arguments: vec![src, src_lane, src_opts, membermask],
+                                is_external: true,
+                            },
+                        }));
+                        result.push(Statement::RepackVector(RepackVectorDetails {
+                            is_extract: true,
+                            typ: ast::ScalarType::U32,
+                            packed: packed_var,
+                            unpacked: vec![dst, dst_pred_wide],
+                            relaxed_type_check: false,
+                        }));
+                        result.push(Statement::Instruction(ast::Instruction::Cvt {
+                            data: ast::CvtDetails {
+                                from: ast::ScalarType::U32,
+                                to: ast::ScalarType::Pred,
+                                mode: ast::CvtMode::Truncate,
+                            },
+                            arguments: ast::CvtArgs {
+                                dst: dst_pred,
+                                src: dst_pred_wide,
+                                src2: None,
+                            },
+                        }));
+                    } else {
+                        // Without predicate output: simple call
+                        let shfl_sync_inst = ptx_parser::Instruction::ShflSync {
+                            data,
+                            arguments: ast::ShflSyncArgs {
+                                dst,
+                                dst_pred: None,
+                                src,
+                                src_lane,
+                                src_opts,
+                                src_membermask: membermask,
+                            },
+                        };
+                        result.push(Statement::Instruction(to_call(
+                            resolver,
+                            fn_declarations,
+                            format!("shfl_sync_{}_b32", mode).into(),
+                            shfl_sync_inst,
+                        )?));
+                    }
+                    result
+                }
+                // Pre-sm_70 vote without .sync (no membermask) — convert to Vote with mask=0xFFFFFFFF
+                Statement::Instruction(ptx_parser::Instruction::VotePreSync {
+                    data,
+                    arguments: ast::VotePreSyncArgs { dst, src1 },
+                }) => {
+                    let membermask = resolver.register_unnamed(Some((
+                        ast::Type::Scalar(ast::ScalarType::U32),
+                        ptx_parser::StateSpace::Reg,
+                    )));
+                    let mode_str = match data.mode {
+                        ptx_parser::VoteMode::Any => "any_pred",
+                        ptx_parser::VoteMode::All => "all_pred",
+                        ptx_parser::VoteMode::Ballot => "ballot_b32",
+                    };
+                    let negate = if data.negate { "_negate" } else { "" };
+                    let name = format!("vote_sync_{mode_str}{negate}");
+                    let vote_inst = ptx_parser::Instruction::Vote {
                         data,
-                        arguments: ast::ShflSyncArgs {
+                        arguments: ast::VoteArgs {
                             dst,
-                            dst_pred: None,
-                            src,
-                            src_lane,
-                            src_opts,
-                            src_membermask: membermask,
+                            src1,
+                            src2: membermask,
                         },
                     };
                     smallvec![
@@ -296,9 +398,9 @@ fn run_statements<'input>(
                         Statement::Instruction(to_call(
                             resolver,
                             fn_declarations,
-                            format!("shfl_sync_{}_b32", mode).into(),
-                            shfl_sync_inst,
-                        )?)
+                            name.into(),
+                            vote_inst,
+                        )?),
                     ]
                 }
                 Statement::<ast::Instruction<SpirvWord>, SpirvWord>::Instruction(instruction) => {
@@ -525,8 +627,9 @@ fn run_instruction<'input>(
                 },
             )?
         }
-        // Shfl is handled in run_statements (outer match) since it expands to multiple statements
+        // Shfl and VotePreSync are handled in run_statements (outer match) since they expand to multiple statements
         i @ ptx_parser::Instruction::Shfl { .. } => i,
+        i @ ptx_parser::Instruction::VotePreSync { .. } => i,
         i @ ptx_parser::Instruction::Nanosleep { .. } => {
             to_call(resolver, fn_declarations, "nanosleep_u32".into(), i)?
         }

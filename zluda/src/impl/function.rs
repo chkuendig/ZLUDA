@@ -50,29 +50,61 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
-    super::driver::zluda_log(&format!(
-        "[ZLUDA] cuLaunchKernel(grid=[{},{},{}], block=[{},{},{}], shared={}, stream={:?})",
-        grid_dim_x, grid_dim_y, grid_dim_z,
-        block_dim_x, block_dim_y, block_dim_z,
-        shared_mem_bytes, stream
-    ));
-    // TODO: fix constants in extra
-    let result = unsafe {
-        hipModuleLaunchKernel(
-            f,
-            grid_dim_x,
-            grid_dim_y,
-            grid_dim_z,
-            block_dim_x,
-            block_dim_y,
-            block_dim_z,
-            shared_mem_bytes,
-            stream,
-            kernel_params,
-            extra,
-        )
+    // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
+    let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
+    let cu_launch_param_buffer_pointer = 0x1usize as *mut ::core::ffi::c_void;
+    let cu_launch_param_buffer_size = 0x2usize as *mut ::core::ffi::c_void;
+    let result = if !extra.is_null() && kernel_params.is_null() {
+        // Translate CU_LAUNCH_PARAM_END (0) -> HIP_LAUNCH_PARAM_END (3)
+        // extra format: [BUFFER_POINTER, ptr, BUFFER_SIZE, size_ptr, END]
+        let extra_params = unsafe { std::slice::from_raw_parts(extra, 5) };
+        if extra_params[0] == cu_launch_param_buffer_pointer
+            && extra_params[2] == cu_launch_param_buffer_size
+        {
+            let mut patched = [
+                extra_params[0],
+                extra_params[1],
+                extra_params[2],
+                extra_params[3],
+                hip_launch_param_end,
+            ];
+            unsafe {
+                hipModuleLaunchKernel(
+                    f, grid_dim_x, grid_dim_y, grid_dim_z,
+                    block_dim_x, block_dim_y, block_dim_z,
+                    shared_mem_bytes, stream,
+                    std::ptr::null_mut(),
+                    patched.as_mut_ptr(),
+                )
+            }
+        } else {
+            unsafe {
+                hipModuleLaunchKernel(
+                    f, grid_dim_x, grid_dim_y, grid_dim_z,
+                    block_dim_x, block_dim_y, block_dim_z,
+                    shared_mem_bytes, stream, kernel_params, extra,
+                )
+            }
+        }
+    } else {
+        unsafe {
+            hipModuleLaunchKernel(
+                f, grid_dim_x, grid_dim_y, grid_dim_z,
+                block_dim_x, block_dim_y, block_dim_z,
+                shared_mem_bytes, stream, kernel_params, extra,
+            )
+        }
     };
-    super::driver::zluda_log(&format!("[ZLUDA] cuLaunchKernel -> {:?}", result));
+    // Log all kernel launches (lightweight)
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
+            let _ = writeln!(file, "launch grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
+                grid_dim_x, grid_dim_y, grid_dim_z,
+                block_dim_x, block_dim_y, block_dim_z,
+                shared_mem_bytes, result);
+        }
+    }
     result
 }
 

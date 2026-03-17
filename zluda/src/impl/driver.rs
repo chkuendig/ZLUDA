@@ -129,6 +129,20 @@ fn should_zero_allocations() -> Option<bool> {
 
 pub(crate) fn zluda_log(msg: &str) {
     use std::io::Write;
+    // Check ZLUDA_DEBUG env var (cached after first check)
+    static ENABLED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let enabled = match ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let e = std::env::var("ZLUDA_DEBUG").map_or(false, |v| v == "1");
+            ENABLED.store(if e { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+            e
+        }
+        2 => true,
+        _ => false,
+    };
+    if !enabled {
+        return;
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -815,4 +829,28 @@ mod tests {
         api.cuDevicePrimaryCtxRetain(&mut primary_ctx, 0);
         assert_eq!(dark_ctx.0, primary_ctx.0);
     }
+}
+
+// Forwarding functions for cuMipmappedArray* — the cuda_normalize_fn macro
+// routes these to driver:: because "mipmapped" is not in the MODULES list.
+pub(crate) unsafe fn mipmapped_array_create(
+    p_handle: &mut cuda_types::cuda::CUmipmappedArray,
+    p_mipmapped_array_desc: &cuda_types::cuda::CUDA_ARRAY3D_DESCRIPTOR,
+    num_mipmap_levels: u32,
+) -> cuda_types::cuda::CUresult {
+    super::array::mipmapped_create(p_handle, p_mipmapped_array_desc, num_mipmap_levels)
+}
+
+pub(crate) unsafe fn mipmapped_array_destroy(
+    h_mipmapped_array: cuda_types::cuda::CUmipmappedArray,
+) -> cuda_types::cuda::CUresult {
+    super::array::mipmapped_destroy(h_mipmapped_array)
+}
+
+pub(crate) unsafe fn mipmapped_array_get_level(
+    p_level_array: &mut cuda_types::cuda::CUarray,
+    h_mipmapped_array: cuda_types::cuda::CUmipmappedArray,
+    level: u32,
+) -> cuda_types::cuda::CUresult {
+    super::array::mipmapped_get_level(p_level_array, h_mipmapped_array, level)
 }

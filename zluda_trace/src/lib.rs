@@ -366,6 +366,8 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApiTrace {
                 pctx: *mut cuda_types::cuda::CUcontext,
                 dev: cuda_types::cuda::CUdevice
             ) -> cuda_types::cuda::CUresult,
+            [4] = set_device_flags(dev: cuda_types::cuda::CUdevice, flags: std::ffi::c_uint) -> cuda_types::cuda::CUresult,
+            [5] = set_device(dev: cuda_types::cuda::CUdevice) -> cuda_types::cuda::CUresult,
             [7] = cudart_interface_fn7(arg1: usize) -> (),
             [12] = load_compilers() -> cuda_types::cuda::CUresult
         }

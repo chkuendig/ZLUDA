@@ -8,4 +8,4 @@ pub mod utils;
 
 pub use ffi::*;
 
-pub use compile::compile;
+pub use compile::{compile, compile_with_extra};

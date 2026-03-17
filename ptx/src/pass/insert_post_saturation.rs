@@ -203,6 +203,7 @@ fn run_instruction<'input>(
         | ast::Instruction::Trap {}
         | ast::Instruction::Xor { .. }
         | ast::Instruction::Vote { .. }
+        | ast::Instruction::VotePreSync { .. }
         | ast::Instruction::ReduxSync { .. }
         | ast::Instruction::GridDepControl { .. }
         | ast::Instruction::LdMatrix { .. }

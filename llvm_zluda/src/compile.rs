@@ -103,6 +103,18 @@ pub fn compile(
     attributes: Module,
     compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
 ) -> Result<Vec<u8>, String> {
+    compile_with_extra(ctx, gcn_arch, main, ptx_impl, &[], attributes, compiler_hook)
+}
+
+pub fn compile_with_extra(
+    ctx: &Context,
+    gcn_arch: &str,
+    main: Module,
+    ptx_impl: &[u8],
+    extra_bitcode: &[u8],
+    attributes: Module,
+    compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
+) -> Result<Vec<u8>, String> {
     // Wine threads typically have 1MB stacks, but LLVM's bitcode parser
     // and optimization passes need much more. Spawn a native thread with
     // a 64MB stack to avoid SIGSEGV during compilation.
@@ -117,6 +129,7 @@ pub fn compile(
         main: usize,
         attr: usize,
         ptx_impl: Vec<u8>,
+        extra_bitcode: Vec<u8>,
         gcn_arch: String,
     }
     unsafe impl Send for SendPtrs {}
@@ -126,6 +139,7 @@ pub fn compile(
         main: main.get() as usize,
         attr: attributes.get() as usize,
         ptx_impl: ptx_impl.to_vec(),
+        extra_bitcode: extra_bitcode.to_vec(),
         gcn_arch: gcn_arch.to_string(),
     };
 
@@ -141,7 +155,7 @@ pub fn compile(
             let ctx = unsafe { &*(ptrs.ctx as *const Context) };
             let main = unsafe { Module::from_raw(ptrs.main as *mut _) };
             let attributes = unsafe { Module::from_raw(ptrs.attr as *mut _) };
-            compile_inner(ctx, &ptrs.gcn_arch, main, &ptrs.ptx_impl, attributes, None)
+            compile_inner(ctx, &ptrs.gcn_arch, main, &ptrs.ptx_impl, &ptrs.extra_bitcode, attributes, None)
         })
         .map_err(|e| format!("Failed to spawn compile thread: {}", e))?
         .join()
@@ -153,6 +167,7 @@ fn compile_inner(
     gcn_arch: &str,
     main: Module,
     ptx_impl: &[u8],
+    extra_bitcode: &[u8],
     attributes: Module,
     compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
 ) -> Result<Vec<u8>, String> {
@@ -185,6 +200,13 @@ fn compile_inner(
     linked.link(oclc_constants)?;
     compile_log("compile: linking ptx_impl");
     linked.link(ptx_impl)?;
+    if !extra_bitcode.is_empty() {
+        compile_log(&format!("compile: load extra bitcode ({} bytes)", extra_bitcode.len()));
+        let extra_mod = Module::try_from_bitcode(ctx, extra_bitcode, Some(c"ptx_impl_tex.bc"))
+            .ok_or("Failed to parse extra bitcode".to_string())?;
+        compile_log("compile: linking extra bitcode");
+        linked.link(extra_mod)?;
+    }
     compile_log("compile: linking ockl");
     linked.link(ockl)?;
     compile_log("compile: linking ocml");

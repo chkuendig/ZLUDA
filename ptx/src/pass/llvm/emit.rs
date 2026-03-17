@@ -75,6 +75,11 @@ pub(crate) fn run<'input>(
             Directive2::Method(method) => emit_ctx.emit_method(method)?,
         }
     }
+    // Add preserved globals (e.g. .texref/.surfref) to @llvm.used so they survive
+    // -amdgpu-internalize-symbols and O3 optimization
+    if !emit_ctx.preserved_globals.is_empty() {
+        emit_llvm_used(emit_ctx.context, emit_ctx.module, &emit_ctx.preserved_globals);
+    }
     if cfg!(debug_assertions) {
         if let Err(err) = module.verify() {
             panic!("{}\n{:?}", module.print_module_to_string(), err);
@@ -83,12 +88,36 @@ pub(crate) fn run<'input>(
     Ok(module)
 }
 
+/// Emit @llvm.used = appending global [N x ptr] [...], section "llvm.metadata"
+/// This prevents LLVM from stripping the listed globals during optimization.
+fn emit_llvm_used(context: LLVMContextRef, module: LLVMModuleRef, globals: &[LLVMValueRef]) {
+    unsafe {
+        let ptr_type = LLVMPointerTypeInContext(context, 0);
+        let array_type = LLVMArrayType2(ptr_type, globals.len() as u64);
+        let mut values: Vec<LLVMValueRef> = globals
+            .iter()
+            .map(|&g| {
+                // Globals are in address space 1 (AMDGPU global), @llvm.used needs AS 0
+                LLVMConstAddrSpaceCast(g, ptr_type)
+            })
+            .collect();
+        let const_array = LLVMConstArray2(ptr_type, values.as_mut_ptr(), values.len() as u64);
+        let llvm_used = LLVMAddGlobal(module, array_type, c"llvm.used".as_ptr());
+        LLVMSetInitializer(llvm_used, const_array);
+        LLVMSetLinkage(llvm_used, LLVMLinkage::LLVMAppendingLinkage);
+        LLVMSetSection(llvm_used, c"llvm.metadata".as_ptr());
+    }
+}
+
 struct ModuleEmitContext<'a, 'input> {
     context: LLVMContextRef,
     module: LLVMModuleRef,
     builder: Builder,
     id_defs: &'a GlobalStringIdentResolver2<'input>,
     resolver: ResolveIdent,
+    /// Globals that must survive optimization (e.g. .texref/.surfref compiled as .global .u64).
+    /// These get added to @llvm.used so -amdgpu-internalize-symbols doesn't strip them.
+    preserved_globals: Vec<LLVMValueRef>,
 }
 
 impl<'a, 'input> ModuleEmitContext<'a, 'input> {
@@ -103,6 +132,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             builder: Builder::new(context),
             id_defs,
             resolver: ResolveIdent::new(&id_defs),
+            preserved_globals: Vec::new(),
         }
     }
 
@@ -270,6 +300,15 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         if !var.info.array_init.is_empty() {
             let initializer = self.get_array_init(&var.info.v_type, &*var.info.array_init)?;
             unsafe { LLVMSetInitializer(global, initializer) };
+        } else if var.info.state_space == ast::StateSpace::Global {
+            // Global variables without explicit initializers (e.g. .texref/.surfref)
+            // need a zero initializer so the linker doesn't treat them as undefined externals
+            let ty = get_type(self.context, &var.info.v_type)?;
+            unsafe { LLVMSetInitializer(global, LLVMConstNull(ty)) };
+            unsafe { LLVMSetExternallyInitialized(global, 0) };
+            // Preserve this global so -amdgpu-internalize-symbols doesn't strip it.
+            // These are typically .texref/.surfref handles that the host writes to at runtime.
+            self.preserved_globals.push(global);
         }
         Ok(())
     }
@@ -647,6 +686,7 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::ShflSync { .. }
             | ast::Instruction::Shfl { .. }
             | ast::Instruction::Vote { .. }
+            | ast::Instruction::VotePreSync { .. }
             | ast::Instruction::Nanosleep { .. }
             | ast::Instruction::ReduxSync { .. }
             | ast::Instruction::LdMatrix { .. }

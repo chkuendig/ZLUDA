@@ -2,8 +2,24 @@ use super::driver;
 use crate::r#impl::driver::GlobalState;
 use cuda_types::{cuda::*, dark_api::FatbinFileHeader};
 use hip_runtime_sys::*;
-use std::{borrow::Cow, ffi::CStr, fs, mem, ops::ControlFlow};
+use std::{borrow::Cow, collections::HashMap, ffi::CStr, fs, mem, ops::ControlFlow, sync::Mutex};
 use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
+
+/// Global map from synthetic texture reference pointers to their device global variable addresses.
+/// When .texref variables are compiled as .global .u64 in PTX, hipModuleGetTexRef can't find them.
+/// We create synthetic textureReference structs and track which device global they correspond to.
+/// After a texture object is created (via hipTexRefSetArray), we copy the handle to the device global
+/// so the kernel can read it at runtime.
+static SYNTHETIC_TEXREFS: std::sync::LazyLock<Mutex<HashMap<usize, hipDeviceptr_t>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Check if a texture reference is synthetic and get its device global address
+pub(crate) fn get_synthetic_texref_global(tex_ref: *const textureReference) -> Option<hipDeviceptr_t> {
+    SYNTHETIC_TEXREFS
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&(tex_ref as usize)).copied())
+}
 
 pub(crate) struct Module {
     pub(crate) base: hipModule_t,
@@ -237,19 +253,23 @@ fn compile_and_cache(
         ptx::Attributes {
             clock_rate: attributes.clock_rate,
         },
-        |_| {},
+        |pass_name| {
+            super::driver::zluda_log(&format!("[ZLUDA]     pass complete: {}", pass_name));
+        },
     )
     .map_err(|e| {
-        super::driver::zluda_log(&format!("[ZLUDA]   ptx::to_llvm_module FAILED: {:?}", e));
+        super::driver::zluda_log(&format!("[ZLUDA]   ptx::to_llvm_module FAILED: {}", e));
         CUerror::UNKNOWN
     })?;
     super::driver::zluda_log(&format!("[ZLUDA]   ptx::to_llvm_module OK in {:?}, starting llvm_zluda::compile", compile_start.elapsed()));
     let ptx_impl = llvm_module.linked_bitcode();
-    let elf_module = llvm_zluda::compile(
+    let ptx_impl_tex = llvm_module.linked_bitcode_tex();
+    let elf_module = llvm_zluda::compile_with_extra(
         &llvm_module.context,
         gcn_arch,
         llvm_module.llvm_ir,
         ptx_impl,
+        ptx_impl_tex,
         llvm_module.attributes_ir,
         None,
     )
@@ -273,6 +293,7 @@ fn compile_in_subprocess(
     // Create a temp file for the output
     let output_path = format!("/tmp/zluda_compile_{}.elf", std::process::id());
     let ptx_impl = llvm_module.linked_bitcode();
+    let ptx_impl_tex = llvm_module.linked_bitcode_tex();
 
     // Use fork to compile in a child process
     let pid = unsafe { libc::fork() };
@@ -282,11 +303,12 @@ fn compile_in_subprocess(
     }
     if pid == 0 {
         // Child process — do the compilation
-        let result = llvm_zluda::compile(
+        let result = llvm_zluda::compile_with_extra(
             &llvm_module.context,
             gcn_arch,
             llvm_module.llvm_ir,
             ptx_impl,
+            ptx_impl_tex,
             llvm_module.attributes_ir,
             None,
         );
@@ -404,6 +426,114 @@ pub(crate) fn get_global_v2(
     let result = unsafe { hipModuleGetGlobal(dptr, bytes, hmod.base, name) };
     super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetGlobal('{}') -> {:?}", name_str, result));
     result
+}
+
+pub(crate) fn get_tex_ref(
+    p_tex_ref: &mut CUtexref,
+    hmod: &Module,
+    name: *const ::core::ffi::c_char,
+) -> CUresult {
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+    let mut tex_ref: *mut textureReference = std::ptr::null_mut();
+    let result = unsafe { hipModuleGetTexRef(&mut tex_ref, hmod.base, name) };
+    match result {
+        Ok(()) => {
+            super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetTexRef('{}') -> {:p}", name_str, tex_ref));
+            *p_tex_ref = tex_ref as CUtexref;
+            Ok(())
+        }
+        Err(e) => {
+            // .texref in PTX is compiled as a .global .u64 variable, not a HIP texture reference.
+            // Try to find it as a global variable and create a synthetic texture reference.
+            let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
+            let mut bytes = 0usize;
+            let global_result = unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hmod.base, name) };
+            if global_result.is_ok() {
+                super::driver::zluda_log(&format!(
+                    "[ZLUDA] cuModuleGetTexRef('{}') -> found as global variable at {:p} ({} bytes), creating synthetic texref",
+                    name_str, dptr.0, bytes
+                ));
+                // Allocate a textureReference on the heap and return it.
+                // The device-side global variable holds the texture object handle (u64).
+                // When cuTexRefSetArray/cuTexObjectCreate is called, we'll write the
+                // texture object handle to this device global.
+                let synth_ref = Box::new(SyntheticTexRef {
+                    tex_ref: unsafe { mem::zeroed::<textureReference>() },
+                    device_global: dptr,
+                });
+                let tex_ref_ptr = &synth_ref.tex_ref as *const textureReference as *mut textureReference;
+                // Register in global map so tex.rs can find the device global
+                if let Ok(mut map) = SYNTHETIC_TEXREFS.lock() {
+                    map.insert(tex_ref_ptr as usize, dptr);
+                }
+                // Leak the Box — the texture reference lives as long as the module
+                Box::leak(synth_ref);
+                *p_tex_ref = tex_ref_ptr as CUtexref;
+                Ok(())
+            } else {
+                super::driver::zluda_log(&format!(
+                    "[ZLUDA] cuModuleGetTexRef('{}') -> NOT FOUND (hip={:?}, global={:?})",
+                    name_str, e, global_result
+                ));
+                Err(e.into())
+            }
+        }
+    }
+}
+
+/// A synthetic texture reference for .texref variables compiled as .global .u64
+#[repr(C)]
+struct SyntheticTexRef {
+    tex_ref: textureReference,
+    device_global: hipDeviceptr_t,
+}
+
+pub(crate) fn get_surf_ref(
+    p_surf_ref: &mut cuda_types::cuda::CUsurfref,
+    hmod: &Module,
+    name: *const ::core::ffi::c_char,
+) -> CUresult {
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+    // HIP doesn't have a separate hipModuleGetSurfRef - use hipModuleGetTexRef
+    // since surface and texture references share the same underlying textureReference struct
+    let mut tex_ref: *mut textureReference = std::ptr::null_mut();
+    let result = unsafe { hipModuleGetTexRef(&mut tex_ref, hmod.base, name) };
+    match result {
+        Ok(()) => {
+            super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetSurfRef('{}') -> {:p}", name_str, tex_ref));
+            *p_surf_ref = tex_ref as cuda_types::cuda::CUsurfref;
+            Ok(())
+        }
+        Err(_) => {
+            // .surfref compiled as .global .u64 — same approach as .texref
+            let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
+            let mut bytes = 0usize;
+            let global_result = unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hmod.base, name) };
+            if global_result.is_ok() {
+                super::driver::zluda_log(&format!(
+                    "[ZLUDA] cuModuleGetSurfRef('{}') -> found as global at {:p}, creating synthetic surfref",
+                    name_str, dptr.0
+                ));
+                let synth_ref = Box::new(SyntheticTexRef {
+                    tex_ref: unsafe { mem::zeroed::<textureReference>() },
+                    device_global: dptr,
+                });
+                let tex_ref_ptr = &synth_ref.tex_ref as *const textureReference as *mut textureReference;
+                if let Ok(mut map) = SYNTHETIC_TEXREFS.lock() {
+                    map.insert(tex_ref_ptr as usize, dptr);
+                }
+                Box::leak(synth_ref);
+                *p_surf_ref = tex_ref_ptr as cuda_types::cuda::CUsurfref;
+                Ok(())
+            } else {
+                super::driver::zluda_log(&format!(
+                    "[ZLUDA] cuModuleGetSurfRef('{}') -> NOT FOUND",
+                    name_str
+                ));
+                Err(result.unwrap_err().into())
+            }
+        }
+    }
 }
 
 pub(crate) fn get_loading_mode(mode: &mut cuda_types::cuda::CUmoduleLoadingMode) -> CUresult {

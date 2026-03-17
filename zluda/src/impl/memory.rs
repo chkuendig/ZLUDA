@@ -137,6 +137,13 @@ pub(crate) unsafe fn free_host(ptr: *mut ::core::ffi::c_void) -> CUresult {
     Ok(hip_result?)
 }
 
+pub(crate) unsafe fn alloc_host_v2(
+    pp: &mut *mut ::core::ffi::c_void,
+    bytesize: usize,
+) -> CUresult {
+    host_alloc(pp, bytesize, 0)
+}
+
 pub(crate) unsafe fn host_alloc(
     pp: &mut *mut ::core::ffi::c_void,
     bytesize: usize,

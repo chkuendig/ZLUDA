@@ -204,6 +204,7 @@ from_cuda_nop!(
     u16,
     i32,
     u32,
+    f32,
     u64,
     i64,
     usize,
@@ -248,7 +249,19 @@ from_cuda_nop!(
     cudnn9::cudnnTensorFormat_t,
     cudnn9::cudnnConvolutionBwdDataAlgoPerf_t,
     cudnn9::cudnnConvolutionBwdFilterAlgoPerf_t,
-    cublasLtMatmulPreferenceAttributes_t
+    cublasLtMatmulPreferenceAttributes_t,
+    CUtexref,
+    CUsurfref,
+    CUarray,
+    CUmipmappedArray,
+    CUarray_format,
+    CUaddress_mode,
+    CUfilter_mode,
+    cuda_types::cuda::CUDA_ARRAY_DESCRIPTOR,
+    cuda_types::cuda::CUDA_ARRAY3D_DESCRIPTOR,
+    cuda_types::cuda::CUDA_RESOURCE_DESC,
+    cuda_types::cuda::CUDA_TEXTURE_DESC,
+    cuda_types::cuda::CUDA_RESOURCE_VIEW_DESC
 );
 from_cuda_transmute!(
     CUuuid => hipUUID,

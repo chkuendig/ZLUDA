@@ -1,5 +1,7 @@
 use cuda_types::cuda::CUerror;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Mutex;
+use std::io::Write;
 
 pub(crate) mod r#impl;
 #[cfg_attr(windows, path = "os_win.rs")]
@@ -7,6 +9,42 @@ pub(crate) mod r#impl;
 mod os;
 
 static INITIALIZED: AtomicBool = AtomicBool::new(true);
+// 0 = not checked, 1 = disabled, 2 = enabled
+static ZLUDA_DEBUG: AtomicU8 = AtomicU8::new(0);
+static DEBUG_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+fn is_debug_enabled() -> bool {
+    match ZLUDA_DEBUG.load(Ordering::Relaxed) {
+        0 => {
+            let enabled = std::env::var("ZLUDA_DEBUG").map_or(false, |v| v == "1");
+            if enabled {
+                if let Ok(f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("/tmp/zluda_debug.log")
+                {
+                    if let Ok(mut guard) = DEBUG_LOG.lock() {
+                        *guard = Some(f);
+                    }
+                }
+            }
+            ZLUDA_DEBUG.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+            enabled
+        }
+        2 => true,
+        _ => false,
+    }
+}
+
+#[allow(unused)]
+fn debug_log(msg: &str) {
+    eprintln!("{}", msg);
+    if let Ok(mut guard) = DEBUG_LOG.lock() {
+        if let Some(ref mut f) = *guard {
+            let _ = writeln!(f, "{}", msg);
+            let _ = f.flush();
+        }
+    }
+}
 pub(crate) fn initialized() -> bool {
     INITIALIZED.load(Ordering::SeqCst)
 }
@@ -24,6 +62,9 @@ macro_rules! unimplemented {
             #[allow(improper_ctypes_definitions)]
             #[allow(unused_variables)]
             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
+                if is_debug_enabled() {
+                    debug_log(&format!("[ZLUDA] UNIMPLEMENTED: {}", stringify!($fn_name)));
+                }
                 Err(r#impl::unimplemented())
             }
         )*
@@ -40,7 +81,14 @@ macro_rules! implemented {
                 if !initialized() {
                     return Err(CUerror::DEINITIALIZED);
                 }
-                cuda_macros::cuda_normalize_fn!( crate::r#impl::$fn_name ) ($(zluda_common::FromCuda::<_, CUerror>::from_cuda(&$arg_id)?),*)?;
+                let result = cuda_macros::cuda_normalize_fn!( crate::r#impl::$fn_name ) ($(zluda_common::FromCuda::<_, CUerror>::from_cuda(&$arg_id)?),*);
+                if is_debug_enabled() {
+                    match &result {
+                        Ok(()) => debug_log(&format!("[ZLUDA] {} -> OK", stringify!($fn_name))),
+                        Err(e) => debug_log(&format!("[ZLUDA] {} -> {:?}", stringify!($fn_name), e)),
+                    }
+                }
+                result?;
                 Ok(())
             }
         )*
@@ -57,7 +105,14 @@ macro_rules! implemented_in_function {
                 if !initialized() {
                     return Err(CUerror::DEINITIALIZED);
                 }
-                cuda_macros::cuda_normalize_fn!( crate::r#impl::function::$fn_name ) ($(zluda_common::FromCuda::<_, CUerror>::from_cuda(&$arg_id)?),*)?;
+                let result = cuda_macros::cuda_normalize_fn!( crate::r#impl::function::$fn_name ) ($(zluda_common::FromCuda::<_, CUerror>::from_cuda(&$arg_id)?),*);
+                if is_debug_enabled() {
+                    match &result {
+                        Ok(()) => debug_log(&format!("[ZLUDA] {} -> OK", stringify!($fn_name))),
+                        Err(e) => debug_log(&format!("[ZLUDA] {} -> {:?}", stringify!($fn_name), e)),
+                    }
+                }
+                result?;
                 Ok(())
             }
         )*
@@ -136,6 +191,7 @@ cuda_macros::cuda_function_declarations!(
             cuLibraryLoadData,
             cuLibraryUnload,
             cuMemAlloc_v2,
+            cuMemAllocHost_v2,
             cuMemAllocPitch_v2,
             cuMemcpy2D_v2,
             cuMemcpy2DUnaligned_v2,
@@ -166,6 +222,8 @@ cuda_macros::cuda_function_declarations!(
             cuModuleGetFunction,
             cuModuleGetGlobal_v2,
             cuModuleGetLoadingMode,
+            cuModuleGetSurfRef,
+            cuModuleGetTexRef,
             cuModuleLoad,
             cuModuleLoadData,
             cuModuleLoadDataEx,
@@ -185,9 +243,36 @@ cuda_macros::cuda_function_declarations!(
             cuStreamGetCaptureInfo_v2,
             cuStreamGetCaptureInfo_v3,
             cuStreamIsCapturing,
+            cuStreamQuery,
             cuStreamSynchronize,
             cuStreamWaitEvent,
             cuThreadExchangeStreamCaptureMode,
+            cuArrayCreate_v2,
+            cuArrayDestroy,
+            cuArrayGetDescriptor_v2,
+            cuArray3DCreate_v2,
+            cuArray3DGetDescriptor_v2,
+            cuMipmappedArrayCreate,
+            cuMipmappedArrayDestroy,
+            cuMipmappedArrayGetLevel,
+            cuTexRefSetAddress_v2,
+            cuTexRefSetAddress2D_v3,
+            cuTexRefSetArray,
+            cuTexRefSetMipmappedArray,
+            cuTexRefSetFormat,
+            cuTexRefSetAddressMode,
+            cuTexRefSetFilterMode,
+            cuTexRefSetMipmapFilterMode,
+            cuTexRefSetMipmapLevelBias,
+            cuTexRefSetMipmapLevelClamp,
+            cuTexRefSetMaxAnisotropy,
+            cuTexRefSetBorderColor,
+            cuTexRefSetFlags,
+            cuTexObjectCreate,
+            cuTexObjectDestroy,
+            cuSurfObjectCreate,
+            cuSurfObjectDestroy,
+            cuSurfRefSetArray,
         ],
     implemented_in_function <= [cuLaunchKernel,]
 );

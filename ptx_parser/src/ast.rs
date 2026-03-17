@@ -796,6 +796,18 @@ ptx_parser_macros::generate_instruction_type!(
             }
 
         },
+        // Pre-sm_70 vote without .sync and without membermask
+        VotePreSync {
+            type: Type::Scalar(data.mode.type_()),
+            data: VoteDetails,
+            arguments<T>: {
+                dst: T,
+                src1: {
+                    repr: T,
+                    type: { Type::Scalar(ScalarType::Pred) },
+                }
+            }
+        },
         ReduxSync {
             type: Type::Scalar(data.type_),
             data: ReduxSyncData,
@@ -1558,12 +1570,8 @@ impl TexDetails {
     }
 
     pub fn coord_vec_type(&self) -> Type {
-        let width = self.geometry.coord_width();
-        if width == 1 {
-            Type::Scalar(self.coord_type)
-        } else {
-            Type::Vector(width, self.coord_type)
-        }
+        // Always use Vector, even for 1D — the parser wraps coords in braces (VecPack)
+        Type::Vector(self.geometry.coord_width(), self.coord_type)
     }
 }
 
@@ -1577,12 +1585,8 @@ pub struct SustDetails {
 
 impl SustDetails {
     pub fn coord_vec_type(&self) -> Type {
-        let width = self.geometry.coord_width();
-        if width == 1 {
-            Type::Scalar(ScalarType::S32)
-        } else {
-            Type::Vector(width, ScalarType::S32)
-        }
+        // Always use Vector — the parser wraps coords in braces (VecPack)
+        Type::Vector(self.geometry.coord_width(), ScalarType::S32)
     }
 
     pub fn val_type(&self) -> Type {
@@ -1614,12 +1618,8 @@ pub struct SuldDetails {
 
 impl SuldDetails {
     pub fn coord_vec_type(&self) -> Type {
-        let width = self.geometry.coord_width();
-        if width == 1 {
-            Type::Scalar(ScalarType::S32)
-        } else {
-            Type::Vector(width, ScalarType::S32)
-        }
+        // Always use Vector — the parser wraps coords in braces (VecPack)
+        Type::Vector(self.geometry.coord_width(), ScalarType::S32)
     }
 
     pub fn val_type(&self) -> Type {

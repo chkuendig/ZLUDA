@@ -85,6 +85,10 @@ pub(crate) fn get_capture_info_v3(
     }
 }
 
+pub(crate) fn query(stream: hipStream_t) -> hipError_t {
+    unsafe { hipStreamQuery(stream) }
+}
+
 pub(crate) fn wait_event(
     stream: hipStream_t,
     event: hipEvent_t,

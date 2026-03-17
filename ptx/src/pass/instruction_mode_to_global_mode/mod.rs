@@ -2162,6 +2162,7 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Nanosleep { .. }
         | ast::Instruction::AtomCas { .. }
         | ast::Instruction::Vote { .. }
+        | ast::Instruction::VotePreSync { .. }
         | ast::Instruction::ReduxSync { .. }
         | ast::Instruction::GridDepControl { .. }
         | ast::Instruction::LdMatrix { .. }

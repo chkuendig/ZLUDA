@@ -348,7 +348,11 @@ fn join(
         normalized = globalized;
     }
     let (module, path) = normalized.split_first().unwrap();
-    let path = path.join("_");
+    let mut path = path.join("_");
+    // Rust identifiers cannot start with a digit (e.g. "3d_create_v2")
+    if path.starts_with(|c: char| c.is_ascii_digit()) {
+        path.insert(0, '_');
+    }
     [module, &&*path]
         .into_iter()
         .map(|s| Ident::new(s, Span::call_site()))

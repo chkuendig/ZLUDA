@@ -571,8 +571,7 @@ fn directive<'a, 'input>(
                 function.map(|(linking, func)| Some(ast::Directive::Method(linking, func))),
                 file.map(|_| None),
                 section.map(|_| None),
-                texref_surfref
-                    .map(|(linking, var)| Some(ast::Directive::Variable(linking, var))),
+                texref_surfref.map(|_| None),
                 (module_variable, Token::Semicolon)
                     .map(|((linking, var), _)| Some(ast::Directive::Variable(linking, var))),
             )),
@@ -635,39 +634,20 @@ fn file<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
     .parse_next(stream)
 }
 
-/// Parse .texref/.surfref global declarations as .global .u64 variables.
-/// These are opaque texture/surface handles used by tex/sust/suld instructions.
+/// Parse and skip .texref/.surfref global declarations.
 /// Format: [.extern] .global .texref name;
 ///         [.extern] .global .surfref name;
-fn texref_surfref<'a, 'input>(
-    stream: &mut PtxParser<'a, 'input>,
-) -> PResult<(ast::LinkingDirective, ast::Variable<&'input str>)> {
+fn texref_surfref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
     trace(
         "texref_surfref",
         (
             opt(Token::DotExtern),
             Token::DotGlobal,
             alt((Token::DotTexref.void(), Token::DotSurfref.void())),
-            ident,
+            ident.void(),
             Token::Semicolon,
         )
-            .map(|(is_extern, _, _, name, _)| {
-                let linking = if is_extern.is_some() {
-                    ast::LinkingDirective::EXTERN
-                } else {
-                    ast::LinkingDirective::NONE
-                };
-                let var = ast::Variable {
-                    info: ast::VariableInfo {
-                        align: None,
-                        v_type: ast::Type::Scalar(ScalarType::U64),
-                        state_space: StateSpace::Global,
-                        array_init: Vec::new(),
-                    },
-                    name,
-                };
-                (linking, var)
-            }),
+            .void(),
     )
     .parse_next(stream)
 }
@@ -1638,6 +1618,68 @@ impl<'input, X, I: Stream<Token = (Self, X)> + StreamIsPartial, E: ParserError<I
     }
 }
 
+// Parse vote instruction: both vote.sync.* (sm_70+) and vote.* (pre-sm_70)
+// Forms:
+//   vote.sync.{all,any}.pred  d, {!}a, membermask
+//   vote.sync.ballot.b32      d, {!}a, membermask
+//   vote.{all,any}.pred       d, {!}a             (pre-sync)
+//   vote.ballot.b32           d, {!}a             (pre-sync)
+fn vote_instruction<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    use winnow::combinator::*;
+    use winnow::token::any;
+
+    // Check if first modifier is .sync
+    let has_sync = opt(any.verify_map(|(t, _): (Token<'input>, _)| {
+        if t == Token::DotSync { Some(()) } else { None }
+    })).parse_next(stream)?.is_some();
+
+    // Parse mode: .all, .any, or .ballot (these may be DotIdent since no grammar rule generates them)
+    let mode = any.verify_map(|(t, _): (Token<'input>, _)| {
+        match t {
+            Token::DotIdent(".all") => Some(VoteMode::All),
+            Token::DotIdent(".any") => Some(VoteMode::Any),
+            Token::DotIdent(".ballot") => Some(VoteMode::Ballot),
+            _ => None,
+        }
+    }).parse_next(stream)?;
+
+    // Parse type: .pred or .b32
+    let _type_token = any.verify(|(t, _): &(Token<'input>, _)| {
+        *t == Token::DotPred || *t == Token::DotB32
+    }).parse_next(stream)?;
+
+    // Parse destination operand
+    let dst = ParsedOperandStr::parse.parse_next(stream)?;
+
+    // Parse comma + optional negate + source predicate
+    any.verify(|(t, _): &(Token<'input>, _)| *t == Token::Comma).parse_next(stream)?;
+
+    let negate = opt(any.verify_map(|(t, _): (Token<'input>, _)| {
+        if t == Token::Exclamation { Some(()) } else { None }
+    })).parse_next(stream)?.is_some();
+
+    let src1 = ParsedOperandStr::parse.parse_next(stream)?;
+
+    if has_sync {
+        // Sync form: parse comma + membermask
+        any.verify(|(t, _): &(Token<'input>, _)| *t == Token::Comma).parse_next(stream)?;
+        let src2 = ParsedOperandStr::parse.parse_next(stream)?;
+
+        Ok(ast::Instruction::Vote {
+            data: ast::VoteDetails { mode, negate },
+            arguments: VoteArgs { dst, src1, src2 },
+        })
+    } else {
+        // Pre-sync form: no membermask
+        Ok(ast::Instruction::VotePreSync {
+            data: ast::VoteDetails { mode, negate },
+            arguments: VotePreSyncArgs { dst, src1 },
+        })
+    }
+}
+
 fn bra<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
@@ -2138,9 +2180,7 @@ derive_parser!(
     pub enum FunnelShiftMode { }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
-    pub enum VoteMode {
-        Ballot
-    }
+    pub enum VoteMode { }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
     pub enum MatrixShape { }
@@ -4165,30 +4205,11 @@ derive_parser!(
     .btype: ScalarType = { .u32, .s32 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-vote-sync
-
-    vote.sync.mode.pred  d, {!}a, membermask => {
-        let (negate, a) = a;
-        Instruction::Vote {
-            data: VoteDetails {
-                mode,
-                negate
-            },
-            arguments: VoteArgs { dst: d, src1: a, src2: membermask }
-        }
-    }
-    vote.sync.ballot.b32 d, {!}a, membermask => {
-        let (negate, a) = a;
-        Instruction::Vote {
-            data: VoteDetails {
-                mode: VoteMode::Ballot,
-                negate
-            },
-            arguments: VoteArgs { dst: d, src1: a, src2: membermask }
-        }
-    }
+    // Also handles pre-sm_70 vote without .sync
+    vote <= { vote_instruction(stream) }
 
     // .mode: VoteMode = { .all, .any, .uni };
-    .mode: VoteMode = { .all, .any };
+    .mode: VoteMode = { .all, .any, .ballot };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-redux-sync
 
@@ -4874,5 +4895,88 @@ mod tests {
             result.array_init,
             vec![crate::RegOrImmediate::Imm(crate::ImmediateValue::U64(0))]
         );
+    }
+
+    #[test]
+    fn vote_presync_any_pred() {
+        let text = "
+            .version 3.2
+            .target sm_30
+            .address_size 64
+
+            .visible .entry test_vote()
+            {
+                .reg .pred %p1, %p2;
+                vote.any.pred %p2, %p1;
+                ret;
+            }";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let module = module.parse(stream).unwrap();
+        assert_eq!(module.directives.len(), 1);
+        assert_eq!(module.invalid_directives, 0);
+    }
+
+    #[test]
+    fn vote_presync_ballot_b32() {
+        let text = "
+            .version 3.2
+            .target sm_30
+            .address_size 64
+
+            .visible .entry test_vote()
+            {
+                .reg .pred %p1;
+                .reg .b32 %r1;
+                vote.ballot.b32 %r1, %p1;
+                ret;
+            }";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let module = module.parse(stream).unwrap();
+        assert_eq!(module.directives.len(), 1);
+        assert_eq!(module.invalid_directives, 0);
+    }
+
+    #[test]
+    fn vote_sync_any_pred() {
+        let text = "
+            .version 6.5
+            .target sm_70
+            .address_size 64
+
+            .visible .entry test_vote()
+            {
+                .reg .pred %p1, %p2;
+                .reg .b32 %r1;
+                vote.sync.any.pred %p2, %p1, %r1;
+                ret;
+            }";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let module = module.parse(stream).unwrap();
+        assert_eq!(module.directives.len(), 1);
+        assert_eq!(module.invalid_directives, 0);
     }
 }
