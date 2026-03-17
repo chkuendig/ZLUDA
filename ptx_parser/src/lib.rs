@@ -1707,6 +1707,157 @@ fn empty_call<'input>(
     }
 }
 
+// Parse texture geometry modifier: .1d, .2d, .3d
+fn tex_geometry<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::TextureGeometry> {
+    any.verify_map(|(t, _)| match t {
+        Token::Dot1d => Some(ast::TextureGeometry::Dim1d),
+        Token::Dot2d => Some(ast::TextureGeometry::Dim2d),
+        Token::Dot3d => Some(ast::TextureGeometry::Dim3d),
+        _ => None,
+    })
+    .parse_next(stream)
+}
+
+// Parse surface clamp mode: .zero, .clamp, .trap
+fn surf_clamp_mode<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::SurfClampMode> {
+    any.verify_map(|(t, _)| match t {
+        Token::DotZero => Some(ast::SurfClampMode::Zero),
+        Token::DotClamp => Some(ast::SurfClampMode::Clamp),
+        Token::DotTrap => Some(ast::SurfClampMode::Trap),
+        _ => None,
+    })
+    .parse_next(stream)
+}
+
+// Parse a vector operand in braces: {%r1, %r2, ...}
+fn brace_vec_operand<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ParsedOperandStr<'input>> {
+    delimited(
+        Token::LBrace,
+        separated(1..=8, reg_or_immediate, Token::Comma).map(|v: Vec<_>| {
+            ast::ParsedOperand::VecPack(v)
+        }),
+        Token::RBrace,
+    )
+    .parse_next(stream)
+}
+
+// tex.{geometry}.v4.{dtype}.{ctype} {dst_v4}, [tex_handle, {coord_vec}]
+fn tex<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    let (geometry, _, channel_type, coord_type) = (
+        tex_geometry,
+        Token::DotV4,
+        scalar_type,
+        scalar_type,
+    )
+        .parse_next(stream)?;
+
+    let dst = brace_vec_operand.parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    // [tex_handle, {coords}]
+    Token::LBracket.parse_next(stream)?;
+    let src_texture = ident.map(ast::ParsedOperand::Reg).parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let src_coords = brace_vec_operand.parse_next(stream)?;
+    Token::RBracket.parse_next(stream)?;
+
+    Ok(ast::Instruction::Tex {
+        data: ast::TexDetails {
+            geometry,
+            channel_type,
+            coord_type,
+        },
+        arguments: ast::TexArgs {
+            dst,
+            src_texture,
+            src_coords,
+        },
+    })
+}
+
+// sust.b.{geometry}{.vec}.{dtype}.{clamp} [surf_handle, {coords}], {values}
+fn sust<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    Token::DotB.parse_next(stream)?;
+    let geometry = tex_geometry.parse_next(stream)?;
+    let vector: Option<VectorPrefix> = opt(alt((
+        Token::DotV2.value(VectorPrefix::V2),
+        Token::DotV4.value(VectorPrefix::V4),
+    )))
+    .parse_next(stream)?;
+    let data_type = scalar_type.parse_next(stream)?;
+    let clamp = surf_clamp_mode.parse_next(stream)?;
+
+    // [surf_handle, {coords}]
+    Token::LBracket.parse_next(stream)?;
+    let src_surface = ident.map(ast::ParsedOperand::Reg).parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let src_coords = brace_vec_operand.parse_next(stream)?;
+    Token::RBracket.parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let src_val = brace_vec_operand.parse_next(stream)?;
+
+    Ok(ast::Instruction::Sust {
+        data: ast::SustDetails {
+            geometry,
+            vector,
+            data_type,
+            clamp,
+        },
+        arguments: ast::SustArgs {
+            src_surface,
+            src_coords,
+            src_val,
+        },
+    })
+}
+
+// suld.b.{geometry}{.vec}.{dtype}.{clamp} {dst}, [surf_handle, {coords}]
+fn suld<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    Token::DotB.parse_next(stream)?;
+    let geometry = tex_geometry.parse_next(stream)?;
+    let vector: Option<VectorPrefix> = opt(alt((
+        Token::DotV2.value(VectorPrefix::V2),
+        Token::DotV4.value(VectorPrefix::V4),
+    )))
+    .parse_next(stream)?;
+    let data_type = scalar_type.parse_next(stream)?;
+    let clamp = surf_clamp_mode.parse_next(stream)?;
+
+    let dst = brace_vec_operand.parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    // [surf_handle, {coords}]
+    Token::LBracket.parse_next(stream)?;
+    let src_surface = ident.map(ast::ParsedOperand::Reg).parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let src_coords = brace_vec_operand.parse_next(stream)?;
+    Token::RBracket.parse_next(stream)?;
+
+    Ok(ast::Instruction::Suld {
+        data: ast::SuldDetails {
+            geometry,
+            vector,
+            data_type,
+            clamp,
+        },
+        arguments: ast::SuldArgs {
+            dst,
+            src_surface,
+            src_coords,
+        },
+    })
+}
+
 type ParsedOperandStr<'input> = ast::ParsedOperand<&'input str>;
 
 #[derive(Clone, PartialEq, Default, Debug, Display)]
@@ -1916,7 +2067,19 @@ derive_parser!(
         #[token(".texref")]
         DotTexref,
         #[token(".surfref")]
-        DotSurfref
+        DotSurfref,
+        #[token(".1d")]
+        Dot1d,
+        #[token(".2d")]
+        Dot2d,
+        #[token(".3d")]
+        Dot3d,
+        #[token(".zero")]
+        DotZero,
+        #[token(".trap")]
+        DotTrap,
+        #[token(".b")]
+        DotB
     }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
@@ -4250,6 +4413,11 @@ derive_parser!(
 
     .mode: RawMulIntControl = { .lo, .hi };
     .type: ScalarType = { .u32, .s32, .u64, .s64 };
+
+    // Texture and surface instructions (custom-parsed due to complex operand layout)
+    tex <= { tex(stream) }
+    sust <= { sust(stream) }
+    suld <= { suld(stream) }
 );
 
 #[cfg(test)]

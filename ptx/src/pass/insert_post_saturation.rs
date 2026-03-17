@@ -209,7 +209,10 @@ fn run_instruction<'input>(
         | ast::Instruction::Prefetch { .. }
         | ast::Instruction::Sad { .. }
         | ast::Instruction::Dp2a { .. }
-        | ast::Instruction::Mma { .. } => result.push(Statement::Instruction(instruction)),
+        | ast::Instruction::Mma { .. }
+        | ast::Instruction::Tex { .. }
+        | ast::Instruction::Sust { .. }
+        | ast::Instruction::Suld { .. } => result.push(Statement::Instruction(instruction)),
         ast::Instruction::Add {
             data:
                 ast::ArithDetails::Float(ast::ArithFloat {

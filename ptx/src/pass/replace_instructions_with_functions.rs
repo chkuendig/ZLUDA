@@ -260,6 +260,47 @@ fn run_statements<'input>(
                         })
                     ]
                 }
+                // Pre-sm_70 shfl (no .sync, no membermask) — convert to ShflSync with mask=0xFFFFFFFF
+                // Handled here (not in run_instruction) because it expands to multiple statements
+                Statement::Instruction(ptx_parser::Instruction::Shfl {
+                    data,
+                    arguments: ast::ShflArgs { dst, dst_pred: _, src, src_lane, src_opts },
+                }) => {
+                    let membermask = resolver.register_unnamed(Some((
+                        ast::Type::Scalar(ast::ScalarType::U32),
+                        ptx_parser::StateSpace::Reg,
+                    )));
+                    let mode = match data.mode {
+                        ptx_parser::ShuffleMode::Up => "up",
+                        ptx_parser::ShuffleMode::Down => "down",
+                        ptx_parser::ShuffleMode::BFly => "bfly",
+                        ptx_parser::ShuffleMode::Idx => "idx",
+                    };
+                    let shfl_sync_inst = ptx_parser::Instruction::ShflSync {
+                        data,
+                        arguments: ast::ShflSyncArgs {
+                            dst,
+                            dst_pred: None,
+                            src,
+                            src_lane,
+                            src_opts,
+                            src_membermask: membermask,
+                        },
+                    };
+                    smallvec![
+                        Statement::Constant(ConstantDefinition {
+                            dst: membermask,
+                            typ: ast::ScalarType::U32,
+                            value: ast::ImmediateValue::U64(0xFFFFFFFF),
+                        }),
+                        Statement::Instruction(to_call(
+                            resolver,
+                            fn_declarations,
+                            format!("shfl_sync_{}_b32", mode).into(),
+                            shfl_sync_inst,
+                        )?)
+                    ]
+                }
                 Statement::<ast::Instruction<SpirvWord>, SpirvWord>::Instruction(instruction) => {
                     smallvec![
                         Statement::<ast::Instruction<SpirvWord>, SpirvWord>::Instruction(
@@ -484,52 +525,8 @@ fn run_instruction<'input>(
                 },
             )?
         }
-        // Pre-sm_70 shfl (no .sync, no membermask) — convert to ShflSync with mask=0xFFFFFFFF
-        ptx_parser::Instruction::Shfl {
-            data,
-            arguments: ast::ShflArgs { dst, dst_pred, src, src_lane, src_opts },
-        } => {
-            let membermask = resolver.register_unnamed(Some((
-                ast::Type::Scalar(ast::ScalarType::U32),
-                ptx_parser::StateSpace::Reg,
-            )));
-            let mut result: smallvec::SmallVec<[_; 4]> = smallvec::smallvec![
-                Statement::Constant(ConstantDefinition {
-                    dst: membermask,
-                    typ: ast::ScalarType::U32,
-                    value: ast::ImmediateValue::U64(0xFFFFFFFF),
-                }),
-            ];
-            let shfl_sync_inst = ptx_parser::Instruction::ShflSync {
-                data,
-                arguments: ast::ShflSyncArgs {
-                    dst,
-                    dst_pred,
-                    src,
-                    src_lane,
-                    src_opts,
-                    src_membermask: membermask,
-                },
-            };
-            // Delegate to ShflSync handling (with or without predicate)
-            if dst_pred.is_some() {
-                result.extend(replace_instruction(resolver, fn_declarations, shfl_sync_inst)?);
-            } else {
-                let mode = match data.mode {
-                    ptx_parser::ShuffleMode::Up => "up",
-                    ptx_parser::ShuffleMode::Down => "down",
-                    ptx_parser::ShuffleMode::BFly => "bfly",
-                    ptx_parser::ShuffleMode::Idx => "idx",
-                };
-                result.extend(to_call(
-                    resolver,
-                    fn_declarations,
-                    format!("shfl_sync_{}_b32", mode).into(),
-                    shfl_sync_inst,
-                )?);
-            }
-            result
-        }
+        // Shfl is handled in run_statements (outer match) since it expands to multiple statements
+        i @ ptx_parser::Instruction::Shfl { .. } => i,
         i @ ptx_parser::Instruction::Nanosleep { .. } => {
             to_call(resolver, fn_declarations, "nanosleep_u32".into(), i)?
         }

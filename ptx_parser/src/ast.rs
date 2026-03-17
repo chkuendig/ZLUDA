@@ -903,6 +903,63 @@ ptx_parser_macros::generate_instruction_type!(
                 }
             }
         },
+        // tex.{geometry}.v4.{dtype}.{ctype} {dst_v4}, [tex_handle, {coords}]
+        Tex {
+            data: TexDetails,
+            type: { data.typ() },
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    relaxed_type_check: true,
+                },
+                src_texture: {
+                    repr: T,
+                    relaxed_type_check: true,
+                },
+                src_coords: {
+                    repr: T,
+                    relaxed_type_check: true,
+                }
+            }
+        },
+        // sust.b.{geometry}{.vec}.{dtype}.{clamp} [surf_handle, {coords}], {values}
+        Sust {
+            data: SustDetails,
+            type: !,
+            arguments<T>: {
+                src_surface: {
+                    repr: T,
+                    relaxed_type_check: true,
+                },
+                src_coords: {
+                    repr: T,
+                    relaxed_type_check: true,
+                },
+                src_val: {
+                    repr: T,
+                    relaxed_type_check: true,
+                }
+            }
+        },
+        // suld.b.{geometry}{.vec}.{dtype}.{clamp} {dst}, [surf_handle, {coords}]
+        Suld {
+            data: SuldDetails,
+            type: !,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    relaxed_type_check: true,
+                },
+                src_surface: {
+                    repr: T,
+                    relaxed_type_check: true,
+                },
+                src_coords: {
+                    repr: T,
+                    relaxed_type_check: true,
+                }
+            }
+        },
     }
 );
 
@@ -1447,6 +1504,49 @@ impl MovDetails {
 #[derive(Copy, Clone)]
 pub struct ShflSyncDetails {
     pub mode: ShuffleMode,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum TextureGeometry {
+    Dim1d,
+    Dim2d,
+    Dim3d,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum SurfClampMode {
+    Zero,
+    Clamp,
+    Trap,
+}
+
+#[derive(Copy, Clone)]
+pub struct TexDetails {
+    pub geometry: TextureGeometry,
+    pub channel_type: ScalarType,
+    pub coord_type: ScalarType,
+}
+
+impl TexDetails {
+    pub fn typ(&self) -> Type {
+        Type::Vector(4, self.channel_type)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct SustDetails {
+    pub geometry: TextureGeometry,
+    pub vector: Option<VectorPrefix>,
+    pub data_type: ScalarType,
+    pub clamp: SurfClampMode,
+}
+
+#[derive(Copy, Clone)]
+pub struct SuldDetails {
+    pub geometry: TextureGeometry,
+    pub vector: Option<VectorPrefix>,
+    pub data_type: ScalarType,
+    pub clamp: SurfClampMode,
 }
 
 pub enum CpAsyncCpSize {

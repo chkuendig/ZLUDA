@@ -652,7 +652,10 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::LdMatrix { .. }
             | ast::Instruction::Prmt { .. }
             | ast::Instruction::Mma { .. }
-            | ast::Instruction::Dp2a { .. } => return Err(error_unreachable()),
+            | ast::Instruction::Dp2a { .. }
+            | ast::Instruction::Tex { .. }
+            | ast::Instruction::Sust { .. }
+            | ast::Instruction::Suld { .. } => return Err(error_unreachable()),
         }
     }
 
