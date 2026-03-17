@@ -300,15 +300,21 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         if !var.info.array_init.is_empty() {
             let initializer = self.get_array_init(&var.info.v_type, &*var.info.array_init)?;
             unsafe { LLVMSetInitializer(global, initializer) };
-        } else if var.info.state_space == ast::StateSpace::Global {
-            // Global variables without explicit initializers (e.g. .texref/.surfref)
-            // need a zero initializer so the linker doesn't treat them as undefined externals
+        } else if var.info.state_space == ast::StateSpace::Global
+            && matches!(var.info.v_type, ast::Type::Texref | ast::Type::Surfref)
+        {
+            // .texref/.surfref globals: define with zero initializer so the symbol
+            // is exported (not undefined). The HIP runtime writes the actual texture
+            // handle via hipModuleGetTexRef at runtime.
             let ty = get_type(self.context, &var.info.v_type)?;
             unsafe { LLVMSetInitializer(global, LLVMConstNull(ty)) };
-            unsafe { LLVMSetExternallyInitialized(global, 0) };
-            // Preserve this global so -amdgpu-internalize-symbols doesn't strip it.
-            // These are typically .texref/.surfref handles that the host writes to at runtime.
+            unsafe { LLVMSetExternallyInitialized(global, 1) };
+            unsafe { LLVMSetAlignment(global, std::mem::size_of::<usize>() as u32) };
             self.preserved_globals.push(global);
+        } else if var.info.state_space == ast::StateSpace::Global {
+            // Other global variables without explicit initializers need a zero initializer
+            let ty = get_type(self.context, &var.info.v_type)?;
+            unsafe { LLVMSetInitializer(global, LLVMConstNull(ty)) };
         }
         Ok(())
     }
@@ -3598,6 +3604,8 @@ fn get_ordering_failure(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
     }
 }
 
+const TEXREF_UNDERLYING: &[u8] = b"struct.textureReference\0";
+
 fn get_type(context: LLVMContextRef, type_: &ast::Type) -> Result<LLVMTypeRef, TranslateError> {
     Ok(match type_ {
         ast::Type::Scalar(scalar) => get_scalar_type(context, *scalar),
@@ -3618,6 +3626,10 @@ fn get_type(context: LLVMContextRef, type_: &ast::Type) -> Result<LLVMTypeRef, T
                 .rfold(underlying_type, |result, dimension| unsafe {
                     LLVMArrayType2(result, *dimension as u64)
                 })
+        }
+        ast::Type::Texref | ast::Type::Surfref => {
+            // Texture/surface references are pointer-sized handles (u64 on 64-bit)
+            unsafe { LLVMInt64TypeInContext(context) }
         }
     })
 }

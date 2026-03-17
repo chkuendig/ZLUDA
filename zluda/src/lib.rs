@@ -88,6 +88,13 @@ macro_rules! implemented {
                         Err(e) => debug_log(&format!("[ZLUDA] {} -> {:?}", stringify!($fn_name), e)),
                     }
                 }
+                // Always log errors to lightweight error log
+                if let Err(ref e) = result {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
+                        let _ = writeln!(f, "ERR {} -> {:?}", stringify!($fn_name), e);
+                    }
+                }
                 result?;
                 Ok(())
             }
@@ -110,6 +117,13 @@ macro_rules! implemented_in_function {
                     match &result {
                         Ok(()) => debug_log(&format!("[ZLUDA] {} -> OK", stringify!($fn_name))),
                         Err(e) => debug_log(&format!("[ZLUDA] {} -> {:?}", stringify!($fn_name), e)),
+                    }
+                }
+                // Always log errors to lightweight error log
+                if let Err(ref e) = result {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
+                        let _ = writeln!(f, "ERR {} -> {:?}", stringify!($fn_name), e);
                     }
                 }
                 result?;

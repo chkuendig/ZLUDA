@@ -1255,12 +1255,19 @@ impl<ID: std::fmt::Display> std::fmt::Display for Variable<ID> {
             write!(f, " .align {}", align)?;
         }
 
+        match &self.info.v_type {
+            Type::Texref => return write!(f, " .texref {}", self.name),
+            Type::Surfref => return write!(f, " .surfref {}", self.name),
+            _ => {}
+        }
+
         let (vector_size, scalar_type, array_dims) = match &self.info.v_type {
             Type::Scalar(scalar_type) => (None, *scalar_type, &vec![]),
             Type::Vector(size, scalar_type) => (Some(*size), *scalar_type, &vec![]),
             Type::Array(vector_size, scalar_type, array_dims) => {
                 (vector_size.map(|s| s.get()), *scalar_type, array_dims)
             }
+            Type::Texref | Type::Surfref => unreachable!(),
         };
 
         if let Some(size) = vector_size {
@@ -1294,6 +1301,10 @@ pub enum Type {
     Vector(u8, ScalarType),
     // .param.b32 foo[4];
     Array(Option<NonZeroU8>, ScalarType, Vec<u32>),
+    // .global .texref name;
+    Texref,
+    // .global .surfref name;
+    Surfref,
 }
 
 impl std::fmt::Display for Type {
@@ -1354,6 +1365,7 @@ impl Type {
                     )
                 }
             }
+            Type::Texref | Type::Surfref => Layout::new::<usize>(),
         }
     }
 }
