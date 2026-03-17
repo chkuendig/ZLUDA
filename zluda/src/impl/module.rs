@@ -109,8 +109,12 @@ fn get_best_ptx_and_compile(
     let (text, module) = match maybe_module {
         ControlFlow::Break((ast, module)) | ControlFlow::Continue(Some((ast, module))) => {
             super::driver::zluda_log("[ZLUDA]   selected PTX module for compilation");
-            // Dump PTX for offline debugging
-            let _ = std::fs::write("/tmp/zluda_physx.ptx", ast.as_bytes());
+            // Dump each PTX module with a unique counter for offline debugging
+            static PTX_DUMP_CTR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = PTX_DUMP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dump_path = format!("/tmp/zluda_ptx_{:03}.ptx", n);
+            let _ = std::fs::write(&dump_path, ast.as_bytes());
+            super::driver::zluda_log(&format!("[ZLUDA]   dumped PTX to {}", dump_path));
             (Some(ast), module)
         }
         ControlFlow::Continue(None) => {

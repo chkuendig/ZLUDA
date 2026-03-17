@@ -580,6 +580,52 @@ fn run_instruction<'input>(
         i @ ptx_parser::Instruction::Prmt { .. } => {
             to_call(resolver, fn_declarations, "prmt_b32".into(), i)?
         }
+        ptx_parser::Instruction::Tex { data, arguments } => {
+            let name = format!(
+                "tex_{}_v4_{}_{}",
+                data.geometry.as_ptx(),
+                scalar_to_ptx_name(data.channel_type),
+                scalar_to_ptx_name(data.coord_type),
+            );
+            to_call(
+                resolver,
+                fn_declarations,
+                name.into(),
+                ptx_parser::Instruction::Tex { data, arguments },
+            )?
+        }
+        ptx_parser::Instruction::Sust { data, arguments } => {
+            let vector = data.vector_ptx();
+            let name = format!(
+                "sust_b_{}{}_{}_{}",
+                data.geometry.as_ptx(),
+                vector,
+                scalar_to_ptx_name(data.data_type),
+                data.clamp.as_ptx(),
+            );
+            to_call(
+                resolver,
+                fn_declarations,
+                name.into(),
+                ptx_parser::Instruction::Sust { data, arguments },
+            )?
+        }
+        ptx_parser::Instruction::Suld { data, arguments } => {
+            let vector = data.vector_ptx();
+            let name = format!(
+                "suld_b_{}{}_{}_{}",
+                data.geometry.as_ptx(),
+                vector,
+                scalar_to_ptx_name(data.data_type),
+                data.clamp.as_ptx(),
+            );
+            to_call(
+                resolver,
+                fn_declarations,
+                name.into(),
+                ptx_parser::Instruction::Suld { data, arguments },
+            )?
+        }
         i => i,
     })
 }

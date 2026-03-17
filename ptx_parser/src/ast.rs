@@ -908,17 +908,14 @@ ptx_parser_macros::generate_instruction_type!(
             data: TexDetails,
             type: { data.typ() },
             arguments<T>: {
-                dst: {
-                    repr: T,
-                    relaxed_type_check: true,
-                },
+                dst: T,
                 src_texture: {
                     repr: T,
-                    relaxed_type_check: true,
+                    type: { Type::Scalar(ScalarType::U64) },
                 },
                 src_coords: {
                     repr: T,
-                    relaxed_type_check: true,
+                    type: { data.coord_vec_type() },
                 }
             }
         },
@@ -929,15 +926,15 @@ ptx_parser_macros::generate_instruction_type!(
             arguments<T>: {
                 src_surface: {
                     repr: T,
-                    relaxed_type_check: true,
+                    type: { Type::Scalar(ScalarType::U64) },
                 },
                 src_coords: {
                     repr: T,
-                    relaxed_type_check: true,
+                    type: { data.coord_vec_type() },
                 },
                 src_val: {
                     repr: T,
-                    relaxed_type_check: true,
+                    type: { data.val_type() },
                 }
             }
         },
@@ -948,15 +945,15 @@ ptx_parser_macros::generate_instruction_type!(
             arguments<T>: {
                 dst: {
                     repr: T,
-                    relaxed_type_check: true,
+                    type: { data.val_type() },
                 },
                 src_surface: {
                     repr: T,
-                    relaxed_type_check: true,
+                    type: { Type::Scalar(ScalarType::U64) },
                 },
                 src_coords: {
                     repr: T,
-                    relaxed_type_check: true,
+                    type: { data.coord_vec_type() },
                 }
             }
         },
@@ -1527,9 +1524,46 @@ pub struct TexDetails {
     pub coord_type: ScalarType,
 }
 
+impl TextureGeometry {
+    pub fn coord_width(self) -> u8 {
+        match self {
+            TextureGeometry::Dim1d => 1,
+            TextureGeometry::Dim2d => 2,
+            TextureGeometry::Dim3d => 4, // 3D uses 4-element coords (padded)
+        }
+    }
+
+    pub fn as_ptx(self) -> &'static str {
+        match self {
+            TextureGeometry::Dim1d => "1d",
+            TextureGeometry::Dim2d => "2d",
+            TextureGeometry::Dim3d => "3d",
+        }
+    }
+}
+
+impl SurfClampMode {
+    pub fn as_ptx(self) -> &'static str {
+        match self {
+            SurfClampMode::Zero => "zero",
+            SurfClampMode::Clamp => "clamp",
+            SurfClampMode::Trap => "trap",
+        }
+    }
+}
+
 impl TexDetails {
     pub fn typ(&self) -> Type {
         Type::Vector(4, self.channel_type)
+    }
+
+    pub fn coord_vec_type(&self) -> Type {
+        let width = self.geometry.coord_width();
+        if width == 1 {
+            Type::Scalar(self.coord_type)
+        } else {
+            Type::Vector(width, self.coord_type)
+        }
     }
 }
 
@@ -1541,12 +1575,70 @@ pub struct SustDetails {
     pub clamp: SurfClampMode,
 }
 
+impl SustDetails {
+    pub fn coord_vec_type(&self) -> Type {
+        let width = self.geometry.coord_width();
+        if width == 1 {
+            Type::Scalar(ScalarType::S32)
+        } else {
+            Type::Vector(width, ScalarType::S32)
+        }
+    }
+
+    pub fn val_type(&self) -> Type {
+        match self.vector {
+            Some(v) => Type::Vector(v.len().get(), self.data_type),
+            None => Type::Scalar(self.data_type),
+        }
+    }
+
+    pub fn vector_ptx(&self) -> &'static str {
+        match self.vector {
+            Some(v) => match v.len().get() {
+                2 => "_v2",
+                4 => "_v4",
+                _ => "",
+            },
+            None => "",
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct SuldDetails {
     pub geometry: TextureGeometry,
     pub vector: Option<VectorPrefix>,
     pub data_type: ScalarType,
     pub clamp: SurfClampMode,
+}
+
+impl SuldDetails {
+    pub fn coord_vec_type(&self) -> Type {
+        let width = self.geometry.coord_width();
+        if width == 1 {
+            Type::Scalar(ScalarType::S32)
+        } else {
+            Type::Vector(width, ScalarType::S32)
+        }
+    }
+
+    pub fn val_type(&self) -> Type {
+        match self.vector {
+            Some(v) => Type::Vector(v.len().get(), self.data_type),
+            None => Type::Scalar(self.data_type),
+        }
+    }
+
+    pub fn vector_ptx(&self) -> &'static str {
+        match self.vector {
+            Some(v) => match v.len().get() {
+                2 => "_v2",
+                4 => "_v4",
+                _ => "",
+            },
+            None => "",
+        }
+    }
 }
 
 pub enum CpAsyncCpSize {
