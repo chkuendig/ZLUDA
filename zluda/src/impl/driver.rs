@@ -354,12 +354,19 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     }
 
     unsafe extern "system" fn ctx_create_v2_bypass(
-        _pctx: *mut cuda_types::cuda::CUcontext,
-        _flags: ::std::os::raw::c_uint,
-        _dev: cuda_types::cuda::CUdevice,
+        pctx: *mut cuda_types::cuda::CUcontext,
+        flags: ::std::os::raw::c_uint,
+        dev: cuda_types::cuda::CUdevice,
     ) -> cuda_types::cuda::CUresult {
-        zluda_log(&format!("[ZLUDA] dark_api::ctx_create_v2_bypass(dev={})", _dev));
-        Err(r#impl::unimplemented())
+        zluda_log(&format!("[ZLUDA] dark_api::ctx_create_v2_bypass(dev={}, flags={})", dev, flags));
+        // PhysX uses this dark API to create a context without the normal
+        // overhead. Implement it the same as cuCtxCreate_v2.
+        let result = match pctx.as_mut() {
+            Some(pctx) => r#impl::context::create_v2(pctx, flags, dev),
+            None => Err(cuda_types::cuda::CUerror::INVALID_VALUE),
+        };
+        zluda_log(&format!("[ZLUDA] dark_api::ctx_create_v2_bypass -> {:?}", result));
+        result
     }
 
     unsafe extern "system" fn heap_alloc(
@@ -575,6 +582,9 @@ pub(crate) unsafe fn get_proc_address_v2(
         include!("../../../zluda_bindgen/src/process_table.rs")
     }
     let fn_ptr = raw_match(symbol.to_bytes(), flags, cuda_version);
+    zluda_log(&format!("[ZLUDA] cuGetProcAddress('{}', ver={}, flags={}) -> {:?}",
+        symbol.to_string_lossy(), cuda_version, flags,
+        if fn_ptr as usize == 0 { "NOT_FOUND" } else if fn_ptr as usize == usize::MAX { "VERSION_NOT_SUFFICIENT" } else { "FOUND" }));
     match fn_ptr as usize {
         0 => {
             if let Some(symbol_status) = symbol_status {

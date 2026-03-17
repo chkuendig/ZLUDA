@@ -384,7 +384,10 @@ pub(crate) fn get_function(
     hmod: &Module,
     name: *const ::core::ffi::c_char,
 ) -> hipError_t {
-    unsafe { hipModuleGetFunction(hfunc, hmod.base, name) }
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+    let result = unsafe { hipModuleGetFunction(hfunc, hmod.base, name) };
+    super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetFunction('{}') -> {:?}", name_str, result));
+    result
 }
 
 pub(crate) fn get_global_v2(
@@ -393,7 +396,10 @@ pub(crate) fn get_global_v2(
     hmod: &Module,
     name: *const ::core::ffi::c_char,
 ) -> hipError_t {
-    unsafe { hipModuleGetGlobal(dptr, bytes, hmod.base, name) }
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+    let result = unsafe { hipModuleGetGlobal(dptr, bytes, hmod.base, name) };
+    super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetGlobal('{}') -> {:?}", name_str, result));
+    result
 }
 
 pub(crate) fn get_loading_mode(mode: &mut cuda_types::cuda::CUmoduleLoadingMode) -> CUresult {

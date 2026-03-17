@@ -13,6 +13,7 @@ pub(crate) fn get_attribute(
         CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION
         | CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION => {
             *pi = 120;
+            super::driver::zluda_log(&format!("[ZLUDA] cuFuncGetAttribute({:?}) -> {} (hardcoded)", cu_attrib, *pi));
             return Ok(());
         }
         CUfunction_attribute::CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET
@@ -26,11 +27,14 @@ pub(crate) fn get_attribute(
         }
         _ => {}
     }
-    unsafe { hipFuncGetAttribute(pi, mem::transmute(cu_attrib), func) }?;
-    if cu_attrib == CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS {
-        *pi = (*pi).max(1);
+    let result = unsafe { hipFuncGetAttribute(pi, mem::transmute(cu_attrib), func) };
+    super::driver::zluda_log(&format!("[ZLUDA] cuFuncGetAttribute({:?}) -> val={}, result={:?}", cu_attrib, *pi, result));
+    if let Ok(()) = result {
+        if cu_attrib == CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS {
+            *pi = (*pi).max(1);
+        }
     }
-    Ok(())
+    result
 }
 
 pub(crate) fn launch_kernel(
@@ -46,8 +50,14 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuLaunchKernel(grid=[{},{},{}], block=[{},{},{}], shared={}, stream={:?})",
+        grid_dim_x, grid_dim_y, grid_dim_z,
+        block_dim_x, block_dim_y, block_dim_z,
+        shared_mem_bytes, stream
+    ));
     // TODO: fix constants in extra
-    unsafe {
+    let result = unsafe {
         hipModuleLaunchKernel(
             f,
             grid_dim_x,
@@ -61,7 +71,9 @@ pub(crate) fn launch_kernel(
             kernel_params,
             extra,
         )
-    }
+    };
+    super::driver::zluda_log(&format!("[ZLUDA] cuLaunchKernel -> {:?}", result));
+    result
 }
 
 pub(crate) unsafe fn set_attribute(

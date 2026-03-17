@@ -1,11 +1,17 @@
 use hip_runtime_sys::*;
 
 pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
-    unsafe { hipStreamSynchronize(stream) }
+    super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize({:?})", stream));
+    let result = unsafe { hipStreamSynchronize(stream) };
+    super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize -> {:?}", result));
+    result
 }
 
 pub(crate) fn create(stream: *mut hipStream_t, flags: ::core::ffi::c_uint) -> hipError_t {
-    unsafe { hipStreamCreateWithFlags(stream, flags) }
+    super::driver::zluda_log(&format!("[ZLUDA] cuStreamCreate(flags={})", flags));
+    let result = unsafe { hipStreamCreateWithFlags(stream, flags) };
+    super::driver::zluda_log(&format!("[ZLUDA] cuStreamCreate -> {:?}", result));
+    result
 }
 
 pub(crate) fn create_with_priority(

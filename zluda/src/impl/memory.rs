@@ -7,6 +7,7 @@ use hip_runtime_sys::*;
 use std::{mem, ptr};
 
 pub(crate) unsafe fn alloc_v2(dptr: &mut hipDeviceptr_t, bytesize: usize) -> CUresult {
+    super::driver::zluda_log(&format!("[ZLUDA] cuMemAlloc_v2({} bytes)", bytesize));
     let global = global_state()?;
     let context = context::get_current_context()?;
     hipMalloc(ptr::from_mut(dptr).cast(), bytesize)?;
@@ -18,10 +19,12 @@ pub(crate) unsafe fn alloc_v2(dptr: &mut hipDeviceptr_t, bytesize: usize) -> CUr
     {
         hipMemsetD8(*dptr, 0, bytesize)?;
     }
+    super::driver::zluda_log(&format!("[ZLUDA] cuMemAlloc_v2 -> {:?} OK", dptr.0));
     Ok(())
 }
 
 pub(crate) unsafe fn free_v2(dptr: hipDeviceptr_t) -> CUresult {
+    super::driver::zluda_log(&format!("[ZLUDA] cuMemFree_v2({:?})", dptr.0));
     let hip_result = hipFree(dptr.0);
     remove_allocation(dptr.0)?;
     Ok(hip_result?)
