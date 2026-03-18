@@ -254,6 +254,7 @@ from_cuda_nop!(
     CUsurfref,
     CUarray,
     CUmipmappedArray,
+    CUgraphicsResource,
     CUarray_format,
     CUaddress_mode,
     CUfilter_mode,

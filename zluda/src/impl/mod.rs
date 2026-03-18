@@ -8,6 +8,7 @@ pub(super) mod driver;
 pub(super) mod event;
 pub(super) mod function;
 pub(super) mod graph;
+pub(super) mod graphics;
 pub(super) mod hipfix;
 pub(super) mod kernel;
 pub(super) mod library;

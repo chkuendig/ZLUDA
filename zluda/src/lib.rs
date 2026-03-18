@@ -89,10 +89,31 @@ macro_rules! implemented {
                     }
                 }
                 // Always log errors to lightweight error log
-                if let Err(ref e) = result {
+                {
                     use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-                        let _ = writeln!(f, "ERR {} -> {:?}", stringify!($fn_name), e);
+                    let fn_name = stringify!($fn_name);
+                    // Log success for critical PhysX init functions
+                    let log_success = matches!(fn_name,
+                        "cuModuleLoadDataEx" | "cuModuleGetTexRef" | "cuModuleGetSurfRef" |
+                        "cuModuleGetFunction" | "cuModuleGetGlobal_v2" |
+                        "cuLaunchKernel" | "cuTexRefSetAddress_v2" |
+                        "cuTexRefSetArray" | "cuTexRefSetFormat" | "cuTexRefSetFilterMode" |
+                        "cuTexRefSetAddressMode" | "cuTexRefSetFlags" |
+                        "cuTexObjectCreate" | "cuCtxCreate_v2" |
+                        "cuMemAlloc_v2" | "cuMemHostAlloc" | "cuMemcpyHtoDAsync_v2"
+                    );
+                    match &result {
+                        Ok(()) if log_success => {
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
+                                let _ = writeln!(f, "OK {}", fn_name);
+                            }
+                        }
+                        Err(ref e) => {
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
+                                let _ = writeln!(f, "ERR {} -> {:?}", fn_name, e);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 result?;
@@ -120,10 +141,25 @@ macro_rules! implemented_in_function {
                     }
                 }
                 // Always log errors to lightweight error log
-                if let Err(ref e) = result {
+                {
                     use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-                        let _ = writeln!(f, "ERR {} -> {:?}", stringify!($fn_name), e);
+                    let fn_name = stringify!($fn_name);
+                    let log_success = matches!(fn_name,
+                        "cuModuleLoadDataEx" | "cuModuleGetTexRef" | "cuModuleGetSurfRef" |
+                        "cuModuleGetFunction" | "cuLaunchKernel"
+                    );
+                    match &result {
+                        Ok(()) if log_success => {
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
+                                let _ = writeln!(f, "OK {}", fn_name);
+                            }
+                        }
+                        Err(ref e) => {
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
+                                let _ = writeln!(f, "ERR {} -> {:?}", fn_name, e);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 result?;
@@ -287,6 +323,16 @@ cuda_macros::cuda_function_declarations!(
             cuSurfObjectCreate,
             cuSurfObjectDestroy,
             cuSurfRefSetArray,
+            cuGraphicsMapResources,
+            cuGraphicsMapResources_ptsz,
+            cuGraphicsUnmapResources,
+            cuGraphicsUnmapResources_ptsz,
+            cuGraphicsSubResourceGetMappedArray,
+            cuGraphicsResourceGetMappedPointer_v2,
+            cuGraphicsResourceSetMapFlags_v2,
+            cuGraphicsResourceSetMapFlags,
+            cuGraphicsUnregisterResource,
+            cuGraphicsResourceGetMappedMipmappedArray,
         ],
     implemented_in_function <= [cuLaunchKernel,]
 );

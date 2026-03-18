@@ -28,7 +28,11 @@ pub(crate) fn get_attribute(
         _ => {}
     }
     let result = unsafe { hipFuncGetAttribute(pi, mem::transmute(cu_attrib), func) };
-    super::driver::zluda_log(&format!("[ZLUDA] cuFuncGetAttribute({:?}) -> val={}, result={:?}", cu_attrib, *pi, result));
+    // Always log cuFuncGetAttribute to track what PhysX sees
+    super::driver::zluda_log_err(&format!(
+        "cuFuncGetAttribute({:?}, func={:?}) -> val={}, result={:?}",
+        cu_attrib, func, *pi, result
+    ));
     if let Ok(()) = result {
         if cu_attrib == CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS {
             *pi = (*pi).max(1);

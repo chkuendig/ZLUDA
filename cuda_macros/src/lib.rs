@@ -244,8 +244,8 @@ impl VisitMut for FixFnSignatures {
 }
 
 const MODULES: &[&str] = &[
-    "array", "context", "device", "driver", "event", "function", "graph", "kernel",
-    "library", "link", "memory", "module", "pointer", "stream", "surf", "tex"
+    "array", "context", "device", "driver", "event", "function", "graph", "graphics",
+    "kernel", "library", "link", "memory", "module", "pointer", "stream", "surf", "tex"
 ];
 
 fn normalize_fn_impl(

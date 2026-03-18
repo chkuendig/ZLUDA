@@ -13,8 +13,8 @@ pub(crate) unsafe fn elapsed_time(
     // Flag values are compatible between CUDA and HIP for 0,1,2,4
     let result = hipEventElapsedTime(milliseconds, start, end);
     if !milliseconds.is_null() {
-        super::driver::zluda_log(&format!(
-            "[ZLUDA] cuEventElapsedTime -> {:.6} ms (result={:?})",
+        super::driver::zluda_log_err(&format!(
+            "cuEventElapsedTime -> {:.6} ms (result={:?})",
             *milliseconds, result
         ));
     }
