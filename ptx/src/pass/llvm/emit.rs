@@ -719,15 +719,66 @@ impl<'a> MethodEmitContext<'a> {
             underlying_type
         };
         let src = self.resolver.value(arguments.src)?;
-        let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
-        apply_qualifier(load, data.qualifier)?;
-        unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
-        if needs_cast {
-            self.resolver.with_result(arguments.dst, |dst| unsafe {
-                LLVMBuildBitCast(builder, load, underlying_type, dst)
-            });
+        // AMD GPU null-pointer guard for global loads.
+        // NVIDIA CUDA kernels can safely read from device address 0 (shared memory
+        // aperture on Fermi+). AMD GPUs have address 0 unmapped (AMDGPU_VA_RESERVED_BOTTOM
+        // = 64KB, kernel compile-time constant). XNACK not available on RDNA 2 (gfx10.3).
+        // For global loads, emit: if (ptr == null) { result = 0 } else { result = *ptr }
+        // This prevents fatal GPU page faults from NULL pointer dereferences in NVIDIA
+        // code (e.g. PhysX Flex particle grid with empty cell pointers).
+        let is_global = data.state_space == ast::StateSpace::Global
+            || data.state_space == ast::StateSpace::Generic;
+        if is_global {
+            let result = unsafe {
+                // Build: is_null = (src == null)
+                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(src));
+                let src_int = LLVMBuildPtrToInt(builder, src, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let null_int = LLVMBuildPtrToInt(builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let is_null = LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, src_int, null_int, LLVM_UNNAMED.as_ptr());
+                // Build basic blocks: current → check → load_bb / null_bb → merge
+                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+                let load_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_load".as_ptr());
+                let null_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_zero".as_ptr());
+                let merge_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_merge".as_ptr());
+                LLVMBuildCondBr(builder, is_null, null_bb, load_bb);
+                // Load block: do the actual load
+                LLVMPositionBuilderAtEnd(builder, load_bb);
+                let load = LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr());
+                apply_qualifier(load, data.qualifier)?;
+                LLVMSetAlignment(load, data.typ.layout().align() as u32);
+                LLVMBuildBr(builder, merge_bb);
+                let load_bb_end = LLVMGetInsertBlock(builder);
+                // Null block: return zero
+                LLVMPositionBuilderAtEnd(builder, null_bb);
+                let zero = LLVMConstNull(op_type);
+                LLVMBuildBr(builder, merge_bb);
+                let null_bb_end = LLVMGetInsertBlock(builder);
+                // Merge: phi node selects between load result and zero
+                LLVMPositionBuilderAtEnd(builder, merge_bb);
+                let phi = LLVMBuildPhi(builder, op_type, LLVM_UNNAMED.as_ptr());
+                let mut values = [load, zero];
+                let mut blocks = [load_bb_end, null_bb_end];
+                LLVMAddIncoming(phi, values.as_mut_ptr(), blocks.as_mut_ptr(), 2);
+                phi
+            };
+            if needs_cast {
+                self.resolver.with_result(arguments.dst, |dst| unsafe {
+                    LLVMBuildBitCast(builder, result, underlying_type, dst)
+                });
+            } else {
+                self.resolver.register(arguments.dst, result);
+            }
         } else {
-            self.resolver.register(arguments.dst, load);
+            let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
+            apply_qualifier(load, data.qualifier)?;
+            unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
+            if needs_cast {
+                self.resolver.with_result(arguments.dst, |dst| unsafe {
+                    LLVMBuildBitCast(builder, load, underlying_type, dst)
+                });
+            } else {
+                self.resolver.register(arguments.dst, load);
+            }
         }
         Ok(())
     }
