@@ -54,6 +54,12 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
+    // Skip kernels known to fault on AMD (NULL pointer dereference at address 0).
+    // On NVIDIA, address 0 is valid shared memory. On AMD, it's unmapped → fatal.
+    if super::module::is_faulting_kernel(f) {
+        super::driver::zluda_log_err("SKIPPING faulting kernel (CollideParticles/CollideConvexes)");
+        return Ok(());
+    }
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
     let cu_launch_param_buffer_pointer = 0x1usize as *mut ::core::ffi::c_void;
@@ -138,19 +144,6 @@ pub(crate) fn launch_kernel(
             f.0, grid_dim_x, grid_dim_y, grid_dim_z,
             block_dim_x, block_dim_y, block_dim_z,
             shared_mem_bytes, result));
-        // Sync after specific launches to binary-search which kernel faults.
-        // Launch count tracked via atomic counter.
-        static LAUNCH_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = LAUNCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Sync after each of the first 9 kernels to find the faulting one.
-        // Skip early kernels that are known good to narrow down.
-        if result.is_ok() && n < 9 {
-            let sync = unsafe { hipDeviceSynchronize() };
-            super::driver::zluda_log_err(&format!(
-                "SYNC AFTER LAUNCH #{}: grid=[{},{},{}] -> {:?}",
-                n, grid_dim_x, grid_dim_y, grid_dim_z, sync
-            ));
-        }
     }
     result
 }
