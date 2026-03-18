@@ -89,12 +89,22 @@ static QUERY_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 
 pub(crate) fn query(stream: hipStream_t) -> hipError_t {
     let result = unsafe { hipStreamQuery(stream) };
-    // Log the first 20 queries with stream pointer to identify which streams PhysX polls
+    // PhysX uses cuStreamQuery(NULL) as a push-buffer flush / dispatch heartbeat.
+    // On real NVIDIA, this returns NOT_READY when there's pending GPU work.
+    // Our dispatch loop runs too fast (no real kernels), causing PhysX to
+    // decide "no GPU work needed" and tear down GPU before APEX creates actors.
+    // Always return NOT_READY for NULL stream to keep the dispatch loop alive.
+    let result = if stream.0.is_null() {
+        Err(hipErrorCode_t::NotReady)
+    } else {
+        result
+    };
     let count = QUERY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count < 20 {
+    // Log first 100, then only when ZLUDA_LOG_ALL is set
+    if count < 100 || crate::is_log_all_enabled() {
         super::driver::zluda_log_err(&format!(
-            "cuStreamQuery(stream={:?}) -> {:?}",
-            stream, result
+            "cuStreamQuery(stream={:?}) -> {:?} [#{}]",
+            stream, result, count
         ));
     }
     result

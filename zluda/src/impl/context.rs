@@ -138,7 +138,14 @@ pub(crate) fn get_current_context() -> Result<CUcontext, CUerror> {
     if let Some(ctx) = STACK.with(|stack| stack.borrow().last().copied().map(|(ctx, _)| ctx)) {
         return Ok(ctx);
     }
-    Err(CUerror::INVALID_CONTEXT)
+    // Fall back to primary context for device 0 when stack is empty.
+    // Real CUDA makes the primary context implicitly available after cuInit.
+    // PhysX creates/destroys explicit contexts during probe, then expects
+    // the primary context to still be accessible.
+    match super::device::get_primary_context(0) {
+        Ok((_, cu_ctx)) => Ok(cu_ctx),
+        Err(_) => Err(CUerror::INVALID_CONTEXT),
+    }
 }
 
 pub(crate) unsafe fn get_limit(pvalue: *mut usize, limit: hipLimit_t) -> hipError_t {
@@ -209,22 +216,57 @@ pub(crate) fn set_current(raw_ctx: CUcontext) -> CUresult {
 pub(crate) fn get_current(pctx: &mut CUcontext) -> CUresult {
     match get_current_context() {
         Ok(ctx) => *pctx = ctx,
-        Err(_) => *pctx = CUcontext(ptr::null_mut()),
+        Err(_) => {
+            // Return primary context instead of NULL to prevent APEX from
+            // passing NULL to ContextStorage_Set (which causes NULL deref crash)
+            super::driver::zluda_log("[ZLUDA] cuCtxGetCurrent: stack empty, returning primary context");
+            super::driver::zluda_log_err("cuCtxGetCurrent: stack empty, returning primary context");
+            match super::device::get_primary_context(0) {
+                Ok((_, cu_ctx)) => *pctx = cu_ctx,
+                Err(_) => *pctx = CUcontext(ptr::null_mut()),
+            }
+        }
     }
     CUresult::SUCCESS
 }
 
 pub(crate) fn get_device(dev: &mut hipDevice_t) -> CUresult {
-    get_device_v2(dev, MaybeContextRef::None)
+    match get_device_v2(dev, MaybeContextRef::None) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // PhysX GPU dispatcher calls cuCtxGetDevice after destroying contexts.
+            // Return device 0 instead of error to keep the dispatcher running.
+            super::driver::zluda_log_err("cuCtxGetDevice failed, returning device 0");
+            *dev = 0;
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn get_device_v2(dev: &mut hipDevice_t, ctx: MaybeContextRef) -> CUresult {
     let device = match ctx {
         MaybeContextRef::Some(ctx) => ctx.device,
         MaybeContextRef::None => {
-            let cu_ctx: CUcontext = get_current_context()?;
-            let ctx: &Context = FromCuda::<_, CUerror>::from_cuda(&cu_ctx)?;
-            ctx.device
+            match get_current_context() {
+                Ok(cu_ctx) => {
+                    let ctx: Result<&Context, CUerror> = FromCuda::from_cuda(&cu_ctx);
+                    match ctx {
+                        Ok(ctx) => ctx.device,
+                        Err(_) => {
+                            // Primary context fallback: return device 0
+                            super::driver::zluda_log("[ZLUDA] cuCtxGetDevice: from_cuda failed, falling back to device 0");
+                            super::driver::zluda_log_err("cuCtxGetDevice: from_cuda failed, falling back to device 0");
+                            0
+                        }
+                    }
+                }
+                Err(_) => {
+                    // No context at all: return device 0 as PhysX expects
+                    super::driver::zluda_log("[ZLUDA] cuCtxGetDevice: no context, falling back to device 0");
+                    super::driver::zluda_log_err("cuCtxGetDevice: no context, falling back to device 0");
+                    0
+                }
+            }
         }
     };
     *dev = device;
@@ -270,16 +312,28 @@ pub(crate) unsafe fn create_v2(
     dev: cuda_types::cuda::CUdevice,
 ) -> CUresult {
     super::driver::zluda_log(&format!("[ZLUDA] cuCtxCreate_v2(dev={})", dev));
+    super::driver::zluda_log_err(&format!("cuCtxCreate_v2(dev={})", dev));
     let handle = Context::wrap(Context::new(dev));
     // TODO: optimize
     set_current(handle)?;
     *ctx = handle;
     super::driver::zluda_log("[ZLUDA] cuCtxCreate_v2 -> SUCCESS");
+    super::driver::zluda_log_err(&format!("cuCtxCreate_v2 -> SUCCESS (ctx={:p})", handle.0));
     Ok(())
 }
 
-pub(crate) unsafe fn destroy_v2(ctx: CUcontext) -> CUresult {
-    zluda_common::drop_checked::<Context>(ctx)
+pub(crate) unsafe fn destroy_v2(_ctx: CUcontext) -> CUresult {
+    // Complete no-op: don't pop from stack, don't free memory.
+    // Wine's nvcuda relay has a ContextStorage system that crashes (NULL deref)
+    // when cuCtxGetCurrent returns NULL (empty stack). PhysX creates contexts
+    // via dark API, "destroys" them, then later code (Relay1_func0) calls
+    // ContextStorage_Get with whatever cuCtxGetCurrent returns. If we popped
+    // the context, Wine gets NULL and crashes. By keeping the context on the
+    // stack, Wine always has a valid context pointer.
+    // On real NVIDIA, dark API contexts survive cuCtxDestroy anyway.
+    super::driver::zluda_log("[ZLUDA] cuCtxDestroy_v2: no-op (context kept on stack)");
+    super::driver::zluda_log_err(&format!("cuCtxDestroy_v2(ctx={:p}): no-op (context kept on stack)", _ctx.0));
+    Ok(())
 }
 
 pub(crate) unsafe fn pop_current_v2(ctx: Option<&mut CUcontext>) -> CUresult {

@@ -2,7 +2,12 @@ use hip_runtime_sys::*;
 
 pub(crate) unsafe fn create(event: *mut hipEvent_t, flags: ::core::ffi::c_uint) -> hipError_t {
     // Flag values are compatible between CUDA and HIP for 0,1,2,4
-    hipEventCreateWithFlags(event, flags)
+    let result = hipEventCreateWithFlags(event, flags);
+    super::driver::zluda_log_err(&format!(
+        "cuEventCreate(flags={}) -> {:?} (event={:p})",
+        flags, result, if event.is_null() { std::ptr::null() } else { *event as *const _ }
+    ));
+    result
 }
 
 pub(crate) unsafe fn elapsed_time(
@@ -30,15 +35,24 @@ pub(crate) unsafe fn elapsed_time_v2(
 }
 
 pub(crate) unsafe fn query(event: hipEvent_t) -> hipError_t {
-    hipEventQuery(event)
+    let result = hipEventQuery(event);
+    super::driver::zluda_log_err(&format!(
+        "cuEventQuery(event={:?}) -> {:?}", event, result
+    ));
+    result
 }
 
 pub(crate) unsafe fn destroy_v2(event: hipEvent_t) -> hipError_t {
+    super::driver::zluda_log_err(&format!("cuEventDestroy_v2(event={:?})", event));
     hipEventDestroy(event)
 }
 
 pub(crate) unsafe fn record(event: hipEvent_t, stream: hipStream_t) -> hipError_t {
-    hipEventRecord(event, stream)
+    let result = hipEventRecord(event, stream);
+    super::driver::zluda_log_err(&format!(
+        "cuEventRecord(event={:?}, stream={:?}) -> {:?}", event, stream, result
+    ));
+    result
 }
 
 pub(crate) unsafe fn record_with_flags(
@@ -58,5 +72,8 @@ pub(crate) unsafe fn record_with_flags(
 }
 
 pub(crate) unsafe fn synchronize(event: hipEvent_t) -> hipError_t {
-    hipEventSynchronize(event)
+    super::driver::zluda_log_err(&format!("cuEventSynchronize(event={:?}) ENTER", event));
+    let result = hipEventSynchronize(event);
+    super::driver::zluda_log_err(&format!("cuEventSynchronize(event={:?}) -> {:?}", event, result));
+    result
 }

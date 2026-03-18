@@ -154,20 +154,23 @@ pub(crate) fn zluda_log(msg: &str) {
 
 pub(crate) fn zluda_log_err(msg: &str) {
     use std::io::Write;
+    let ms = crate::elapsed_ms();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open("/tmp/zluda_tex.log")
     {
-        let _ = writeln!(f, "{}", msg);
+        let _ = writeln!(f, "[{}ms] {}", ms, msg);
     }
 }
 
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log(&format!("[ZLUDA] cuInit({})", flags));
+    zluda_log_err(&format!("=== ZLUDA init (flags={}) LOG_ALL={} ===", flags, crate::is_log_all_enabled()));
     unsafe { hipInit(flags) }?;
     global_state()?;
     zluda_log("[ZLUDA] cuInit -> SUCCESS");
+    zluda_log_err("=== ZLUDA cuInit -> SUCCESS ===");
     Ok(())
 }
 
@@ -198,6 +201,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         result: *mut cuda_types::cuda::CUmodule,
         fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::get_module_from_cubin(fatbinc={:p})", fatbinc_wrapper));
         let result = match result.as_mut() {
             Some(p) => p,
             None => return CUresult::ERROR_INVALID_VALUE,
@@ -206,13 +210,16 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             .cast::<c_void>()
             .as_ref()
             .ok_or(CUerror::INVALID_VALUE)?;
-        module::load_data(result, data)
+        let r = module::load_data(result, data);
+        zluda_log_err(&format!("dark_api::get_module_from_cubin -> {:?}", r));
+        r
     }
 
     unsafe extern "system" fn cudart_interface_fn2(
         pctx: *mut cuda_types::cuda::CUcontext,
         hip_dev: hipDevice_t,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::cudart_interface_fn2(dev={})", hip_dev));
         let pctx = match pctx.as_mut() {
             Some(p) => p,
             None => return CUresult::ERROR_INVALID_VALUE,
@@ -220,6 +227,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
 
         let (_, cu_ctx) = device::get_primary_context(hip_dev)?;
         *pctx = cu_ctx;
+        zluda_log_err(&format!("dark_api::cudart_interface_fn2 -> OK (ctx={:p})", cu_ctx.0));
         Ok(())
     }
 
@@ -230,6 +238,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         dev: hipDevice_t,
         flags: std::ffi::c_uint,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::set_device_flags(dev={}, flags={})", dev, flags));
         let mut active_dev = 0i32;
         hipGetDevice(&mut active_dev)?;
         if dev != active_dev {
@@ -246,6 +255,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     unsafe extern "system" fn set_device(
         dev: hipDevice_t,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::set_device(dev={})", dev));
         hipSetDevice(dev)?;
         Ok(())
     }
@@ -258,8 +268,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         arg5: u32,
     ) -> cuda_types::cuda::CUresult {
         zluda_log("[ZLUDA] dark_api::get_module_from_cubin_ext1");
+        zluda_log_err(&format!("dark_api::get_module_from_cubin_ext1(fatbinc={:p})", fatbinc_wrapper));
         if arg3 != ptr::null_mut() || arg4 != ptr::null_mut() || arg5 != 0 {
             zluda_log("[ZLUDA] dark_api::get_module_from_cubin_ext1 -> NOT_SUPPORTED (non-null args)");
+            zluda_log_err("dark_api::get_module_from_cubin_ext1 -> NOT_SUPPORTED (non-null args)");
             return CUresult::ERROR_NOT_SUPPORTED;
         }
         let result = match result.as_mut() {
@@ -272,11 +284,12 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             .ok_or(CUerror::INVALID_VALUE)?;
         let r = module::load_data(result, data);
         zluda_log(&format!("[ZLUDA] dark_api::get_module_from_cubin_ext1 -> {:?}", r));
+        zluda_log_err(&format!("dark_api::get_module_from_cubin_ext1 -> {:?}", r));
         r
     }
 
     unsafe extern "system" fn cudart_interface_fn7(_arg1: usize) -> () {
-        ()
+        zluda_log_err(&format!("dark_api::cudart_interface_fn7(arg1=0x{:x})", _arg1));
     }
 
     unsafe extern "system" fn get_module_from_cubin_ext2(
@@ -286,7 +299,9 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         arg4: *mut std::ffi::c_void,
         arg5: u32,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::get_module_from_cubin_ext2(fatbin={:p})", fatbin_header));
         if arg3 != ptr::null_mut() || arg4 != ptr::null_mut() || arg5 != 0 {
+            zluda_log_err("dark_api::get_module_from_cubin_ext2 -> NOT_SUPPORTED (non-null args)");
             return CUresult::ERROR_NOT_SUPPORTED;
         }
         let result = match result.as_mut() {
@@ -297,7 +312,9 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             .cast::<c_void>()
             .as_ref()
             .ok_or(CUerror::INVALID_VALUE)?;
-        module::load_data(result, data)
+        let r = module::load_data(result, data);
+        zluda_log_err(&format!("dark_api::get_module_from_cubin_ext2 -> {:?}", r));
+        r
     }
 
     unsafe extern "system" fn get_unknown_buffer1(
@@ -306,6 +323,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     ) -> () {
         *ptr = UNKNOWN_BUFFER1.buffer.get() as *mut std::ffi::c_void;
         *size = UNKNOWN_BUFFER1.len();
+        zluda_log_err(&format!("dark_api::get_unknown_buffer1 -> ptr={:p}, size={}", *ptr, *size));
     }
 
     unsafe extern "system" fn get_unknown_buffer2(
@@ -314,6 +332,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     ) -> () {
         *ptr = UNKNOWN_BUFFER2.buffer.get() as *mut std::ffi::c_void;
         *size = UNKNOWN_BUFFER2.len();
+        zluda_log_err(&format!("dark_api::get_unknown_buffer2 -> ptr={:p}, size={}", *ptr, *size));
     }
 
     unsafe extern "system" fn context_local_storage_put(
@@ -322,6 +341,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         value: *mut c_void,
         dtor_cb: Option<extern "system" fn(CUcontext, *mut c_void, *mut c_void)>,
     ) -> CUresult {
+        zluda_log_err(&format!("dark_api::context_local_storage_put(ctx={:p}, key={:p}, val={:p})", cu_ctx.0, key, value));
         let _ctx = if cu_ctx.0 != ptr::null_mut() {
             cu_ctx
         } else {
@@ -348,6 +368,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         cu_ctx: CUcontext,
         key: *mut c_void,
     ) -> CUresult {
+        zluda_log_err(&format!("dark_api::context_local_storage_delete(ctx={:p}, key={:p})", cu_ctx.0, key));
         let ctx_obj: &context::Context = FromCuda::<_, CUerror>::from_cuda(&cu_ctx)?;
         ctx_obj.with_state_mut(|state: &mut context::ContextState| {
             state.storage.remove(&(key as usize));
@@ -361,6 +382,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         cu_ctx: CUcontext,
         key: *mut c_void,
     ) -> CUresult {
+        zluda_log_err(&format!("dark_api::context_local_storage_get(ctx={:p}, key={:p})", cu_ctx.0, key));
         let mut _ctx: CUcontext;
         if cu_ctx.0 == ptr::null_mut() {
             _ctx = context::get_current_context()?;
@@ -384,6 +406,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         dev: cuda_types::cuda::CUdevice,
     ) -> cuda_types::cuda::CUresult {
         zluda_log(&format!("[ZLUDA] dark_api::ctx_create_v2_bypass(dev={}, flags={})", dev, flags));
+        zluda_log_err(&format!("dark_api::ctx_create_v2_bypass(dev={}, flags={})", dev, flags));
         // PhysX uses this dark API to create a context without the normal
         // overhead. Implement it the same as cuCtxCreate_v2.
         let result = match pctx.as_mut() {
@@ -391,6 +414,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             None => Err(cuda_types::cuda::CUerror::INVALID_VALUE),
         };
         zluda_log(&format!("[ZLUDA] dark_api::ctx_create_v2_bypass -> {:?}", result));
+        zluda_log_err(&format!("dark_api::ctx_create_v2_bypass -> {:?}", result));
         result
     }
 
@@ -399,6 +423,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _arg2: usize,
         _arg3: usize,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::heap_alloc(arg2=0x{:x}, arg3=0x{:x})", _arg2, _arg3));
         Err(r#impl::unimplemented())
     }
 
@@ -406,6 +431,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _heap_alloc_record_ptr: *const std::ffi::c_void,
         _arg2: *mut usize,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::heap_free(ptr={:p})", _heap_alloc_record_ptr));
         Err(r#impl::unimplemented())
     }
 
@@ -415,6 +441,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _unknown: std::ffi::c_int,
         _result: *mut [usize; 2],
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::device_get_attribute_ext(dev={}, attr={}, unknown={})", _dev, _attribute, _unknown));
         Err(r#impl::unimplemented())
     }
 
@@ -422,6 +449,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _result: *mut std::ffi::c_uchar,
         _dev: cuda_types::cuda::CUdevice,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::device_get_something(dev={})", _dev));
         Err(r#impl::unimplemented())
     }
 
@@ -430,6 +458,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         unix_seconds: u64,
         result: *mut [u64; 2],
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::integrity_check(version={}, unix_seconds={})", version, unix_seconds));
         let current_process = std::process::id();
         let current_thread = os::current_thread();
 
@@ -462,11 +491,13 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         result1: *mut u32,
         _result2: *mut *const std::ffi::c_void,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::context_check(ctx={:p})", _ctx_in.0));
         *result1 = 0;
         CUresult::SUCCESS
     }
 
     unsafe extern "system" fn check_fn3() -> u32 {
+        zluda_log_err("dark_api::check_fn3()");
         0
     }
 
@@ -478,6 +509,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         let name = CStr::from_ptr(name)
             .to_str()
             .map_err(|_| CUerror::INVALID_VALUE)?;
+        zluda_log_err(&format!("dark_api::hybrid_runtime_load_get_proc_address(name='{}')", name));
         if name != "nvcudart_hybrid64.dll" && name != "nvcudart_hybrid64a.dll" {
             return CUresult::ERROR_INVALID_VALUE;
         }
@@ -501,6 +533,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     }
 
     unsafe extern "system" fn hybrid_runtime_free(token: usize) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::hybrid_runtime_free(token={})", token));
         if token != 302100128 {
             return CUresult::ERROR_INVALID_HANDLE;
         }
@@ -508,6 +541,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     }
 
     unsafe extern "system" fn load_compilers() -> cuda_types::cuda::CUresult {
+        zluda_log_err("dark_api::load_compilers()");
         CUresult::SUCCESS
     }
 }
@@ -572,9 +606,11 @@ pub(crate) fn get_export_table(
     if let Some(table) = EXPORT_TABLE.get(p_export_table_id) {
         *pp_export_table = table.start();
         zluda_log(&format!("[ZLUDA] cuGetExportTable({}) -> SUCCESS", guid_str));
+        zluda_log_err(&format!("cuGetExportTable({}) -> SUCCESS", guid_str));
         cuda_types::cuda::CUresult::SUCCESS
     } else {
         zluda_log(&format!("[ZLUDA] cuGetExportTable({}) -> ERROR_INVALID_VALUE (unknown GUID!)", guid_str));
+        zluda_log_err(&format!("cuGetExportTable({}) -> ERROR_INVALID_VALUE (unknown GUID!)", guid_str));
         cuda_types::cuda::CUresult::ERROR_INVALID_VALUE
     }
 }
@@ -607,9 +643,11 @@ pub(crate) unsafe fn get_proc_address_v2(
         include!("../../../zluda_bindgen/src/process_table.rs")
     }
     let fn_ptr = raw_match(symbol.to_bytes(), flags, cuda_version);
+    let status_str = if fn_ptr as usize == 0 { "NOT_FOUND" } else if fn_ptr as usize == usize::MAX { "VERSION_NOT_SUFFICIENT" } else { "FOUND" };
     zluda_log(&format!("[ZLUDA] cuGetProcAddress('{}', ver={}, flags={}) -> {:?}",
-        symbol.to_string_lossy(), cuda_version, flags,
-        if fn_ptr as usize == 0 { "NOT_FOUND" } else if fn_ptr as usize == usize::MAX { "VERSION_NOT_SUFFICIENT" } else { "FOUND" }));
+        symbol.to_string_lossy(), cuda_version, flags, status_str));
+    zluda_log_err(&format!("cuGetProcAddress('{}', ver={}, flags={}) -> {}",
+        symbol.to_string_lossy(), cuda_version, flags, status_str));
     match fn_ptr as usize {
         0 => {
             if let Some(symbol_status) = symbol_status {

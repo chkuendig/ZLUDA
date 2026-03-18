@@ -30,12 +30,42 @@ pub(crate) unsafe fn free_v2(dptr: hipDeviceptr_t) -> CUresult {
     Ok(hip_result?)
 }
 
+/// Wine/ROCm HSA SDMA Signal Hang — All memcpy variants use direct CPU copy.
+///
+/// Under Wine, ALL synchronous HIP memory operations that wait on HSA
+/// signals hang indefinitely. Wine uses SIGUSR1 for APC delivery, which
+/// interrupts the KFD ioctl (AMDKFD_IOC_WAIT_EVENTS →
+/// schedule_timeout_interruptible) that the HSA runtime uses to wait for
+/// SDMA DMA copy completion. The ROCT-Thunk layer returns
+/// HSAKMT_STATUS_ERROR on -ERESTARTSYS instead of retrying, causing
+/// InterruptSignal::WaitRelaxed to livelock in a busy-poll loop
+/// (rdtsc + monitorx/mwaitx at libhsa-runtime64.so+0x657c6).
+///
+/// Affected: hipMemcpyHtoD, hipMemcpyDtoH, hipMemcpyDtoD (sync),
+///           hipStreamSynchronize, hipEventQuery, hipEventSynchronize.
+/// NOT affected: hipMemsetD8 (compute kernel), hipModuleLaunchKernel,
+///               hipMalloc/hipFree, hipMemcpyDtoDAsync (no wait).
+///
+/// HSA_ENABLE_SDMA=0 and HSA_ENABLE_INTERRUPT=0 env vars were tried but
+/// both break game startup (HIP initialization itself needs SDMA/interrupts).
+///
+/// Workaround: On AMD APUs (Steam Deck Van Gogh), "device" memory is
+/// system RAM — hipMalloc returns GTT pointers that are CPU-accessible.
+/// We bypass HIP's copy functions entirely and use plain CPU memcpy.
+/// No DMA engine, no HSA signals, no hang.
+///
+/// See: ROCm/ROCT-Thunk-Interface#56, ROCm/ROCR-Runtime#180,
+///      ROCm/ROCm#4528, ROCm/clr@f4b9d3b (SWDEV-501757)
+
 pub(crate) fn copy_dto_h_v2(
     dst_host: *mut ::core::ffi::c_void,
     src_device: hipDeviceptr_t,
     byte_count: usize,
 ) -> hipError_t {
-    unsafe { hipMemcpyDtoH(dst_host, src_device, byte_count) }
+    unsafe {
+        ptr::copy_nonoverlapping(src_device.0.cast::<u8>(), dst_host.cast::<u8>(), byte_count);
+    }
+    Ok(())
 }
 
 pub(crate) fn copy_hto_d_v2(
@@ -43,7 +73,10 @@ pub(crate) fn copy_hto_d_v2(
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
 ) -> hipError_t {
-    unsafe { hipMemcpyHtoD(dst_device, src_host.cast_mut(), byte_count) }
+    unsafe {
+        ptr::copy_nonoverlapping(src_host.cast::<u8>(), dst_device.0.cast::<u8>(), byte_count);
+    }
+    Ok(())
 }
 
 pub(crate) fn copy_hto_d_v2_ptds(
@@ -51,14 +84,7 @@ pub(crate) fn copy_hto_d_v2_ptds(
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
 ) -> hipError_t {
-    unsafe {
-        hipMemcpy_spt(
-            dst_device.0.cast(),
-            src_host.cast_mut(),
-            byte_count,
-            hipMemcpyKind::hipMemcpyHostToDevice,
-        )
-    }
+    copy_hto_d_v2(dst_device, src_host, byte_count)
 }
 
 pub(crate) fn copy_dto_h_v2_ptds(
@@ -66,14 +92,7 @@ pub(crate) fn copy_dto_h_v2_ptds(
     src_device: hipDeviceptr_t,
     byte_count: usize,
 ) -> hipError_t {
-    unsafe {
-        hipMemcpy_spt(
-            dst_host.cast(),
-            src_device.0.cast(),
-            byte_count,
-            hipMemcpyKind::hipMemcpyDeviceToHost,
-        )
-    }
+    copy_dto_h_v2(dst_host, src_device, byte_count)
 }
 
 pub(crate) fn get_address_range_v2(
@@ -209,18 +228,20 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
     dst_device: hipDeviceptr_t,
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
-    stream: hipStream_t,
+    _stream: hipStream_t,
 ) -> hipError_t {
-    hipMemcpyHtoDAsync(dst_device, src_host.cast_mut(), byte_count, stream)
+    // Direct CPU memcpy — see Wine/HSA SDMA signal hang comment above.
+    copy_hto_d_v2(dst_device, src_host, byte_count)
 }
 
 pub(crate) unsafe fn copy_dto_h_async_v2(
     dst_host: *mut ::core::ffi::c_void,
     src_device: hipDeviceptr_t,
     byte_count: usize,
-    stream: hipStream_t,
+    _stream: hipStream_t,
 ) -> hipError_t {
-    hipMemcpyDtoHAsync(dst_host, src_device, byte_count, stream)
+    // Direct CPU memcpy — see Wine/HSA SDMA signal hang comment above.
+    copy_dto_h_v2(dst_host, src_device, byte_count)
 }
 
 pub(crate) unsafe fn copy_dto_d_async_v2(
