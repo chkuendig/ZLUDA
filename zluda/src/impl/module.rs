@@ -2,21 +2,7 @@ use super::driver;
 use crate::r#impl::driver::GlobalState;
 use cuda_types::{cuda::*, dark_api::FatbinFileHeader};
 use hip_runtime_sys::*;
-use std::{borrow::Cow, collections::{HashMap, HashSet}, ffi::CStr, fs, mem, ops::ControlFlow, sync::Mutex};
-
-/// Set of hipFunction_t handles for kernels that fault on AMD due to NULL
-/// pointer dereferences (address 0 unmapped, unlike NVIDIA shared memory).
-/// These kernels are skipped during launch to prevent fatal GPU page faults.
-static FAULTING_KERNELS: std::sync::LazyLock<Mutex<HashSet<usize>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
-
-/// Check if a kernel should be skipped because it faults on AMD.
-pub(crate) fn is_faulting_kernel(func: hipFunction_t) -> bool {
-    FAULTING_KERNELS
-        .lock()
-        .ok()
-        .map_or(false, |set| set.contains(&(func.0 as usize)))
-}
+use std::{borrow::Cow, collections::HashMap, ffi::CStr, fs, mem, ops::ControlFlow, sync::Mutex};
 use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 
 /// Global map from synthetic texture reference pointers to their device global variable addresses.
@@ -426,18 +412,6 @@ pub(crate) fn get_function(
 ) -> hipError_t {
     let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
     let result = unsafe { hipModuleGetFunction(hfunc, hmod.base, name) };
-    if result.is_ok() {
-        super::driver::zluda_log_err(&format!(
-            "cuModuleGetFunction('{}') -> func={:p}",
-            name_str, hfunc.0
-        ));
-        // Track kernels that access NULL pointers on AMD (address 0 is unmapped,
-        // unlike NVIDIA where shared memory starts at address 0).
-        // CollideParticles reads grid cell arrays with NULL entries for empty cells.
-        if name_str.contains("CollideParticles") || name_str.contains("CollideConvexes") {
-            FAULTING_KERNELS.lock().ok().map(|mut set| set.insert(hfunc.0 as usize));
-        }
-    }
     super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetFunction('{}') -> {:?}", name_str, result));
     result
 }

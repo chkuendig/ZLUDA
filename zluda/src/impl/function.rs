@@ -54,12 +54,6 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
-    // Skip kernels known to fault on AMD (NULL pointer dereference at address 0).
-    // On NVIDIA, address 0 is valid shared memory. On AMD, it's unmapped → fatal.
-    if super::module::is_faulting_kernel(f) {
-        super::driver::zluda_log_err("SKIPPING faulting kernel (CollideParticles/CollideConvexes)");
-        return Ok(());
-    }
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
     let cu_launch_param_buffer_pointer = 0x1usize as *mut ::core::ffi::c_void;
@@ -135,15 +129,15 @@ pub(crate) fn launch_kernel(
             )
         }
     };
-    // Log kernel launches and force sync to identify which kernel faults.
-    // hipDeviceSynchronize after each launch is expensive but pinpoints
-    // which kernel causes the GPU NULL page fault.
+    // Log all kernel launches (lightweight)
     {
-        super::driver::zluda_log_err(&format!(
-            "launch func={:p} grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
-            f.0, grid_dim_x, grid_dim_y, grid_dim_z,
-            block_dim_x, block_dim_y, block_dim_z,
-            shared_mem_bytes, result));
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
+            let _ = writeln!(file, "launch grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
+                grid_dim_x, grid_dim_y, grid_dim_z,
+                block_dim_x, block_dim_y, block_dim_z,
+                shared_mem_bytes, result);
+        }
     }
     result
 }

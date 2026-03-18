@@ -719,66 +719,15 @@ impl<'a> MethodEmitContext<'a> {
             underlying_type
         };
         let src = self.resolver.value(arguments.src)?;
-        // AMD GPU null-pointer guard for global loads.
-        // NVIDIA CUDA kernels can safely read from device address 0 (shared memory
-        // aperture on Fermi+). AMD GPUs have address 0 unmapped (AMDGPU_VA_RESERVED_BOTTOM
-        // = 64KB, kernel compile-time constant). XNACK not available on RDNA 2 (gfx10.3).
-        // For global loads, emit: if (ptr == null) { result = 0 } else { result = *ptr }
-        // This prevents fatal GPU page faults from NULL pointer dereferences in NVIDIA
-        // code (e.g. PhysX Flex particle grid with empty cell pointers).
-        let is_global = data.state_space == ast::StateSpace::Global
-            || data.state_space == ast::StateSpace::Generic;
-        if is_global {
-            let result = unsafe {
-                // Build: is_null = (src == null)
-                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(src));
-                let src_int = LLVMBuildPtrToInt(builder, src, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
-                let null_int = LLVMBuildPtrToInt(builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
-                let is_null = LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, src_int, null_int, LLVM_UNNAMED.as_ptr());
-                // Build basic blocks: current → check → load_bb / null_bb → merge
-                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
-                let load_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_load".as_ptr());
-                let null_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_zero".as_ptr());
-                let merge_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_merge".as_ptr());
-                LLVMBuildCondBr(builder, is_null, null_bb, load_bb);
-                // Load block: do the actual load
-                LLVMPositionBuilderAtEnd(builder, load_bb);
-                let load = LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr());
-                apply_qualifier(load, data.qualifier)?;
-                LLVMSetAlignment(load, data.typ.layout().align() as u32);
-                LLVMBuildBr(builder, merge_bb);
-                let load_bb_end = LLVMGetInsertBlock(builder);
-                // Null block: return zero
-                LLVMPositionBuilderAtEnd(builder, null_bb);
-                let zero = LLVMConstNull(op_type);
-                LLVMBuildBr(builder, merge_bb);
-                let null_bb_end = LLVMGetInsertBlock(builder);
-                // Merge: phi node selects between load result and zero
-                LLVMPositionBuilderAtEnd(builder, merge_bb);
-                let phi = LLVMBuildPhi(builder, op_type, LLVM_UNNAMED.as_ptr());
-                let mut values = [load, zero];
-                let mut blocks = [load_bb_end, null_bb_end];
-                LLVMAddIncoming(phi, values.as_mut_ptr(), blocks.as_mut_ptr(), 2);
-                phi
-            };
-            if needs_cast {
-                self.resolver.with_result(arguments.dst, |dst| unsafe {
-                    LLVMBuildBitCast(builder, result, underlying_type, dst)
-                });
-            } else {
-                self.resolver.register(arguments.dst, result);
-            }
+        let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
+        apply_qualifier(load, data.qualifier)?;
+        unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
+        if needs_cast {
+            self.resolver.with_result(arguments.dst, |dst| unsafe {
+                LLVMBuildBitCast(builder, load, underlying_type, dst)
+            });
         } else {
-            let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
-            apply_qualifier(load, data.qualifier)?;
-            unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
-            if needs_cast {
-                self.resolver.with_result(arguments.dst, |dst| unsafe {
-                    LLVMBuildBitCast(builder, load, underlying_type, dst)
-                });
-            } else {
-                self.resolver.register(arguments.dst, load);
-            }
+            self.resolver.register(arguments.dst, load);
         }
         Ok(())
     }
@@ -1191,34 +1140,10 @@ impl<'a> MethodEmitContext<'a> {
                 )
             };
         }
-        // AMD GPU null-pointer guard for global stores (same issue as loads).
-        let is_global = data.state_space == ast::StateSpace::Global
-            || data.state_space == ast::StateSpace::Generic;
-        if is_global {
-            unsafe {
-                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(ptr));
-                let ptr_int = LLVMBuildPtrToInt(self.builder, ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
-                let null_int = LLVMBuildPtrToInt(self.builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
-                let is_null = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, ptr_int, null_int, LLVM_UNNAMED.as_ptr());
-                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
-                let store_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_store".as_ptr());
-                let skip_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_skip".as_ptr());
-                LLVMBuildCondBr(self.builder, is_null, skip_bb, store_bb);
-                // Store block: do the actual store
-                LLVMPositionBuilderAtEnd(self.builder, store_bb);
-                let store = LLVMBuildStore(self.builder, value, ptr);
-                apply_qualifier(store, data.qualifier)?;
-                LLVMSetAlignment(store, data.typ.layout().align() as u32);
-                LLVMBuildBr(self.builder, skip_bb);
-                // Skip block: continue (store was skipped)
-                LLVMPositionBuilderAtEnd(self.builder, skip_bb);
-            }
-        } else {
-            let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
-            apply_qualifier(store, data.qualifier)?;
-            unsafe {
-                LLVMSetAlignment(store, data.typ.layout().align() as u32);
-            }
+        let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
+        apply_qualifier(store, data.qualifier)?;
+        unsafe {
+            LLVMSetAlignment(store, data.typ.layout().align() as u32);
         }
         Ok(())
     }
@@ -1333,52 +1258,16 @@ impl<'a> MethodEmitContext<'a> {
             ast::AtomicOp::FloatMin => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMin,
             ast::AtomicOp::FloatMax => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMax,
         };
-        // AMD GPU null-pointer guard for atomic operations.
-        // Flex particle grid uses atomics on cell pointers that may be NULL.
-        let is_global = data.space == ast::StateSpace::Global
-            || data.space == ast::StateSpace::Generic;
-        if is_global {
-            unsafe {
-                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(src1));
-                let ptr_int = LLVMBuildPtrToInt(builder, src1, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
-                let null_int = LLVMBuildPtrToInt(builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
-                let is_null = LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, ptr_int, null_int, LLVM_UNNAMED.as_ptr());
-                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
-                let atom_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_atom".as_ptr());
-                let skip_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_atom_skip".as_ptr());
-                let merge_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_atom_merge".as_ptr());
-                LLVMBuildCondBr(builder, is_null, skip_bb, atom_bb);
-                // Atom block
-                LLVMPositionBuilderAtEnd(builder, atom_bb);
-                let atom_result = LLVMZludaBuildAtomicRMW(
-                    builder, op, src1, src2,
-                    get_scope(data.scope)?,
-                    get_ordering(data.semantics),
-                );
-                LLVMBuildBr(builder, merge_bb);
-                let atom_bb_end = LLVMGetInsertBlock(builder);
-                // Skip block
-                LLVMPositionBuilderAtEnd(builder, skip_bb);
-                let zero = LLVMConstNull(LLVMTypeOf(src2));
-                LLVMBuildBr(builder, merge_bb);
-                let skip_bb_end = LLVMGetInsertBlock(builder);
-                // Merge
-                LLVMPositionBuilderAtEnd(builder, merge_bb);
-                let phi = LLVMBuildPhi(builder, LLVMTypeOf(src2), LLVM_UNNAMED.as_ptr());
-                let mut values = [atom_result, zero];
-                let mut blocks = [atom_bb_end, skip_bb_end];
-                LLVMAddIncoming(phi, values.as_mut_ptr(), blocks.as_mut_ptr(), 2);
-                self.resolver.register(arguments.dst, phi);
-            }
-        } else {
-            self.resolver.register(arguments.dst, unsafe {
-                LLVMZludaBuildAtomicRMW(
-                    builder, op, src1, src2,
-                    get_scope(data.scope)?,
-                    get_ordering(data.semantics),
-                )
-            });
-        }
+        self.resolver.register(arguments.dst, unsafe {
+            LLVMZludaBuildAtomicRMW(
+                builder,
+                op,
+                src1,
+                src2,
+                get_scope(data.scope)?,
+                get_ordering(data.semantics),
+            )
+        });
         Ok(())
     }
 
