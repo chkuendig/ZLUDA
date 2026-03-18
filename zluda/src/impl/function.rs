@@ -99,15 +99,50 @@ pub(crate) fn launch_kernel(
             )
         }
     };
-    // Log all kernel launches (lightweight)
+    // Log all kernel launches with function handle, name, and param pointers
     {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-            let _ = writeln!(file, "launch grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
-                grid_dim_x, grid_dim_y, grid_dim_z,
-                block_dim_x, block_dim_y, block_dim_z,
-                shared_mem_bytes, result);
+        let name = super::module::get_kernel_name(f)
+            .unwrap_or_else(|| format!("unknown@{:p}", f.0));
+        // Dump kernel parameter pointers to find NULLs causing GPU page faults
+        let mut param_info = String::new();
+        unsafe {
+            if !kernel_params.is_null() {
+                // kernel_params is array of pointers to individual params
+                // Each param is a pointer to the actual value
+                // For device pointers, the value itself is a u64 device address
+                let mut ptrs = Vec::new();
+                let mut i = 0;
+                while i < 20 {
+                    let param_ptr = *kernel_params.add(i);
+                    if param_ptr.is_null() { break; }
+                    let val = *(param_ptr as *const u64);
+                    ptrs.push(if val == 0 { format!("NULL") } else { format!("0x{:x}", val) });
+                    i += 1;
+                }
+                param_info = format!(" kparams=[{}]", ptrs.join(","));
+            } else if !extra.is_null() {
+                // extra format: [BUFFER_POINTER(1), ptr, BUFFER_SIZE(2), size_ptr, END(0)]
+                let tag = *extra as usize;
+                if tag == 1 {
+                    let buf = *extra.add(1) as *const u64;
+                    let size = *(*extra.add(3) as *const usize);
+                    let num_vals = (size / 8).min(16);
+                    let ptrs: Vec<String> = (0..num_vals)
+                        .map(|i| {
+                            let val = *buf.add(i);
+                            if val == 0 { format!("NULL") } else { format!("0x{:x}", val) }
+                        })
+                        .collect();
+                    param_info = format!(" extra[{}B]=[{}]", size, ptrs.join(","));
+                }
+            }
         }
+        super::driver::zluda_log_err(&format!(
+            "launch func={:p} '{}' grid=[{},{},{}] block=[{},{},{}] shared={}{} -> {:?}",
+            f.0, name,
+            grid_dim_x, grid_dim_y, grid_dim_z,
+            block_dim_x, block_dim_y, block_dim_z,
+            shared_mem_bytes, param_info, result));
     }
     result
 }

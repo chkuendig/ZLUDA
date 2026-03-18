@@ -405,6 +405,18 @@ pub(crate) fn unload(hmod: CUmodule) -> CUresult {
     zluda_common::drop_checked::<Module>(hmod)
 }
 
+/// Global map from hipFunction_t pointer to kernel name for crash diagnosis.
+static FUNCTION_NAMES: std::sync::LazyLock<Mutex<HashMap<usize, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Look up a kernel name by its hipFunction_t handle.
+pub(crate) fn get_kernel_name(func: hipFunction_t) -> Option<String> {
+    FUNCTION_NAMES
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&(func.0 as usize)).cloned())
+}
+
 pub(crate) fn get_function(
     hfunc: &mut hipFunction_t,
     hmod: &Module,
@@ -412,6 +424,11 @@ pub(crate) fn get_function(
 ) -> hipError_t {
     let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
     let result = unsafe { hipModuleGetFunction(hfunc, hmod.base, name) };
+    if result.is_ok() {
+        if let Ok(mut map) = FUNCTION_NAMES.lock() {
+            map.insert(hfunc.0 as usize, name_str.to_string());
+        }
+    }
     super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetFunction('{}') -> {:?}", name_str, result));
     result
 }
