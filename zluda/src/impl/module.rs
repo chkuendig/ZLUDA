@@ -64,6 +64,16 @@ fn get_best_ptx_and_compile(
                             match cow_bytes_to_str(text) {
                                 Some(text) => {
                                     super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: PTX text extracted ({} bytes), first 100 chars: {}", module_count, text.len(), &text[..text.len().min(100)]));
+                                    // Dump PTX to file for analysis
+                                    {
+                                        use std::io::Write;
+                                        let _ = std::fs::create_dir_all("/tmp/zluda_ptx_dump");
+                                        static DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                        let n = DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if let Ok(mut f) = std::fs::File::create(format!("/tmp/zluda_ptx_dump/module_{}.ptx", n)) {
+                                            let _ = f.write_all(text.as_bytes());
+                                        }
+                                    }
                                     ptx_modules.push(text);
                                 }
                                 None => {
