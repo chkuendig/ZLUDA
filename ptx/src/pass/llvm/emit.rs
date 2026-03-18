@@ -1191,10 +1191,34 @@ impl<'a> MethodEmitContext<'a> {
                 )
             };
         }
-        let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
-        apply_qualifier(store, data.qualifier)?;
-        unsafe {
-            LLVMSetAlignment(store, data.typ.layout().align() as u32);
+        // AMD GPU null-pointer guard for global stores (same issue as loads).
+        let is_global = data.state_space == ast::StateSpace::Global
+            || data.state_space == ast::StateSpace::Generic;
+        if is_global {
+            unsafe {
+                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(ptr));
+                let ptr_int = LLVMBuildPtrToInt(self.builder, ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let null_int = LLVMBuildPtrToInt(self.builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let is_null = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, ptr_int, null_int, LLVM_UNNAMED.as_ptr());
+                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
+                let store_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_store".as_ptr());
+                let skip_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_skip".as_ptr());
+                LLVMBuildCondBr(self.builder, is_null, skip_bb, store_bb);
+                // Store block: do the actual store
+                LLVMPositionBuilderAtEnd(self.builder, store_bb);
+                let store = LLVMBuildStore(self.builder, value, ptr);
+                apply_qualifier(store, data.qualifier)?;
+                LLVMSetAlignment(store, data.typ.layout().align() as u32);
+                LLVMBuildBr(self.builder, skip_bb);
+                // Skip block: continue (store was skipped)
+                LLVMPositionBuilderAtEnd(self.builder, skip_bb);
+            }
+        } else {
+            let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
+            apply_qualifier(store, data.qualifier)?;
+            unsafe {
+                LLVMSetAlignment(store, data.typ.layout().align() as u32);
+            }
         }
         Ok(())
     }
@@ -1309,16 +1333,52 @@ impl<'a> MethodEmitContext<'a> {
             ast::AtomicOp::FloatMin => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMin,
             ast::AtomicOp::FloatMax => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMax,
         };
-        self.resolver.register(arguments.dst, unsafe {
-            LLVMZludaBuildAtomicRMW(
-                builder,
-                op,
-                src1,
-                src2,
-                get_scope(data.scope)?,
-                get_ordering(data.semantics),
-            )
-        });
+        // AMD GPU null-pointer guard for atomic operations.
+        // Flex particle grid uses atomics on cell pointers that may be NULL.
+        let is_global = data.space == ast::StateSpace::Global
+            || data.space == ast::StateSpace::Generic;
+        if is_global {
+            unsafe {
+                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(src1));
+                let ptr_int = LLVMBuildPtrToInt(builder, src1, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let null_int = LLVMBuildPtrToInt(builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let is_null = LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, ptr_int, null_int, LLVM_UNNAMED.as_ptr());
+                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+                let atom_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_atom".as_ptr());
+                let skip_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_atom_skip".as_ptr());
+                let merge_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"null_guard_atom_merge".as_ptr());
+                LLVMBuildCondBr(builder, is_null, skip_bb, atom_bb);
+                // Atom block
+                LLVMPositionBuilderAtEnd(builder, atom_bb);
+                let atom_result = LLVMZludaBuildAtomicRMW(
+                    builder, op, src1, src2,
+                    get_scope(data.scope)?,
+                    get_ordering(data.semantics),
+                );
+                LLVMBuildBr(builder, merge_bb);
+                let atom_bb_end = LLVMGetInsertBlock(builder);
+                // Skip block
+                LLVMPositionBuilderAtEnd(builder, skip_bb);
+                let zero = LLVMConstNull(LLVMTypeOf(src2));
+                LLVMBuildBr(builder, merge_bb);
+                let skip_bb_end = LLVMGetInsertBlock(builder);
+                // Merge
+                LLVMPositionBuilderAtEnd(builder, merge_bb);
+                let phi = LLVMBuildPhi(builder, LLVMTypeOf(src2), LLVM_UNNAMED.as_ptr());
+                let mut values = [atom_result, zero];
+                let mut blocks = [atom_bb_end, skip_bb_end];
+                LLVMAddIncoming(phi, values.as_mut_ptr(), blocks.as_mut_ptr(), 2);
+                self.resolver.register(arguments.dst, phi);
+            }
+        } else {
+            self.resolver.register(arguments.dst, unsafe {
+                LLVMZludaBuildAtomicRMW(
+                    builder, op, src1, src2,
+                    get_scope(data.scope)?,
+                    get_ordering(data.semantics),
+                )
+            });
+        }
         Ok(())
     }
 
