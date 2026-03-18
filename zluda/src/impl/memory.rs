@@ -43,6 +43,21 @@ pub(crate) fn copy_hto_d_v2(
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
 ) -> hipError_t {
+    // Log gParams writes (496 bytes) to see texture handle at offset 328
+    if byte_count == 496 {
+        let data = src_host as *const u64;
+        let tex_handle = unsafe { *data.add(41) }; // offset 328 = u64 index 41
+        super::driver::zluda_log_err(&format!(
+            "cuMemcpyHtoD gParams? dst={:p} size={} tex_handle@328=0x{:x}",
+            dst_device.0, byte_count, tex_handle
+        ));
+        // Dump u64 values around offset 320-352
+        let vals: Vec<String> = (40..44).map(|i| {
+            let v = unsafe { *data.add(i) };
+            format!("[{}]=0x{:x}", i*8, v)
+        }).collect();
+        super::driver::zluda_log_err(&format!("  gParams dump: {}", vals.join(" ")));
+    }
     let result = unsafe { hipMemcpyHtoD(dst_device, src_host.cast_mut(), byte_count) };
     if result.is_err() {
         // CUDA unified addressing allows cuMemcpyHtoD to host-mapped pointers.
@@ -236,6 +251,19 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    // Log gParams writes (496 bytes) to check texture handle at offset 328
+    if byte_count == 496 {
+        let data = src_host as *const u64;
+        let tex_handle = *data.add(41); // offset 328 = u64 index 41
+        super::driver::zluda_log_err(&format!(
+            "cuMemcpyHtoDAsync gParams? dst={:p} size={} tex_handle@328=0x{:x}",
+            dst_device.0, byte_count, tex_handle
+        ));
+        let vals: Vec<String> = (38..46).map(|i| {
+            format!("[{}]=0x{:x}", i*8, *data.add(i))
+        }).collect();
+        super::driver::zluda_log_err(&format!("  gParams dump: {}", vals.join(" ")));
+    }
     let result = hipMemcpyHtoDAsync(dst_device, src_host.cast_mut(), byte_count, stream);
     if result.is_err() {
         // CUDA unified addressing allows cuMemcpyHtoD to host-mapped pointers
