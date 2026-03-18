@@ -43,7 +43,23 @@ pub(crate) fn copy_hto_d_v2(
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
 ) -> hipError_t {
-    unsafe { hipMemcpyHtoD(dst_device, src_host.cast_mut(), byte_count) }
+    let result = unsafe { hipMemcpyHtoD(dst_device, src_host.cast_mut(), byte_count) };
+    if result.is_err() {
+        // CUDA unified addressing allows cuMemcpyHtoD to host-mapped pointers.
+        // HIP rejects these. Fallback to memcpy for host→host copies.
+        super::driver::zluda_log_err(&format!(
+            "cuMemcpyHtoD_v2 dst={:p} src={:p} size={} -> {:?}, falling back to memcpy",
+            dst_device.0, src_host, byte_count, result
+        ));
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_host.cast::<u8>(),
+                dst_device.0.cast::<u8>(),
+                byte_count,
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn copy_hto_d_v2_ptds(
@@ -211,7 +227,37 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
-    hipMemcpyHtoDAsync(dst_device, src_host.cast_mut(), byte_count, stream)
+    let result = hipMemcpyHtoDAsync(dst_device, src_host.cast_mut(), byte_count, stream);
+    if result.is_err() {
+        // CUDA unified addressing allows cuMemcpyHtoD to host-mapped pointers
+        // (e.g. from cuMemHostAlloc with hipHostMallocMapped). HIP rejects
+        // these because the pointer is in host address space, not device.
+        // Try hipMemcpy with hipMemcpyDefault which handles unified pointers.
+        super::driver::zluda_log_err(&format!(
+            "cuMemcpyHtoDAsync_v2 dst={:p} src={:p} size={} -> {:?}, trying hipMemcpy default",
+            dst_device.0, src_host, byte_count, result
+        ));
+        let result2 = hipMemcpyAsync(
+            dst_device.0,
+            src_host.cast_mut(),
+            byte_count,
+            hipMemcpyKind::hipMemcpyDefault,
+            stream,
+        );
+        if result2.is_err() {
+            // Last resort: plain memcpy (host→host)
+            super::driver::zluda_log_err(&format!(
+                "cuMemcpyHtoDAsync_v2 hipMemcpy also failed ({:?}), using memcpy",
+                result2
+            ));
+            std::ptr::copy_nonoverlapping(
+                src_host.cast::<u8>(),
+                dst_device.0.cast::<u8>(),
+                byte_count,
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) unsafe fn copy_dto_h_async_v2(
