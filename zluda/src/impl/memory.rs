@@ -251,18 +251,69 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
-    // Log gParams writes (496 bytes) to check texture handle at offset 328
+    // Patch gParams writes (496 bytes): replace zero texture handle at offset 328
+    // with a valid dummy texture. Flex particle kernels do tex.1d.v4.f32.s32
+    // from this handle to read particle positions. Without a valid texture,
+    // the kernel accesses address 0 → GPU page fault.
     if byte_count == 496 {
-        let data = src_host as *const u64;
+        let data = src_host as *mut u64;
         let tex_handle = *data.add(41); // offset 328 = u64 index 41
-        super::driver::zluda_log_err(&format!(
-            "cuMemcpyHtoDAsync gParams? dst={:p} size={} tex_handle@328=0x{:x}",
-            dst_device.0, byte_count, tex_handle
-        ));
-        let vals: Vec<String> = (38..46).map(|i| {
-            format!("[{}]=0x{:x}", i*8, *data.add(i))
+        // Dump ALL zero u64 fields in gParams to find all uninitialized pointers
+        let zeros: Vec<String> = (0..62).filter_map(|i| {
+            if *data.add(i) == 0 { Some(format!("{}", i*8)) } else { None }
         }).collect();
-        super::driver::zluda_log_err(&format!("  gParams dump: {}", vals.join(" ")));
+        super::driver::zluda_log_err(&format!(
+            "cuMemcpyHtoDAsync gParams dst={:p} tex@328=0x{:x} zero_offsets=[{}]",
+            dst_device.0, tex_handle, zeros.join(",")
+        ));
+        if tex_handle == 0 {
+            // Create a dummy 1D float4 texture if we haven't already
+            static DUMMY_TEX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let handle = *DUMMY_TEX.get_or_init(|| {
+                // Create a 1D array of float4 (enough for max particle count)
+                let desc = HIP_ARRAY_DESCRIPTOR {
+                    Width: 16384, // 16K particles max
+                    Height: 0,    // 1D
+                    Format: hipArray_Format::HIP_AD_FORMAT_FLOAT,
+                    NumChannels: 4,
+                };
+                let mut array: hipArray_t = ptr::null_mut();
+                if hipArrayCreate(&mut array, &desc).is_err() || array.is_null() {
+                    super::driver::zluda_log_err("gParams: failed to create dummy array");
+                    return 0;
+                }
+                // Create texture object from the array
+                let mut res_desc: HIP_RESOURCE_DESC = std::mem::zeroed();
+                res_desc.resType = HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY;
+                res_desc.res.array.hArray = array;
+                let mut tex_desc: HIP_TEXTURE_DESC = std::mem::zeroed();
+                tex_desc.filterMode = HIPfilter_mode(0); // point filtering
+                let mut tex_obj: hipTextureObject_t = ptr::null_mut();
+                if hipTexObjectCreate(&mut tex_obj, &res_desc, &tex_desc, ptr::null()).is_err() {
+                    super::driver::zluda_log_err("gParams: failed to create dummy tex object");
+                    return 0;
+                }
+                super::driver::zluda_log_err(&format!(
+                    "gParams: created dummy tex object {:p}", tex_obj
+                ));
+                tex_obj as u64
+            });
+            if handle != 0 {
+                // Patch ALL zero u64 values in the pointer/handle section of gParams
+                // (offsets 296+). Lower offsets are float params (not pointers).
+                let mut patched = Vec::new();
+                for i in 37..62 { // offsets 296..496
+                    if *data.add(i) == 0 {
+                        *data.add(i) = handle;
+                        patched.push(i * 8);
+                    }
+                }
+                super::driver::zluda_log_err(&format!(
+                    "gParams: patched {} zero fields with dummy tex 0x{:x}: {:?}",
+                    patched.len(), handle, patched
+                ));
+            }
+        }
     }
     let result = hipMemcpyHtoDAsync(dst_device, src_host.cast_mut(), byte_count, stream);
     if result.is_err() {
