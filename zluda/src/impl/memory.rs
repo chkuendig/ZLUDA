@@ -172,6 +172,15 @@ pub(crate) unsafe fn host_alloc(
     // GPU→CPU signaling pattern (pinned memory spinWait).
     let hip_flags = flags | 0x02; // hipHostMallocMapped
     hipHostMalloc(pp, bytesize, hip_flags)?;
+    // Log host alloc addresses — Flex may pass these directly as kernel args
+    // expecting CUDA UVA (host pointer = device pointer). On HIP, the device
+    // pointer for mapped memory is different from the host pointer.
+    let mut dev_ptr: *mut ::core::ffi::c_void = ptr::null_mut();
+    let _ = hipHostGetDevicePointer(&mut dev_ptr, *pp, 0);
+    super::driver::zluda_log_err(&format!(
+        "cuMemHostAlloc size={} host={:p} dev={:p} same={}",
+        bytesize, *pp, dev_ptr, *pp == dev_ptr
+    ));
     add_allocation(*pp, bytesize, context)?;
     Ok(())
 }

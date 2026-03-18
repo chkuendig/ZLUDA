@@ -129,15 +129,32 @@ pub(crate) fn launch_kernel(
             )
         }
     };
-    // Log all kernel launches (lightweight)
+    // Log kernel launches with param values for crash diagnosis
     {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-            let _ = writeln!(file, "launch grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
-                grid_dim_x, grid_dim_y, grid_dim_z,
-                block_dim_x, block_dim_y, block_dim_z,
-                shared_mem_bytes, result);
+        let mut param_info = String::new();
+        if !extra.is_null() && kernel_params.is_null() {
+            let extra_params = unsafe { std::slice::from_raw_parts(extra, 5) };
+            if extra_params[0] as usize == 1 && extra_params[2] as usize == 2 {
+                let buf = extra_params[1] as *const u64;
+                let size = unsafe { *(extra_params[3] as *const usize) };
+                let num_vals = (size / 8).min(20);
+                let has_null = (0..num_vals).any(|i| unsafe { *buf.add(i) } == 0);
+                if has_null {
+                    let ptrs: Vec<String> = (0..num_vals)
+                        .map(|i| {
+                            let val = unsafe { *buf.add(i) };
+                            if val == 0 { "NULL".to_string() } else { format!("0x{:x}", val) }
+                        })
+                        .collect();
+                    param_info = format!(" NULLS_IN_PARAMS[{}B]=[{}]", size, ptrs.join(","));
+                }
+            }
         }
+        super::driver::zluda_log_err(&format!(
+            "launch func={:p} grid=[{},{},{}] block=[{},{},{}] shared={}{}-> {:?}",
+            f.0, grid_dim_x, grid_dim_y, grid_dim_z,
+            block_dim_x, block_dim_y, block_dim_z,
+            shared_mem_bytes, param_info, result));
     }
     result
 }
