@@ -412,6 +412,12 @@ pub(crate) fn get_function(
 ) -> hipError_t {
     let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
     let result = unsafe { hipModuleGetFunction(hfunc, hmod.base, name) };
+    if result.is_ok() {
+        super::driver::zluda_log_err(&format!(
+            "cuModuleGetFunction('{}') -> func={:p}",
+            name_str, hfunc.0
+        ));
+    }
     super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetFunction('{}') -> {:?}", name_str, result));
     result
 }

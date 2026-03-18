@@ -129,14 +129,27 @@ pub(crate) fn launch_kernel(
             )
         }
     };
-    // Log all kernel launches (lightweight)
+    // Log kernel launches and force sync to identify which kernel faults.
+    // hipDeviceSynchronize after each launch is expensive but pinpoints
+    // which kernel causes the GPU NULL page fault.
     {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-            let _ = writeln!(file, "launch grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
-                grid_dim_x, grid_dim_y, grid_dim_z,
-                block_dim_x, block_dim_y, block_dim_z,
-                shared_mem_bytes, result);
+        super::driver::zluda_log_err(&format!(
+            "launch func={:p} grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
+            f.0, grid_dim_x, grid_dim_y, grid_dim_z,
+            block_dim_x, block_dim_y, block_dim_z,
+            shared_mem_bytes, result));
+        // Sync after specific launches to binary-search which kernel faults.
+        // Launch count tracked via atomic counter.
+        static LAUNCH_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = LAUNCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Sync after each of the first 9 kernels to find the faulting one.
+        // Skip early kernels that are known good to narrow down.
+        if result.is_ok() && n < 9 {
+            let sync = unsafe { hipDeviceSynchronize() };
+            super::driver::zluda_log_err(&format!(
+                "SYNC AFTER LAUNCH #{}: grid=[{},{},{}] -> {:?}",
+                n, grid_dim_x, grid_dim_y, grid_dim_z, sync
+            ));
         }
     }
     result
