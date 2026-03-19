@@ -274,6 +274,14 @@ fn compile_and_cache(
     super::driver::zluda_log(&format!("[ZLUDA]   ptx::to_llvm_module OK in {:?}, starting llvm_zluda::compile", compile_start.elapsed()));
     let ptx_impl = llvm_module.linked_bitcode();
     let ptx_impl_tex = llvm_module.linked_bitcode_tex();
+    // Dump LLVM IR and assembly for debugging PTX compilation issues
+    static COMPILE_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COMPILE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let hook = move |data: &Vec<u8>, name: String| {
+        let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
+        let path = format!("/tmp/zluda_ir_dump/module_{}_{}", n, name);
+        let _ = std::fs::write(&path, data);
+    };
     let elf_module = llvm_zluda::compile_with_extra(
         &llvm_module.context,
         gcn_arch,
@@ -281,7 +289,7 @@ fn compile_and_cache(
         ptx_impl,
         ptx_impl_tex,
         llvm_module.attributes_ir,
-        None,
+        Some(&hook),
     )
     .map_err(|e| {
         super::driver::zluda_log(&format!("[ZLUDA]   llvm_zluda::compile FAILED: {}", e));
