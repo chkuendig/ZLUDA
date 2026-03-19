@@ -57,11 +57,11 @@ pub(crate) fn launch_kernel(
     // Skip ALL kernels through index N to find faulting kernel.
     // If skipping 0-N prevents fault, kernel N+1 is the culprit.
     // Set to 99 to disable. Start with 5 (skip all Flex, run only sort).
-    const SKIP_THROUGH: u32 = 99; // Skip ALL kernels
+    // Skip kernels 6+ (RadixSort) but let Flex kernels 0-5 run
     static LAUNCH_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = LAUNCH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n <= SKIP_THROUGH {
-        super::driver::zluda_log_err(&format!("SKIPPING kernel #{}", n));
+    if n >= 6 {
+        super::driver::zluda_log_err(&format!("SKIPPING kernel #{} (RadixSort)", n));
         return Ok(());
     }
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
