@@ -266,6 +266,17 @@ fn compile_inner(
     }
     compile_log("compile: LLVMRunPasses OK");
 
+    // Always dump LLVM IR for debugging
+    {
+        static DUMP_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = DUMP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
+        let message = linked.print_module_to_string();
+        let data = message.to_bytes();
+        let _ = std::fs::write(format!("/tmp/zluda_ir_dump/module_{}_opt.ll", n), data);
+        compile_log(&format!("compile: dumped IR to /tmp/zluda_ir_dump/module_{}_opt.ll ({} bytes)", n, data.len()));
+    }
+
     if let Some(hook) = compiler_hook {
         // Run compiler hook on optimized human-readable LLVM IR
         let message = linked.print_module_to_string();

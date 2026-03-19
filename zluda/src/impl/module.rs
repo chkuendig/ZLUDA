@@ -277,9 +277,15 @@ fn compile_and_cache(
     // Dump LLVM IR and assembly for debugging PTX compilation issues
     static COMPILE_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COMPILE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Direct test: write a marker file to confirm this code path runs
+    {
+        let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
+        let _ = std::fs::write(format!("/tmp/zluda_ir_dump/MARKER_{}", n), format!("compile #{}", n));
+    }
     let hook = move |data: &Vec<u8>, name: String| {
         let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
         let path = format!("/tmp/zluda_ir_dump/module_{}_{}", n, name);
+        super::driver::zluda_log_err(&format!("IR DUMP: {} ({} bytes) -> {}", name, data.len(), path));
         let _ = std::fs::write(&path, data);
     };
     let elf_module = llvm_zluda::compile_with_extra(
