@@ -719,15 +719,60 @@ impl<'a> MethodEmitContext<'a> {
             underlying_type
         };
         let src = self.resolver.value(arguments.src)?;
-        let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
-        apply_qualifier(load, data.qualifier)?;
-        unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
-        if needs_cast {
-            self.resolver.with_result(arguments.dst, |dst| unsafe {
-                LLVMBuildBitCast(builder, load, underlying_type, dst)
-            });
+        // LLVM null-guard for global/generic loads.
+        // This guards actual pointer dereferences (ld.global), NOT kernel
+        // param values (which can legitimately be zero for float/int types).
+        // If we don't know whether the remaining NULLs are bugs or valid
+        // behavior, this is a safe defense: returns 0 for null loads
+        // instead of fatally crashing on AMD (address 0 unmapped).
+        let is_global = data.state_space == ast::StateSpace::Global
+            || data.state_space == ast::StateSpace::Generic;
+        if is_global {
+            let result = unsafe {
+                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(src));
+                let src_int = LLVMBuildPtrToInt(builder, src, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let null_int = LLVMBuildPtrToInt(builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let is_null = LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, src_int, null_int, LLVM_UNNAMED.as_ptr());
+                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+                let load_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_ld".as_ptr());
+                let null_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_z".as_ptr());
+                let merge_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_m".as_ptr());
+                LLVMBuildCondBr(builder, is_null, null_bb, load_bb);
+                LLVMPositionBuilderAtEnd(builder, load_bb);
+                let load = LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr());
+                apply_qualifier(load, data.qualifier)?;
+                LLVMSetAlignment(load, data.typ.layout().align() as u32);
+                LLVMBuildBr(builder, merge_bb);
+                let load_bb_end = LLVMGetInsertBlock(builder);
+                LLVMPositionBuilderAtEnd(builder, null_bb);
+                let zero = LLVMConstNull(op_type);
+                LLVMBuildBr(builder, merge_bb);
+                let null_bb_end = LLVMGetInsertBlock(builder);
+                LLVMPositionBuilderAtEnd(builder, merge_bb);
+                let phi = LLVMBuildPhi(builder, op_type, LLVM_UNNAMED.as_ptr());
+                let mut values = [load, zero];
+                let mut blocks = [load_bb_end, null_bb_end];
+                LLVMAddIncoming(phi, values.as_mut_ptr(), blocks.as_mut_ptr(), 2);
+                phi
+            };
+            if needs_cast {
+                self.resolver.with_result(arguments.dst, |dst| unsafe {
+                    LLVMBuildBitCast(builder, result, underlying_type, dst)
+                });
+            } else {
+                self.resolver.register(arguments.dst, result);
+            }
         } else {
-            self.resolver.register(arguments.dst, load);
+            let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
+            apply_qualifier(load, data.qualifier)?;
+            unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
+            if needs_cast {
+                self.resolver.with_result(arguments.dst, |dst| unsafe {
+                    LLVMBuildBitCast(builder, load, underlying_type, dst)
+                });
+            } else {
+                self.resolver.register(arguments.dst, load);
+            }
         }
         Ok(())
     }
@@ -1140,10 +1185,32 @@ impl<'a> MethodEmitContext<'a> {
                 )
             };
         }
-        let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
-        apply_qualifier(store, data.qualifier)?;
-        unsafe {
-            LLVMSetAlignment(store, data.typ.layout().align() as u32);
+        // Null-guard for global/generic stores (same as loads).
+        let is_global = data.state_space == ast::StateSpace::Global
+            || data.state_space == ast::StateSpace::Generic;
+        if is_global {
+            unsafe {
+                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(ptr));
+                let ptr_int = LLVMBuildPtrToInt(self.builder, ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let null_int = LLVMBuildPtrToInt(self.builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let is_null = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, ptr_int, null_int, LLVM_UNNAMED.as_ptr());
+                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
+                let store_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_st".as_ptr());
+                let skip_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_sk".as_ptr());
+                LLVMBuildCondBr(self.builder, is_null, skip_bb, store_bb);
+                LLVMPositionBuilderAtEnd(self.builder, store_bb);
+                let store = LLVMBuildStore(self.builder, value, ptr);
+                apply_qualifier(store, data.qualifier)?;
+                LLVMSetAlignment(store, data.typ.layout().align() as u32);
+                LLVMBuildBr(self.builder, skip_bb);
+                LLVMPositionBuilderAtEnd(self.builder, skip_bb);
+            }
+        } else {
+            let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
+            apply_qualifier(store, data.qualifier)?;
+            unsafe {
+                LLVMSetAlignment(store, data.typ.layout().align() as u32);
+            }
         }
         Ok(())
     }
