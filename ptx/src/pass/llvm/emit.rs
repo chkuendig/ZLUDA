@@ -1185,10 +1185,32 @@ impl<'a> MethodEmitContext<'a> {
                 )
             };
         }
-        let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
-        apply_qualifier(store, data.qualifier)?;
-        unsafe {
-            LLVMSetAlignment(store, data.typ.layout().align() as u32);
+        // Null-guard for global/generic stores (same as loads).
+        let is_global = data.state_space == ast::StateSpace::Global
+            || data.state_space == ast::StateSpace::Generic;
+        if is_global {
+            unsafe {
+                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(ptr));
+                let ptr_int = LLVMBuildPtrToInt(self.builder, ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let null_int = LLVMBuildPtrToInt(self.builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
+                let is_null = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, ptr_int, null_int, LLVM_UNNAMED.as_ptr());
+                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
+                let store_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_st".as_ptr());
+                let skip_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_sk".as_ptr());
+                LLVMBuildCondBr(self.builder, is_null, skip_bb, store_bb);
+                LLVMPositionBuilderAtEnd(self.builder, store_bb);
+                let store = LLVMBuildStore(self.builder, value, ptr);
+                apply_qualifier(store, data.qualifier)?;
+                LLVMSetAlignment(store, data.typ.layout().align() as u32);
+                LLVMBuildBr(self.builder, skip_bb);
+                LLVMPositionBuilderAtEnd(self.builder, skip_bb);
+            }
+        } else {
+            let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
+            apply_qualifier(store, data.qualifier)?;
+            unsafe {
+                LLVMSetAlignment(store, data.typ.layout().align() as u32);
+            }
         }
         Ok(())
     }
