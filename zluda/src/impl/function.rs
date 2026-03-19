@@ -54,6 +54,16 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
+    // Skip ALL kernels through index N to find faulting kernel.
+    // If skipping 0-N prevents fault, kernel N+1 is the culprit.
+    // Set to 99 to disable. Start with 5 (skip all Flex, run only sort).
+    const SKIP_THROUGH: u32 = 5;
+    static LAUNCH_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = LAUNCH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n <= SKIP_THROUGH {
+        super::driver::zluda_log_err(&format!("SKIPPING kernel #{}", n));
+        return Ok(());
+    }
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
     let cu_launch_param_buffer_pointer = 0x1usize as *mut ::core::ffi::c_void;
