@@ -212,6 +212,7 @@ from_cuda_nop!(
     CUdevice_attribute,
     CUdriverProcAddressQueryResult,
     CUjit_option,
+    CUsharedconfig,
     *mut CUsharedconfig,
     CUlibraryOption,
     CUmoduleLoadingMode,

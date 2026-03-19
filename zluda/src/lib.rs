@@ -230,6 +230,7 @@ cuda_macros::cuda_function_declarations!(
             cuCtxSetCurrent,
             cuCtxSetFlags,
             cuCtxSetLimit,
+            cuCtxSetSharedMemConfig,
             cuCtxSynchronize_v2,
             cuCtxSynchronize,
             cuDeviceComputeCapability,
