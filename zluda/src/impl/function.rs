@@ -65,36 +65,6 @@ pub(crate) fn launch_kernel(
         if extra_params[0] == cu_launch_param_buffer_pointer
             && extra_params[2] == cu_launch_param_buffer_size
         {
-            // Replace NULL device pointers in the param buffer.
-            // NVIDIA Flex passes NULL for optional buffers (velocities,
-            // delta-positions). On NVIDIA, address 0 contains valid shared
-            // memory (Fermi architecture), so NULL reads return data.
-            // On AMD/ROCm, address 0 is unmapped → fatal GPU page fault.
-            // We replace NULLs with the first valid device pointer in the
-            // buffer so the kernel reads harmless (wrong but non-crashing)
-            // data instead of faulting.
-            // Ref: NVIDIA Fermi Compute Architecture Whitepaper (address 0)
-            //      ROCm/ROCm#5616 (memory access fault on address nil)
-            let buf = extra_params[1] as *mut u64;
-            let size = unsafe { *(extra_params[3] as *const usize) };
-            let num_slots = size / 8;
-            // Find first value that looks like a device pointer (high bits set)
-            let mut guard_ptr: u64 = 0;
-            for i in 0..num_slots {
-                let val = unsafe { *buf.add(i) };
-                if val > 0x1000_0000_0000 { // looks like a device pointer
-                    guard_ptr = val;
-                    break;
-                }
-            }
-            if guard_ptr != 0 {
-                for i in 0..num_slots {
-                    let val = unsafe { *buf.add(i) };
-                    if val == 0 {
-                        unsafe { *buf.add(i) = guard_ptr; }
-                    }
-                }
-            }
             let mut patched = [
                 extra_params[0],
                 extra_params[1],

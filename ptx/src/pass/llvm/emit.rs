@@ -719,59 +719,15 @@ impl<'a> MethodEmitContext<'a> {
             underlying_type
         };
         let src = self.resolver.value(arguments.src)?;
-        // Null-guard for global/generic loads: NVIDIA drivers silently handle
-        // accesses to address 0 (non-fatal), AMD GPUs fatally fault.
-        // PhysX Flex has uninitialized pointers in device memory that get
-        // dereferenced — this is a bug but works on NVIDIA due to forgiving
-        // driver behavior. Guard with: if (ptr==null) return 0 else load.
-        let is_global = data.state_space == ast::StateSpace::Global
-            || data.state_space == ast::StateSpace::Generic;
-        if is_global {
-            let result = unsafe {
-                let null_ptr = LLVMConstPointerNull(LLVMTypeOf(src));
-                let src_int = LLVMBuildPtrToInt(builder, src, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
-                let null_int = LLVMBuildPtrToInt(builder, null_ptr, LLVMInt64TypeInContext(self.context), LLVM_UNNAMED.as_ptr());
-                let is_null = LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, src_int, null_int, LLVM_UNNAMED.as_ptr());
-                let current_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
-                let load_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_ld".as_ptr());
-                let null_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_z".as_ptr());
-                let merge_bb = LLVMAppendBasicBlockInContext(self.context, current_fn, c"ng_m".as_ptr());
-                LLVMBuildCondBr(builder, is_null, null_bb, load_bb);
-                LLVMPositionBuilderAtEnd(builder, load_bb);
-                let load = LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr());
-                apply_qualifier(load, data.qualifier)?;
-                LLVMSetAlignment(load, data.typ.layout().align() as u32);
-                LLVMBuildBr(builder, merge_bb);
-                let load_bb_end = LLVMGetInsertBlock(builder);
-                LLVMPositionBuilderAtEnd(builder, null_bb);
-                let zero = LLVMConstNull(op_type);
-                LLVMBuildBr(builder, merge_bb);
-                let null_bb_end = LLVMGetInsertBlock(builder);
-                LLVMPositionBuilderAtEnd(builder, merge_bb);
-                let phi = LLVMBuildPhi(builder, op_type, LLVM_UNNAMED.as_ptr());
-                let mut values = [load, zero];
-                let mut blocks = [load_bb_end, null_bb_end];
-                LLVMAddIncoming(phi, values.as_mut_ptr(), blocks.as_mut_ptr(), 2);
-                phi
-            };
-            if needs_cast {
-                self.resolver.with_result(arguments.dst, |dst| unsafe {
-                    LLVMBuildBitCast(builder, result, underlying_type, dst)
-                });
-            } else {
-                self.resolver.register(arguments.dst, result);
-            }
+        let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
+        apply_qualifier(load, data.qualifier)?;
+        unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
+        if needs_cast {
+            self.resolver.with_result(arguments.dst, |dst| unsafe {
+                LLVMBuildBitCast(builder, load, underlying_type, dst)
+            });
         } else {
-            let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
-            apply_qualifier(load, data.qualifier)?;
-            unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
-            if needs_cast {
-                self.resolver.with_result(arguments.dst, |dst| unsafe {
-                    LLVMBuildBitCast(builder, load, underlying_type, dst)
-                });
-            } else {
-                self.resolver.register(arguments.dst, load);
-            }
+            self.resolver.register(arguments.dst, load);
         }
         Ok(())
     }
