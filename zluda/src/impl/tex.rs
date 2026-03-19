@@ -191,11 +191,11 @@ pub(crate) unsafe fn object_create(
     p_tex_object: &mut CUtexObject,
     p_res_desc: &CUDA_RESOURCE_DESC,
     p_tex_desc: &CUDA_TEXTURE_DESC,
-    p_res_view_desc: &CUDA_RESOURCE_VIEW_DESC,
+    _p_res_view_desc: *const CUDA_RESOURCE_VIEW_DESC,
 ) -> CUresult {
     super::driver::zluda_log_err(&format!(
-        "cuTexObjectCreate ENTER resType={:?}",
-        p_res_desc.resType
+        "cuTexObjectCreate ENTER resType={:?} viewDesc={:p}",
+        p_res_desc.resType, _p_res_view_desc
     ));
     // Build HIP resource desc
     let mut hip_res_desc: HIP_RESOURCE_DESC = mem::zeroed();

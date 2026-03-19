@@ -214,6 +214,7 @@ from_cuda_nop!(
     CUjit_option,
     CUsharedconfig,
     *mut CUsharedconfig,
+    *const CUDA_RESOURCE_VIEW_DESC,
     CUlibraryOption,
     CUmoduleLoadingMode,
     CUuuid,
