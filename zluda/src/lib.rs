@@ -221,6 +221,7 @@ cuda_macros::cuda_function_declarations!(
             cuCtxGetDevice_v2,
             cuCtxGetDevice,
             cuCtxGetLimit,
+            cuCtxGetSharedMemConfig,
             cuCtxGetStreamPriorityRange,
             cuCtxPopCurrent_v2,
             cuCtxPopCurrent,

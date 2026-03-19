@@ -356,6 +356,30 @@ pub(crate) unsafe fn set_flags(flags: ::core::ffi::c_uint) -> CUresult {
     })
 }
 
+/// cuCtxGetSharedMemConfig implementation.
+/// cudart64_55.dll calls this during context init. Previously unimplemented,
+/// which returned NOT_SUPPORTED, potentially causing the runtime to skip
+/// texture object creation (gParams NULL texture bug).
+pub(crate) unsafe fn get_shared_memory_config(
+    p_config: *mut CUsharedconfig,
+) -> hipError_t {
+    let p_config = p_config as *mut hipSharedMemConfig;
+    let result = hipCtxGetSharedMemConfig(p_config);
+    super::driver::zluda_log_err(&format!(
+        "cuCtxGetSharedMemConfig -> result={:?}", result
+    ));
+    match result {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Return default (4-byte banks) so cudart doesn't skip init
+            if !p_config.is_null() {
+                *p_config = hipSharedMemConfig(1);
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(crate) unsafe fn get_api_version(
     _ctx: CUcontext,
     version: &mut ::core::ffi::c_uint,
