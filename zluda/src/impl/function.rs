@@ -57,7 +57,7 @@ pub(crate) fn launch_kernel(
     // Skip ALL kernels through index N to find faulting kernel.
     // If skipping 0-N prevents fault, kernel N+1 is the culprit.
     // Set to 99 to disable. Start with 5 (skip all Flex, run only sort).
-    const SKIP_THROUGH: u32 = 5;
+    const SKIP_THROUGH: u32 = 99; // Skip ALL kernels
     static LAUNCH_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = LAUNCH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n <= SKIP_THROUGH {
