@@ -17,6 +17,7 @@ use llvm_sys::{LLVMLinkage, LLVMVisibility};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::sync::OnceLock;
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 const OCKL_MODULE: &[u8] = include_bytes!("device-libs/ockl.bc");
@@ -103,18 +104,6 @@ pub fn compile(
     attributes: Module,
     compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
 ) -> Result<Vec<u8>, String> {
-    compile_with_extra(ctx, gcn_arch, main, ptx_impl, &[], attributes, compiler_hook)
-}
-
-pub fn compile_with_extra(
-    ctx: &Context,
-    gcn_arch: &str,
-    main: Module,
-    ptx_impl: &[u8],
-    extra_bitcode: &[u8],
-    attributes: Module,
-    compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
-) -> Result<Vec<u8>, String> {
     // Wine threads typically have 1MB stacks, but LLVM's bitcode parser
     // and optimization passes need much more. Spawn a native thread with
     // a 64MB stack to avoid SIGSEGV during compilation.
@@ -129,7 +118,6 @@ pub fn compile_with_extra(
         main: usize,
         attr: usize,
         ptx_impl: Vec<u8>,
-        extra_bitcode: Vec<u8>,
         gcn_arch: String,
     }
     unsafe impl Send for SendPtrs {}
@@ -139,7 +127,6 @@ pub fn compile_with_extra(
         main: main.get() as usize,
         attr: attributes.get() as usize,
         ptx_impl: ptx_impl.to_vec(),
-        extra_bitcode: extra_bitcode.to_vec(),
         gcn_arch: gcn_arch.to_string(),
     };
 
@@ -148,6 +135,7 @@ pub fn compile_with_extra(
     std::mem::forget(main);
     std::mem::forget(attributes);
 
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("zluda-llvm-compile".into())
         .stack_size(stack_size)
@@ -155,11 +143,22 @@ pub fn compile_with_extra(
             let ctx = unsafe { &*(ptrs.ctx as *const Context) };
             let main = unsafe { Module::from_raw(ptrs.main as *mut _) };
             let attributes = unsafe { Module::from_raw(ptrs.attr as *mut _) };
-            compile_inner(ctx, &ptrs.gcn_arch, main, &ptrs.ptx_impl, &ptrs.extra_bitcode, attributes, None)
+            let result = compile_inner(ctx, &ptrs.gcn_arch, main, &ptrs.ptx_impl, attributes, None);
+            let _ = tx.send(result);
         })
-        .map_err(|e| format!("Failed to spawn compile thread: {}", e))?
-        .join()
-        .map_err(|e| format!("Compile thread panicked: {:?}", e))?
+        .map_err(|e| format!("Failed to spawn compile thread: {}", e))?;
+
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            compile_log("compile: TIMED OUT after 120s — abandoning module");
+            Err("LLVM compilation timed out after 120s".to_string())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            compile_log("compile: thread panicked (channel disconnected)");
+            Err("Compile thread panicked".to_string())
+        }
+    }
 }
 
 fn compile_inner(
@@ -167,7 +166,6 @@ fn compile_inner(
     gcn_arch: &str,
     main: Module,
     ptx_impl: &[u8],
-    extra_bitcode: &[u8],
     attributes: Module,
     compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
 ) -> Result<Vec<u8>, String> {
@@ -200,13 +198,6 @@ fn compile_inner(
     linked.link(oclc_constants)?;
     compile_log("compile: linking ptx_impl");
     linked.link(ptx_impl)?;
-    if !extra_bitcode.is_empty() {
-        compile_log(&format!("compile: load extra bitcode ({} bytes)", extra_bitcode.len()));
-        let extra_mod = Module::try_from_bitcode(ctx, extra_bitcode, Some(c"ptx_impl_tex.bc"))
-            .ok_or("Failed to parse extra bitcode".to_string())?;
-        compile_log("compile: linking extra bitcode");
-        linked.link(extra_mod)?;
-    }
     compile_log("compile: linking ockl");
     linked.link(ockl)?;
     compile_log("compile: linking ocml");
@@ -215,6 +206,17 @@ fn compile_inner(
     compile_log("compile: verify");
     linked.verify()?;
     compile_log("compile: verify OK");
+
+    // Always dump linked (pre-O3) IR for debugging
+    {
+        static LINKED_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = LINKED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
+        let message = linked.print_module_to_string();
+        let data = message.to_bytes();
+        let _ = std::fs::write(format!("/tmp/zluda_ir_dump/module_{}_linked.ll", n), data);
+        compile_log(&format!("compile: dumped linked IR to /tmp/zluda_ir_dump/module_{}_linked.ll ({} bytes)", n, data.len()));
+    }
 
     if let Some(hook) = compiler_hook {
         // Run compiler hook on human-readable LLVM IR
@@ -325,6 +327,7 @@ fn compile_inner(
     };
     if result != 0 {
         let message = Message::new(unsafe { CStr::from_ptr(err) });
+        compile_log(&format!("compile: LLD FAILED: {}", message.to_str()));
         return Err(message.to_str().to_string());
     }
 

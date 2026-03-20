@@ -5,3 +5,14 @@ Cargo.lock
 .idea/
 
 ptx/lib/zluda_ptx_impl.ll
+
+# Downloaded ROCm packages (reproducible via script)
+ext/rocm/
+
+# Debug artifacts
+module_*.ll
+perf.data
+perf.data.old
+test_compile.rs
+test_ptx_invalid.rs
+test_ptx_parse.sh

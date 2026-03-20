@@ -381,15 +381,14 @@ pub(crate) unsafe fn get_shared_memory_config(
 }
 
 /// cuCtxSetSharedMemConfig — set shared memory bank size.
+/// No-op: hipCtxSetSharedMemConfig is unimplemented in ROCm (assertion failure).
+/// AMDGPU LDS always uses 32-bit bank mode, so this is safe to ignore.
 pub(crate) unsafe fn set_shared_memory_config(
     config: CUsharedconfig,
 ) -> hipError_t {
-    let hip_config = hipSharedMemConfig(config.0);
-    let result = hipCtxSetSharedMemConfig(hip_config);
     super::driver::zluda_log_err(&format!(
-        "cuCtxSetSharedMemConfig(config={}) -> {:?}", config.0, result
+        "cuCtxSetSharedMemConfig(config={}) -> no-op", config.0
     ));
-    // Always return OK — don't let this block cudart init
     Ok(())
 }
 

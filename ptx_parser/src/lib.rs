@@ -1857,6 +1857,7 @@ fn tex<'a, 'input>(
             geometry,
             channel_type,
             coord_type,
+            is_texref: false,
         },
         arguments: ast::TexArgs {
             dst,

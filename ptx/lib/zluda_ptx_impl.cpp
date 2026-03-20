@@ -18,7 +18,9 @@ then cd to the directory with this file and run this simple command:
 ../../ext/llvm-project/build/bin/clang \
     -std=c++20 \
     -Xclang -fdenormal-fp-math=dynamic \
-    -Wall -Wextra -Wsign-compare -Wconversion \
+    -Wno-unused-parameter -Wno-sign-conversion -Wno-shorten-64-to-32 \
+    -Wno-deprecated-pragma -Wno-unused-variable \
+    -I ../../ext/rocm/include \
     -x hip \
     zluda_ptx_impl.cpp \
     -nogpulib \
@@ -49,6 +51,7 @@ then cd to the directory with this file and run this simple command:
 #include <hip/amd_detail/amd_device_functions.h>
 #include <hip/hip_fp8.h>
 
+#define GLOBAL_SPACE __attribute__((address_space(1)))
 #define SHARED_SPACE __attribute__((address_space(3)))
 #define CONSTANT_SPACE __attribute__((address_space(4)))
 
@@ -567,7 +570,7 @@ extern "C"
         const uint8_t sign = (bits & 0x80000000) ? 0x80 : 0x0;
         const uint32_t abs = bits & 0x7fffffff;
 
-        const uint32_t min = interp == __HIP_E4M3 ? 0x3A800000 : 0x37000000;
+        const uint32_t min = interp == __HIP_E4M3_FNUZ ? 0x3A800000 : 0x37000000;
         if (abs < min)
         {
             return sign; // +/- 0
@@ -585,20 +588,20 @@ extern "C"
     Fp8x2 FUNC(cvt_rn_satfinite_e4m3x2_f32)(float a, float b)
     {
         // If built-in support for fp8 formats is added to LLVM IR we should switch to use that.
-        return {cvt_float_to_fp8(b, __HIP_E4M3), cvt_float_to_fp8(a, __HIP_E4M3)};
+        return {cvt_float_to_fp8(b, __HIP_E4M3_FNUZ), cvt_float_to_fp8(a, __HIP_E4M3_FNUZ)};
     }
 
     Fp8x2 FUNC(cvt_rn_satfinite_e5m2x2_f32)(float a, float b)
     {
-        return {cvt_float_to_fp8(b, __HIP_E5M2), cvt_float_to_fp8(a, __HIP_E5M2)};
+        return {cvt_float_to_fp8(b, __HIP_E5M2_FNUZ), cvt_float_to_fp8(a, __HIP_E5M2_FNUZ)};
     }
 
-    __half2 FUNC(cvt_rn_f16x2_e4m3x2)(__hip_fp8x2_e4m3 in)
+    __half2 FUNC(cvt_rn_f16x2_e4m3x2)(__hip_fp8x2_e4m3_fnuz in)
     {
         return in;
     }
 
-    __half2 FUNC(cvt_rn_f16x2_e5m2x2)(__hip_fp8x2_e5m2 in)
+    __half2 FUNC(cvt_rn_f16x2_e5m2x2)(__hip_fp8x2_e5m2_fnuz in)
     {
         return in;
     }
@@ -769,6 +772,118 @@ extern "C"
         // to write SSA passes
         // Use https://github.com/ROCm/llvm-project/blob/99a81d16b9d811cadd420190bed16981a0a57bc6/llvm/lib/Transforms/Utils/AMDGPUEmitPrintf.cpp#L426
         return -1;
+    }
+
+    // ===================== SURFACE LOAD/STORE =====================
+    // Uses AMDGPU ISA inline assembly (image_store_pck/image_load_pck).
+
+    typedef int int4_vec __attribute__((ext_vector_type(4)));
+    typedef unsigned int uint4_vec __attribute__((ext_vector_type(4)));
+    typedef unsigned int uint2_vec __attribute__((ext_vector_type(2)));
+
+    // 256-bit image resource descriptor (8 x uint32)
+    typedef unsigned int surf_desc __attribute__((ext_vector_type(8)));
+    typedef surf_desc CONSTANT_SPACE *surface_ptr;
+
+    const unsigned int IMAGE_RESERVED_TOP_BITS = 3;
+
+    static __device__ unsigned int surf_x_shift(uint64_t s)
+    {
+        return (unsigned int)(s >> (64 - IMAGE_RESERVED_TOP_BITS));
+    }
+
+    static __device__ surface_ptr surf_get_ptr(uint64_t s)
+    {
+        return (surface_ptr)((s << IMAGE_RESERVED_TOP_BITS) >> IMAGE_RESERVED_TOP_BITS);
+    }
+
+    // --- sust_b_2d_b32 (single 32-bit store, 2D, all clamp modes) ---
+
+    void FUNC(sust_b_2d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
+    {
+        unsigned int shift = surf_x_shift(handle);
+        surface_ptr surface = surf_get_ptr(handle);
+        coord[0] = coord[0] >> shift;
+        asm volatile("image_store_pck %0, %1, %2 dmask:0x1 dim:2D unorm"
+                     :
+                     : "v"(value), "v"(coord), "s"(*surface)
+                     : "memory");
+    }
+
+    void FUNC(sust_b_2d_b32_clamp)(uint64_t handle, int4_vec coord, unsigned int value)
+    {
+        FUNC_CALL(sust_b_2d_b32_zero)(handle, coord, value);
+    }
+
+    void FUNC(sust_b_2d_b32_trap)(uint64_t handle, int4_vec coord, unsigned int value)
+    {
+        FUNC_CALL(sust_b_2d_b32_zero)(handle, coord, value);
+    }
+
+    // --- sust_b_3d_b32 (single 32-bit store, all clamp modes) ---
+
+    void FUNC(sust_b_3d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
+    {
+        unsigned int shift = surf_x_shift(handle);
+        surface_ptr surface = surf_get_ptr(handle);
+        coord[0] = coord[0] >> shift;
+        asm volatile("image_store_pck %0, %1, %2 dmask:0x1 dim:3D unorm"
+                     :
+                     : "v"(value), "v"(coord), "s"(*surface)
+                     : "memory");
+    }
+
+    void FUNC(sust_b_3d_b32_clamp)(uint64_t handle, int4_vec coord, unsigned int value)
+    {
+        FUNC_CALL(sust_b_3d_b32_zero)(handle, coord, value);
+    }
+
+    void FUNC(sust_b_3d_b32_trap)(uint64_t handle, int4_vec coord, unsigned int value)
+    {
+        FUNC_CALL(sust_b_3d_b32_zero)(handle, coord, value);
+    }
+
+    // --- sust_b_3d_b64 (64-bit store) ---
+
+    void FUNC(sust_b_3d_b64_zero)(uint64_t handle, int4_vec coord, uint64_t value)
+    {
+        unsigned int shift = surf_x_shift(handle);
+        surface_ptr surface = surf_get_ptr(handle);
+        coord[0] = coord[0] >> shift;
+        uint2_vec value2 = std::bit_cast<uint2_vec>(value);
+        asm volatile("image_store_pck %0, %1, %2 dmask:0x3 dim:3D unorm"
+                     :
+                     : "v"(value2), "v"(coord), "s"(*surface)
+                     : "memory");
+    }
+
+    // --- sust_b_3d_v4_b32 (4-component 32-bit store) ---
+
+    void FUNC(sust_b_3d_v4_b32_zero)(uint64_t handle, int4_vec coord, int4_vec value)
+    {
+        unsigned int shift = surf_x_shift(handle);
+        surface_ptr surface = surf_get_ptr(handle);
+        coord[0] = coord[0] >> shift;
+        uint4_vec value4 = std::bit_cast<uint4_vec>(value);
+        asm volatile("image_store_pck %0, %1, %2 dmask:0xf dim:3D unorm"
+                     :
+                     : "v"(value4), "v"(coord), "s"(*surface)
+                     : "memory");
+    }
+
+    // --- suld_b_3d_b32 (single 32-bit load) ---
+
+    unsigned int FUNC(suld_b_3d_b32_zero)(uint64_t handle, int4_vec coord)
+    {
+        unsigned int shift = surf_x_shift(handle);
+        surface_ptr surface = surf_get_ptr(handle);
+        coord[0] = coord[0] >> shift;
+        unsigned int result;
+        asm volatile("image_load_pck %0, %1, %2 dmask:0x1 dim:3D unorm\n\ts_waitcnt vmcnt(0)"
+                     : "=v"(result)
+                     : "v"(coord), "s"(*surface)
+                     : "memory");
+        return result;
     }
 }
 

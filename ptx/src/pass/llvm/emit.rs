@@ -770,6 +770,11 @@ impl<'a> MethodEmitContext<'a> {
             ConversionKind::AddressOf => {
                 let src = self.resolver.value(conversion.src)?;
                 let dst_type = get_type(self.context, &conversion.to_type)?;
+                // On AMDGPU, ptrtoint on addrspace(3) gives an LDS offset (0-64KB).
+                // This is correct because downstream BitToPtr does
+                // inttoptr(i64 → ptr addrspace(3)), which expects an LDS offset.
+                // Do NOT addrspacecast to flat first — flat addresses are 64-bit
+                // and truncating them to 32-bit (p3:32:32) produces garbage.
                 self.resolver.with_result(conversion.dst, |dst| unsafe {
                     LLVMBuildPtrToInt(self.builder, src, dst_type, dst)
                 });

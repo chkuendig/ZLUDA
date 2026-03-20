@@ -33,10 +33,6 @@ mod resolve_function_pointers;
 mod test;
 
 static ZLUDA_PTX_IMPL: &'static [u8] = include_bytes!("../../lib/zluda_ptx_impl.bc");
-// TODO: Merge into zluda_ptx_impl.bc once submodule LLVM 19 clang is built.
-// The tex .bc was compiled with ROCm clang 17 because the main .bc needs LLVM 19.
-// See ptx/lib/zluda_ptx_impl.cpp header for the full rebuild command.
-static ZLUDA_PTX_IMPL_TEX: &'static [u8] = include_bytes!("../../lib/zluda_ptx_impl_tex.bc");
 const ZLUDA_PTX_PREFIX: &'static str = "__zluda_ptx_impl_";
 
 quick_error! {
@@ -96,6 +92,27 @@ pub fn to_llvm_module<'input>(
     on_pass_end("instruction_mode_to_global_mode");
     let directives = insert_explicit_load_store::run(&mut flat_resolver, directives)?;
     on_pass_end("insert_explicit_load_store");
+    // Mark Tex instructions that use .texref globals (vs object-based access).
+    // Must run before insert_implicit_conversions, which replaces the texref
+    // operand with an AddressOf conversion (losing the original type info).
+    let mut directives = directives;
+    for directive in &mut directives {
+        if let Directive2::Method(ref mut method) = directive {
+            if let Some(ref mut stmts) = method.body {
+                for stmt in stmts.iter_mut() {
+                    if let Statement::Instruction(ast::Instruction::Tex {
+                        ref mut data,
+                        ref arguments,
+                    }) = stmt
+                    {
+                        if let Ok((ty, _)) = flat_resolver.get_typed(arguments.src_texture) {
+                            data.is_texref = matches!(ty, ast::Type::Texref);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let directives = insert_implicit_conversions::run(&mut flat_resolver, directives)?;
     on_pass_end("insert_implicit_conversions");
     let directives = replace_instructions_with_functions::run(&mut flat_resolver, directives)?;
@@ -124,9 +141,6 @@ pub struct Module {
 impl Module {
     pub fn linked_bitcode(&self) -> &'static [u8] {
         ZLUDA_PTX_IMPL
-    }
-    pub fn linked_bitcode_tex(&self) -> &'static [u8] {
-        ZLUDA_PTX_IMPL_TEX
     }
 }
 

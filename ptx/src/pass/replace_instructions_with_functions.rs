@@ -684,11 +684,13 @@ fn run_instruction<'input>(
             to_call(resolver, fn_declarations, "prmt_b32".into(), i)?
         }
         ptx_parser::Instruction::Tex { data, arguments } => {
+            let suffix = if data.is_texref { "" } else { "_obj" };
             let name = format!(
-                "tex_{}_v4_{}_{}",
+                "tex_{}_v4_{}_{}{}",
                 data.geometry.as_ptx(),
                 scalar_to_ptx_name(data.channel_type),
                 scalar_to_ptx_name(data.coord_type),
+                suffix,
             );
             to_call(
                 resolver,

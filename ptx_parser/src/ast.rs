@@ -1549,6 +1549,7 @@ pub struct TexDetails {
     pub geometry: TextureGeometry,
     pub channel_type: ScalarType,
     pub coord_type: ScalarType,
+    pub is_texref: bool,
 }
 
 impl TextureGeometry {

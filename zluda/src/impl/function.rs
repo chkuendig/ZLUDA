@@ -54,16 +54,34 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
-    // Skip ALL kernels through index N to find faulting kernel.
-    // If skipping 0-N prevents fault, kernel N+1 is the culprit.
-    // Set to 99 to disable. Start with 5 (skip all Flex, run only sort).
-    // Skip kernels 6+ (RadixSort) but let Flex kernels 0-5 run
+    // Kernel launch counter for debugging
     static LAUNCH_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = LAUNCH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n >= 6 {
-        super::driver::zluda_log_err(&format!("SKIPPING kernel #{} (RadixSort)", n));
-        return Ok(());
-    }
+    // Clamp block dimensions to kernel's declared max threads per block.
+    // CUDA .maxntid is advisory (exceeding it is UB but doesn't crash on NVIDIA).
+    // On AMDGPU, flat-work-group-size is a hard limit — launching with more
+    // threads causes GPU fault. Query the kernel's max and clamp if needed.
+    let (block_dim_x, block_dim_y, block_dim_z) = {
+        let mut max_threads: i32 = 0;
+        let attr_result = unsafe {
+            hipFuncGetAttribute(
+                &mut max_threads,
+                hip_runtime_sys::hipFunction_attribute::HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                f,
+            )
+        };
+        let total_threads = (block_dim_x as u64) * (block_dim_y as u64) * (block_dim_z as u64);
+        if attr_result.is_ok() && max_threads > 0 && total_threads > max_threads as u64 {
+            super::driver::zluda_log_err(&format!(
+                "CLAMPING block [{},{},{}] ({} threads) to kernel max {} for func {:p}",
+                block_dim_x, block_dim_y, block_dim_z, total_threads, max_threads, f.0
+            ));
+            // Simple clamp: set x to max, y/z to 1
+            (max_threads as ::core::ffi::c_uint, 1u32, 1u32)
+        } else {
+            (block_dim_x, block_dim_y, block_dim_z)
+        }
+    };
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
     let cu_launch_param_buffer_pointer = 0x1usize as *mut ::core::ffi::c_void;
@@ -131,8 +149,8 @@ pub(crate) fn launch_kernel(
             }
         }
         super::driver::zluda_log_err(&format!(
-            "launch func={:p} grid=[{},{},{}] block=[{},{},{}] shared={}{}-> {:?}",
-            f.0, grid_dim_x, grid_dim_y, grid_dim_z,
+            "launch #{} func={:p} grid=[{},{},{}] block=[{},{},{}] shared={}{}-> {:?}",
+            n, f.0, grid_dim_x, grid_dim_y, grid_dim_z,
             block_dim_x, block_dim_y, block_dim_z,
             shared_mem_bytes, param_info, result));
     }

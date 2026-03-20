@@ -273,7 +273,6 @@ fn compile_and_cache(
     })?;
     super::driver::zluda_log(&format!("[ZLUDA]   ptx::to_llvm_module OK in {:?}, starting llvm_zluda::compile", compile_start.elapsed()));
     let ptx_impl = llvm_module.linked_bitcode();
-    let ptx_impl_tex = llvm_module.linked_bitcode_tex();
     // Dump LLVM IR and assembly for debugging PTX compilation issues
     static COMPILE_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COMPILE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -288,12 +287,11 @@ fn compile_and_cache(
         super::driver::zluda_log_err(&format!("IR DUMP: {} ({} bytes) -> {}", name, data.len(), path));
         let _ = std::fs::write(&path, data);
     };
-    let elf_module = llvm_zluda::compile_with_extra(
+    let elf_module = llvm_zluda::compile(
         &llvm_module.context,
         gcn_arch,
         llvm_module.llvm_ir,
         ptx_impl,
-        ptx_impl_tex,
         llvm_module.attributes_ir,
         Some(&hook),
     )
@@ -317,7 +315,6 @@ fn compile_in_subprocess(
     // Create a temp file for the output
     let output_path = format!("/tmp/zluda_compile_{}.elf", std::process::id());
     let ptx_impl = llvm_module.linked_bitcode();
-    let ptx_impl_tex = llvm_module.linked_bitcode_tex();
 
     // Use fork to compile in a child process
     let pid = unsafe { libc::fork() };
@@ -327,12 +324,11 @@ fn compile_in_subprocess(
     }
     if pid == 0 {
         // Child process — do the compilation
-        let result = llvm_zluda::compile_with_extra(
+        let result = llvm_zluda::compile(
             &llvm_module.context,
             gcn_arch,
             llvm_module.llvm_ir,
             ptx_impl,
-            ptx_impl_tex,
             llvm_module.attributes_ir,
             None,
         );

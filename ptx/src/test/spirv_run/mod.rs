@@ -308,6 +308,7 @@ test_ptx!(stateful_ld_st_ntid_chain, [12651u64], [12651u64]);
 test_ptx!(stateful_ld_st_ntid_sub, [96311u64], [96311u64]);
 test_ptx!(shared_ptr_take_address, [97815231u64], [97815231u64]);
 test_ptx!(shared_ptr_offset, [42u64], [42u64]);
+test_ptx!(sust_stub);
 test_ptx!(cvt_s64_s32, [-1i32], [-1i64]);
 test_ptx!(add_tuning, [2u64], [3u64]);
 test_ptx!(add_non_coherent, [3u64], [4u64]);
