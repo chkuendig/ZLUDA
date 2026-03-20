@@ -207,15 +207,17 @@ fn compile_inner(
     linked.verify()?;
     compile_log("compile: verify OK");
 
-    // Always dump linked (pre-O3) IR for debugging
+    // Always dump linked (pre-optimization) IR for debugging
+    let linked_ir_size;
     {
         static LINKED_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = LINKED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
         let message = linked.print_module_to_string();
         let data = message.to_bytes();
+        linked_ir_size = data.len();
         let _ = std::fs::write(format!("/tmp/zluda_ir_dump/module_{}_linked.ll", n), data);
-        compile_log(&format!("compile: dumped linked IR to /tmp/zluda_ir_dump/module_{}_linked.ll ({} bytes)", n, data.len()));
+        compile_log(&format!("compile: dumped linked IR to /tmp/zluda_ir_dump/module_{}_linked.ll ({} bytes)", n, linked_ir_size));
     }
 
     if let Some(hook) = compiler_hook {
@@ -249,12 +251,20 @@ fn compile_inner(
         LLVMCodeModel::LLVMCodeModelDefault,
     );
 
-    compile_log("compile: running LLVMRunPasses (default<O3>)");
+    // Use O2 for large modules to avoid pathological O3 compile times
+    // (e.g. TurbulenceFS at 2.8MB linked IR hangs indefinitely with O3)
+    let opt_passes = if linked_ir_size > 2_000_000 {
+        compile_log(&format!("compile: large module ({} bytes), using default<O2>", linked_ir_size));
+        c"default<O2>"
+    } else {
+        compile_log(&format!("compile: running LLVMRunPasses (default<O3>, {} bytes)", linked_ir_size));
+        c"default<O3>"
+    };
     let pb_options = PassBuilderOptions::new();
     let error = unsafe {
         LLVMRunPasses(
             linked.get(),
-            c"default<O3>".as_ptr(),
+            opt_passes.as_ptr(),
             target_machine.get(),
             pb_options.get(),
         )
