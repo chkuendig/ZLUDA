@@ -778,6 +778,8 @@ extern "C"
     // Uses AMDGPU ISA inline assembly (image_store_pck/image_load_pck).
 
     typedef int int4_vec __attribute__((ext_vector_type(4)));
+    typedef int int3_vec __attribute__((ext_vector_type(3)));
+    typedef int int2_vec __attribute__((ext_vector_type(2)));
     typedef unsigned int uint4_vec __attribute__((ext_vector_type(4)));
     typedef unsigned int uint2_vec __attribute__((ext_vector_type(2)));
 
@@ -804,9 +806,11 @@ extern "C"
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
+        // AMDGPU dim:2D requires exactly 2 VGPRs for address
+        int2_vec coord2 = __builtin_shufflevector(coord, coord, 0, 1);
         asm volatile("image_store_pck %0, %1, %2 dmask:0x1 dim:2D unorm"
                      :
-                     : "v"(value), "v"(coord), "s"(*surface)
+                     : "v"(value), "v"(coord2), "s"(*surface)
                      : "memory");
     }
 
@@ -827,9 +831,11 @@ extern "C"
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
+        // AMDGPU dim:3D requires exactly 3 VGPRs for address
+        int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         asm volatile("image_store_pck %0, %1, %2 dmask:0x1 dim:3D unorm"
                      :
-                     : "v"(value), "v"(coord), "s"(*surface)
+                     : "v"(value), "v"(coord3), "s"(*surface)
                      : "memory");
     }
 
@@ -850,10 +856,11 @@ extern "C"
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
+        int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         uint2_vec value2 = std::bit_cast<uint2_vec>(value);
         asm volatile("image_store_pck %0, %1, %2 dmask:0x3 dim:3D unorm"
                      :
-                     : "v"(value2), "v"(coord), "s"(*surface)
+                     : "v"(value2), "v"(coord3), "s"(*surface)
                      : "memory");
     }
 
@@ -864,10 +871,11 @@ extern "C"
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
+        int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         uint4_vec value4 = std::bit_cast<uint4_vec>(value);
         asm volatile("image_store_pck %0, %1, %2 dmask:0xf dim:3D unorm"
                      :
-                     : "v"(value4), "v"(coord), "s"(*surface)
+                     : "v"(value4), "v"(coord3), "s"(*surface)
                      : "memory");
     }
 
@@ -878,10 +886,12 @@ extern "C"
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
+        // AMDGPU dim:3D requires exactly 3 VGPRs for address
+        int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         unsigned int result;
         asm volatile("image_load_pck %0, %1, %2 dmask:0x1 dim:3D unorm\n\ts_waitcnt vmcnt(0)"
                      : "=v"(result)
-                     : "v"(coord), "s"(*surface)
+                     : "v"(coord3), "s"(*surface)
                      : "memory");
         return result;
     }

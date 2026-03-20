@@ -754,6 +754,27 @@ impl<'a> MethodEmitContext<'a> {
             ConversionKind::BitToPtr => {
                 let src = self.resolver.value(conversion.src)?;
                 let type_ = get_pointer_type(self.context, conversion.to_space)?;
+                let from_size = conversion.from_type.layout().size();
+                // On AMDGPU, shared (addrspace 3) and local (addrspace 5)
+                // pointers are 32-bit. PTX uses 64-bit integers for addresses
+                // (`mov.u64 reg, shared_var`), so the round-trip through i64
+                // produces `inttoptr i64 → ptr addrspace(3)` which LLVM's
+                // AMDGPU backend mishandles — the IR type-checks but generates
+                // incorrect machine code. Direct shared access works fine;
+                // only the indirect address pattern fails on GPU.
+                // Truncate to native i32 width before inttoptr to fix this.
+                let src = if is_32bit_ptr_space(conversion.to_space) && from_size > 4 {
+                    unsafe {
+                        LLVMBuildTrunc(
+                            builder,
+                            src,
+                            LLVMInt32TypeInContext(self.context),
+                            LLVM_UNNAMED.as_ptr(),
+                        )
+                    }
+                } else {
+                    src
+                };
                 self.resolver.with_result(conversion.dst, |dst| unsafe {
                     LLVMBuildIntToPtr(builder, src, type_, dst)
                 });
@@ -770,14 +791,28 @@ impl<'a> MethodEmitContext<'a> {
             ConversionKind::AddressOf => {
                 let src = self.resolver.value(conversion.src)?;
                 let dst_type = get_type(self.context, &conversion.to_type)?;
-                // On AMDGPU, ptrtoint on addrspace(3) gives an LDS offset (0-64KB).
-                // This is correct because downstream BitToPtr does
-                // inttoptr(i64 → ptr addrspace(3)), which expects an LDS offset.
-                // Do NOT addrspacecast to flat first — flat addresses are 64-bit
-                // and truncating them to 32-bit (p3:32:32) produces garbage.
-                self.resolver.with_result(conversion.dst, |dst| unsafe {
-                    LLVMBuildPtrToInt(self.builder, src, dst_type, dst)
-                });
+                let to_size = conversion.to_type.layout().size();
+                // On AMDGPU, shared (addrspace 3) and local (addrspace 5)
+                // pointers are 32-bit. PTX takes addresses into 64-bit regs
+                // (`mov.u64 reg, shared_var`), producing `ptrtoint ptr
+                // addrspace(3) → i64`. This IR type-checks but LLVM's AMDGPU
+                // backend generates incorrect relocations/constant expressions
+                // for the 64←32 bit mismatch. Direct shared access is fine;
+                // only this address-taking round-trip fails on GPU.
+                // Convert to native i32 first, then zero-extend to i64.
+                if is_32bit_ptr_space(conversion.from_space) && to_size > 4 {
+                    let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+                    let narrow = unsafe {
+                        LLVMBuildPtrToInt(self.builder, src, i32_type, LLVM_UNNAMED.as_ptr())
+                    };
+                    self.resolver.with_result(conversion.dst, |dst| unsafe {
+                        LLVMBuildZExt(self.builder, narrow, dst_type, dst)
+                    });
+                } else {
+                    self.resolver.with_result(conversion.dst, |dst| unsafe {
+                        LLVMBuildPtrToInt(self.builder, src, dst_type, dst)
+                    });
+                }
                 Ok(())
             }
         }

@@ -46,6 +46,17 @@ fn get_scalar_type(context: LLVMContextRef, type_: ast::ScalarType) -> LLVMTypeR
     }
 }
 
+// AMDGPU uses 32-bit pointers for shared (addrspace 3) and private/local (addrspace 5)
+fn is_32bit_ptr_space(space: ast::StateSpace) -> bool {
+    matches!(
+        space,
+        ast::StateSpace::Shared
+            | ast::StateSpace::SharedCta
+            | ast::StateSpace::SharedCluster
+            | ast::StateSpace::Local
+    )
+}
+
 fn get_state_space(space: ast::StateSpace) -> Result<u32, TranslateError> {
     match space {
         ast::StateSpace::Reg => Ok(PRIVATE_ADDRESS_SPACE),
