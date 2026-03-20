@@ -1157,6 +1157,23 @@ extern "C"
     tex_1d(f32, float, s32, int, tex1Dfetch);
     tex_1d(f32, float, f32, float, tex1D);
 
+    // --- Texture object (bindless) variants ---
+    // These take hipTextureObject_t directly instead of textureReference*.
+
+#define tex_1d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE, TEX_FN)                              \
+    HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_1d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
+        hipTextureObject_t textureObject, HIP_COORD_TYPE##1 ::Native_vec_ x)                                        \
+    {                                                                                                               \
+        return TEX_FN<HIP_CHANNEL_TYPE##4>(textureObject, x.x).data;                                                \
+    }
+
+    tex_1d_obj(u32, uint, s32, int, tex1Dfetch);
+    tex_1d_obj(u32, uint, f32, float, tex1D);
+    tex_1d_obj(s32, int, s32, int, tex1Dfetch);
+    tex_1d_obj(s32, int, f32, float, tex1D);
+    tex_1d_obj(f32, float, s32, int, tex1Dfetch);
+    tex_1d_obj(f32, float, f32, float, tex1D);
+
 #define tex_2d(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE)                                          \
     HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_2d_v4_##CHANNEL_TYPE##_##COORD_TYPE)(                                \
         struct textureReference GLOBAL_SPACE * ptr, HIP_COORD_TYPE##2 ::Native_vec_ coord)                          \
@@ -1172,6 +1189,20 @@ extern "C"
     tex_2d(f32, float, s32, int);
     tex_2d(f32, float, f32, float);
 
+#define tex_2d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE)                                      \
+    HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_2d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
+        hipTextureObject_t textureObject, HIP_COORD_TYPE##2 ::Native_vec_ coord)                                    \
+    {                                                                                                               \
+        return tex2D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y)).data;                       \
+    }
+
+    tex_2d_obj(u32, uint, s32, int);
+    tex_2d_obj(u32, uint, f32, float);
+    tex_2d_obj(s32, int, s32, int);
+    tex_2d_obj(s32, int, f32, float);
+    tex_2d_obj(f32, float, s32, int);
+    tex_2d_obj(f32, float, f32, float);
+
 #define tex_3d(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE)                                          \
     HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_3d_v4_##CHANNEL_TYPE##_##COORD_TYPE)(                                \
         struct textureReference GLOBAL_SPACE * ptr, HIP_COORD_TYPE##4 ::Native_vec_ coord)                          \
@@ -1186,4 +1217,18 @@ extern "C"
     tex_3d(s32, int, f32, float);
     tex_3d(f32, float, s32, int);
     tex_3d(f32, float, f32, float);
+
+#define tex_3d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE)                                      \
+    HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_3d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
+        hipTextureObject_t textureObject, HIP_COORD_TYPE##4 ::Native_vec_ coord)                                    \
+    {                                                                                                               \
+        return tex3D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y), float(coord.z)).data;       \
+    }
+
+    tex_3d_obj(u32, uint, s32, int);
+    tex_3d_obj(u32, uint, f32, float);
+    tex_3d_obj(s32, int, s32, int);
+    tex_3d_obj(s32, int, f32, float);
+    tex_3d_obj(f32, float, s32, int);
+    tex_3d_obj(f32, float, f32, float);
 }
