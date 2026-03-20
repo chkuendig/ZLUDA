@@ -302,11 +302,26 @@ fn compile_inner(
         hook(&assembly, String::from("asm"))
     }
 
+    // In large modules, noinline helpers create a massive cross-function call
+    // graph (e.g. TurbulenceFS: 31 kernels × 7 helpers = 669 calls) that the
+    // AMDGPU backend's SCC-ordered codegen cannot process in bounded time.
+    // Strip noinline and add alwaysinline AFTER optimization (so SGPR pressure
+    // is managed during LLVMRunPasses) but BEFORE emission (so the codegen
+    // pipeline's AMDGPUAlwaysInlinePass inlines them, eliminating the SCC).
+    if linked_ir_size > 2_000_000 {
+        prepare_helpers_for_emission(&linked, ctx);
+    }
+
+    let emit_start = std::time::Instant::now();
     compile_log("compile: emitting object file");
     let object_file = target_machine
         .emit_to_memory_buffer(&linked, LLVMCodeGenFileType::LLVMObjectFile)?
         .to_vec();
-    compile_log(&format!("compile: object file {} bytes", object_file.len()));
+    compile_log(&format!(
+        "compile: object file {} bytes in {:.1}s",
+        object_file.len(),
+        emit_start.elapsed().as_secs_f64()
+    ));
 
     if let Some(hook) = compiler_hook {
         // Run compiler hook for object file
@@ -352,6 +367,81 @@ fn compile_inner(
     }
 
     Ok(executable)
+}
+
+/// Prepares internal helper functions for AMDGPU codegen emission by replacing
+/// `noinline` with `alwaysinline` (and stripping `convergent`).
+///
+/// Called AFTER LLVMRunPasses (so optimization runs with noinline intact,
+/// keeping SGPR descriptors local to small helpers) but BEFORE emission.
+///
+/// Background: Surface/texture helpers (sust_*, suld_*, tex_*_obj) need
+/// `noinline` during optimization to prevent <8 x i32> SGPR spills (commit
+/// 6101600c). But the AMDGPU backend uses SCC-ordered codegen across the
+/// entire call graph (AMDGPUTargetMachine.cpp:1021). In large modules like
+/// TurbulenceFS (31 kernels × 7 helpers = 669 calls), this creates an SCC
+/// the backend cannot process in bounded time — hanging during emission at
+/// ANY optimization level. Marking helpers alwaysinline lets the codegen
+/// pipeline's AMDGPUAlwaysInlinePass inline them, eliminating the SCC.
+fn prepare_helpers_for_emission(module: &Module, ctx: &Context) {
+    unsafe {
+        let noinline_kind = LLVMGetEnumAttributeKindForName(
+            b"noinline".as_ptr().cast(),
+            b"noinline".len(),
+        );
+        let convergent_kind = LLVMGetEnumAttributeKindForName(
+            b"convergent".as_ptr().cast(),
+            b"convergent".len(),
+        );
+        let alwaysinline_kind = LLVMGetEnumAttributeKindForName(
+            b"alwaysinline".as_ptr().cast(),
+            b"alwaysinline".len(),
+        );
+        let func_index = llvm_sys::LLVMAttributeFunctionIndex;
+        let alwaysinline_attr = LLVMCreateEnumAttribute(ctx.get(), alwaysinline_kind, 0);
+
+        let mut count = 0u32;
+        let mut func = LLVMGetFirstFunction(module.get());
+        while !func.is_null() {
+            // Skip declarations (no basic blocks) and kernels (cc 91)
+            let is_definition = LLVMCountBasicBlocks(func) > 0;
+            let is_kernel = LLVMGetFunctionCallConv(func) == 91;
+
+            if is_definition && !is_kernel {
+                let has_noinline =
+                    !LLVMGetEnumAttributeAtIndex(func, func_index, noinline_kind).is_null();
+
+                if has_noinline {
+                    LLVMRemoveEnumAttributeAtIndex(func, func_index, noinline_kind);
+                    LLVMRemoveEnumAttributeAtIndex(func, func_index, convergent_kind);
+                    LLVMAddAttributeAtIndex(func, func_index, alwaysinline_attr);
+
+                    let mut name_len = 0;
+                    let name_ptr = LLVMGetValueName2(func, &mut name_len);
+                    let name = if !name_ptr.is_null() && name_len > 0 {
+                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                            name_ptr as *const u8,
+                            name_len,
+                        ))
+                    } else {
+                        "<unnamed>"
+                    };
+                    compile_log(&format!(
+                        "compile: prepared helper for inline: {}",
+                        name
+                    ));
+                    count += 1;
+                }
+            }
+            func = LLVMGetNextFunction(func);
+        }
+        if count > 0 {
+            compile_log(&format!(
+                "compile: marked {} helpers alwaysinline for emission",
+                count
+            ));
+        }
+    }
 }
 
 fn init_globals() -> Result<(), String> {
