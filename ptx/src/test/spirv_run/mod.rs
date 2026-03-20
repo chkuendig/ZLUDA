@@ -309,6 +309,9 @@ test_ptx!(stateful_ld_st_ntid_sub, [96311u64], [96311u64]);
 test_ptx!(shared_ptr_take_address, [97815231u64], [97815231u64]);
 test_ptx!(shared_ptr_offset, [42u64], [42u64]);
 test_ptx!(sust_stub);
+test_ptx!(sust_2d_stub);
+test_ptx!(suld_stub);
+test_ptx!(tex_obj_stub);
 test_ptx!(cvt_s64_s32, [-1i32], [-1i64]);
 test_ptx!(add_tuning, [2u64], [3u64]);
 test_ptx!(add_non_coherent, [3u64], [4u64]);
@@ -1456,3 +1459,10 @@ pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_mod
         );
     }
 }
+
+// NOTE: GPU execution tests for surface ops (sust/suld) are not possible in the
+// test framework because surface functions use AMDGPU inline asm (image_store_pck,
+// image_load_pck) which requires the MC asm parser not included in llvm_zluda.
+// Surface operations are verified via:
+// - IR tests (sust_stub, sust_2d_stub, suld_stub) for correct IR generation
+// - Game testing (Arkham Knight) for runtime execution on real hardware

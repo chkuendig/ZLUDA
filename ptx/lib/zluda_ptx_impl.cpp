@@ -801,7 +801,7 @@ extern "C"
 
     // --- sust_b_2d_b32 (single 32-bit store, 2D, all clamp modes) ---
 
-    void FUNC(sust_b_2d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
+    __attribute__((noinline)) void FUNC(sust_b_2d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
@@ -826,7 +826,7 @@ extern "C"
 
     // --- sust_b_3d_b32 (single 32-bit store, all clamp modes) ---
 
-    void FUNC(sust_b_3d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
+    __attribute__((noinline)) void FUNC(sust_b_3d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
@@ -851,7 +851,7 @@ extern "C"
 
     // --- sust_b_3d_b64 (64-bit store) ---
 
-    void FUNC(sust_b_3d_b64_zero)(uint64_t handle, int4_vec coord, uint64_t value)
+    __attribute__((noinline)) void FUNC(sust_b_3d_b64_zero)(uint64_t handle, int4_vec coord, uint64_t value)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
@@ -866,7 +866,7 @@ extern "C"
 
     // --- sust_b_3d_v4_b32 (4-component 32-bit store) ---
 
-    void FUNC(sust_b_3d_v4_b32_zero)(uint64_t handle, int4_vec coord, int4_vec value)
+    __attribute__((noinline)) void FUNC(sust_b_3d_v4_b32_zero)(uint64_t handle, int4_vec coord, int4_vec value)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
@@ -881,7 +881,7 @@ extern "C"
 
     // --- suld_b_3d_b32 (single 32-bit load) ---
 
-    unsigned int FUNC(suld_b_3d_b32_zero)(uint64_t handle, int4_vec coord)
+    __attribute__((noinline)) unsigned int FUNC(suld_b_3d_b32_zero)(uint64_t handle, int4_vec coord)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
@@ -1171,7 +1171,7 @@ extern "C"
     // These take hipTextureObject_t directly instead of textureReference*.
 
 #define tex_1d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE, TEX_FN)                              \
-    HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_1d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
+    __attribute__((noinline)) HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_1d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##1 ::Native_vec_ x)                                        \
     {                                                                                                               \
         return TEX_FN<HIP_CHANNEL_TYPE##4>(textureObject, x.x).data;                                                \
@@ -1200,7 +1200,7 @@ extern "C"
     tex_2d(f32, float, f32, float);
 
 #define tex_2d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE)                                      \
-    HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_2d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
+    __attribute__((noinline)) HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_2d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##2 ::Native_vec_ coord)                                    \
     {                                                                                                               \
         return tex2D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y)).data;                       \
@@ -1229,7 +1229,7 @@ extern "C"
     tex_3d(f32, float, f32, float);
 
 #define tex_3d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE)                                      \
-    HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_3d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
+    __attribute__((noinline)) HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_3d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##4 ::Native_vec_ coord)                                    \
     {                                                                                                               \
         return tex3D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y), float(coord.z)).data;       \
