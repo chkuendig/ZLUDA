@@ -312,12 +312,14 @@ fn f64<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<f64> {
     .parse_next(stream)
 }
 
-fn s32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<i32> {
+// PTX ISA allows 64-bit signed offsets in memory operands; nvcc generates
+// offsets exceeding i32 range (e.g. [%rd1+17179869180]) for PhysX fluid kernels.
+fn s32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<i64> {
     take_error((opt(Token::Minus), num).map(|(sign, x)| {
         let (text, radix, _) = x;
-        match i32::from_str_radix(text, radix) {
+        match i64::from_str_radix(text, radix) {
             Ok(x) => Ok(if sign.is_some() { -x } else { x }),
-            Err(err) => Err((0, PtxError::from(err))),
+            Err(err) => Err((0i64, PtxError::from(err))),
         }
     }))
     .parse_next(stream)

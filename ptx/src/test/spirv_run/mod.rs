@@ -183,6 +183,7 @@ test_ptx!(
     [8u32]
 );
 test_ptx!(ld_st_offset, [1u32, 2u32], [2u32, 1u32]);
+test_ptx!(ld_st_large_offset);
 test_ptx!(ntid, [3u32], [4u32]);
 test_ptx!(reg_local, [12u64], [13u64]);
 test_ptx!(reg_multi, [123u32, 456u32], [123u32, 456u32]);
