@@ -402,10 +402,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 ptx_parser::TuningDirective::MaxNtid(x, y, z) => {
                     // On NVIDIA, .maxntid is a register-allocation hint, NOT an
                     // enforced launch limit — the driver never rejects a launch
-                    // that exceeds it. Translate faithfully so LLVM budgets
-                    // registers for the declared thread count; it will spill to
-                    // scratch if VGPR pressure is too high.
-                    let size = x * y * z;
+                    // that exceeds it. Always use 1024 as the upper bound so
+                    // any legal CUDA launch succeeds (e.g. CUB RadixSort
+                    // declares .maxntid 512 but launches with 1024 threads).
+                    // LLVM will allocate VGPRs for 1024 threads and spill to
+                    // scratch if pressure is too high.
+                    let size = (x * y * z).max(1024);
                     let value = format!("1,{size}");
                     self.emit_fn_attribute(fn_, "amdgpu-flat-work-group-size", &value);
                 }
