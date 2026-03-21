@@ -799,18 +799,35 @@ extern "C"
         return (surface_ptr)((s << IMAGE_RESERVED_TOP_BITS) >> IMAGE_RESERVED_TOP_BITS);
     }
 
+    // Move surface descriptor from VGPRs to SGPRs via readfirstlane.
+    // The "s" constraint on image_store/load inline asm requires the descriptor
+    // in SGPRs, but after inlining the descriptor may be in VGPRs.
+    static __device__ surf_desc surf_to_sgpr(surf_desc desc) {
+        surf_desc result;
+        result[0] = __builtin_amdgcn_readfirstlane(desc[0]);
+        result[1] = __builtin_amdgcn_readfirstlane(desc[1]);
+        result[2] = __builtin_amdgcn_readfirstlane(desc[2]);
+        result[3] = __builtin_amdgcn_readfirstlane(desc[3]);
+        result[4] = __builtin_amdgcn_readfirstlane(desc[4]);
+        result[5] = __builtin_amdgcn_readfirstlane(desc[5]);
+        result[6] = __builtin_amdgcn_readfirstlane(desc[6]);
+        result[7] = __builtin_amdgcn_readfirstlane(desc[7]);
+        return result;
+    }
+
     // --- sust_b_2d_b32 (single 32-bit store, 2D, all clamp modes) ---
 
-    __attribute__((noinline)) void FUNC(sust_b_2d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
+    void FUNC(sust_b_2d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
         // AMDGPU dim:2D requires exactly 2 VGPRs for address
         int2_vec coord2 = __builtin_shufflevector(coord, coord, 0, 1);
+        surf_desc surface_sgpr = surf_to_sgpr(*surface);
         asm volatile("image_store_pck %0, %1, %2 dmask:0x1 dim:2D unorm"
                      :
-                     : "v"(value), "v"(coord2), "s"(*surface)
+                     : "v"(value), "v"(coord2), "s"(surface_sgpr)
                      : "memory");
     }
 
@@ -826,16 +843,17 @@ extern "C"
 
     // --- sust_b_3d_b32 (single 32-bit store, all clamp modes) ---
 
-    __attribute__((noinline)) void FUNC(sust_b_3d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
+    void FUNC(sust_b_3d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
         // AMDGPU dim:3D requires exactly 3 VGPRs for address
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
+        surf_desc surface_sgpr = surf_to_sgpr(*surface);
         asm volatile("image_store_pck %0, %1, %2 dmask:0x1 dim:3D unorm"
                      :
-                     : "v"(value), "v"(coord3), "s"(*surface)
+                     : "v"(value), "v"(coord3), "s"(surface_sgpr)
                      : "memory");
     }
 
@@ -851,47 +869,50 @@ extern "C"
 
     // --- sust_b_3d_b64 (64-bit store) ---
 
-    __attribute__((noinline)) void FUNC(sust_b_3d_b64_zero)(uint64_t handle, int4_vec coord, uint64_t value)
+    void FUNC(sust_b_3d_b64_zero)(uint64_t handle, int4_vec coord, uint64_t value)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         uint2_vec value2 = std::bit_cast<uint2_vec>(value);
+        surf_desc surface_sgpr = surf_to_sgpr(*surface);
         asm volatile("image_store_pck %0, %1, %2 dmask:0x3 dim:3D unorm"
                      :
-                     : "v"(value2), "v"(coord3), "s"(*surface)
+                     : "v"(value2), "v"(coord3), "s"(surface_sgpr)
                      : "memory");
     }
 
     // --- sust_b_3d_v4_b32 (4-component 32-bit store) ---
 
-    __attribute__((noinline)) void FUNC(sust_b_3d_v4_b32_zero)(uint64_t handle, int4_vec coord, int4_vec value)
+    void FUNC(sust_b_3d_v4_b32_zero)(uint64_t handle, int4_vec coord, int4_vec value)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         uint4_vec value4 = std::bit_cast<uint4_vec>(value);
+        surf_desc surface_sgpr = surf_to_sgpr(*surface);
         asm volatile("image_store_pck %0, %1, %2 dmask:0xf dim:3D unorm"
                      :
-                     : "v"(value4), "v"(coord3), "s"(*surface)
+                     : "v"(value4), "v"(coord3), "s"(surface_sgpr)
                      : "memory");
     }
 
     // --- suld_b_3d_b32 (single 32-bit load) ---
 
-    __attribute__((noinline)) unsigned int FUNC(suld_b_3d_b32_zero)(uint64_t handle, int4_vec coord)
+    unsigned int FUNC(suld_b_3d_b32_zero)(uint64_t handle, int4_vec coord)
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
         coord[0] = coord[0] >> shift;
         // AMDGPU dim:3D requires exactly 3 VGPRs for address
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
+        surf_desc surface_sgpr = surf_to_sgpr(*surface);
         unsigned int result;
         asm volatile("image_load_pck %0, %1, %2 dmask:0x1 dim:3D unorm\n\ts_waitcnt vmcnt(0)"
                      : "=v"(result)
-                     : "v"(coord3), "s"(*surface)
+                     : "v"(coord3), "s"(surface_sgpr)
                      : "memory");
         return result;
     }
@@ -1171,7 +1192,7 @@ extern "C"
     // These take hipTextureObject_t directly instead of textureReference*.
 
 #define tex_1d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE, TEX_FN)                              \
-    __attribute__((noinline)) HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_1d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
+    HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_1d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##1 ::Native_vec_ x)                                        \
     {                                                                                                               \
         return TEX_FN<HIP_CHANNEL_TYPE##4>(textureObject, x.x).data;                                                \
@@ -1200,7 +1221,7 @@ extern "C"
     tex_2d(f32, float, f32, float);
 
 #define tex_2d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE)                                      \
-    __attribute__((noinline)) HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_2d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
+    HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_2d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##2 ::Native_vec_ coord)                                    \
     {                                                                                                               \
         return tex2D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y)).data;                       \
@@ -1229,7 +1250,7 @@ extern "C"
     tex_3d(f32, float, f32, float);
 
 #define tex_3d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE)                                      \
-    __attribute__((noinline)) HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_3d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
+    HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_3d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##4 ::Native_vec_ coord)                                    \
     {                                                                                                               \
         return tex3D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y), float(coord.z)).data;       \

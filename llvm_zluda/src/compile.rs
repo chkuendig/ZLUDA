@@ -302,50 +302,80 @@ fn compile_inner(
         hook(&assembly, String::from("asm"))
     }
 
-    // In large modules, noinline helpers create a massive cross-function call
-    // graph (e.g. TurbulenceFS: 31 kernels × 7 helpers = 669 calls) that the
-    // AMDGPU backend's SCC-ordered codegen cannot process in bounded time.
-    // Strip noinline and add alwaysinline AFTER optimization (so SGPR pressure
-    // is managed during LLVMRunPasses) but BEFORE emission (so the codegen
-    // pipeline's AMDGPUAlwaysInlinePass inlines them, eliminating the SCC).
-    if linked_ir_size > 2_000_000 {
-        prepare_helpers_for_emission(&linked, ctx);
-    }
+    // Count internal helpers to decide emission strategy.
+    // Modules with helpers need per-kernel emission to avoid the AMDGPU
+    // backend's SCC-ordered codegen hanging on large cross-kernel call graphs
+    // (e.g. TurbulenceFS: 31 kernels × 7 helpers).
+    let helper_count = count_internal_helpers(&linked);
 
     let emit_start = std::time::Instant::now();
-    compile_log("compile: emitting object file");
-    let object_file = target_machine
-        .emit_to_memory_buffer(&linked, LLVMCodeGenFileType::LLVMObjectFile)?
-        .to_vec();
+    let object_files = if helper_count > 0 {
+        match emit_per_kernel(&target_machine, &linked) {
+            Ok(objects) => objects,
+            Err(e) => {
+                // Per-kernel emission failed (e.g. sust_2d SGPR constraint).
+                // Fall back to full-module alwaysinline — this produces an
+                // object with diagnostic warnings but continues (same as
+                // committed behavior before per-kernel emission).
+                compile_log(&format!(
+                    "compile: per-kernel emission failed: {}, falling back to full-module alwaysinline",
+                    e
+                ));
+                mark_helpers_alwaysinline(&linked);
+                let obj = target_machine
+                    .emit_to_memory_buffer(&linked, LLVMCodeGenFileType::LLVMObjectFile)?
+                    .to_vec();
+                vec![obj]
+            }
+        }
+    } else {
+        compile_log("compile: emitting single object file (no helpers)");
+        let obj = target_machine
+            .emit_to_memory_buffer(&linked, LLVMCodeGenFileType::LLVMObjectFile)?
+            .to_vec();
+        vec![obj]
+    };
     compile_log(&format!(
-        "compile: object file {} bytes in {:.1}s",
-        object_file.len(),
+        "compile: emitted {} object(s) in {:.1}s",
+        object_files.len(),
         emit_start.elapsed().as_secs_f64()
     ));
 
     if let Some(hook) = compiler_hook {
-        // Run compiler hook for object file
-        hook(&object_file, String::from("o"));
+        hook(&object_files[0], String::from("o"));
     }
 
-    let object_path = NamedTempFile::with_prefix("zluda.o")
-        .map_err(|_| ("Failed to create temporary file").to_string())?
-        .into_temp_path();
+    // Write objects to temp files for LLD
+    let object_paths: Vec<_> = object_files
+        .iter()
+        .enumerate()
+        .map(|(i, obj)| -> Result<_, String> {
+            let path = NamedTempFile::with_prefix(&format!("zluda_{}.o", i))
+                .map_err(|_| "Failed to create temporary file".to_string())?
+                .into_temp_path();
+            fs::write(&path, obj)
+                .map_err(|_| "Failed to write object file".to_string())?;
+            Ok(path)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
     let executable_path = NamedTempFile::with_prefix("zluda.elf")
-        .map_err(|_| ("Failed to create temporary file").to_string())?
+        .map_err(|_| "Failed to create temporary file".to_string())?
         .into_temp_path();
 
-    fs::write(&object_path, &object_file)
-        .map_err(|_| ("Failed to write object file").to_string())?;
-
-    let object_path_cstr = path_to_cstring(&object_path)?;
+    let path_cstrs: Vec<CString> = object_paths
+        .iter()
+        .map(|p| path_to_cstring(p))
+        .collect::<Result<Vec<_>, String>>()?;
+    let path_ptrs: Vec<*const i8> = path_cstrs.iter().map(|cs| cs.as_ptr()).collect();
     let executable_path_cstr = path_to_cstring(&executable_path)?;
 
-    compile_log("compile: linking with LLD");
+    compile_log(&format!("compile: linking with LLD ({} objects)", path_ptrs.len()));
     let mut err = std::ptr::null_mut();
     let result = unsafe {
         LLVMZludaLinkWithLLD(
-            object_path_cstr.as_ptr(),
+            path_ptrs.as_ptr(),
+            path_ptrs.len() as i32,
             executable_path_cstr.as_ptr(),
             &mut err,
         )
@@ -369,21 +399,118 @@ fn compile_inner(
     Ok(executable)
 }
 
-/// Prepares internal helper functions for AMDGPU codegen emission by replacing
-/// `noinline` with `alwaysinline` (and stripping `convergent`).
+/// Count internal non-kernel function definitions (helpers).
+fn count_internal_helpers(module: &Module) -> u32 {
+    unsafe {
+        let mut count = 0u32;
+        let mut func = LLVMGetFirstFunction(module.get());
+        while !func.is_null() {
+            let is_definition = LLVMCountBasicBlocks(func) > 0;
+            let is_kernel = LLVMGetFunctionCallConv(func) == 91;
+            if is_definition && !is_kernel {
+                count += 1;
+            }
+            func = LLVMGetNextFunction(func);
+        }
+        count
+    }
+}
+
+/// Collect names of kernel functions (callconv 91 with body).
+fn collect_kernel_names(module: &Module) -> Vec<String> {
+    unsafe {
+        let mut names = Vec::new();
+        let mut func = LLVMGetFirstFunction(module.get());
+        while !func.is_null() {
+            let is_definition = LLVMCountBasicBlocks(func) > 0;
+            let is_kernel = LLVMGetFunctionCallConv(func) == 91;
+            if is_definition && is_kernel {
+                let mut name_len = 0;
+                let name_ptr = LLVMGetValueName2(func, &mut name_len);
+                if !name_ptr.is_null() && name_len > 0 {
+                    let name = std::str::from_utf8_unchecked(
+                        std::slice::from_raw_parts(name_ptr as *const u8, name_len),
+                    );
+                    names.push(name.to_string());
+                }
+            }
+            func = LLVMGetNextFunction(func);
+        }
+        names
+    }
+}
+
+/// Emit one object file per kernel for modules with internal helpers.
 ///
-/// Called AFTER LLVMRunPasses (so optimization runs with noinline intact,
-/// keeping SGPR descriptors local to small helpers) but BEFORE emission.
-///
-/// Background: Surface/texture helpers (sust_*, suld_*, tex_*_obj) need
-/// `noinline` during optimization to prevent <8 x i32> SGPR spills (commit
-/// 6101600c). But the AMDGPU backend uses SCC-ordered codegen across the
-/// entire call graph (AMDGPUTargetMachine.cpp:1021). In large modules like
-/// TurbulenceFS (31 kernels × 7 helpers = 669 calls), this creates an SCC
-/// the backend cannot process in bounded time — hanging during emission at
-/// ANY optimization level. Marking helpers alwaysinline lets the codegen
-/// pipeline's AMDGPUAlwaysInlinePass inline them, eliminating the SCC.
-fn prepare_helpers_for_emission(module: &Module, ctx: &Context) {
+/// Clones the module for each kernel, makes all other kernels internal,
+/// then runs globaldce to strip unreachable code. Each resulting sub-module
+/// has exactly 1 kernel + only its reachable helpers, eliminating the
+/// cross-kernel SCC that hangs the AMDGPU backend.
+fn emit_per_kernel(
+    tm: &TargetMachine,
+    module: &Module,
+) -> Result<Vec<Vec<u8>>, String> {
+    let kernel_names = collect_kernel_names(module);
+    compile_log(&format!(
+        "compile: per-kernel emission for {} kernels",
+        kernel_names.len()
+    ));
+
+    let mut objects = Vec::new();
+    for (idx, name) in kernel_names.iter().enumerate() {
+        compile_log(&format!(
+            "compile:   [{}/{}] {} cloning",
+            idx + 1, kernel_names.len(), name
+        ));
+        let sub = module.clone();
+        internalize_other_kernels(&sub, name);
+        run_dce_pass(tm, &sub);
+        mark_helpers_alwaysinline(&sub);
+        compile_log(&format!(
+            "compile:   [{}/{}] {} emitting",
+            idx + 1, kernel_names.len(), name
+        ));
+        let obj = tm
+            .emit_to_memory_buffer(&sub, LLVMCodeGenFileType::LLVMObjectFile)?
+            .to_vec();
+        compile_log(&format!(
+            "compile:   [{}/{}] {} -> {} bytes",
+            idx + 1, kernel_names.len(), name, obj.len()
+        ));
+        objects.push(obj);
+    }
+    Ok(objects)
+}
+
+/// Make all kernel definitions except `keep` internal so globaldce can remove them.
+fn internalize_other_kernels(module: &Module, keep: &str) {
+    unsafe {
+        let mut func = LLVMGetFirstFunction(module.get());
+        while !func.is_null() {
+            let is_definition = LLVMCountBasicBlocks(func) > 0;
+            let is_kernel = LLVMGetFunctionCallConv(func) == 91;
+            if is_definition && is_kernel {
+                let mut name_len = 0;
+                let name_ptr = LLVMGetValueName2(func, &mut name_len);
+                let name = if !name_ptr.is_null() && name_len > 0 {
+                    std::str::from_utf8_unchecked(
+                        std::slice::from_raw_parts(name_ptr as *const u8, name_len),
+                    )
+                } else {
+                    ""
+                };
+                if name != keep {
+                    LLVMSetLinkage(func, LLVMLinkage::LLVMInternalLinkage);
+                }
+            }
+            func = LLVMGetNextFunction(func);
+        }
+    }
+}
+
+/// Strip noinline/convergent and add alwaysinline to all non-kernel definitions.
+/// This lets the AMDGPU codegen pipeline inline helpers, avoiding the SCC hang.
+fn mark_helpers_alwaysinline(module: &Module) {
     unsafe {
         let noinline_kind = LLVMGetEnumAttributeKindForName(
             b"noinline".as_ptr().cast(),
@@ -398,49 +525,29 @@ fn prepare_helpers_for_emission(module: &Module, ctx: &Context) {
             b"alwaysinline".len(),
         );
         let func_index = llvm_sys::LLVMAttributeFunctionIndex;
-        let alwaysinline_attr = LLVMCreateEnumAttribute(ctx.get(), alwaysinline_kind, 0);
+        // Create attribute using the module's context
+        let ctx = LLVMGetModuleContext(module.get());
+        let alwaysinline_attr = LLVMCreateEnumAttribute(ctx, alwaysinline_kind, 0);
 
-        let mut count = 0u32;
         let mut func = LLVMGetFirstFunction(module.get());
         while !func.is_null() {
-            // Skip declarations (no basic blocks) and kernels (cc 91)
             let is_definition = LLVMCountBasicBlocks(func) > 0;
             let is_kernel = LLVMGetFunctionCallConv(func) == 91;
-
             if is_definition && !is_kernel {
-                let has_noinline =
-                    !LLVMGetEnumAttributeAtIndex(func, func_index, noinline_kind).is_null();
-
-                if has_noinline {
-                    LLVMRemoveEnumAttributeAtIndex(func, func_index, noinline_kind);
-                    LLVMRemoveEnumAttributeAtIndex(func, func_index, convergent_kind);
-                    LLVMAddAttributeAtIndex(func, func_index, alwaysinline_attr);
-
-                    let mut name_len = 0;
-                    let name_ptr = LLVMGetValueName2(func, &mut name_len);
-                    let name = if !name_ptr.is_null() && name_len > 0 {
-                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                            name_ptr as *const u8,
-                            name_len,
-                        ))
-                    } else {
-                        "<unnamed>"
-                    };
-                    compile_log(&format!(
-                        "compile: prepared helper for inline: {}",
-                        name
-                    ));
-                    count += 1;
-                }
+                LLVMRemoveEnumAttributeAtIndex(func, func_index, noinline_kind);
+                LLVMRemoveEnumAttributeAtIndex(func, func_index, convergent_kind);
+                LLVMAddAttributeAtIndex(func, func_index, alwaysinline_attr);
             }
             func = LLVMGetNextFunction(func);
         }
-        if count > 0 {
-            compile_log(&format!(
-                "compile: marked {} helpers alwaysinline for emission",
-                count
-            ));
-        }
+    }
+}
+
+/// Run GlobalDCE to remove unreachable internal functions.
+fn run_dce_pass(tm: &TargetMachine, module: &Module) {
+    let pb = PassBuilderOptions::new();
+    unsafe {
+        LLVMRunPasses(module.get(), c"globaldce".as_ptr(), tm.get(), pb.get());
     }
 }
 

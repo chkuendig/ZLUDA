@@ -84,7 +84,8 @@ extern "C" {
     );
 
     pub fn LLVMZludaLinkWithLLD(
-        input_path: *const i8,
+        input_paths: *const *const i8,
+        num_inputs: i32,
         output_path: *const i8,
         error_message: *mut *mut i8,
     ) -> i32;
