@@ -456,6 +456,12 @@ fn emit_per_kernel(
         kernel_names.len()
     ));
 
+    // Check if per-kernel IR/ASM dumps are requested
+    static DUMP_PER_KERNEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let dump = *DUMP_PER_KERNEL.get_or_init(|| {
+        std::env::var("ZLUDA_DUMP_PER_KERNEL").map_or(false, |v| v == "1")
+    });
+
     let mut objects = Vec::new();
     for (idx, name) in kernel_names.iter().enumerate() {
         compile_log(&format!(
@@ -466,6 +472,36 @@ fn emit_per_kernel(
         internalize_other_kernels(&sub, name);
         run_dce_pass(tm, &sub);
         mark_helpers_alwaysinline(&sub);
+
+        // Dump per-kernel IR and assembly for diagnosis
+        if dump {
+            let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
+            let ir = sub.print_module_to_string();
+            let _ = std::fs::write(
+                format!("/tmp/zluda_ir_dump/kernel_{}.ll", name),
+                ir.to_bytes(),
+            );
+            // Also dump assembly to see VGPR usage in kernel metadata
+            if let Ok(asm_buf) = tm.emit_to_memory_buffer(&sub.clone(), LLVMCodeGenFileType::LLVMAssemblyFile) {
+                let asm = asm_buf.to_vec();
+                let _ = std::fs::write(
+                    format!("/tmp/zluda_ir_dump/kernel_{}.s", name),
+                    &asm,
+                );
+                // Extract and log VGPR info from assembly metadata
+                if let Ok(asm_str) = std::str::from_utf8(&asm) {
+                    for line in asm_str.lines() {
+                        if line.contains(".vgpr_count:") || line.contains(".sgpr_count:")
+                            || line.contains(".max_flat_workgroup_size:")
+                            || line.contains(".vgpr_spill_count:")
+                        {
+                            compile_log(&format!("compile:   {} {}", name, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+
         compile_log(&format!(
             "compile:   [{}/{}] {} emitting",
             idx + 1, kernel_names.len(), name

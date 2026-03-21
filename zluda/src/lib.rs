@@ -377,7 +377,10 @@ cuda_macros::cuda_function_declarations!(
             cuGraphicsUnregisterResource,
             cuGraphicsResourceGetMappedMipmappedArray,
         ],
-    implemented_in_function <= [cuLaunchKernel,]
+    // cuLaunchKernel_ptsz is the per-thread default stream variant.
+    // cuGetProcAddress returns it for cuLaunchKernel with certain version/flags.
+    // Without this, it falls through to the unimplemented stub and fails silently.
+    implemented_in_function <= [cuLaunchKernel, cuLaunchKernel_ptsz,]
 );
 
 #[cfg(test)]

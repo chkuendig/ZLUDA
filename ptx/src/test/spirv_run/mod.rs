@@ -315,6 +315,16 @@ test_ptx!(suld_stub);
 test_ptx!(tex_obj_stub);
 test_ptx!(cvt_s64_s32, [-1i32], [-1i64]);
 test_ptx!(add_tuning, [2u64], [3u64]);
+test_ptx!(maxntid_cap);
+test_ptx!(reqntid_uncapped);
+test_ptx_llvm!(maxntid_cap_run);
+
+#[test]
+fn maxntid_cap_run_amdgpu() -> Result<(), Box<dyn std::error::Error>> {
+    let ptx = read_test_file!("maxntid_cap_run.ptx");
+    test_hip_assert("maxntid_cap_run", &ptx, Some(&[1u64]), &[2u64], 256)
+}
+
 test_ptx!(add_non_coherent, [3u64], [4u64]);
 test_ptx!(sign_extend, [-1i16], [-1i32]);
 test_ptx!(atom_add_float, [1.25f32, 0.5f32], [1.25f32, 1.75f32]);

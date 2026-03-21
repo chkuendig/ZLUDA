@@ -56,6 +56,7 @@ pub(crate) unsafe fn ref_set_array(
     hipArrayGetDescriptor(&mut desc, h_array as hipArray_t)?;
     hipTexRefSetFormat(surf_ref, desc.Format, desc.NumChannels as i32)?;
     hipTexRefSetArray(surf_ref, h_array as hipArray_t, CU_TRSA_OVERRIDE_FORMAT)?;
+    crate::r#impl::tex::sync_synthetic_texref(surf_ref);
     Ok(())
 }
 

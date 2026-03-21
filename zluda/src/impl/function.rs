@@ -13,7 +13,6 @@ pub(crate) fn get_attribute(
         CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION
         | CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION => {
             *pi = 120;
-            super::driver::zluda_log(&format!("[ZLUDA] cuFuncGetAttribute({:?}) -> {} (hardcoded)", cu_attrib, *pi));
             return Ok(());
         }
         CUfunction_attribute::CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET
@@ -28,11 +27,6 @@ pub(crate) fn get_attribute(
         _ => {}
     }
     let result = unsafe { hipFuncGetAttribute(pi, mem::transmute(cu_attrib), func) };
-    // Always log cuFuncGetAttribute to track what PhysX sees
-    super::driver::zluda_log_err(&format!(
-        "cuFuncGetAttribute({:?}, func={:?}) -> val={}, result={:?}",
-        cu_attrib, func, *pi, result
-    ));
     if let Ok(()) = result {
         if cu_attrib == CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS {
             *pi = (*pi).max(1);
@@ -54,34 +48,6 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
-    // Kernel launch counter for debugging
-    static LAUNCH_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = LAUNCH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Clamp block dimensions to kernel's declared max threads per block.
-    // CUDA .maxntid is advisory (exceeding it is UB but doesn't crash on NVIDIA).
-    // On AMDGPU, flat-work-group-size is a hard limit — launching with more
-    // threads causes GPU fault. Query the kernel's max and clamp if needed.
-    let (block_dim_x, block_dim_y, block_dim_z) = {
-        let mut max_threads: i32 = 0;
-        let attr_result = unsafe {
-            hipFuncGetAttribute(
-                &mut max_threads,
-                hip_runtime_sys::hipFunction_attribute::HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-                f,
-            )
-        };
-        let total_threads = (block_dim_x as u64) * (block_dim_y as u64) * (block_dim_z as u64);
-        if attr_result.is_ok() && max_threads > 0 && total_threads > max_threads as u64 {
-            super::driver::zluda_log_err(&format!(
-                "CLAMPING block [{},{},{}] ({} threads) to kernel max {} for func {:p}",
-                block_dim_x, block_dim_y, block_dim_z, total_threads, max_threads, f.0
-            ));
-            // Simple clamp: set x to max, y/z to 1
-            (max_threads as ::core::ffi::c_uint, 1u32, 1u32)
-        } else {
-            (block_dim_x, block_dim_y, block_dim_z)
-        }
-    };
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
     let cu_launch_param_buffer_pointer = 0x1usize as *mut ::core::ffi::c_void;
@@ -127,34 +93,73 @@ pub(crate) fn launch_kernel(
             )
         }
     };
-    // Log kernel launches with param values for crash diagnosis
-    {
-        let mut param_info = String::new();
-        if !extra.is_null() && kernel_params.is_null() {
-            let extra_params = unsafe { std::slice::from_raw_parts(extra, 5) };
-            if extra_params[0] as usize == 1 && extra_params[2] as usize == 2 {
-                let buf = extra_params[1] as *const u64;
-                let size = unsafe { *(extra_params[3] as *const usize) };
-                let num_vals = (size / 8).min(20);
-                let has_null = (0..num_vals).any(|i| unsafe { *buf.add(i) } == 0);
-                if has_null {
-                    let ptrs: Vec<String> = (0..num_vals)
-                        .map(|i| {
-                            let val = unsafe { *buf.add(i) };
-                            if val == 0 { "NULL".to_string() } else { format!("0x{:x}", val) }
-                        })
-                        .collect();
-                    param_info = format!(" NULLS_IN_PARAMS[{}B]=[{}]", size, ptrs.join(","));
-                }
+    // Translate HIP error 719 (LaunchFailure) → LaunchOutOfResources.
+    // On NVIDIA, launching with too many threads returns CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES (701),
+    // which CUDA apps handle by reducing block size and retrying. HIP returns 719 (LAUNCH_FAILURE)
+    // which many apps treat as fatal. This translation makes ZLUDA match NVIDIA behavior.
+    let result = match result {
+        Err(code) if code == hipErrorCode_t::LaunchFailure => {
+            hipError_t::ErrorLaunchOutOfResources
+        }
+        other => other,
+    };
+    // Log launch failures with full context for diagnosis
+    if result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "cuLaunchKernel FAILED func={:p} grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
+            f.0, grid_dim_x, grid_dim_y, grid_dim_z,
+            block_dim_x, block_dim_y, block_dim_z,
+            shared_mem_bytes, result));
+    }
+    // ZLUDA_SYNC_LAUNCHES: synchronize after every kernel launch to pinpoint GPU faults.
+    // When enabled, any GPU fault will be reported immediately after the faulting kernel
+    // instead of being detected asynchronously later.
+    if result.is_ok() {
+        static SYNC_LAUNCHES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sync = *SYNC_LAUNCHES.get_or_init(|| {
+            std::env::var("ZLUDA_SYNC_LAUNCHES").map_or(false, |v| v == "1")
+        });
+        if sync {
+            // Log before sync — HSA may kill the process during hipStreamSynchronize on fault
+            super::driver::zluda_log_err(&format!(
+                "ZLUDA_SYNC_LAUNCHES: syncing func={:p} grid=[{},{},{}] block=[{},{},{}] shared={}",
+                f.0, grid_dim_x, grid_dim_y, grid_dim_z,
+                block_dim_x, block_dim_y, block_dim_z,
+                shared_mem_bytes));
+            let sync_result = unsafe { hipStreamSynchronize(stream) };
+            if sync_result.is_err() {
+                super::driver::zluda_log_err(&format!(
+                    "SYNC FAULT func={:p} -> {:?}",
+                    f.0, sync_result));
+                return sync_result;
             }
         }
-        super::driver::zluda_log_err(&format!(
-            "launch #{} func={:p} grid=[{},{},{}] block=[{},{},{}] shared={}{}-> {:?}",
-            n, f.0, grid_dim_x, grid_dim_y, grid_dim_z,
-            block_dim_x, block_dim_y, block_dim_z,
-            shared_mem_bytes, param_info, result));
     }
     result
+}
+
+// _ptsz = per-thread default stream variant of cuLaunchKernel.
+// cuGetProcAddress returns this for cuLaunchKernel with certain version/flags.
+// Behavior is identical to launch_kernel — the stream difference is already
+// handled by HIP's stream semantics.
+pub(crate) fn launch_kernel_ptsz(
+    f: hipFunction_t,
+    grid_dim_x: ::core::ffi::c_uint,
+    grid_dim_y: ::core::ffi::c_uint,
+    grid_dim_z: ::core::ffi::c_uint,
+    block_dim_x: ::core::ffi::c_uint,
+    block_dim_y: ::core::ffi::c_uint,
+    block_dim_z: ::core::ffi::c_uint,
+    shared_mem_bytes: ::core::ffi::c_uint,
+    stream: hipStream_t,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> hipError_t {
+    launch_kernel(
+        f, grid_dim_x, grid_dim_y, grid_dim_z,
+        block_dim_x, block_dim_y, block_dim_z,
+        shared_mem_bytes, stream, kernel_params, extra,
+    )
 }
 
 pub(crate) unsafe fn set_attribute(

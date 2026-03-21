@@ -68,5 +68,14 @@ opt-level = 2
 [profile.dev.package.xtask]
 opt-level = 2
 
+# Optimize compute-heavy crates even in dev/test builds.
+# GPU tests call LLVM O3 via these crates; without optimization,
+# a single _amdgpu test takes ~170s vs ~10s with opt-level=2.
+[profile.dev.package.ptx]
+opt-level = 2
+
+[profile.dev.package.llvm_zluda]
+opt-level = 2
+
 [patch.crates-io]
 highs-sys = { path = "ext/highs-sys" }

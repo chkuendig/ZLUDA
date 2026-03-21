@@ -4,7 +4,7 @@ use std::mem;
 
 /// After a texture object is created on a synthetic texref, copy the handle
 /// to the device global variable so the kernel can read it at runtime.
-unsafe fn sync_synthetic_texref(tex_ref: *mut textureReference) {
+pub(crate) unsafe fn sync_synthetic_texref(tex_ref: *mut textureReference) {
     if tex_ref.is_null() {
         return;
     }
@@ -47,6 +47,9 @@ pub(crate) unsafe fn ref_set_address_v2(
         dptr,
         bytes,
     )?;
+    // Sync the texture object to device global if this is a synthetic texref,
+    // matching the pattern in ref_set_array()
+    sync_synthetic_texref(tex_ref);
     Ok(())
 }
 
