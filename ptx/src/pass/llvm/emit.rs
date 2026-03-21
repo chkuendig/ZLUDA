@@ -171,14 +171,10 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         self.emit_target_features(fn_);
         self.emit_tuning(fn_, &method.tuning);
         // Kernels without .maxntid/.reqntid get no amdgpu-flat-work-group-size,
-        // causing LLVM to assume a small default.
-        // Cap at 256 threads to give LLVM register headroom on RDNA2 wave32:
-        //   1024 threads = 32 waves → 16/SIMD → max 64 VGPRs (too tight, causes 719)
-        //    512 threads = 16 waves →  8/SIMD → max 128 VGPRs (borderline)
-        //    256 threads =  8 waves →  4/SIMD → max 256 VGPRs (comfortable)
-        // When an app launches >256 threads, HIP rejects with error 719 which we
-        // translate to CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES (701). CUDA apps handle
-        // this by retrying with smaller block sizes, matching NVIDIA behavior.
+        // causing LLVM to assume a small default. Default to 1024 (CUDA max) so
+        // that any legal CUDA launch succeeds — LLVM will spill to scratch if
+        // VGPR pressure is too high, which is slower but correct. This matches
+        // NVIDIA behavior where .maxntid is a hint, not an enforced limit.
         if method.is_kernel() {
             let has_workgroup_size = method.tuning.iter().any(|t| {
                 matches!(
@@ -188,7 +184,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 )
             });
             if !has_workgroup_size {
-                self.emit_fn_attribute(fn_, "amdgpu-flat-work-group-size", "1,256");
+                self.emit_fn_attribute(fn_, "amdgpu-flat-work-group-size", "1,1024");
             }
         }
         if let Some(kernel_attrs) = &method.kernel_attributes {
@@ -404,13 +400,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 // Not really applicable
                 ptx_parser::TuningDirective::MaxNReg(_) => {}
                 ptx_parser::TuningDirective::MaxNtid(x, y, z) => {
-                    // Cap at 256 to avoid VGPR pressure on RDNA2 wave32.
-                    // e.g. .maxntid 1024 → 32 waves → 64 VGPRs max (too tight for
-                    // most kernels like PhysX simulateCloths). Capping at 256 gives
-                    // 8 waves → 128 VGPRs. Apps launching >256 threads get
-                    // LAUNCH_OUT_OF_RESOURCES and retry with smaller block size.
-                    // Note: .reqntid is NOT capped — it's an exact requirement.
-                    let size = (x * y * z).min(256);
+                    // On NVIDIA, .maxntid is a register-allocation hint, NOT an
+                    // enforced launch limit — the driver never rejects a launch
+                    // that exceeds it. Translate faithfully so LLVM budgets
+                    // registers for the declared thread count; it will spill to
+                    // scratch if VGPR pressure is too high.
+                    let size = x * y * z;
                     let value = format!("1,{size}");
                     self.emit_fn_attribute(fn_, "amdgpu-flat-work-group-size", &value);
                 }

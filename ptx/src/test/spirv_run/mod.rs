@@ -322,7 +322,7 @@ test_ptx_llvm!(maxntid_cap_run);
 #[test]
 fn maxntid_cap_run_amdgpu() -> Result<(), Box<dyn std::error::Error>> {
     let ptx = read_test_file!("maxntid_cap_run.ptx");
-    test_hip_assert("maxntid_cap_run", &ptx, Some(&[1u64]), &[2u64], 256)
+    test_hip_assert("maxntid_cap_run", &ptx, Some(&[1u64]), &[2u64], 1024)
 }
 
 test_ptx!(add_non_coherent, [3u64], [4u64]);
