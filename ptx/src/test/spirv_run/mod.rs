@@ -363,6 +363,10 @@ test_ptx!(const_ident, [0u16], [0u64, 0u64]);
 // Exercises the gParams pattern: .const .b8 array[] without initializer (zeroinitializer).
 // Verifies .const globals compile to addrspace(1) so hipMemcpyHtoD can write them.
 test_ptx_llvm!(const_zero_init);
+// Multiple .const globals without initializer — ensures each gets a distinct device address.
+// Reproduces the Batman AK gParams/gBounds pattern where hipModuleGetGlobal returned
+// duplicate host-space addresses causing hipMemcpyHtoD failures.
+test_ptx_llvm!(const_multi_zero_init);
 test_ptx!(cvt_s16_s8, [0x139231C2u32], [0xFFFFFFC2u32]);
 test_ptx!(cvt_f64_f32, [0.125f32], [0.125f64]);
 test_ptx!(prmt, [0x70c507d6u32, 0x6fbd4b5cu32], [0x6fbdd65cu32]);
@@ -1480,3 +1484,416 @@ pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_mod
 // Surface operations are verified via:
 // - IR tests (sust_stub, sust_2d_stub, suld_stub) for correct IR generation
 // - Game testing (Arkham Knight) for runtime execution on real hardware
+
+/// Test hipModuleGetGlobal on a module with 45 kernels + helper (per-kernel emission).
+/// Reproduces the Batman AK FlexFluids crash: hipModuleGetGlobal returns HOST/bytes=0.
+#[test]
+fn const_global_perkernel_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(()); // skip if no GPU
+    }
+
+    let ptx = read_test_file!("const_global_perkernel.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        None,
+    )
+    .unwrap();
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    // Test hipModuleGetGlobal for gTestParams
+    let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
+    let mut bytes = 0usize;
+    unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"gTestParams".as_ptr()) }
+        .unwrap();
+    let dptr_val = dptr.0 as u64;
+    eprintln!(
+        "gTestParams: dptr={:#x} bytes={} {}",
+        dptr_val,
+        bytes,
+        if dptr_val >= 0x7f0000000000 { "DEV" } else { "HOST" }
+    );
+    assert!(bytes > 0, "gTestParams bytes should be > 0, got {}", bytes);
+    assert!(
+        dptr_val >= 0x7f0000000000,
+        "gTestParams should be DEV address, got {:#x}",
+        dptr_val
+    );
+
+    // Test hipModuleGetGlobal for gTestBounds
+    let mut dptr2 = hipDeviceptr_t(std::ptr::null_mut());
+    let mut bytes2 = 0usize;
+    unsafe { hipModuleGetGlobal(&mut dptr2, &mut bytes2, hip_mod, c"gTestBounds".as_ptr()) }
+        .unwrap();
+    let dptr2_val = dptr2.0 as u64;
+    eprintln!(
+        "gTestBounds: dptr={:#x} bytes={} {}",
+        dptr2_val,
+        bytes2,
+        if dptr2_val >= 0x7f0000000000 { "DEV" } else { "HOST" }
+    );
+    assert!(bytes2 > 0, "gTestBounds bytes should be > 0, got {}", bytes2);
+    assert!(
+        dptr.0 != dptr2.0,
+        "gTestParams and gTestBounds should have distinct addresses"
+    );
+
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    Ok(())
+}
+
+/// Test hipModuleGetGlobal with the actual FlexFluids PTX from Batman AK.
+/// This is the exact PTX that triggers HOST/bytes=0 in-game.
+#[test]
+fn const_global_flexfluids_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(()); // skip if no GPU
+    }
+
+    let ptx_path = "/tmp/zluda_ptx_dump/module_5.ptx";
+    let ptx = match fs::read_to_string(ptx_path) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("SKIP: {} not found (run Batman AK once to extract)", ptx_path);
+            return Ok(());
+        }
+    };
+
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    eprintln!("Compiling FlexFluids PTX ({} bytes, 45 kernels)...", ptx.len());
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        None,
+    )
+    .unwrap();
+    eprintln!("ELF: {} bytes", elf.len());
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    // Test hipModuleGetGlobal for gParams
+    let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
+    let mut bytes = 0usize;
+    unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"gParams".as_ptr()) }.unwrap();
+    let dptr_val = dptr.0 as u64;
+    eprintln!(
+        "gParams: dptr={:#x} bytes={} {}",
+        dptr_val,
+        bytes,
+        if dptr_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+    );
+
+    // Test hipModuleGetGlobal for gBounds
+    let mut dptr2 = hipDeviceptr_t(std::ptr::null_mut());
+    let mut bytes2 = 0usize;
+    unsafe { hipModuleGetGlobal(&mut dptr2, &mut bytes2, hip_mod, c"gBounds".as_ptr()) }.unwrap();
+    let dptr2_val = dptr2.0 as u64;
+    eprintln!(
+        "gBounds: dptr={:#x} bytes={} {}",
+        dptr2_val,
+        bytes2,
+        if dptr2_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+    );
+
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+
+    assert!(bytes > 0, "gParams bytes should be > 0, got {}", bytes);
+    assert!(
+        dptr_val >= 0x7f0000000000,
+        "gParams should be DEV address, got {:#x}",
+        dptr_val
+    );
+    assert!(bytes2 > 0, "gBounds bytes should be > 0, got {}", bytes2);
+    assert!(
+        dptr.0 != dptr2.0,
+        "gParams and gBounds should have distinct addresses"
+    );
+    Ok(())
+}
+
+/// Test hipModuleGetGlobal after loading multiple modules (like the game does).
+/// The game loads modules 0-4 before FlexFluids (module 5). If memory pressure
+/// or module loading order causes the issue, this test will fail.
+#[test]
+fn const_global_multimodule_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(()); // skip if no GPU
+    }
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_dir = "/tmp/zluda_ptx_dump";
+
+    // Load modules 0-5 in order (same as game)
+    let mut hip_modules = Vec::new();
+    for i in 0..=5 {
+        let ptx_path = format!("{}/module_{}.ptx", ptx_dir, i);
+        let ptx = match fs::read_to_string(&ptx_path) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("SKIP: {} not found", ptx_path);
+                return Ok(());
+            }
+        };
+
+        let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+        let module = pass::to_llvm_module(
+            ast,
+            pass::Attributes { clock_rate: 2124000 },
+            |_| {},
+        )
+        .unwrap();
+        let ptx_impl = module.linked_bitcode();
+        let elf = llvm_zluda::compile(
+            &module.context,
+            gcn_arch,
+            module.llvm_ir,
+            ptx_impl,
+            module.attributes_ir,
+            None,
+        )
+        .unwrap();
+        eprintln!("module_{}: compiled {} bytes ELF", i, elf.len());
+
+        let mut hip_mod = unsafe { mem::zeroed() };
+        unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+        eprintln!("module_{}: loaded OK", i);
+        hip_modules.push(hip_mod);
+    }
+
+    // Now test hipModuleGetGlobal on module 5 (FlexFluids)
+    let flex_mod = hip_modules[5];
+
+    let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
+    let mut bytes = 0usize;
+    unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, flex_mod, c"gParams".as_ptr()) }.unwrap();
+    let dptr_val = dptr.0 as u64;
+    eprintln!(
+        "gParams: dptr={:#x} bytes={} {}",
+        dptr_val, bytes,
+        if dptr_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+    );
+
+    let mut dptr2 = hipDeviceptr_t(std::ptr::null_mut());
+    let mut bytes2 = 0usize;
+    unsafe { hipModuleGetGlobal(&mut dptr2, &mut bytes2, flex_mod, c"gBounds".as_ptr()) }.unwrap();
+    let dptr2_val = dptr2.0 as u64;
+    eprintln!(
+        "gBounds: dptr={:#x} bytes={} {}",
+        dptr2_val, bytes2,
+        if dptr2_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+    );
+
+    // Also test module 0's globals for comparison
+    let mut dptr3 = hipDeviceptr_t(std::ptr::null_mut());
+    let mut bytes3 = 0usize;
+    let result = unsafe { hipModuleGetGlobal(&mut dptr3, &mut bytes3, hip_modules[0], c"gKernelData".as_ptr()) };
+    if result.is_ok() {
+        let dptr3_val = dptr3.0 as u64;
+        eprintln!(
+            "gKernelData (module 0): dptr={:#x} bytes={} {}",
+            dptr3_val, bytes3,
+            if dptr3_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+        );
+    }
+
+    // Cleanup
+    for m in &hip_modules {
+        unsafe { hipModuleUnload(*m) }.unwrap();
+    }
+
+    assert!(bytes > 0, "gParams bytes should be > 0, got {}", bytes);
+    assert!(
+        dptr_val >= 0x7f0000000000,
+        "gParams should be DEV address, got {:#x}",
+        dptr_val
+    );
+    assert!(bytes2 > 0, "gBounds bytes should be > 0, got {}", bytes2);
+    Ok(())
+}
+
+/// Load the Wine-produced ELF directly (no compilation) to test if the ELF
+/// itself triggers the hipModuleGetGlobal failure, or if it's Wine-specific.
+#[test]
+fn const_global_wine_elf_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let elf_path = "/tmp/zluda_ir_dump/module_5.elf";
+    let elf = match fs::read(elf_path) {
+        Ok(data) => data,
+        Err(_) => {
+            eprintln!("SKIP: {} not found", elf_path);
+            return Ok(());
+        }
+    };
+    eprintln!("Loading Wine-produced ELF: {} bytes", elf.len());
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+    eprintln!("Module loaded: {:?}", hip_mod);
+
+    // Use sentinel pattern to detect if HIP writes output
+    let mut dptr = hipDeviceptr_t(0xDEADBEEFDEADBEEFu64 as *mut _);
+    let mut bytes = 0xDEADBEEFusize;
+    unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"gParams".as_ptr()) }.unwrap();
+    let dptr_val = dptr.0 as u64;
+    let sentinel = dptr_val == 0xDEADBEEFDEADBEEF;
+    eprintln!(
+        "gParams: dptr={:#x} bytes={} {}",
+        dptr_val, bytes,
+        if sentinel { "SENTINEL (NOT WRITTEN!)" }
+        else if dptr_val >= 0x7f0000000000 { "DEV ✓" }
+        else { "HOST ✗" }
+    );
+
+    let mut dptr2 = hipDeviceptr_t(0xDEADBEEFDEADBEEFu64 as *mut _);
+    let mut bytes2 = 0xDEADBEEFusize;
+    unsafe { hipModuleGetGlobal(&mut dptr2, &mut bytes2, hip_mod, c"gBounds".as_ptr()) }.unwrap();
+    let dptr2_val = dptr2.0 as u64;
+    let sentinel2 = dptr2_val == 0xDEADBEEFDEADBEEF;
+    eprintln!(
+        "gBounds: dptr={:#x} bytes={} {}",
+        dptr2_val, bytes2,
+        if sentinel2 { "SENTINEL (NOT WRITTEN!)" }
+        else if dptr2_val >= 0x7f0000000000 { "DEV ✓" }
+        else { "HOST ✗" }
+    );
+
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+
+    assert!(!sentinel, "gParams: HIP did not write output (sentinel untouched)");
+    assert!(bytes > 0, "gParams bytes should be > 0, got {}", bytes);
+    assert!(dptr_val >= 0x7f0000000000, "gParams should be DEV, got {:#x}", dptr_val);
+    Ok(())
+}
+
+/// Parameterized test: vary kernel count to find the threshold where
+/// hipModuleGetGlobal breaks for per-kernel linked modules.
+#[test]
+fn const_global_perkernel_threshold_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(()); // skip if no GPU
+    }
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    for n_kernels in [1, 2, 5, 10, 12, 15, 20, 30, 45] {
+        // Generate PTX with N kernels + helper + 2 .const globals
+        let mut ptx = String::new();
+        ptx.push_str(".version 6.5\n.target sm_50\n.address_size 64\n\n");
+        ptx.push_str(".const .align 8 .b8 gTestParams[64];\n");
+        ptx.push_str(".const .align 4 .b8 gTestBounds[16];\n\n");
+        ptx.push_str(".func (.reg .u32 result) helper(.reg .u32 x)\n{\n");
+        ptx.push_str("    add.u32 result, x, 1;\n    ret;\n}\n\n");
+        for i in 0..n_kernels {
+            ptx.push_str(&format!(
+                ".visible .entry kernel_{}(.param .u64 out) {{\n    .reg .u32 tmp;\n    call (tmp), helper, ({});\n    ret;\n}}\n\n",
+                i, i
+            ));
+        }
+
+        let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+        let module = pass::to_llvm_module(
+            ast,
+            pass::Attributes { clock_rate: 2124000 },
+            |_| {},
+        )
+        .unwrap();
+        let ptx_impl = module.linked_bitcode();
+        let elf = llvm_zluda::compile(
+            &module.context,
+            gcn_arch,
+            module.llvm_ir,
+            ptx_impl,
+            module.attributes_ir,
+            None,
+        )
+        .unwrap();
+
+        let mut hip_mod = unsafe { mem::zeroed() };
+        unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+        let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
+        let mut bytes = 0usize;
+        unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"gTestParams".as_ptr()) }
+            .unwrap();
+
+        let dptr_val = dptr.0 as u64;
+        let is_dev = dptr_val >= 0x7f0000000000;
+        eprintln!(
+            "N={:>2} kernels: gTestParams dptr={:#x} bytes={} {}",
+            n_kernels,
+            dptr_val,
+            bytes,
+            if is_dev { "DEV ✓" } else { "HOST ✗" }
+        );
+
+        unsafe { hipModuleUnload(hip_mod) }.unwrap();
+
+        assert!(
+            bytes > 0,
+            "N={}: gTestParams bytes should be > 0, got {}",
+            n_kernels, bytes
+        );
+        assert!(
+            is_dev,
+            "N={}: gTestParams should be DEV address, got {:#x}",
+            n_kernels, dptr_val
+        );
+    }
+    Ok(())
+}

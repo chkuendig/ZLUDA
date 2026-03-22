@@ -13,6 +13,7 @@ use llvm_sys::{
     },
     transforms::pass_builder::LLVMRunPasses,
 };
+use llvm_sys::prelude::LLVMValueRef;
 use llvm_sys::{LLVMLinkage, LLVMVisibility};
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -387,9 +388,20 @@ fn compile_inner(
     }
 
     compile_log("compile: LLD link OK, reading executable");
-    let executable =
+    let mut executable =
         fs::read(&executable_path).map_err(|_| ("Failed to read executable file").to_string())?;
+    if object_files.len() > 1 {
+        merge_amdgpu_metadata_notes(&mut executable)?;
+    }
     compile_log(&format!("compile: DONE, executable {} bytes", executable.len()));
+
+    // Dump final ELF for readelf inspection
+    {
+        static ELF_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = ELF_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
+        let _ = std::fs::write(format!("/tmp/zluda_ir_dump/module_{}.elf", n), &executable);
+    }
 
     if let Some(hook) = compiler_hook {
         // Run compiler hook for final executable
@@ -471,6 +483,7 @@ fn emit_per_kernel(
         let sub = module.clone();
         internalize_other_kernels(&sub, name);
         run_dce_pass(tm, &sub);
+        delete_unused_globals(&sub);
         mark_helpers_alwaysinline(&sub);
 
         // Dump per-kernel IR and assembly for diagnosis
@@ -544,6 +557,80 @@ fn internalize_other_kernels(module: &Module, keep: &str) {
     }
 }
 
+/// Delete global variables that have no code uses and aren't in @llvm.used.
+///
+/// Removes dead globals (e.g. `$str` / `__CUDA_FTZ`) that create .data sections
+/// in per-kernel objects. When per-kernel objects are linked by LLD, these dead
+/// globals produce an ELF with both .data (SHT_PROGBITS) and .bss (SHT_NOBITS)
+/// sections. Empirically, hipModuleGetGlobal then returns HOST addresses and
+/// bytes=0 for .bss globals instead of valid device pointers.
+///
+/// Safety: @llvm.used protects all host-accessible globals (set during PTX emission
+/// in emit.rs). Globals not in @llvm.used and with no code uses are truly dead.
+fn delete_unused_globals(module: &Module) {
+    unsafe {
+        // Collect @llvm.used entries (protected globals)
+        let mut used_set = std::collections::HashSet::new();
+        let llvm_used = LLVMGetNamedGlobal(module.get(), c"llvm.used".as_ptr());
+        if !llvm_used.is_null() {
+            let init = LLVMGetInitializer(llvm_used);
+            if !init.is_null() {
+                let num = LLVMGetNumOperands(init);
+                for i in 0..num {
+                    let op = LLVMGetOperand(init, i as u32);
+                    // @llvm.used entries may be addrspacecast(ptr addrspace(N) @X to ptr)
+                    // Unwrap the cast to get the underlying global
+                    let underlying = if LLVMIsAConstantExpr(op).is_null() {
+                        op
+                    } else {
+                        LLVMGetOperand(op, 0)
+                    };
+                    used_set.insert(underlying);
+                }
+            }
+        }
+
+        // Collect globals to delete (can't delete while iterating)
+        let mut to_delete = Vec::new();
+        let mut global = LLVMGetFirstGlobal(module.get());
+        while !global.is_null() {
+            let next = LLVMGetNextGlobal(global);
+            let is_llvm_meta = global == llvm_used;
+            let is_protected = used_set.contains(&(global as LLVMValueRef));
+            let has_uses = !LLVMGetFirstUse(global as LLVMValueRef).is_null();
+
+            // Log each global's status for diagnosis
+            let mut name_len = 0;
+            let name_ptr = LLVMGetValueName2(global as LLVMValueRef, &mut name_len);
+            let name = if !name_ptr.is_null() && name_len > 0 {
+                std::str::from_utf8_unchecked(
+                    std::slice::from_raw_parts(name_ptr as *const u8, name_len),
+                )
+            } else {
+                "<unnamed>"
+            };
+            compile_log(&format!(
+                "  global '{}': meta={} protected={} has_uses={} -> {}",
+                name, is_llvm_meta, is_protected, has_uses,
+                if !is_llvm_meta && !is_protected && !has_uses { "DELETE" } else { "keep" }
+            ));
+
+            if !is_llvm_meta && !is_protected && !has_uses {
+                to_delete.push(global);
+            }
+            global = next;
+        }
+
+        // Delete collected globals
+        for g in &to_delete {
+            LLVMDeleteGlobal(*g);
+        }
+        if !to_delete.is_empty() {
+            compile_log(&format!("  deleted {} unused globals", to_delete.len()));
+        }
+    }
+}
+
 /// Strip noinline/convergent and add alwaysinline to all non-kernel definitions.
 /// This lets the AMDGPU codegen pipeline inline helpers, avoiding the SCC hang.
 fn mark_helpers_alwaysinline(module: &Module) {
@@ -585,6 +672,227 @@ fn run_dce_pass(tm: &TargetMachine, module: &Module) {
     unsafe {
         LLVMRunPasses(module.get(), c"globaldce".as_ptr(), tm.get(), pb.get());
     }
+}
+
+/// Merge fragmented NT_AMDGPU_METADATA notes in an ELF binary.
+///
+/// When per-kernel emission produces multiple .o files, LLD concatenates
+/// their NT_AMDGPU_METADATA notes instead of merging them. The HIP runtime
+/// only reads the first note, so kernels from later objects have missing
+/// metadata. This function merges all metadata notes into one.
+fn merge_amdgpu_metadata_notes(elf: &mut Vec<u8>) -> Result<(), String> {
+    const SHT_NOTE: u32 = 7;
+    const PT_NOTE: u32 = 4;
+    const NT_AMDGPU_METADATA: u32 = 0x20;
+    const AMDGPU_NAME: &[u8] = b"AMDGPU\0";
+
+    fn r_u16(data: &[u8], off: usize) -> u16 {
+        u16::from_le_bytes([data[off], data[off + 1]])
+    }
+    fn r_u32(data: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+    }
+    fn r_u64(data: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
+    }
+    fn w_u64(data: &mut [u8], off: usize, val: u64) {
+        data[off..off + 8].copy_from_slice(&val.to_le_bytes());
+    }
+    fn pad4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+
+    if elf.len() < 64 {
+        return Ok(());
+    }
+
+    // Parse ELF64 header
+    let e_shoff = r_u64(elf, 0x28) as usize;
+    let e_shentsize = r_u16(elf, 0x3A) as usize;
+    let e_shnum = r_u16(elf, 0x3C) as usize;
+    let e_phoff = r_u64(elf, 0x20) as usize;
+    let e_phentsize = r_u16(elf, 0x36) as usize;
+    let e_phnum = r_u16(elf, 0x38) as usize;
+
+    // Find .note section (type SHT_NOTE)
+    let mut note_sh_idx = None;
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        if sh + 0x28 > elf.len() {
+            break;
+        }
+        let sh_type = r_u32(elf, sh + 4);
+        if sh_type == SHT_NOTE {
+            note_sh_idx = Some(i);
+            break;
+        }
+    }
+    let note_sh_idx = match note_sh_idx {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+
+    let sh = e_shoff + note_sh_idx * e_shentsize;
+    let note_offset = r_u64(elf, sh + 0x18) as usize;
+    let note_size = r_u64(elf, sh + 0x20) as usize;
+
+    if note_offset + note_size > elf.len() {
+        return Ok(());
+    }
+
+    // Walk note entries, identify metadata notes
+    struct NoteEntry {
+        offset: usize,
+        total_size: usize,
+        is_metadata: bool,
+        desc_offset: usize,
+        desc_size: usize,
+    }
+
+    let mut entries = Vec::new();
+    let mut pos = note_offset;
+    let note_end = note_offset + note_size;
+    while pos + 12 <= note_end {
+        let namesz = r_u32(elf, pos) as usize;
+        let descsz = r_u32(elf, pos + 4) as usize;
+        let note_type = r_u32(elf, pos + 8);
+        let name_start = pos + 12;
+        let desc_start = name_start + pad4(namesz);
+        let entry_end = desc_start + pad4(descsz);
+        if entry_end > note_end {
+            break;
+        }
+        let is_metadata = note_type == NT_AMDGPU_METADATA
+            && namesz == AMDGPU_NAME.len()
+            && elf[name_start..name_start + namesz] == *AMDGPU_NAME;
+        entries.push(NoteEntry {
+            offset: pos,
+            total_size: entry_end - pos,
+            is_metadata,
+            desc_offset: desc_start,
+            desc_size: descsz,
+        });
+        pos = entry_end;
+    }
+
+    let metadata_count = entries.iter().filter(|e| e.is_metadata).count();
+    if metadata_count <= 1 {
+        return Ok(());
+    }
+
+    compile_log(&format!(
+        "merge_amdgpu_metadata_notes: merging {} metadata notes",
+        metadata_count
+    ));
+
+    // Decode all metadata notes as msgpack, collect kernels
+    let mut all_kernels: Vec<rmpv::Value> = Vec::new();
+    let mut base_map: Option<Vec<(rmpv::Value, rmpv::Value)>> = None;
+
+    for entry in &entries {
+        if !entry.is_metadata {
+            continue;
+        }
+        let desc = &elf[entry.desc_offset..entry.desc_offset + entry.desc_size];
+        let val = rmpv::decode::read_value(&mut &desc[..])
+            .map_err(|e| format!("Failed to decode AMDGPU metadata msgpack: {}", e))?;
+        if let rmpv::Value::Map(pairs) = val {
+            let mut kernels = Vec::new();
+            let mut other_pairs = Vec::new();
+            for (k, v) in pairs {
+                if k.as_str() == Some("amdhsa.kernels") {
+                    if let rmpv::Value::Array(arr) = v {
+                        kernels = arr;
+                    }
+                } else {
+                    other_pairs.push((k, v));
+                }
+            }
+            all_kernels.extend(kernels);
+            if base_map.is_none() {
+                base_map = Some(other_pairs);
+            }
+        }
+    }
+
+    // Build merged map: base metadata + all kernels combined
+    let mut merged_pairs = base_map.unwrap_or_default();
+    merged_pairs.push((
+        rmpv::Value::String("amdhsa.kernels".into()),
+        rmpv::Value::Array(all_kernels),
+    ));
+    let merged_value = rmpv::Value::Map(merged_pairs);
+
+    // Encode merged msgpack
+    let mut merged_desc = Vec::new();
+    rmpv::encode::write_value(&mut merged_desc, &merged_value)
+        .map_err(|e| format!("Failed to encode merged AMDGPU metadata: {}", e))?;
+
+    // Build new note section: non-metadata notes + single merged metadata note
+    let mut new_notes = Vec::new();
+    for entry in &entries {
+        if !entry.is_metadata {
+            new_notes.extend_from_slice(&elf[entry.offset..entry.offset + entry.total_size]);
+        }
+    }
+
+    // Append merged metadata note
+    let namesz = AMDGPU_NAME.len() as u32;
+    let descsz = merged_desc.len() as u32;
+    new_notes.extend_from_slice(&namesz.to_le_bytes());
+    new_notes.extend_from_slice(&descsz.to_le_bytes());
+    new_notes.extend_from_slice(&NT_AMDGPU_METADATA.to_le_bytes());
+    new_notes.extend_from_slice(AMDGPU_NAME);
+    let name_pad = pad4(AMDGPU_NAME.len()) - AMDGPU_NAME.len();
+    for _ in 0..name_pad {
+        new_notes.push(0);
+    }
+    new_notes.extend_from_slice(&merged_desc);
+    let desc_pad = pad4(merged_desc.len()) - merged_desc.len();
+    for _ in 0..desc_pad {
+        new_notes.push(0);
+    }
+
+    if new_notes.len() > note_size {
+        return Err(format!(
+            "Merged notes ({} bytes) exceed original note section ({} bytes)",
+            new_notes.len(),
+            note_size
+        ));
+    }
+
+    // Write merged notes into .note region, zero-pad remainder
+    elf[note_offset..note_offset + new_notes.len()].copy_from_slice(&new_notes);
+    for b in &mut elf[note_offset + new_notes.len()..note_offset + note_size] {
+        *b = 0;
+    }
+
+    // Update .note section header sh_size
+    let new_note_size = new_notes.len() as u64;
+    w_u64(elf, sh + 0x20, new_note_size);
+
+    // Update PT_NOTE program header p_filesz and p_memsz
+    for i in 0..e_phnum {
+        let ph = e_phoff + i * e_phentsize;
+        if ph + 0x30 > elf.len() {
+            break;
+        }
+        let p_type = r_u32(elf, ph);
+        if p_type == PT_NOTE {
+            w_u64(elf, ph + 0x20, new_note_size);
+            w_u64(elf, ph + 0x28, new_note_size);
+            break;
+        }
+    }
+
+    compile_log(&format!(
+        "merge_amdgpu_metadata_notes: merged {} notes -> {} bytes (was {} bytes)",
+        metadata_count,
+        new_notes.len(),
+        note_size
+    ));
+
+    Ok(())
 }
 
 fn init_globals() -> Result<(), String> {

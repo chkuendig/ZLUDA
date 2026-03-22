@@ -168,6 +168,37 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log(&format!("[ZLUDA] cuInit({})", flags));
     zluda_log_err(&format!("=== ZLUDA init (flags={}) LOG_ALL={} ===", flags, crate::is_log_all_enabled()));
     unsafe { hipInit(flags) }?;
+    // Verify HIP runtime version matches what ZLUDA was compiled against.
+    // Mismatched versions cause silent GPU failures: hipModuleGetGlobal returns
+    // success but doesn't write output parameters, leading to HOST addresses
+    // and bytes=0 for .const globals (e.g. gParams/gBounds in PhysX FleX).
+    {
+        // ROCm version ZLUDA was compiled with (from hip_version.h via hip_runtime-sys build.rs)
+        let compiled_major: i32 = env!("HIP_VERSION_MAJOR").parse().unwrap_or(0);
+        let compiled_minor: i32 = env!("HIP_VERSION_MINOR").parse().unwrap_or(0);
+
+        let mut runtime_ver = 0i32;
+        if unsafe { hip_runtime_sys::hipRuntimeGetVersion(&mut runtime_ver) }.is_ok() {
+            let rt_major = runtime_ver / 10_000_000;
+            let rt_minor = (runtime_ver / 100_000) % 100;
+            let rt_patch = runtime_ver % 100_000;
+            zluda_log(&format!(
+                "[ZLUDA] HIP runtime version: {}.{}.{} (compiled with {}.{})",
+                rt_major, rt_minor, rt_patch, compiled_major, compiled_minor
+            ));
+            if rt_major != compiled_major || rt_minor != compiled_minor {
+                let msg = format!(
+                    "[ZLUDA] FATAL: ROCm version mismatch! Compiled with {}.{}, runtime is {}.{}. \
+                     GPU code compiled with one version cannot be loaded by another. \
+                     Update Proton ROCm libs: cd proton-ge-custom/rocm && ./fetch-rocm.sh",
+                    compiled_major, compiled_minor, rt_major, rt_minor
+                );
+                zluda_log(&msg);
+                zluda_log_err(&msg);
+                return Err(cuda_types::cuda::CUerror::UNKNOWN);
+            }
+        }
+    }
     global_state()?;
     zluda_log("[ZLUDA] cuInit -> SUCCESS");
     zluda_log_err("=== ZLUDA cuInit -> SUCCESS ===");

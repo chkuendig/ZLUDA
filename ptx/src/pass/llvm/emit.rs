@@ -75,8 +75,8 @@ pub(crate) fn run<'input>(
             Directive2::Method(method) => emit_ctx.emit_method(method)?,
         }
     }
-    // Add preserved globals (e.g. .texref/.surfref) to @llvm.used so they survive
-    // -amdgpu-internalize-symbols and O3 optimization
+    // Add preserved globals (e.g. .texref/.surfref, .const) to @llvm.used so they survive
+    // -amdgpu-internalize-symbols and O3 optimization during per-kernel emission
     if !emit_ctx.preserved_globals.is_empty() {
         emit_llvm_used(emit_ctx.context, emit_ctx.module, &emit_ctx.preserved_globals);
     }
@@ -115,7 +115,8 @@ struct ModuleEmitContext<'a, 'input> {
     builder: Builder,
     id_defs: &'a GlobalStringIdentResolver2<'input>,
     resolver: ResolveIdent,
-    /// Globals that must survive optimization (e.g. .texref/.surfref compiled as .global .u64).
+    /// Globals that must survive optimization (e.g. .texref/.surfref compiled as .global .u64,
+    /// and .const globals that need to be visible to hipModuleGetGlobal).
     /// These get added to @llvm.used so -amdgpu-internalize-symbols doesn't strip them.
     preserved_globals: Vec<LLVMValueRef>,
 }
@@ -332,6 +333,18 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             // Other global variables without explicit initializers need a zero initializer
             let ty = get_type(self.context, &var.info.v_type)?;
             unsafe { LLVMSetInitializer(global, LLVMConstNull(ty)) };
+        } else if var.info.state_space == ast::StateSpace::Const {
+            // .const globals without explicit initializers: add explicit zero initializer
+            // so they go in .data instead of .bss in the ELF. This ensures HSA allocates
+            // them in device memory rather than host-mapped code object memory.
+            let ty = get_type(self.context, &var.info.v_type)?;
+            unsafe { LLVMSetInitializer(global, LLVMConstNull(ty)) };
+        }
+        // Preserve .const globals in @llvm.used so -amdgpu-internalize-symbols
+        // (set in init_globals()) doesn't internalize them during per-kernel
+        // object emission, which would cause hipModuleGetGlobal to fail.
+        if var.info.state_space == ast::StateSpace::Const {
+            self.preserved_globals.push(global);
         }
         Ok(())
     }

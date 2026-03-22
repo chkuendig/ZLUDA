@@ -1,4 +1,5 @@
 @params = addrspace(1) externally_initialized global [16 x i8] zeroinitializer, align 8
+@llvm.used = appending global [1 x ptr] [ptr addrspacecast (ptr addrspace(1) @params to ptr)], section "llvm.metadata"
 
 define amdgpu_kernel void @const_zero_init(ptr addrspace(4) byref(i64) %"45", ptr addrspace(4) byref(i64) %"46") #0 {
   %"47" = alloca i64, align 8, addrspace(5)

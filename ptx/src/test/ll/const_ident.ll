@@ -1,6 +1,7 @@
 @x = addrspace(1) externally_initialized global i64 1
 @y = addrspace(1) externally_initialized global [4 x i64] [i64 4, i64 5, i64 6, i64 0]
 @constparams = addrspace(1) externally_initialized global [2 x i64] [i64 ptrtoint (ptr addrspace(1) @x to i64), i64 ptrtoint (ptr addrspace(1) @y to i64)]
+@llvm.used = appending global [3 x ptr] [ptr addrspacecast (ptr addrspace(1) @x to ptr), ptr addrspacecast (ptr addrspace(1) @y to ptr), ptr addrspacecast (ptr addrspace(1) @constparams to ptr)], section "llvm.metadata"
 
 define amdgpu_kernel void @const_ident(ptr addrspace(4) byref(i64) %"55", ptr addrspace(4) byref(i64) %"56") #0 {
   %"57" = alloca i64, align 8, addrspace(5)
