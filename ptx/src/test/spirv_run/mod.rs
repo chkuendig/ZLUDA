@@ -1484,6 +1484,165 @@ pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_mod
 // Surface operations are verified via:
 // - IR tests (sust_stub, sust_2d_stub, suld_stub) for correct IR generation
 
+/// Test compiling and loading the actual TurbulenceFS PTX from Batman AK.
+/// This module has 31 kernels with surface store operations that crash the game.
+#[test]
+fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx_path = "/tmp/zluda_ptx_dump/module_195.ptx";
+    let ptx = match fs::read_to_string(ptx_path) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("SKIP: {} not found (run Batman AK once to extract)", ptx_path);
+            return Ok(());
+        }
+    };
+
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    eprintln!("turbulencefs: compiling {} bytes PTX (31 kernels)...", ptx.len());
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        None,
+    )
+    .unwrap();
+    eprintln!("turbulencefs: ELF {} bytes", elf.len());
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+    eprintln!("turbulencefs: module loaded");
+
+    // Create a 3D array and surface like the game does
+    let mut array: hipArray_t = std::ptr::null_mut();
+    let desc = HIP_ARRAY3D_DESCRIPTOR {
+        Width: 64,
+        Height: 64,
+        Depth: 64,
+        Format: hipArray_Format::HIP_AD_FORMAT_FLOAT,
+        NumChannels: 1,
+        Flags: 0x02, // CUDA_ARRAY3D_SURFACE_LDST
+    };
+    unsafe { hipArray3DCreate(&mut array, &desc) }.unwrap();
+
+    // Create surface object
+    let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+    let res_desc = hipResourceDesc {
+        resType: hipResourceType::hipResourceTypeArray,
+        res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
+                array: array,
+            },
+        },
+    };
+    unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
+    eprintln!("turbulencefs: surface object created: {:#x}", surf_obj as u64);
+
+    // Get the surfref and write the surface handle to it
+    let mut surf_dptr = hipDeviceptr_t(std::ptr::null_mut());
+    let mut surf_bytes = 0usize;
+    let global_result = unsafe {
+        hipModuleGetGlobal(&mut surf_dptr, &mut surf_bytes, hip_mod, c"TurbulenceFS_dynamicgrid_clearSurf".as_ptr())
+    };
+    eprintln!("turbulencefs: clearSurf global -> {:?} dptr={:p} bytes={}", global_result, surf_dptr.0, surf_bytes);
+
+    if global_result.is_ok() && !surf_dptr.0.is_null() {
+        // Write surf handle to device global
+        let mut stream = unsafe { mem::zeroed() };
+        unsafe { hipStreamCreate(&mut stream) }.unwrap();
+        let handle = surf_obj as u64;
+        unsafe {
+            hipMemcpyWithStream(surf_dptr.0, &handle as *const _ as _, 8,
+                hipMemcpyKind::hipMemcpyHostToDevice, stream)
+        }.unwrap();
+        unsafe { hipStreamSynchronize(stream) }.unwrap();
+        eprintln!("turbulencefs: wrote surf handle to device global");
+
+        // Try launching the clear kernel
+        let mut kernel = unsafe { mem::zeroed() };
+        let func_result = unsafe {
+            hipModuleGetFunction(&mut kernel, hip_mod, c"TurbulenceFS_dynamicGridClear2DKernel".as_ptr())
+        };
+        eprintln!("turbulencefs: GetFunction(Clear2D) -> {:?}", func_result);
+
+        if func_result.is_ok() {
+            eprintln!("turbulencefs: kernel found, would launch");
+        }
+
+        // Try the ClearKernel (exists in this module, uses sust via helpers)
+        let mut clear_kernel = unsafe { mem::zeroed() };
+        let clear_result = unsafe {
+            hipModuleGetFunction(&mut clear_kernel, hip_mod, c"TurbulenceFS_dynamicGridClearKernel".as_ptr())
+        };
+        eprintln!("turbulencefs: GetFunction(ClearKernel) -> {:?}", clear_result);
+
+        if clear_result.is_ok() {
+            // ClearKernel(param0: u64, param1: u16, param2-4: u32, param5: u64=surfHandle, param6: u32=elemType)
+            // Game launches: grid=[32,8,8] block=[8,8,8]
+            let param0: u64 = 0;  // unused ptr
+            let param1: u16 = 0;  // unused
+            let param2: u32 = 64; // grid dim X
+            let param3: u32 = 64; // grid dim Y
+            let param4: u32 = 64; // grid dim Z
+            let param5: u64 = surf_obj as u64; // surface handle
+            let param6: u32 = 4;  // element size (float = 4 bytes)
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &param0 as *const _ as *mut _,
+                &param1 as *const _ as *mut _,
+                &param2 as *const _ as *mut _,
+                &param3 as *const _ as *mut _,
+                &param4 as *const _ as *mut _,
+                &param5 as *const _ as *mut _,
+                &param6 as *const _ as *mut _,
+            ];
+            eprintln!("turbulencefs: launching ClearKernel grid=[8,8,8] block=[8,8,8] surf={:#x}...", param5);
+            let launch_result = unsafe {
+                hipModuleLaunchKernel(clear_kernel, 8, 8, 8, 8, 8, 8, 0, stream,
+                    args.as_mut_ptr(), ptr::null_mut())
+            };
+            eprintln!("turbulencefs: launch -> {:?}", launch_result);
+
+            if launch_result.is_ok() {
+                let sync_result = unsafe { hipStreamSynchronize(stream) };
+                eprintln!("turbulencefs: sync -> {:?}", sync_result);
+                if sync_result.is_err() {
+                    eprintln!("turbulencefs: GPU FAULT — surface write failed!");
+                    return Err("GPU fault during surface write".into());
+                }
+            }
+        }
+
+        unsafe { hipStreamDestroy(stream) }.unwrap();
+    }
+
+    unsafe { hipDestroySurfaceObject(surf_obj) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipFreeArray(array) }.unwrap();
+
+    eprintln!("turbulencefs: PASSED (no GPU fault)");
+    Ok(())
+}
+
 /// GPU test for surface store operations — attempts to reproduce TurbulenceFS crash.
 /// Creates a 3D CUDA array, binds it as a surface, and tries to run a kernel that
 /// writes to it via sust. NOTE: This test may SKIP because surface ops use AMDGPU
