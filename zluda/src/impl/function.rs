@@ -1,6 +1,25 @@
 use cuda_types::cuda::CUfunction_attribute;
 use hip_runtime_sys::*;
 use std::mem;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+static FUNC_NAMES: std::sync::LazyLock<Mutex<HashMap<usize, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn register_name(f: hipFunction_t, name: &str) {
+    if let Ok(mut map) = FUNC_NAMES.lock() {
+        map.insert(f.0 as usize, name.to_string());
+    }
+}
+
+fn lookup_name(f: hipFunction_t) -> String {
+    FUNC_NAMES
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&(f.0 as usize)).cloned())
+        .unwrap_or_default()
+}
 
 pub(crate) fn get_attribute(
     pi: &mut i32,
@@ -105,9 +124,10 @@ pub(crate) fn launch_kernel(
     };
     // Log launch failures with full context for diagnosis
     if result.is_err() {
+        let name = lookup_name(f);
         super::driver::zluda_log_err(&format!(
-            "cuLaunchKernel FAILED func={:p} grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
-            f.0, grid_dim_x, grid_dim_y, grid_dim_z,
+            "cuLaunchKernel FAILED '{}' func={:p} grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
+            name, f.0, grid_dim_x, grid_dim_y, grid_dim_z,
             block_dim_x, block_dim_y, block_dim_z,
             shared_mem_bytes, result));
     }
@@ -120,17 +140,18 @@ pub(crate) fn launch_kernel(
             std::env::var("ZLUDA_SYNC_LAUNCHES").map_or(false, |v| v == "1")
         });
         if sync {
+            let name = lookup_name(f);
             // Log before sync — HSA may kill the process during hipStreamSynchronize on fault
             super::driver::zluda_log_err(&format!(
-                "ZLUDA_SYNC_LAUNCHES: syncing func={:p} grid=[{},{},{}] block=[{},{},{}] shared={}",
-                f.0, grid_dim_x, grid_dim_y, grid_dim_z,
+                "SYNC '{}' func={:p} grid=[{},{},{}] block=[{},{},{}] shared={}",
+                name, f.0, grid_dim_x, grid_dim_y, grid_dim_z,
                 block_dim_x, block_dim_y, block_dim_z,
                 shared_mem_bytes));
             let sync_result = unsafe { hipStreamSynchronize(stream) };
             if sync_result.is_err() {
                 super::driver::zluda_log_err(&format!(
-                    "SYNC FAULT func={:p} -> {:?}",
-                    f.0, sync_result));
+                    "SYNC FAULT '{}' func={:p} -> {:?}",
+                    name, f.0, sync_result));
                 return sync_result;
             }
         }
