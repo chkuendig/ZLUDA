@@ -360,6 +360,9 @@ test_ptx!(non_scalar_ptr_offset, [1u32, 2u32, 3u32, 4u32], [7u32]);
 test_ptx!(stateful_neg_offset, [1237518u64], [1237518u64]);
 test_ptx!(const, [0u16], [10u16, 20, 30, 40]);
 test_ptx!(const_ident, [0u16], [0u64, 0u64]);
+// Exercises the gParams pattern: .const .b8 array[] without initializer (zeroinitializer).
+// Verifies .const globals compile to addrspace(1) so hipMemcpyHtoD can write them.
+test_ptx_llvm!(const_zero_init);
 test_ptx!(cvt_s16_s8, [0x139231C2u32], [0xFFFFFFC2u32]);
 test_ptx!(cvt_f64_f32, [0.125f32], [0.125f64]);
 test_ptx!(prmt, [0x70c507d6u32, 0x6fbd4b5cu32], [0x6fbdd65cu32]);

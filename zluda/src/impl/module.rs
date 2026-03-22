@@ -433,6 +433,7 @@ pub(crate) fn get_function(
     let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
     let result = unsafe { hipModuleGetFunction(hfunc, hmod.base, name) };
     if result.is_ok() {
+        super::function::register_name(*hfunc, &name_str);
         super::driver::zluda_log_err(&format!(
             "cuModuleGetFunction('{}') -> func={:p}", name_str, hfunc.0));
     }
@@ -448,7 +449,11 @@ pub(crate) fn get_global_v2(
 ) -> hipError_t {
     let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
     let result = unsafe { hipModuleGetGlobal(dptr, bytes, hmod.base, name) };
-    super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetGlobal('{}') -> {:?}", name_str, result));
+    // Log the device pointer to verify it's in GPU VRAM (0x7f... range),
+    // not host-mapped code object memory (0x5555... range) which hipMemcpyHtoD rejects.
+    let dptr_val = unsafe { (*dptr).0 };
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuModuleGetGlobal('{}') -> {:?} dptr={:p}", name_str, result, dptr_val));
     result
 }
 

@@ -69,7 +69,12 @@ fn get_state_space(space: ast::StateSpace) -> Result<u32, TranslateError> {
         ast::StateSpace::ParamFunc => Err(error_todo()),
         ast::StateSpace::Local => Ok(PRIVATE_ADDRESS_SPACE),
         ast::StateSpace::Global => Ok(GLOBAL_ADDRESS_SPACE),
-        ast::StateSpace::Const => Ok(CONSTANT_ADDRESS_SPACE),
+        // CUDA .const is in unified device memory, writable via cuMemcpyHtoD.
+        // AMDGPU addrspace(4) is a read-only scalar cache segment whose host-mapped
+        // address is rejected by hipMemcpyHtoDAsync (returns hipErrorCode_t(1)).
+        // Using addrspace(1) (global) places .const in GPU VRAM so hipModuleGetGlobal
+        // returns a valid device pointer and hipMemcpyHtoD works correctly.
+        ast::StateSpace::Const => Ok(GLOBAL_ADDRESS_SPACE),
         ast::StateSpace::Shared => Ok(SHARED_ADDRESS_SPACE),
         ast::StateSpace::SharedCta => Err(error_todo()),
         ast::StateSpace::SharedCluster => Err(error_todo()),
