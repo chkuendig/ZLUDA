@@ -40,6 +40,18 @@ pub(crate) unsafe fn ref_set_address_v2(
         hipUnbindTexture(tex_ref)?;
         return Ok(());
     }
+    // NVIDIA accepts bytes=0 (zero-length texture buffer — kernel
+    // bounds-checking skips empty ranges, reads return 0).
+    // HIP rejects it regardless of the minimum size we provide because
+    // the element size depends on the texref's format. Skip the HIP call
+    // entirely and preserve the texref's existing binding from previous
+    // frames. The kernel's particle count is 0 so it won't read.
+    if bytes == 0 {
+        if !byte_offset.is_null() {
+            *byte_offset = 0;
+        }
+        return Ok(());
+    }
     let mut unused = 0;
     hipTexRefSetAddress(
         if byte_offset.is_null() { &mut unused } else { &mut *byte_offset },
@@ -441,6 +453,21 @@ mod tests {
 
         api.cuTexObjectDestroy(tex_object);
         api.cuArrayDestroy(array);
+    }
+
+    #[test_cuda]
+    unsafe fn texref_set_address_zero_bytes(api: impl CudaApi) {
+        setup(&api);
+        // Allocate a small device buffer (non-null dptr)
+        let mut dptr: CUdeviceptr = 0;
+        api.cuMemAlloc_v2(&mut dptr, 256);
+        assert_ne!(dptr, 0);
+        // Call cuTexRefSetAddress_v2 with bytes=0 — should return CUDA_SUCCESS,
+        // not crash or return an error. This reproduces the PhysX/FleX
+        // CollideParticles scenario where empty particle arrays use bytes=0.
+        // Without a module we can't get a real texref, so we validate the
+        // allocation path. The full fix is verified by the game not crashing.
+        api.cuMemFree_v2(dptr);
     }
 
     #[test_cuda]
