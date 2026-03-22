@@ -167,6 +167,11 @@ pub(crate) fn zluda_log_err(msg: &str) {
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log(&format!("[ZLUDA] cuInit({})", flags));
     zluda_log_err(&format!("=== ZLUDA init (flags={}) LOG_ALL={} ===", flags, crate::is_log_all_enabled()));
+    // Disable SDMA before HIP init. Wine's SIGUSR1 APC delivery interrupts the
+    // KFD ioctl that waits for SDMA completion, causing hangs. On APUs (unified
+    // memory), blit kernels are the correct path anyway — SDMA is for discrete GPUs.
+    // Uses setenv with overwrite=0 so user can still override with HSA_ENABLE_SDMA=1.
+    unsafe { libc::setenv(c"HSA_ENABLE_SDMA".as_ptr(), c"0".as_ptr(), 0) };
     unsafe { hipInit(flags) }?;
     // Verify HIP runtime version matches what ZLUDA was compiled against.
     // Mismatched versions cause silent GPU failures: hipModuleGetGlobal returns
