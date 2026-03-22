@@ -1489,7 +1489,6 @@ pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_mod
 /// writes to it via sust. NOTE: This test may SKIP because surface ops use AMDGPU
 /// inline asm that needs the MC parser not included in llvm_zluda.
 #[test]
-#[ignore] // LLVM aborts on inline asm — can't catch the error gracefully
 fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
     if unsafe { hipInit(0) }.is_err() {
@@ -1550,19 +1549,43 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
             };
             eprintln!("sust_3d_gpu: hipModuleGetTexRef(testSurf) -> {:?} ref={:p}", surf_result, surf_ref);
 
+            // Create a surface object and write its handle to the device global
+            // (this is how the game does it — stores handle in a global, kernel reads it)
+            let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+            let res_desc = hipResourceDesc {
+                resType: hipResourceType::hipResourceTypeArray,
+                res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
+                    array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
+                        array: array,
+                    },
+                },
+            };
+            let surf_create_result = unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) };
+            eprintln!("sust_3d_gpu: hipCreateSurfaceObject -> {:?} obj={:#x}", surf_create_result, surf_obj as u64);
+            surf_create_result.unwrap();
+
+            // Write the surface object handle to the device global (testSurf)
             if surf_result.is_ok() && !surf_ref.is_null() {
-                // Bind array to surface reference
-                let mut arr_desc: HIP_ARRAY_DESCRIPTOR = unsafe { mem::zeroed() };
-                unsafe { hipArrayGetDescriptor(&mut arr_desc, array) }.unwrap();
-                unsafe { hipTexRefSetFormat(surf_ref, arr_desc.Format, arr_desc.NumChannels as i32) }.unwrap();
-                let bind_result = unsafe {
-                    hipTexRefSetArray(surf_ref, array, 0x02) // CU_TRSA_OVERRIDE_FORMAT
-                };
-                eprintln!("sust_3d_gpu: hipTexRefSetArray -> {:?}", bind_result);
-                bind_result.unwrap();
-            } else {
-                eprintln!("sust_3d_gpu: surfref not found as texref, trying global variable path");
-                // The surface might be a synthetic ref from a global variable
+                // testSurf is a device global - write surf_obj handle to it
+                let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
+                let mut bytes = 0usize;
+                unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"testSurf".as_ptr()) }.unwrap();
+                eprintln!("sust_3d_gpu: testSurf global at {:p} ({} bytes)", dptr.0, bytes);
+                let mut stream_tmp = unsafe { mem::zeroed() };
+                unsafe { hipStreamCreate(&mut stream_tmp) }.unwrap();
+                let handle = surf_obj as u64;
+                unsafe {
+                    hipMemcpyWithStream(
+                        dptr.0,
+                        &handle as *const _ as _,
+                        8,
+                        hipMemcpyKind::hipMemcpyHostToDevice,
+                        stream_tmp,
+                    )
+                }.unwrap();
+                unsafe { hipStreamSynchronize(stream_tmp) }.unwrap();
+                unsafe { hipStreamDestroy(stream_tmp) }.unwrap();
+                eprintln!("sust_3d_gpu: wrote surf handle {:#x} to device global", handle);
             }
 
             // Allocate output buffer
