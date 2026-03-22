@@ -17,6 +17,10 @@ pub(crate) unsafe fn object_create(
     hipCreateSurfaceObject(&mut surf_obj, &desc)?;
     let top_reserved_bits = surf_obj as usize >> (usize::BITS - IMAGE_RESERVED_TOP_BITS);
     if top_reserved_bits != 0 {
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] cuSurfObjectCreate: top bits non-zero ({:#x}), rejecting",
+            surf_obj as u64
+        ));
         let _ = hipDestroySurfaceObject(surf_obj);
         return Err(CUerror::UNKNOWN);
     }
@@ -29,9 +33,16 @@ pub(crate) unsafe fn object_create(
     let shift_amount =
         (pixel_size.trailing_zeros() as usize) << (usize::BITS - IMAGE_RESERVED_TOP_BITS);
     surf_obj = (surf_obj as usize | shift_amount) as _;
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuSurfObjectCreate: hip_obj={:#x} format={:?} channels={} pixel_size={} shift={} encoded={:#x}",
+        (surf_obj as usize & !((7usize) << (usize::BITS - IMAGE_RESERVED_TOP_BITS))),
+        array_desc.Format, array_desc.NumChannels, pixel_size,
+        pixel_size.trailing_zeros(), surf_obj as u64
+    ));
     *p_surf_object = surf_obj as CUsurfObject;
     Ok(())
 }
+
 
 pub(crate) unsafe fn object_destroy(
     surf_object: CUsurfObject,
@@ -54,6 +65,10 @@ pub(crate) unsafe fn ref_set_array(
     }
     let mut desc: HIP_ARRAY_DESCRIPTOR = mem::zeroed();
     hipArrayGetDescriptor(&mut desc, h_array as hipArray_t)?;
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuSurfRefSetArray: ref={:p} array={:p} format={:?} channels={}",
+        surf_ref, h_array, desc.Format, desc.NumChannels
+    ));
     hipTexRefSetFormat(surf_ref, desc.Format, desc.NumChannels as i32)?;
     hipTexRefSetArray(surf_ref, h_array as hipArray_t, CU_TRSA_OVERRIDE_FORMAT)?;
     crate::r#impl::tex::sync_synthetic_texref(surf_ref);
