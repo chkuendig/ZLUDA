@@ -33,11 +33,29 @@ pub(crate) unsafe fn object_create(
     let shift_amount =
         (pixel_size.trailing_zeros() as usize) << (usize::BITS - IMAGE_RESERVED_TOP_BITS);
     surf_obj = (surf_obj as usize | shift_amount) as _;
+    // Read back the 256-bit image descriptor to log its base address.
+    // The descriptor is 8 x uint32 at the address pointed to by surf_obj (minus top bits).
+    let desc_ptr = (surf_obj as usize & !((7usize) << (usize::BITS - IMAGE_RESERVED_TOP_BITS))) as *const u8;
+    let mut desc_words = [0u32; 8];
+    let copy_result = hipMemcpyDtoH(
+        desc_words.as_mut_ptr() as *mut std::ffi::c_void,
+        hipDeviceptr_t(desc_ptr as *mut std::ffi::c_void),
+        32,
+    );
+    let base_addr = if copy_result.is_ok() {
+        // Base address is in words 0-1 (48-bit address, bits [47:0] of word0 + word1)
+        let base = (desc_words[0] as u64) | ((desc_words[1] as u64) << 32);
+        format!("base={:#x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            base, desc_words[0], desc_words[1], desc_words[2], desc_words[3],
+            desc_words[4], desc_words[5], desc_words[6], desc_words[7])
+    } else {
+        format!("descriptor read FAILED: {:?}", copy_result)
+    };
     super::driver::zluda_log(&format!(
-        "[ZLUDA] cuSurfObjectCreate: hip_obj={:#x} format={:?} channels={} pixel_size={} shift={} encoded={:#x}",
+        "[ZLUDA] cuSurfObjectCreate: hip_obj={:#x} format={:?} channels={} pixel_size={} shift={} encoded={:#x} {}",
         (surf_obj as usize & !((7usize) << (usize::BITS - IMAGE_RESERVED_TOP_BITS))),
         array_desc.Format, array_desc.NumChannels, pixel_size,
-        pixel_size.trailing_zeros(), surf_obj as u64
+        pixel_size.trailing_zeros(), surf_obj as u64, base_addr
     ));
     *p_surf_object = surf_obj as CUsurfObject;
     Ok(())
