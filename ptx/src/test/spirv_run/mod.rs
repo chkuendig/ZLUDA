@@ -1643,6 +1643,135 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
+/// Regression test: 64x64x64 surface write with byte-scaled x coordinate.
+/// Catches missing pixel size encoding in surface handle top bits.
+/// Without encoding: x stays byte-scaled (max 252) → overflows 64-element row → GPU hang.
+/// With encoding: x is shifted right by 2 → element-scaled (max 63) → within bounds.
+#[test]
+fn sust_3d_large_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx = read_test_file!("sust_3d_large.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        None,
+    )
+    .unwrap();
+    eprintln!("sust_3d_large: compiled {} bytes ELF", elf.len());
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    // Create 64x64x64 float array with surface load/store
+    let mut array: hipArray_t = std::ptr::null_mut();
+    let desc = HIP_ARRAY3D_DESCRIPTOR {
+        Width: 64,
+        Height: 64,
+        Depth: 64,
+        Format: hipArray_Format::HIP_AD_FORMAT_FLOAT,
+        NumChannels: 1,
+        Flags: 0x02, // CUDA_ARRAY3D_SURFACE_LDST
+    };
+    unsafe { hipArray3DCreate(&mut array, &desc) }.unwrap();
+
+    // Create surface object WITH pixel size encoding (like ZLUDA's surf.rs:object_create)
+    let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+    let res_desc = hipResourceDesc {
+        resType: hipResourceType::hipResourceTypeArray,
+        res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
+                array: array,
+            },
+        },
+    };
+    unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
+
+    // Encode pixel size in top 3 bits (same as surf.rs:object_create)
+    let pixel_size: usize = 4; // float = 4 bytes
+    let shift_amount = (pixel_size.trailing_zeros() as usize) << (usize::BITS - 3);
+    let encoded_handle = (surf_obj as usize | shift_amount) as u64;
+    eprintln!(
+        "sust_3d_large: raw_handle={:#x} encoded={:#x} shift={}",
+        surf_obj as u64, encoded_handle, pixel_size.trailing_zeros()
+    );
+
+    // Allocate output buffer
+    let mut out_buf = ptr::null_mut();
+    unsafe { hipMalloc(&mut out_buf, 4) }.unwrap();
+    unsafe { hipMemset(out_buf, 0, 4) }.unwrap();
+
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_3d_large".as_ptr()) }.unwrap();
+
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+
+    // Launch: grid=[8,8,8] block=[8,8,8] → 64x64x64 threads
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        &out_buf as *const _ as *mut _,
+        &encoded_handle as *const _ as *mut _,
+    ];
+    eprintln!("sust_3d_large: launching grid=[8,8,8] block=[8,8,8]...");
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel, 8, 8, 8, 8, 8, 8, 0, stream,
+            args.as_mut_ptr(), ptr::null_mut(),
+        )
+    }
+    .unwrap();
+
+    let sync_result = unsafe { hipStreamSynchronize(stream) };
+    eprintln!("sust_3d_large: sync -> {:?}", sync_result);
+    sync_result.unwrap();
+
+    // Read result
+    let mut result = 0u32;
+    unsafe {
+        hipMemcpyAsync(
+            &mut result as *mut _ as _,
+            out_buf,
+            4,
+            hipMemcpyKind::hipMemcpyDeviceToHost,
+            stream,
+        )
+    }
+    .unwrap();
+    unsafe { hipStreamSynchronize(stream) }.unwrap();
+    eprintln!("sust_3d_large: result = {} (expected 1)", result);
+
+    // Cleanup
+    unsafe { hipFree(out_buf) }.unwrap();
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    unsafe { hipDestroySurfaceObject(surf_obj) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipFreeArray(array) }.unwrap();
+
+    assert_eq!(result, 1, "kernel should write 1 to output");
+    Ok(())
+}
+
 /// GPU test for surface store operations — attempts to reproduce TurbulenceFS crash.
 /// Creates a 3D CUDA array, binds it as a surface, and tries to run a kernel that
 /// writes to it via sust. NOTE: This test may SKIP because surface ops use AMDGPU
