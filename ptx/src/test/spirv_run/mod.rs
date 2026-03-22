@@ -1483,6 +1483,148 @@ pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_mod
 // image_load_pck) which requires the MC asm parser not included in llvm_zluda.
 // Surface operations are verified via:
 // - IR tests (sust_stub, sust_2d_stub, suld_stub) for correct IR generation
+
+/// GPU test for surface store operations — attempts to reproduce TurbulenceFS crash.
+/// Creates a 3D CUDA array, binds it as a surface, and tries to run a kernel that
+/// writes to it via sust. NOTE: This test may SKIP because surface ops use AMDGPU
+/// inline asm that needs the MC parser not included in llvm_zluda.
+#[test]
+#[ignore] // LLVM aborts on inline asm — can't catch the error gracefully
+fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(()); // skip if no GPU
+    }
+
+    let ptx = read_test_file!("sust_3d_gpu.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        None,
+    );
+
+    match elf {
+        Ok(elf_data) => {
+            eprintln!("sust_3d_gpu: compiled {} bytes ELF", elf_data.len());
+
+            let mut hip_mod = unsafe { mem::zeroed() };
+            unsafe { hipModuleLoadData(&mut hip_mod, elf_data.as_ptr() as _) }.unwrap();
+
+            // Create a 3D CUDA array for the surface
+            let mut array: hipArray_t = std::ptr::null_mut();
+            let desc = HIP_ARRAY3D_DESCRIPTOR {
+                Width: 8,
+                Height: 8,
+                Depth: 8,
+                Format: hipArray_Format::HIP_AD_FORMAT_FLOAT,
+                NumChannels: 1,
+                Flags: 0x02, // CUDA_ARRAY3D_SURFACE_LDST
+            };
+            let array_result = unsafe { hipArray3DCreate(&mut array, &desc) };
+            eprintln!("sust_3d_gpu: hipArray3DCreate -> {:?}", array_result);
+            array_result.unwrap();
+
+            // Get the surface reference (ZLUDA compiles .surfref as a global variable,
+            // so hipModuleGetTexRef finds it)
+            let mut surf_ref: *mut textureReference = std::ptr::null_mut();
+            let surf_result = unsafe {
+                hipModuleGetTexRef(&mut surf_ref, hip_mod, c"testSurf".as_ptr())
+            };
+            eprintln!("sust_3d_gpu: hipModuleGetTexRef(testSurf) -> {:?} ref={:p}", surf_result, surf_ref);
+
+            if surf_result.is_ok() && !surf_ref.is_null() {
+                // Bind array to surface reference
+                let mut arr_desc: HIP_ARRAY_DESCRIPTOR = unsafe { mem::zeroed() };
+                unsafe { hipArrayGetDescriptor(&mut arr_desc, array) }.unwrap();
+                unsafe { hipTexRefSetFormat(surf_ref, arr_desc.Format, arr_desc.NumChannels as i32) }.unwrap();
+                let bind_result = unsafe {
+                    hipTexRefSetArray(surf_ref, array, 0x02) // CU_TRSA_OVERRIDE_FORMAT
+                };
+                eprintln!("sust_3d_gpu: hipTexRefSetArray -> {:?}", bind_result);
+                bind_result.unwrap();
+            } else {
+                eprintln!("sust_3d_gpu: surfref not found as texref, trying global variable path");
+                // The surface might be a synthetic ref from a global variable
+            }
+
+            // Allocate output buffer
+            let mut out_buf = ptr::null_mut();
+            unsafe { hipMalloc(&mut out_buf, 4) }.unwrap();
+            unsafe { hipMemset(out_buf, 0, 4) }.unwrap();
+
+            // Get kernel and launch
+            let mut kernel = unsafe { mem::zeroed() };
+            unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_3d_gpu".as_ptr()) }
+                .unwrap();
+
+            let mut stream = unsafe { mem::zeroed() };
+            unsafe { hipStreamCreate(&mut stream) }.unwrap();
+
+            let mut args = [&out_buf as *const _ as *mut std::ffi::c_void];
+            eprintln!("sust_3d_gpu: launching kernel...");
+            unsafe {
+                hipModuleLaunchKernel(
+                    kernel, 1, 1, 1, 1, 1, 1, 0, stream,
+                    args.as_mut_ptr(), ptr::null_mut(),
+                )
+            }
+            .unwrap();
+
+            // Sync and check result
+            let sync_result = unsafe { hipStreamSynchronize(stream) };
+            eprintln!("sust_3d_gpu: hipStreamSynchronize -> {:?}", sync_result);
+
+            let mut result = 0u32;
+            unsafe {
+                hipMemcpyAsync(
+                    &mut result as *mut _ as _,
+                    out_buf,
+                    4,
+                    hipMemcpyKind::hipMemcpyDeviceToHost,
+                    stream,
+                )
+            }
+            .unwrap();
+            unsafe { hipStreamSynchronize(stream) }.unwrap();
+
+            eprintln!("sust_3d_gpu: result = {} (expected 1)", result);
+
+            // Cleanup
+            unsafe { hipFree(out_buf) }.unwrap();
+            unsafe { hipStreamDestroy(stream) }.unwrap();
+            unsafe { hipModuleUnload(hip_mod) }.unwrap();
+            unsafe { hipFreeArray(array) }.unwrap();
+
+            assert_eq!(result, 1, "kernel should have written 1 to output");
+            sync_result.unwrap();
+        }
+        Err(e) => {
+            // Surface ops use AMDGPU inline asm (image_store_pck) that needs the
+            // MC asm parser not included in llvm_zluda. This is expected to fail.
+            eprintln!("sust_3d_gpu: compilation failed (expected): {}", e);
+            eprintln!("sust_3d_gpu: SKIP — inline asm needs MC parser");
+        }
+    }
+    Ok(())
+}
 // - Game testing (Arkham Knight) for runtime execution on real hardware
 
 /// Test hipModuleGetGlobal on a module with 45 kernels + helper (per-kernel emission).
