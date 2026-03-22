@@ -172,6 +172,10 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     // memory), blit kernels are the correct path anyway — SDMA is for discrete GPUs.
     // Uses setenv with overwrite=0 so user can still override with HSA_ENABLE_SDMA=1.
     unsafe { libc::setenv(c"HSA_ENABLE_SDMA".as_ptr(), c"0".as_ptr(), 0) };
+    // Enable HSA VM fault messages for GPU page fault diagnostics.
+    // Prints "Memory access fault by GPU node on address %p. Reason: %s" to stderr.
+    unsafe { libc::setenv(c"HSA_ENABLE_VM_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
+    unsafe { libc::setenv(c"HSA_ENABLE_QUEUE_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
     unsafe { hipInit(flags) }?;
     // Verify HIP runtime version matches what ZLUDA was compiled against.
     // Mismatched versions cause silent GPU failures: hipModuleGetGlobal returns
