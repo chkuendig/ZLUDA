@@ -2473,3 +2473,58 @@ fn const_global_perkernel_threshold_amdgpu() -> Result<(), Box<dyn error::Error>
     }
     Ok(())
 }
+
+
+
+
+
+/// Helper: verify that all expected entry points are resolvable in a HIP module.
+unsafe fn verify_entry_points(
+    hip_mod: hipModule_t,
+    entry_points: &[&str],
+) -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    let mut resolved = 0;
+    let mut failed = 0;
+
+    for name in entry_points {
+        let c_name = CString::new(*name)?;
+        let mut func = unsafe { mem::zeroed() };
+        match unsafe { hipModuleGetFunction(&mut func, hip_mod, c_name.as_ptr()) } {
+            Ok(()) => {
+                resolved += 1;
+                eprintln!("  {} -> OK", name);
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("  {} -> FAIL: {:?}", name, e);
+            }
+        }
+    }
+
+    eprintln!(
+        "physx: {}/{} entry points resolved ({} failed)",
+        resolved,
+        entry_points.len(),
+        failed
+    );
+    if failed > 0 {
+        Err(format!("{} entry points failed to resolve", failed).into())
+    } else {
+        Ok(())
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
