@@ -2480,7 +2480,7 @@ fn const_global_perkernel_threshold_amdgpu() -> Result<(), Box<dyn error::Error>
 
 /// Helper: verify that all expected entry points are resolvable in a HIP module.
 unsafe fn verify_entry_points(
-    hip_mod: hipModule_t,
+    hip_mod: hip_runtime_sys::hipModule_t,
     entry_points: &[&str],
 ) -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
