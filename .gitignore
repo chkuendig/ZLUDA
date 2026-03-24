@@ -16,3 +16,5 @@ perf.data.old
 test_compile.rs
 test_ptx_invalid.rs
 test_ptx_parse.sh
+*.core
+gpucore.*
