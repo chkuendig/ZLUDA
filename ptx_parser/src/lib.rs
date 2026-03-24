@@ -497,6 +497,20 @@ pub fn parse_module_unchecked<'input>(text: &'input str) -> ast::Module<'input> 
             .parse(parser)
             .map_err(|err| PtxError::Parser(err.into_inner()))
     };
+    if !errors.is_empty() {
+        eprintln!("[ZLUDA PTX PARSER] WARNING: {} parse errors in module:", errors.len());
+        for err in &errors {
+            match err {
+                PtxError::UnrecognizedStatement(text) => {
+                    let preview: String = text.chars().take(80).collect();
+                    eprintln!("[ZLUDA PTX PARSER]   Unrecognized: {}", preview);
+                }
+                other => {
+                    eprintln!("[ZLUDA PTX PARSER]   {:?}", other);
+                }
+            }
+        }
+    }
     parse_result.unwrap_or(ast::Module::empty())
 }
 
@@ -3977,6 +3991,21 @@ derive_parser!(
     .atype: ScalarType = { .f16,  .f16x2 };
     .btype: ScalarType = { .bf16, .bf16x2 };
     ScalarType = { .f32 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-bfind
+    bfind.shiftamt.type  d, a => {
+        ast::Instruction::Bfind {
+            data: ast::BfindDetails { shift: true, type_ },
+            arguments: BfindArgs { dst: d, src: a, },
+        }
+    }
+    bfind.type  d, a => {
+        ast::Instruction::Bfind {
+            data: ast::BfindDetails { shift: false, type_ },
+            arguments: BfindArgs { dst: d, src: a, },
+        }
+    }
+    .type: ScalarType = { .u32, .u64 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-clz
     clz.type  d, a => {

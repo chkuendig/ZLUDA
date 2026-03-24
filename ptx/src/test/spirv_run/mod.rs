@@ -288,6 +288,12 @@ test_ptx!(
     [0b11000111_01011100_10101110_11111011u32],
     [0b11011111_01110101_00111010_11100011u32]
 );
+// bfind.u32: finds position of highest set bit (0-indexed from LSB)
+// 0x64eb0414 = 0110_0100... → highest set bit is bit 30
+test_ptx!(bfind, [0x64eb0414u32], [30u32]);
+// bfind.shiftamt.u32: count of leading zeros
+// 0x64eb0414 has 1 leading zero
+test_ptx!(bfind_shiftamt, [0x64eb0414u32], [1u32]);
 test_ptx!(
     xor,
     [
@@ -1531,6 +1537,7 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
         module.llvm_ir,
         ptx_impl,
         module.attributes_ir,
+        module.metadata,
         None,
     )
     .unwrap();
@@ -1682,6 +1689,7 @@ fn sust_3d_b64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
         module.llvm_ir,
         ptx_impl,
         module.attributes_ir,
+        module.metadata,
         None,
     )
     .unwrap();
@@ -1806,6 +1814,7 @@ fn sust_3d_large_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
         module.llvm_ir,
         ptx_impl,
         module.attributes_ir,
+        module.metadata,
         None,
     )
     .unwrap();
@@ -1935,6 +1944,7 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
         module.llvm_ir,
         ptx_impl,
         module.attributes_ir,
+        module.metadata,
         None,
     );
 
@@ -2099,6 +2109,7 @@ fn const_global_perkernel_amdgpu() -> Result<(), Box<dyn error::Error>> {
         module.llvm_ir,
         ptx_impl,
         module.attributes_ir,
+        module.metadata,
         None,
     )
     .unwrap();
@@ -2187,6 +2198,7 @@ fn const_global_flexfluids_amdgpu() -> Result<(), Box<dyn error::Error>> {
         module.llvm_ir,
         ptx_impl,
         module.attributes_ir,
+        module.metadata,
         None,
     )
     .unwrap();
@@ -2279,6 +2291,7 @@ fn const_global_multimodule_amdgpu() -> Result<(), Box<dyn error::Error>> {
             module.llvm_ir,
             ptx_impl,
             module.attributes_ir,
+            module.metadata,
             None,
         )
         .unwrap();
@@ -2443,6 +2456,7 @@ fn const_global_perkernel_threshold_amdgpu() -> Result<(), Box<dyn error::Error>
             module.llvm_ir,
             ptx_impl,
             module.attributes_ir,
+            module.metadata,
             None,
         )
         .unwrap();

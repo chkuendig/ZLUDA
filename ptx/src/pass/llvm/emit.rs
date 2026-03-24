@@ -706,6 +706,7 @@ impl<'a> MethodEmitContext<'a> {
             ast::Instruction::Ex2 { data, arguments } => self.emit_ex2(data, arguments),
             ast::Instruction::Clz { data, arguments } => self.emit_clz(data, arguments),
             ast::Instruction::Brev { data, arguments } => self.emit_brev(data, arguments),
+            ast::Instruction::Bfind { data, arguments } => self.emit_bfind(data, arguments),
             ast::Instruction::Popc { data, arguments } => self.emit_popc(data, arguments),
             ast::Instruction::Xor { data, arguments } => self.emit_xor(data, arguments),
             ast::Instruction::Rem { data, arguments } => self.emit_rem(data, arguments),
@@ -1476,6 +1477,60 @@ impl<'a> MethodEmitContext<'a> {
             vec![&data.into()],
             vec![(src, type_), (false_, pred)],
         )?;
+        Ok(())
+    }
+
+    fn emit_bfind(
+        &mut self,
+        data: ptx_parser::BfindDetails,
+        arguments: ptx_parser::BfindArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let bitwidth = data.type_.size_of() as u64 * 8;
+        let llvm_fn = match data.type_.size_of() {
+            4 => c"llvm.ctlz.i32",
+            8 => c"llvm.ctlz.i64",
+            _ => return Err(error_unreachable()),
+        };
+        let src_type = get_scalar_type(self.context, data.type_.into());
+        let pred = get_scalar_type(self.context, ast::ScalarType::Pred);
+        let i32_type = get_scalar_type(self.context, ast::ScalarType::U32);
+        let src = self.resolver.value(arguments.src)?;
+        let false_ = unsafe { LLVMConstInt(pred, 0, 0) };
+        // ctlz(src, false) — returns bitwidth when src == 0
+        let ctlz = self.emit_intrinsic(
+            llvm_fn,
+            None,
+            vec![&data.type_.into()],
+            vec![(src, src_type), (false_, pred)],
+        )?;
+        // Truncate ctlz to i32 if input was i64
+        let ctlz_i32 = if bitwidth == 64 {
+            unsafe { LLVMBuildTrunc(self.builder, ctlz, i32_type, LLVM_UNNAMED.as_ptr()) }
+        } else {
+            ctlz
+        };
+        // Check if src == 0
+        let zero = unsafe { LLVMConstInt(src_type, 0, 0) };
+        let is_zero = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, src, zero, LLVM_UNNAMED.as_ptr())
+        };
+        let minus_one = unsafe { LLVMConstInt(i32_type, 0xFFFFFFFF, 0) };
+        let result = if data.shift {
+            // bfind.shiftamt: return ctlz directly, or 0xFFFFFFFF if zero
+            unsafe {
+                LLVMBuildSelect(self.builder, is_zero, minus_one, ctlz_i32, LLVM_UNNAMED.as_ptr())
+            }
+        } else {
+            // bfind: return (bitwidth - 1) - ctlz, or 0xFFFFFFFF if zero
+            let bw_minus_1 = unsafe { LLVMConstInt(i32_type, bitwidth - 1, 0) };
+            let position = unsafe {
+                LLVMBuildSub(self.builder, bw_minus_1, ctlz_i32, LLVM_UNNAMED.as_ptr())
+            };
+            unsafe {
+                LLVMBuildSelect(self.builder, is_zero, minus_one, position, LLVM_UNNAMED.as_ptr())
+            }
+        };
+        self.resolver.register(arguments.dst, result);
         Ok(())
     }
 

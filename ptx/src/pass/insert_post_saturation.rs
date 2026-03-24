@@ -85,6 +85,7 @@ fn run_instruction<'input>(
         | ast::Instruction::Bmsk { .. }
         | ast::Instruction::Bra { .. }
         | ast::Instruction::Brev { .. }
+        | ast::Instruction::Bfind { .. }
         | ast::Instruction::Call { .. }
         | ast::Instruction::Clz { .. }
         | ast::Instruction::Cos { .. }

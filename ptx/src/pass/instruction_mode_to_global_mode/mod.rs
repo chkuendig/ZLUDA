@@ -2134,6 +2134,7 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Bra { .. }
         | ast::Instruction::Clz { .. }
         | ast::Instruction::Brev { .. }
+        | ast::Instruction::Bfind { .. }
         | ast::Instruction::Dp4a { .. }
         | ast::Instruction::Popc { .. }
         | ast::Instruction::Xor { .. }

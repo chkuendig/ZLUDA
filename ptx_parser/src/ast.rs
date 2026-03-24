@@ -213,6 +213,17 @@ ptx_parser_macros::generate_instruction_type!(
                 src: T
             }
         },
+        Bfind {
+            type: Type::Scalar(data.type_.clone()),
+            data: BfindDetails,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: Type::Scalar(ScalarType::U32)
+                },
+                src: T
+            }
+        },
         Call {
             data: CallDetails,
             arguments: CallArgs<T>,
@@ -1680,6 +1691,11 @@ impl CpAsyncCpSize {
             CpAsyncCpSize::Bytes16 => 16,
         }
     }
+}
+
+pub struct BfindDetails {
+    pub shift: bool,
+    pub type_: ScalarType,
 }
 
 pub struct CpAsyncDetails {

@@ -168,6 +168,7 @@ pub(crate) fn launch_kernel(
             name, f.base.0, grid_dim_x, grid_dim_y, grid_dim_z,
             block_dim_x, block_dim_y, block_dim_z,
             shared_mem_bytes, result));
+    }
     // ZLUDA_SYNC_LAUNCHES: synchronize after every kernel launch to pinpoint GPU faults.
     // When enabled, any GPU fault will be reported immediately after the faulting kernel
     // instead of being detected asynchronously later.
