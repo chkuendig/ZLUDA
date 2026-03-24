@@ -1,4 +1,4 @@
-use cuda_types::cuda::CUfunction_attribute;
+use cuda_types::cuda::{CUfunction, CUfunction_attribute, CUkernel};
 use hip_runtime_sys::*;
 use std::mem;
 use std::collections::HashMap;
@@ -21,16 +21,54 @@ fn lookup_name(f: hipFunction_t) -> String {
         .unwrap_or_default()
 }
 
+pub(crate) struct Function {
+    pub(crate) base: hipFunction_t,
+    pub(crate) sm_version: u32,
+}
+
+impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, CUfunction, E>
+    for &'a Function
+{
+    fn from_cuda(cu_func: &'a CUfunction) -> Result<Self, E> {
+        Ok(unsafe { mem::transmute(*cu_func) })
+    }
+}
+
+impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, CUkernel, E> for &'a Function {
+    fn from_cuda(cu_func: &'a CUkernel) -> Result<Self, E> {
+        Ok(unsafe { mem::transmute(*cu_func) })
+    }
+}
+
+impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, *mut CUfunction, E>
+    for &'a mut &'a Function
+{
+    fn from_cuda(cu_func: &'a *mut CUfunction) -> Result<Self, E> {
+        let cu_func = unsafe { cu_func.as_mut() }.ok_or_else(|| E::INVALID_VALUE)?;
+        Ok(unsafe { mem::transmute(cu_func) })
+    }
+}
+
+impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, *mut CUkernel, E>
+    for &'a mut &'a Function
+{
+    fn from_cuda(cu_func: &'a *mut CUkernel) -> Result<Self, E> {
+        let cu_func = unsafe { cu_func.as_mut() }.ok_or_else(|| E::INVALID_VALUE)?;
+        Ok(unsafe { mem::transmute(cu_func) })
+    }
+}
+
 pub(crate) fn get_attribute(
     pi: &mut i32,
     cu_attrib: CUfunction_attribute,
-    func: hipFunction_t,
+    func: &Function,
 ) -> hipError_t {
-    // TODO: implement HIP_FUNC_ATTRIBUTE_PTX_VERSION
-    // TODO: implement HIP_FUNC_ATTRIBUTE_BINARY_VERSION
     match cu_attrib {
-        CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION
-        | CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION => {
+        CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION => {
+            *pi = func.sm_version as i32;
+            return Ok(());
+        }
+        CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION => {
             *pi = 120;
             return Ok(());
         }
@@ -45,7 +83,7 @@ pub(crate) fn get_attribute(
         }
         _ => {}
     }
-    let result = unsafe { hipFuncGetAttribute(pi, mem::transmute(cu_attrib), func) };
+    let result = unsafe { hipFuncGetAttribute(pi, mem::transmute(cu_attrib), func.base) };
     if let Ok(()) = result {
         if cu_attrib == CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS {
             *pi = (*pi).max(1);
@@ -55,7 +93,7 @@ pub(crate) fn get_attribute(
 }
 
 pub(crate) fn launch_kernel(
-    f: hipFunction_t,
+    f: &Function,
     grid_dim_x: ::core::ffi::c_uint,
     grid_dim_y: ::core::ffi::c_uint,
     grid_dim_z: ::core::ffi::c_uint,
@@ -87,7 +125,7 @@ pub(crate) fn launch_kernel(
             ];
             unsafe {
                 hipModuleLaunchKernel(
-                    f, grid_dim_x, grid_dim_y, grid_dim_z,
+                    f.base, grid_dim_x, grid_dim_y, grid_dim_z,
                     block_dim_x, block_dim_y, block_dim_z,
                     shared_mem_bytes, stream,
                     std::ptr::null_mut(),
@@ -97,7 +135,7 @@ pub(crate) fn launch_kernel(
         } else {
             unsafe {
                 hipModuleLaunchKernel(
-                    f, grid_dim_x, grid_dim_y, grid_dim_z,
+                    f.base, grid_dim_x, grid_dim_y, grid_dim_z,
                     block_dim_x, block_dim_y, block_dim_z,
                     shared_mem_bytes, stream, kernel_params, extra,
                 )
@@ -106,7 +144,7 @@ pub(crate) fn launch_kernel(
     } else {
         unsafe {
             hipModuleLaunchKernel(
-                f, grid_dim_x, grid_dim_y, grid_dim_z,
+                f.base, grid_dim_x, grid_dim_y, grid_dim_z,
                 block_dim_x, block_dim_y, block_dim_z,
                 shared_mem_bytes, stream, kernel_params, extra,
             )
@@ -124,13 +162,12 @@ pub(crate) fn launch_kernel(
     };
     // Log launch failures with full context for diagnosis
     if result.is_err() {
-        let name = lookup_name(f);
+        let name = lookup_name(f.base);
         super::driver::zluda_log_err(&format!(
             "cuLaunchKernel FAILED '{}' func={:p} grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",
-            name, f.0, grid_dim_x, grid_dim_y, grid_dim_z,
+            name, f.base.0, grid_dim_x, grid_dim_y, grid_dim_z,
             block_dim_x, block_dim_y, block_dim_z,
             shared_mem_bytes, result));
-    }
     // ZLUDA_SYNC_LAUNCHES: synchronize after every kernel launch to pinpoint GPU faults.
     // When enabled, any GPU fault will be reported immediately after the faulting kernel
     // instead of being detected asynchronously later.
@@ -140,18 +177,18 @@ pub(crate) fn launch_kernel(
             std::env::var("ZLUDA_SYNC_LAUNCHES").map_or(false, |v| v == "1")
         });
         if sync {
-            let name = lookup_name(f);
+            let name = lookup_name(f.base);
             // Log before sync — HSA may kill the process during hipStreamSynchronize on fault
             super::driver::zluda_log_err(&format!(
                 "SYNC '{}' func={:p} grid=[{},{},{}] block=[{},{},{}] shared={}",
-                name, f.0, grid_dim_x, grid_dim_y, grid_dim_z,
+                name, f.base.0, grid_dim_x, grid_dim_y, grid_dim_z,
                 block_dim_x, block_dim_y, block_dim_z,
                 shared_mem_bytes));
             let sync_result = unsafe { hipStreamSynchronize(stream) };
             if sync_result.is_err() {
                 super::driver::zluda_log_err(&format!(
                     "SYNC FAULT '{}' func={:p} -> {:?}",
-                    name, f.0, sync_result));
+                    name, f.base.0, sync_result));
                 return sync_result;
             }
         }
@@ -164,7 +201,7 @@ pub(crate) fn launch_kernel(
 // Behavior is identical to launch_kernel — the stream difference is already
 // handled by HIP's stream semantics.
 pub(crate) fn launch_kernel_ptsz(
-    f: hipFunction_t,
+    f: &Function,
     grid_dim_x: ::core::ffi::c_uint,
     grid_dim_y: ::core::ffi::c_uint,
     grid_dim_z: ::core::ffi::c_uint,
@@ -184,7 +221,7 @@ pub(crate) fn launch_kernel_ptsz(
 }
 
 pub(crate) unsafe fn set_attribute(
-    func: hipFunction_t,
+    func: &Function,
     attribute: CUfunction_attribute,
     value: i32,
 ) -> hipError_t {
@@ -195,5 +232,5 @@ pub(crate) unsafe fn set_attribute(
         }
         _ => {}
     }
-    hipFuncSetAttribute(func.0.cast(), hipFuncAttribute(attribute.0), value)
+    hipFuncSetAttribute(func.base.0.cast(), hipFuncAttribute(attribute.0), value)
 }

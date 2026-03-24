@@ -9,7 +9,7 @@ use std::{
     sync::{Mutex, OnceLock},
     usize,
 };
-use zluda_common::{FromCuda, LiveCheck};
+use zluda_common::{constants, FromCuda, LiveCheck};
 
 #[cfg_attr(windows, path = "os_win.rs")]
 #[cfg_attr(not(windows), path = "os_unix.rs")]
@@ -19,7 +19,7 @@ pub(crate) struct GlobalState {
     pub devices: Vec<Device>,
     pub cache_path: Option<String>,
     pub allocations: Mutex<Allocations>,
-    pub should_zero_allocations: bool,
+    pub compute_capability: (i32, i32),
 }
 
 pub(crate) struct Allocations {
@@ -93,7 +93,6 @@ pub(crate) fn global_state() -> Result<&'static GlobalState, CUerror> {
             unsafe { hipGetDeviceCount(&mut device_count) }?;
             let allocations = Mutex::new(Allocations::new());
             Ok(GlobalState {
-                should_zero_allocations: should_zero_allocations().unwrap_or(false),
                 allocations,
                 devices: (0..device_count)
                     .map(|i| {
@@ -105,11 +104,12 @@ pub(crate) fn global_state() -> Result<&'static GlobalState, CUerror> {
                             ))
                             .map_err(|_| CUerror::UNKNOWN)?
                             .to_owned(),
-                            primary_context: LiveCheck::new(context::Context::new(i)),
+                            primary_context: LiveCheck::new(context::Context::new(i)?),
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 cache_path: zluda_cache::ModuleCache::create_cache_dir_and_get_path(),
+                compute_capability: constants::compute_capability(),
             })
         })
         .as_ref()
@@ -163,6 +163,7 @@ pub(crate) fn zluda_log_err(msg: &str) {
         let _ = writeln!(f, "[{}ms] {}", ms, msg);
     }
 }
+
 
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log(&format!("[ZLUDA] cuInit({})", flags));
@@ -730,14 +731,14 @@ pub(crate) unsafe fn thread_exchange_stream_capture_mode(
 
 pub(crate) unsafe fn occupancy_max_active_blocks_per_multiprocessor_with_flags(
     num_blocks: &mut ::core::ffi::c_int,
-    func: hipFunction_t,
+    func: &function::Function,
     block_size: ::core::ffi::c_int,
     dynamic_smem_size: usize,
     flags: ::core::ffi::c_uint,
 ) -> hipError_t {
     hipModuleOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
         num_blocks,
-        func,
+        func.base,
         block_size,
         dynamic_smem_size,
         flags,
@@ -749,7 +750,7 @@ pub(crate) unsafe fn occupancy_max_active_blocks_per_multiprocessor_with_flags(
 pub(crate) unsafe fn occupancy_max_potential_block_size(
     grid_size: &mut ::core::ffi::c_int,
     block_size: &mut ::core::ffi::c_int,
-    f: hipFunction_t,
+    f: &function::Function,
     _block_size_to_dynamic_smem_size: CUoccupancyB2DSize,
     dyn_shared_mem_per_blk: usize,
     block_size_limit: ::core::ffi::c_int,
@@ -757,7 +758,7 @@ pub(crate) unsafe fn occupancy_max_potential_block_size(
     hipModuleOccupancyMaxPotentialBlockSize(
         grid_size,
         block_size,
-        f,
+        f.base,
         dyn_shared_mem_per_blk,
         block_size_limit,
     )?;
@@ -766,7 +767,7 @@ pub(crate) unsafe fn occupancy_max_potential_block_size(
 
 pub(crate) unsafe fn launch_kernel_ex(
     config: &cuda_types::cuda::CUlaunchConfig,
-    f: hipFunction_t,
+    f: &function::Function,
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> CUresult {

@@ -2143,6 +2143,7 @@ pub enum Directive<'input, O: Operand> {
 
 pub struct Module<'input> {
     pub ptx_version: (u8, u8),
+    pub sm_version: u32,
     pub directives: Vec<Directive<'input, ParsedOperand<&'input str>>>,
     pub invalid_directives: usize,
 }
@@ -2151,6 +2152,7 @@ impl Module<'_> {
     pub fn empty() -> Self {
         Module {
             ptx_version: (1, 0),
+            sm_version: 0,
             directives: Vec::new(),
             invalid_directives: usize::MAX,
         }

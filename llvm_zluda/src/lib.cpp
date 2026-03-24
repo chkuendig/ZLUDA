@@ -212,18 +212,19 @@ void LLVMZludaSetAtomic(
 
 std::mutex lld_mutex;
 
-int LLVMZludaLinkWithLLD(const char **input_paths, int num_inputs, const char *output_path, char **ErrorMessage)
+int LLVMZludaLinkWithLLD(uint32_t inputs, const char **input_paths, const char *output_path, char **ErrorMessage)
 {
     std::vector<const char *> args;
     args.push_back("ld.lld");
     args.push_back("-shared");
-    for (int i = 0; i < num_inputs; i++)
+    for (uint32_t i = 0; i < inputs; ++i)
+    {
         args.push_back(input_paths[i]);
+    }
     args.push_back("-o");
     args.push_back(output_path);
     args.push_back("--threads=1");
     args.push_back("--no-undefined");
-    args.push_back("--allow-multiple-definition");
 
     std::string log_out_str;
     std::string log_err_str;

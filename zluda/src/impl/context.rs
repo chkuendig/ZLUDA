@@ -11,6 +11,7 @@ thread_local! {
 
 pub(crate) struct Context {
     pub(crate) device: hipDevice_t,
+    pub(crate) alloc_stream: hipStream_t,
     pub(crate) state: Mutex<ContextState>,
 }
 
@@ -61,11 +62,14 @@ impl ContextState {
 }
 
 impl Context {
-    pub(crate) fn new(device: hipDevice_t) -> Self {
-        Self {
-            device: device,
+    pub(crate) fn new(device: hipDevice_t) -> Result<Self, CUerror> {
+        let mut alloc_stream = unsafe { std::mem::zeroed() };
+        unsafe { hipStreamCreateWithFlags(&mut alloc_stream, hipStreamNonBlocking) }?;
+        Ok(Self {
+            device,
+            alloc_stream,
             state: Mutex::new(ContextState::new()),
-        }
+        })
     }
 
     pub(crate) fn with_state(&self, fn_: impl FnOnce(&ContextState) -> CUresult) -> CUresult {
@@ -313,7 +317,7 @@ pub(crate) unsafe fn create_v2(
 ) -> CUresult {
     super::driver::zluda_log(&format!("[ZLUDA] cuCtxCreate_v2(dev={})", dev));
     super::driver::zluda_log_err(&format!("cuCtxCreate_v2(dev={})", dev));
-    let handle = Context::wrap(Context::new(dev));
+    let handle = Context::wrap(Context::new(dev)?);
     // TODO: optimize
     set_current(handle)?;
     *ctx = handle;
