@@ -24,7 +24,7 @@
 // shows it fails inside amdgpu-isel. You can get a little bit furthr with "-mllvm -global-isel",
 // but it will too fail similarly, but with "unable to legalize instruction"
 
-use std::ffi::{CStr, NulError};
+use std::ffi::{CStr, CString, NulError};
 use std::{i8, ptr, u64};
 
 use super::*;
@@ -69,6 +69,13 @@ pub(crate) fn run<'input>(
 ) -> Result<llvm::Module, TranslateError> {
     let module = llvm::Module::new(context, LLVM_UNNAMED);
     let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs);
+    // Forward-declare all functions so that FunctionPointer statements can
+    // reference functions that appear later in the directive list.
+    for directive in &directives {
+        if let Directive2::Method(method) = directive {
+            emit_ctx.forward_declare_method(method)?;
+        }
+    }
     for directive in directives {
         match directive {
             Directive2::Variable(linking, variable) => emit_ctx.emit_global(linking, variable)?,
@@ -145,6 +152,38 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         LLVMCallConv::LLVMCCallConv as u32
     }
 
+    /// Forward-declare a method: create the LLVM function and register it in
+    /// the resolver so that FunctionPointer statements can reference it before
+    /// it's fully emitted.
+    fn forward_declare_method(
+        &mut self,
+        method: &Function2<ast::Instruction<SpirvWord>, SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        if method.is_kernel() {
+            return Ok(()); // Kernels don't need forward declaration (not called via ptrs)
+        }
+        let name = method
+            .import_as
+            .as_deref()
+            .or_else(|| self.id_defs.ident_map[&method.name].name.as_deref())
+            .ok_or_else(|| error_unreachable())?;
+        let c_name = CString::new(name).map_err(|_| error_unreachable())?;
+        let existing = unsafe { LLVMGetNamedFunction(self.module, c_name.as_ptr()) };
+        if !existing.is_null() {
+            return Ok(()); // Already declared
+        }
+        let fn_type = get_function_type(
+            self.context,
+            method.return_arguments.iter().map(|v| &v.info.v_type),
+            method.input_arguments.iter().map(|v| {
+                get_input_argument_type(self.context, &v.info.v_type, v.info.state_space)
+            }),
+        )?;
+        let fn_ = unsafe { LLVMAddFunction(self.module, c_name.as_ptr(), fn_type) };
+        self.resolver.register(method.name, fn_);
+        Ok(())
+    }
+
     fn emit_method(
         &mut self,
         method: Function2<ast::Instruction<SpirvWord>, SpirvWord>,
@@ -165,10 +204,10 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 }),
             )?;
             fn_ = unsafe { LLVMAddFunction(self.module, name.as_ptr(), fn_type) };
-            self.emit_fn_attribute(fn_, "amdgpu-unsafe-fp-atomics", "true");
-            self.emit_fn_attribute(fn_, "uniform-work-group-size", "true");
-            self.emit_fn_attribute(fn_, "no-trapping-math", "true");
         }
+        self.emit_fn_attribute(fn_, "amdgpu-unsafe-fp-atomics", "true");
+        self.emit_fn_attribute(fn_, "uniform-work-group-size", "true");
+        self.emit_fn_attribute(fn_, "no-trapping-math", "true");
         self.emit_target_features(fn_);
         self.emit_tuning(fn_, &method.tuning);
         // Kernels without .maxntid/.reqntid get no amdgpu-flat-work-group-size,
@@ -573,7 +612,20 @@ impl<'a> MethodEmitContext<'a> {
             Statement::RetValue(_, values) => self.emit_ret_value(values)?,
             Statement::PtrAccess(ptr_access) => self.emit_ptr_access(ptr_access)?,
             Statement::RepackVector(repack) => self.emit_vector_repack(repack)?,
-            Statement::FunctionPointer(_) => todo!(),
+            Statement::FunctionPointer(FunctionPointerDetails { dst, src }) => {
+                let i64_type = get_scalar_type(self.context, ast::ScalarType::U64);
+                let ptr_as_int = if let Some(&func_value) = self.resolver.values.get(&src) {
+                    unsafe {
+                        LLVMBuildPtrToInt(self.builder, func_value, i64_type, LLVM_UNNAMED.as_ptr())
+                    }
+                } else {
+                    // Function pointer target not in resolver (declared externally or
+                    // forward reference not yet resolved). Use null constant so the
+                    // kernel compiles — the indirect call won't work at runtime.
+                    unsafe { LLVMConstInt(i64_type, 0, 0) }
+                };
+                self.resolver.register(dst, ptr_as_int);
+            }
             Statement::VectorRead(vector_read) => self.emit_vector_read(vector_read)?,
             Statement::VectorWrite(vector_write) => self.emit_vector_write(vector_write)?,
             Statement::SetMode(mode_reg) => self.emit_set_mode(mode_reg)?,

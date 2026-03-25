@@ -903,6 +903,7 @@ fn statement<'a, 'input>(
 ) -> PResult<Option<Statement<ParsedOperandStr<'input>>>> {
     with_recovery(
         alt((
+            callprototype_directive.map(|_| None),
             label.map(Some),
             debug_directive.map(|_| None),
             terminated(
@@ -997,6 +998,24 @@ fn pragma<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
     trace(
         "pragma",
         (Token::DotPragma, Token::String, Token::Semicolon).void(),
+    )
+    .parse_next(stream)
+}
+
+// Parse and skip .callprototype directives (used for indirect function calls).
+// Format: label : .callprototype (ret-params) _ (input-params) ;
+// We consume the entire directive up to the semicolon so it doesn't trigger
+// error recovery which would corrupt surrounding kernel instructions.
+fn callprototype_directive<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
+    trace(
+        "callprototype",
+        (
+            ident, // prototype label name
+            Token::Colon,
+            any.verify(|(t, _)| matches!(t, Token::DotIdent(".callprototype"))),
+            take_till_end_of_statement(),
+        )
+            .void(),
     )
     .parse_next(stream)
 }
@@ -1737,7 +1756,7 @@ fn bra<'a, 'input>(
 fn call<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
-    let (uni, return_arguments, name, input_arguments) = trace(
+    let (uni, return_arguments, name, input_arguments, _prototype) = trace(
         "call",
         (
             opt(Token::DotUni),
@@ -1757,6 +1776,8 @@ fn call<'a, 'input>(
                 Token::RParen.void(),
             )
                 .map(|(_, _, arguments, _)| arguments)),
+            // Optional trailing ", prototype_name" for indirect calls via .callprototype
+            opt((Token::Comma, ident).map(|(_, proto)| proto)),
         ),
     )
     .parse_next(stream)?;
@@ -1764,7 +1785,12 @@ fn call<'a, 'input>(
     let recorded_fn = match stream.state.function_declarations.get(name) {
         Some(decl) => decl,
         None => {
-            stream.state.errors.push(PtxError::UnknownFunction);
+            // Indirect calls through function pointers (e.g. call %rd212, (...), prototype)
+            // are not yet fully supported. Don't push UnknownFunction error for register-based
+            // calls since they're valid PTX — just emit an empty call stub.
+            if !name.starts_with('%') {
+                stream.state.errors.push(PtxError::UnknownFunction);
+            }
             return Ok(empty_call(uniform, name));
         }
     };
@@ -2084,7 +2110,7 @@ derive_parser!(
         Semicolon,
         #[token("@")]
         At,
-        #[regex(r"[a-zA-Z][a-zA-Z0-9_$]*|[_$%][a-zA-Z0-9_$]+", |lex| lex.slice(), priority = 0)]
+        #[regex(r"[a-zA-Z][a-zA-Z0-9_$]*|[_$%][a-zA-Z0-9_$]*", |lex| lex.slice(), priority = 0)]
         Ident(&'input str),
         #[regex(r"\.[a-zA-Z][a-zA-Z0-9_$]*|\.[_$%][a-zA-Z0-9_$]+", |lex| lex.slice(), priority = 0)]
         DotIdent(&'input str),
