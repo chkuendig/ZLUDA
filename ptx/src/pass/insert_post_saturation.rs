@@ -77,6 +77,7 @@ fn run_instruction<'input>(
         | ast::Instruction::And { .. }
         | ast::Instruction::Atom { .. }
         | ast::Instruction::AtomCas { .. }
+        | ast::Instruction::Red { .. }
         | ast::Instruction::BarWarp { .. }
         | ast::Instruction::Bar { .. }
         | ast::Instruction::BarRed { .. }

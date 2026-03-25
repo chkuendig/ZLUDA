@@ -121,6 +121,17 @@ ptx_parser_macros::generate_instruction_type!(
                 src3: T,
             }
         },
+        Red {
+            type: &data.type_,
+            data: AtomDetails,
+            arguments<T>: {
+                src1: {
+                    repr: T,
+                    space: { data.space },
+                },
+                src2: T,
+            }
+        },
         BarWarp {
             type: Type::Scalar(ScalarType::U32),
             data: (),

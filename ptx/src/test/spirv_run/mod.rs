@@ -294,6 +294,8 @@ test_ptx!(bfind, [0x64eb0414u32], [30u32]);
 // bfind.shiftamt.u32: count of leading zeros
 // 0x64eb0414 has 1 leading zero
 test_ptx!(bfind_shiftamt, [0x64eb0414u32], [1u32]);
+// red.global.add.f32: atomic float add to output (output starts at 0.0)
+test_ptx!(red_add_f32, [3.0f32], [3.0f32]);
 test_ptx!(
     xor,
     [

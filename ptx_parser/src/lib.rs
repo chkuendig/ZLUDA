@@ -3783,6 +3783,27 @@ derive_parser!(
     StateSpace =                    { .global };
     RawAtomicOp =                   { .exch };
 
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-red
+    red{.sem}{.scope}{.space}.op.type  [a], b => {
+        ast::Instruction::Red {
+            data: AtomDetails {
+                semantics: sem.map(Into::into).unwrap_or(AtomSemantics::Relaxed),
+                scope: scope.unwrap_or(MemScope::Gpu),
+                space: space.unwrap_or(StateSpace::Generic),
+                op: ast::AtomicOp::new(op, type_.kind()),
+                type_: type_.into()
+            },
+            arguments: RedArgs { src1: a, src2: b }
+        }
+    }
+    .space: StateSpace =            { .global, .shared{::cta, ::cluster} };
+    .sem: AtomSemantics =           { .relaxed, .acquire, .release, .acq_rel };
+    .scope: MemScope =              { .cta, .cluster, .gpu, .sys };
+    .op: RawAtomicOp =              { .and, .or, .xor,
+                                      .add, .inc, .dec,
+                                      .min, .max };
+    .type: ScalarType =             { .b32, .b64, .u32, .u64, .s32, .s64, .f32, .f64 };
+
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-div
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-div
     div.type  d, a, b => {
