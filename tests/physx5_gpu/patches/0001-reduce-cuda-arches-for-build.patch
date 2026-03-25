@@ -1,0 +1,48 @@
+From: ZLUDA test setup
+Subject: Reduce CUDA architectures and disable rendering for headless testing
+
+Target only sm_61 (Pascal / Quadro P400) to minimize GPU memory and
+compile-time requirements when building PhysX GPU modules.
+Remove RENDER_SNIPPET so snippets run headless (simulation only, no display).
+
+---
+diff --git a/physx/source/compiler/cmakegpu/CMakeLists.txt b/physx/source/compiler/cmakegpu/CMakeLists.txt
+--- a/physx/source/compiler/cmakegpu/CMakeLists.txt
++++ b/physx/source/compiler/cmakegpu/CMakeLists.txt
+@@ -85,10 +85,9 @@
+ # since that's the default set in: compiler\internal\CMakeLists.txt (using CMAKE_CUDA_ARCHITECTURES)
+ # see policy CMP0104
+ IF(PX_GENERATE_GPU_REDUCED_ARCHITECTURES)
+-	GENERATE_ARCH_CODE_LIST(SASS "80,86,89,90,100,120" PTX "120")
++	GENERATE_ARCH_CODE_LIST(SASS "61" PTX "61")
+ ELSE()
+-	# Volta is the minimum compute arch required because NGC supports V100
+-	GENERATE_ARCH_CODE_LIST(SASS "70,80,86,89,90,100,120" PTX "120")
++	GENERATE_ARCH_CODE_LIST(SASS "61" PTX "61")
+ ENDIF()
+
+ # Force response files off because clangd does not parse them
+diff --git a/physx/snippets/compiler/cmake/linux/SnippetTemplate.cmake b/physx/snippets/compiler/cmake/linux/SnippetTemplate.cmake
+--- a/physx/snippets/compiler/cmake/linux/SnippetTemplate.cmake
++++ b/physx/snippets/compiler/cmake/linux/SnippetTemplate.cmake
+@@ -31,7 +31,7 @@
+ SET(SNIPPET_COMPILE_DEFS
+ 	# Common to all configurations
+
+-	${PHYSX_LINUX_COMPILE_DEFS};RENDER_SNIPPET
++	${PHYSX_LINUX_COMPILE_DEFS}
+
+ 	$<$<CONFIG:debug>:${PHYSX_LINUX_DEBUG_COMPILE_DEFS};>
+ 	$<$<CONFIG:checked>:${PHYSX_LINUX_CHECKED_COMPILE_DEFS};>
+diff --git a/physx/snippets/compiler/cmake/linux/SnippetVehicleTemplate.cmake b/physx/snippets/compiler/cmake/linux/SnippetVehicleTemplate.cmake
+--- a/physx/snippets/compiler/cmake/linux/SnippetVehicleTemplate.cmake
++++ b/physx/snippets/compiler/cmake/linux/SnippetVehicleTemplate.cmake
+@@ -34,7 +34,7 @@
+ SET(SNIPPET_COMPILE_DEFS
+ 	# Common to all configurations
+
+-	${PHYSX_LINUX_COMPILE_DEFS};RENDER_SNIPPET;
++	${PHYSX_LINUX_COMPILE_DEFS};
+
+ 	$<$<CONFIG:debug>:${PHYSX_LINUX_DEBUG_COMPILE_DEFS};>
+ 	$<$<CONFIG:checked>:${PHYSX_LINUX_CHECKED_COMPILE_DEFS};>
