@@ -19,8 +19,8 @@ then cd to the directory with this file and run this simple command:
     -std=c++20 \
     -Xclang -fdenormal-fp-math=dynamic \
     -Wno-unused-parameter -Wno-sign-conversion -Wno-shorten-64-to-32 \
-    -Wno-deprecated-pragma -Wno-unused-variable \
-    -I ../../ext/rocm/include \
+    -Wno-deprecated-pragma -Wno-unused-variable -Wno-deprecated-builtins \
+    --rocm-path=../../ext/rocm \
     -x hip \
     zluda_ptx_impl.cpp \
     -nogpulib \
