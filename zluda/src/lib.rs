@@ -366,6 +366,8 @@ cuda_macros::cuda_function_declarations!(
             cuSurfObjectCreate,
             cuSurfObjectDestroy,
             cuSurfRefSetArray,
+            cuGraphicsGLRegisterBuffer,
+            cuGraphicsGLRegisterImage,
             cuGraphicsMapResources,
             cuGraphicsMapResources_ptsz,
             cuGraphicsUnmapResources,
