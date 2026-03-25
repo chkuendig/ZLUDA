@@ -1,11 +1,26 @@
 From: ZLUDA test setup
-Subject: Reduce CUDA architectures and disable rendering for headless testing
+Subject: Reduce CUDA architectures, lower MIN_SM, disable rendering
 
 Target only sm_61 (Pascal / Quadro P400) to minimize GPU memory and
 compile-time requirements when building PhysX GPU modules.
+Lower MIN_SM from 7.0 (Volta) to 6.0 (Pascal) so GPU acceleration
+is enabled on Pascal GPUs (officially supported in PhysX <= 5.4.x).
 Remove RENDER_SNIPPET so snippets run headless (simulation only, no display).
 
 ---
+diff --git a/physx/source/cudamanager/src/CudaContextManager.cpp b/physx/source/cudamanager/src/CudaContextManager.cpp
+--- a/physx/source/cudamanager/src/CudaContextManager.cpp
++++ b/physx/source/cudamanager/src/CudaContextManager.cpp
+@@ -110,7 +110,7 @@
+ // Refer to https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
+ #define MIN_CUDA_VERSION			12000	// Use Cuda toolkit 12.0 and above
+ #define NV_DRIVER_MAJOR_VERSION		527
+ #define NV_DRIVER_MINOR_VERSION		41
+-#define MIN_SM_MAJOR_VERSION		7
++#define MIN_SM_MAJOR_VERSION		6
+ #define MIN_SM_MINOR_VERSION		0
+
+ #define USE_DEFAULT_CUDA_STREAM		0
 diff --git a/physx/source/compiler/cmakegpu/CMakeLists.txt b/physx/source/compiler/cmakegpu/CMakeLists.txt
 --- a/physx/source/compiler/cmakegpu/CMakeLists.txt
 +++ b/physx/source/compiler/cmakegpu/CMakeLists.txt
