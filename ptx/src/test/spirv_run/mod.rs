@@ -29,6 +29,7 @@ macro_rules! test_ptx_llvm {
 
 macro_rules! test_ptx {
     ($fn_name:ident, $input:expr, $output:expr) => {
+        #[cfg(feature = "has_rocm")]
         paste::item! {
             #[test]
             fn [<$fn_name _amdgpu>]() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,6 +60,7 @@ macro_rules! test_ptx {
 
 macro_rules! test_ptx_warp {
     ($fn_name:ident, $output:expr) => {
+        #[cfg(feature = "has_rocm")]
         paste::item! {
             #[test]
             fn [<$fn_name _amdgpu>]() -> Result<(), Box<dyn std::error::Error>> {
@@ -328,6 +330,7 @@ test_ptx!(maxntid_cap);
 test_ptx!(reqntid_uncapped);
 test_ptx_llvm!(maxntid_cap_run);
 
+#[cfg(feature = "has_rocm")]
 #[test]
 fn maxntid_cap_run_amdgpu() -> Result<(), Box<dyn std::error::Error>> {
     let ptx = read_test_file!("maxntid_cap_run.ptx");
@@ -1153,6 +1156,7 @@ impl<T: Debug> Debug for DisplayError<T> {
 
 impl<T: Debug> error::Error for DisplayError<T> {}
 
+#[cfg(feature = "has_rocm")]
 fn test_hip_assert<
     Input: From<u8> + Debug + Copy + PartialEq,
     Output: From<u8> + Debug + Copy + PartialEq + Default,
@@ -1360,6 +1364,7 @@ cuda_macros::cuda_function_declarations!(dynamic_fns);
 static CUDA: std::sync::LazyLock<DynamicCuda> =
     std::sync::LazyLock::new(|| DynamicCuda::new().unwrap());
 
+#[cfg(feature = "has_rocm")]
 fn run_hip<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + Default>(
     name: &CStr,
     module: pass::Module,
@@ -1501,6 +1506,7 @@ pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_mod
 
 /// Test compiling and loading the actual TurbulenceFS PTX from Batman AK.
 /// This module has 31 kernels with surface store operations that crash the game.
+#[cfg(feature = "has_rocm")]
 #[test]
 fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
@@ -1662,6 +1668,7 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
 /// Regression test: sust.b.3d.b64 on 1-channel FLOAT surface.
 /// This is the actual crash bug: b64 writes use dmask:0x3 (2 channels) but
 /// the surface only has 1 channel. Must write to 2 consecutive x positions instead.
+#[cfg(feature = "has_rocm")]
 #[test]
 fn sust_3d_b64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
@@ -1787,6 +1794,7 @@ fn sust_3d_b64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
 /// Catches missing pixel size encoding in surface handle top bits.
 /// Without encoding: x stays byte-scaled (max 252) → overflows 64-element row → GPU hang.
 /// With encoding: x is shifted right by 2 → element-scaled (max 63) → within bounds.
+#[cfg(feature = "has_rocm")]
 #[test]
 fn sust_3d_large_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
@@ -1917,6 +1925,7 @@ fn sust_3d_large_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
 /// Creates a 3D CUDA array, binds it as a surface, and tries to run a kernel that
 /// writes to it via sust. NOTE: This test may SKIP because surface ops use AMDGPU
 /// inline asm that needs the MC parser not included in llvm_zluda.
+#[cfg(feature = "has_rocm")]
 #[test]
 fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
@@ -2082,6 +2091,7 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
 /// Test hipModuleGetGlobal on a module with 45 kernels + helper (per-kernel emission).
 /// Reproduces the Batman AK FlexFluids crash: hipModuleGetGlobal returns HOST/bytes=0.
+#[cfg(feature = "has_rocm")]
 #[test]
 fn const_global_perkernel_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
@@ -2162,6 +2172,7 @@ fn const_global_perkernel_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
 /// Test hipModuleGetGlobal with the actual FlexFluids PTX from Batman AK.
 /// This is the exact PTX that triggers HOST/bytes=0 in-game.
+#[cfg(feature = "has_rocm")]
 #[test]
 fn const_global_flexfluids_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
@@ -2252,6 +2263,7 @@ fn const_global_flexfluids_amdgpu() -> Result<(), Box<dyn error::Error>> {
 /// Test hipModuleGetGlobal after loading multiple modules (like the game does).
 /// The game loads modules 0-4 before FlexFluids (module 5). If memory pressure
 /// or module loading order causes the issue, this test will fail.
+#[cfg(feature = "has_rocm")]
 #[test]
 fn const_global_multimodule_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
@@ -2358,6 +2370,7 @@ fn const_global_multimodule_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
 /// Load the Wine-produced ELF directly (no compilation) to test if the ELF
 /// itself triggers the hipModuleGetGlobal failure, or if it's Wine-specific.
+#[cfg(feature = "has_rocm")]
 #[test]
 fn const_global_wine_elf_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
@@ -2416,6 +2429,7 @@ fn const_global_wine_elf_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
 /// Parameterized test: vary kernel count to find the threshold where
 /// hipModuleGetGlobal breaks for per-kernel linked modules.
+#[cfg(feature = "has_rocm")]
 #[test]
 fn const_global_perkernel_threshold_amdgpu() -> Result<(), Box<dyn error::Error>> {
     use hip_runtime_sys::*;
@@ -2497,57 +2511,4 @@ fn const_global_perkernel_threshold_amdgpu() -> Result<(), Box<dyn error::Error>
     Ok(())
 }
 
-
-
-
-
-/// Helper: verify that all expected entry points are resolvable in a HIP module.
-unsafe fn verify_entry_points(
-    hip_mod: hip_runtime_sys::hipModule_t,
-    entry_points: &[&str],
-) -> Result<(), Box<dyn error::Error>> {
-    use hip_runtime_sys::*;
-    let mut resolved = 0;
-    let mut failed = 0;
-
-    for name in entry_points {
-        let c_name = CString::new(*name)?;
-        let mut func = unsafe { mem::zeroed() };
-        match unsafe { hipModuleGetFunction(&mut func, hip_mod, c_name.as_ptr()) } {
-            Ok(()) => {
-                resolved += 1;
-                eprintln!("  {} -> OK", name);
-            }
-            Err(e) => {
-                failed += 1;
-                eprintln!("  {} -> FAIL: {:?}", name, e);
-            }
-        }
-    }
-
-    eprintln!(
-        "physx: {}/{} entry points resolved ({} failed)",
-        resolved,
-        entry_points.len(),
-        failed
-    );
-    if failed > 0 {
-        Err(format!("{} entry points failed to resolve", failed).into())
-    } else {
-        Ok(())
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+ // mod physx_amdgpu_tests

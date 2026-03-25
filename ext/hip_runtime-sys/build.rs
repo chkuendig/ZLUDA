@@ -1,9 +1,12 @@
 fn main() {
     if cfg!(windows) {
         println!("cargo:rustc-link-arg=/DELAYLOAD:amdhip64_7.dll");
-    } else {
+    } else if std::path::Path::new("/opt/rocm/lib/libamdhip64.so").exists() {
         println!("cargo:rustc-link-lib=dylib=amdhip64");
         println!("cargo:rustc-link-search=native=/opt/rocm/lib/");
+    } else {
+        // No ROCm installed — skip linking (e.g. NVIDIA-only machine for reference tests)
+        eprintln!("cargo:warning=ROCm not found, skipping HIP linking");
     }
 
     // Parse HIP version from hip_version.h and expose as DEP_HIP_RUNTIME_SYS_*
