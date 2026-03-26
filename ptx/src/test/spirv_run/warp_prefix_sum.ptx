@@ -1,0 +1,52 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Minimal warp prefix sum test.
+// Launch with 32 threads. Each thread i writes its value (i<7?1:0) to shared mem.
+// Then thread 0 sequentially sums shared[0..31] and stores the total.
+// Expected output: 7
+
+.visible .entry warp_prefix_sum(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .u64 in_addr, out_addr;
+	.reg .u32 %tid, %val, %sum, %tmp, %i;
+	.reg .pred %plt7, %peq0, %ploop;
+	.shared .u32 smem[32];
+
+	ld.param.u64 in_addr, [input];
+	ld.param.u64 out_addr, [output];
+
+	mov.u32 %tid, %tid.x;
+
+	// val = (tid < 7) ? 1 : 0
+	setp.lt.u32 %plt7, %tid, 7;
+	selp.u32 %val, 1, 0, %plt7;
+
+	// Write to shared memory
+	mul.lo.u32 %tmp, %tid, 4;
+	st.shared.u32 [smem+%tmp], %val;
+	bar.sync 0;
+
+	// Thread 0 sums all 32 values
+	setp.eq.u32 %peq0, %tid, 0;
+	@!%peq0 bra $DONE;
+
+	mov.u32 %sum, 0;
+	mov.u32 %i, 0;
+$LOOP:
+	mul.lo.u32 %tmp, %i, 4;
+	ld.shared.u32 %val, [smem+%tmp];
+	add.u32 %sum, %sum, %val;
+	add.u32 %i, %i, 1;
+	setp.lt.u32 %ploop, %i, 32;
+	@%ploop bra $LOOP;
+
+	st.u32 [out_addr], %sum;
+
+$DONE:
+	ret;
+}

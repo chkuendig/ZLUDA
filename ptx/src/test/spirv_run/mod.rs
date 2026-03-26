@@ -504,6 +504,26 @@ test_ptx!(assertfail);
 test_ptx!(lanemask_lt);
 test_ptx!(extern_func);
 test_ptx!(trap);
+test_ptx!(shl_overflow, [0u32, 16u32, 32u32, 48u32], [1u32, 65536u32, 0u32, 0u32]);
+// PhysX packed histogram: 1 << ((digit << 4) & 0xF0). Digits 0,1 produce nonzero; 2+ produce 0.
+test_ptx!(shl_packed, [0u32, 1u32, 2u32, 3u32], [1u32, 65536u32, 0u32, 0u32]);
+// PhysX packed histogram accumulation: word 0 for keys [0xFFFFFFFF, 0, 1, 2]
+// digit 15→0(clamped), digit 0→1, digit 1→0x10000, digit 2→0(clamped) = 0x10001
+test_ptx!(histogram_accum, [0xFFFFFFFFu32, 0u32, 1u32, 2u32], [0x00010001u32]);
+// Word 1 of packed histogram: 1 << ((digit*16)-32). Digits 2,3 produce nonzero.
+test_ptx!(histogram_word1, [2u32, 3u32, 4u32, 0u32], [0x00010001u32]);
+// Warp prefix sum with 32 threads
+test_ptx_llvm!(warp_prefix_sum);
+#[cfg(feature = "has_rocm")]
+#[test]
+fn warp_prefix_sum_amdgpu() -> Result<(), Box<dyn std::error::Error>> {
+    let ptx = read_test_file!("warp_prefix_sum.ptx");
+    let input = [0u32];
+    let output = [7u32];
+    test_hip_assert("warp_prefix_sum", &ptx, Some(&input), &output, 32)
+}
+// Test shr.u64 by 32: high 32 bits of 0x00000000FFFFFFFF should be 0
+test_ptx!(shr_u64_32, [0xFFFFFFFFu64], [0u32]);
 test_ptx!(noreturn);
 test_ptx!(createpolicy);
 
@@ -1662,6 +1682,171 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
     unsafe { hipFreeArray(array) }.unwrap();
 
     eprintln!("turbulencefs: PASSED (no GPU fault)");
+    Ok(())
+}
+
+/// Test PhysX radix sort histogram compilation.
+/// Compiles the actual radix sort PTX from PhysX and runs the MultiBlock
+/// kernel to verify the per-digit histogram output.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx_path = "/tmp/zluda_ptx_dump/module_14_debug.ptx";
+    let ptx = match fs::read_to_string(ptx_path) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("SKIP: {} not found (run PhysX snippet once to extract)", ptx_path);
+            return Ok(());
+        }
+    };
+
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let dump_hook = |data: &Vec<u8>, name: String| {
+        let path = format!("/tmp/radix_sort_{}", name);
+        let _ = fs::write(&path, data);
+        eprintln!("radix_sort: dumped {} ({} bytes)", path, data.len());
+    };
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        Some(&dump_hook),
+    )
+    .unwrap();
+
+    // Save ELF for debugging
+    let _ = fs::write("/tmp/radix_sort_test.elf", &elf);
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    let kernel_name = CString::new("radixSortMultiBlockLaunchWithCount").unwrap();
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, kernel_name.as_ptr()) }.unwrap();
+
+    // Set up buffers (same as C++ reproducer)
+    let count: u32 = 27;
+    let padded: usize = 28;
+    let num_blocks: u32 = 32;
+    let shift: u32 = 0;
+
+    let mut d_in_keys: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_in_ranks: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_out_keys: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_out_ranks: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_rbc: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_desc: *mut std::ffi::c_void = ptr::null_mut();
+
+    unsafe {
+        hipMalloc(&mut d_in_keys, padded * 4).unwrap();
+        hipMalloc(&mut d_in_ranks, padded * 4).unwrap();
+        hipMalloc(&mut d_out_keys, 1024 * 4).unwrap(); // extra space for debug dumps
+        hipMalloc(&mut d_out_ranks, 1024 * 4).unwrap(); // extra space for debug
+        hipMalloc(&mut d_rbc, 16 * num_blocks as usize * 4).unwrap();
+        hipMalloc(&mut d_desc, 48).unwrap();
+    }
+
+    // Input keys: [0xFFFFFFFF, 0*18, 1, 2, 3, 4, 5, 6, 7, 8, 0xFFFFFFFF(sentinel)]
+    let mut h_keys = vec![0u32; padded];
+    h_keys[0] = 0xFFFFFFFF;
+    for i in 19..=26 { h_keys[i] = (i - 18) as u32; }
+    h_keys[27] = 0xFFFFFFFF;
+
+    let mut h_ranks: Vec<u32> = (0..27).collect();
+    h_ranks.push(0xFFFFFFFF);
+
+    // Descriptor struct (48 bytes, matching PxgRadixSortDesc)
+    let mut h_desc = [0u8; 48];
+    h_desc[0..8].copy_from_slice(&(d_in_keys as u64).to_ne_bytes());
+    h_desc[8..16].copy_from_slice(&(d_in_ranks as u64).to_ne_bytes());
+    h_desc[16..24].copy_from_slice(&(d_out_keys as u64).to_ne_bytes());
+    h_desc[24..32].copy_from_slice(&(d_out_ranks as u64).to_ne_bytes());
+    h_desc[32..40].copy_from_slice(&(d_rbc as u64).to_ne_bytes());
+    h_desc[40..44].copy_from_slice(&count.to_ne_bytes());
+
+    unsafe {
+        hipMemcpyHtoD(hipDeviceptr_t(d_in_keys), h_keys.as_ptr() as _, padded * 4).unwrap();
+        hipMemcpyHtoD(hipDeviceptr_t(d_in_ranks), h_ranks.as_ptr() as _, padded * 4).unwrap();
+        hipMemsetD8(hipDeviceptr_t(d_out_keys), 0, padded * 4).unwrap();
+        hipMemsetD8(hipDeviceptr_t(d_out_ranks), 0, padded * 4).unwrap();
+        hipMemsetD8(hipDeviceptr_t(d_rbc), 0, 16 * num_blocks as usize * 4).unwrap();
+        hipMemcpyHtoD(hipDeviceptr_t(d_desc), h_desc.as_ptr() as _, 48).unwrap();
+    }
+
+    // Launch kernel
+    let mut args: [*mut std::ffi::c_void; 3] = [
+        &d_desc as *const _ as *mut _,
+        &count as *const _ as *mut _,
+        &shift as *const _ as *mut _,
+    ];
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel,
+            num_blocks, 1, 1,
+            1024, 1, 1,
+            0, hipStream_t(ptr::null_mut()),
+            args.as_mut_ptr(),
+            ptr::null_mut(),
+        ).unwrap();
+        hipDeviceSynchronize().unwrap();
+    }
+
+    // Read back histogram
+    let mut h_rbc = vec![0u32; 16 * num_blocks as usize];
+    unsafe {
+        hipMemcpyDtoH(h_rbc.as_mut_ptr() as _, hipDeviceptr_t(d_rbc), h_rbc.len() * 4).unwrap();
+    }
+
+    // Extract block 0's counts (digit-major layout)
+    let block0: Vec<u32> = (0..16).map(|d| h_rbc[d * num_blocks as usize]).collect();
+    let total: u32 = block0.iter().sum();
+    eprintln!("radix_sort histogram: total={} block0={:?}", total, block0);
+
+    // Read debug: 8 packed words from thread 0 (stored to outputKeys[0..7])
+    let mut h_debug = [0u32; 8];
+    unsafe {
+        hipMemcpyDtoH(h_debug.as_mut_ptr() as _, hipDeviceptr_t(d_out_keys), 32).unwrap();
+    }
+    let dhex: Vec<String> = h_debug.iter().map(|v| format!("0x{:08x}", v)).collect();
+    eprintln!("thread0 words (r467..r460): {:?}", dhex);
+
+    // Assertions at the end (after debug output)
+    let test_passed = total >= 27 && block0[1] > 0;
+
+    // Cleanup
+    unsafe {
+        hipFree(d_in_keys).unwrap();
+        hipFree(d_in_ranks).unwrap();
+        hipFree(d_out_keys).unwrap();
+        hipFree(d_out_ranks).unwrap();
+        hipFree(d_rbc).unwrap();
+        hipFree(d_desc).unwrap();
+        hipModuleUnload(hip_mod).unwrap();
+    }
+
+    assert!(test_passed, "histogram total={} block0={:?}", total, block0);
     Ok(())
 }
 

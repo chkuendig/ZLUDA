@@ -19,8 +19,14 @@ pub(crate) unsafe fn alloc_v2(dptr: &mut hipDeviceptr_t, bytesize: usize) -> CUr
     super::driver::zluda_log(&format!("[ZLUDA] cuMemAlloc_v2({} bytes)", bytesize));
     let cu_context = context::get_current_context()?;
     let context: &context::Context = FromCuda::<_, CUerror>::from_cuda(&cu_context)?;
-    hipMalloc(ptr::from_mut(dptr).cast(), bytesize)?;
-    fill_with_zero_and_register(cu_context, context, dptr, bytesize)?;
+    // Round up to 256-byte boundary to provide headroom for vectorized over-reads.
+    // CUDA kernels (e.g. PhysX radix sort) use ld.global.v4.u32 to load 4 elements
+    // at a time. When the element count isn't a multiple of 4, the last load reads
+    // 1-3 elements past the allocation. On NVIDIA, 2MB page granularity makes this
+    // safe. On AMD with 4KB pages, it can cross into unmapped memory and fault.
+    let alloc_size = (bytesize + 255) & !255;
+    hipMalloc(ptr::from_mut(dptr).cast(), alloc_size)?;
+    fill_with_zero_and_register(cu_context, context, dptr, alloc_size)?;
     Ok(())
 }
 
@@ -208,7 +214,9 @@ pub(crate) unsafe fn host_alloc(
     // hipHostGetDevicePointer to work. PhysX requires this for its
     // GPU→CPU signaling pattern (pinned memory spinWait).
     let hip_flags = flags | 0x02; // hipHostMallocMapped
-    hipHostMalloc(pp, bytesize, hip_flags)?;
+    // Round up for vectorized over-read headroom (same as alloc_v2).
+    let alloc_size = (bytesize + 255) & !255;
+    hipHostMalloc(pp, alloc_size, hip_flags)?;
     // Log host alloc addresses — Flex may pass these directly as kernel args
     // expecting CUDA UVA (host pointer = device pointer). On HIP, the device
     // pointer for mapped memory is different from the host pointer.
