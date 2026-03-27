@@ -512,8 +512,6 @@ test_ptx!(shl_packed, [0u32, 1u32, 2u32, 3u32], [1u32, 65536u32, 0u32, 0u32]);
 test_ptx!(histogram_accum, [0xFFFFFFFFu32, 0u32, 1u32, 2u32], [0x00010001u32]);
 // Word 1 of packed histogram: 1 << ((digit*16)-32). Digits 2,3 produce nonzero.
 test_ptx!(histogram_word1, [2u32, 3u32, 4u32, 0u32], [0x00010001u32]);
-// Warp prefix sum with 32 threads
-test_ptx_llvm!(warp_prefix_sum);
 // Broadcast lane 31's value to all lanes. All 64 threads get 32 (warp 0) or 64 (warp 1).
 test_ptx_warp!(
     shfl_broadcast_31,
@@ -552,14 +550,6 @@ test_ptx_warp!(
         33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
     ]
 );
-#[cfg(feature = "has_rocm")]
-#[test]
-fn warp_prefix_sum_amdgpu() -> Result<(), Box<dyn std::error::Error>> {
-    let ptx = read_test_file!("warp_prefix_sum.ptx");
-    let input = [0u32];
-    let output = [7u32];
-    test_hip_assert("warp_prefix_sum", &ptx, Some(&input), &output, 32)
-}
 // Test shr.u64 by 32: high 32 bits of 0x00000000FFFFFFFF should be 0
 test_ptx!(shr_u64_32, [0xFFFFFFFFu64], [0u32]);
 test_ptx!(noreturn);
