@@ -514,6 +514,44 @@ test_ptx!(histogram_accum, [0xFFFFFFFFu32, 0u32, 1u32, 2u32], [0x00010001u32]);
 test_ptx!(histogram_word1, [2u32, 3u32, 4u32, 0u32], [0x00010001u32]);
 // Warp prefix sum with 32 threads
 test_ptx_llvm!(warp_prefix_sum);
+// Broadcast lane 31's value to all lanes. All 64 threads get 32 (warp 0) or 64 (warp 1).
+test_ptx_warp!(
+    shfl_broadcast_31,
+    [
+        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
+        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
+        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
+        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
+        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
+        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
+        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
+        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
+    ]
+);
+// Multi-register shfl: read regA and regB from lane 0. All threads get [1, 100].
+// 64 threads (2 warps), each writes 2 u32s = 128 output values.
+test_ptx_warp!(
+    shfl_sync_idx_multi_reg,
+    [
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        // warp 1: lane 0 has regA=33, regB=3300
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+    ]
+);
 #[cfg(feature = "has_rocm")]
 #[test]
 fn warp_prefix_sum_amdgpu() -> Result<(), Box<dyn std::error::Error>> {
@@ -1696,7 +1734,7 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
         return Ok(());
     }
 
-    let ptx_path = "/tmp/zluda_ptx_dump/module_14_debug.ptx";
+    let ptx_path = "/tmp/zluda_ptx_dump/module_14.ptx";
     let ptx = match fs::read_to_string(ptx_path) {
         Ok(s) => s,
         Err(_) => {
@@ -1822,7 +1860,13 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // Extract block 0's counts (digit-major layout)
     let block0: Vec<u32> = (0..16).map(|d| h_rbc[d * num_blocks as usize]).collect();
     let total: u32 = block0.iter().sum();
+    // Also dump the FULL first 64 entries (2 rows of 32) to see digit 0 AND digit 1
+    let first64: Vec<u32> = h_rbc[0..64].to_vec();
+    let nonzero64: Vec<(usize, u32)> = first64.iter().enumerate()
+        .filter(|(_, &v)| v != 0).collect::<Vec<_>>()
+        .into_iter().map(|(i, &v)| (i, v)).collect();
     eprintln!("radix_sort histogram: total={} block0={:?}", total, block0);
+    eprintln!("  first 64 entries nonzero: {:?}", nonzero64);
 
     // Read debug: 8 packed words from thread 0 (stored to outputKeys[0..7])
     let mut h_debug = [0u32; 8];
@@ -1831,6 +1875,13 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
     }
     let dhex: Vec<String> = h_debug.iter().map(|v| format!("0x{:08x}", v)).collect();
     eprintln!("thread0 words (r467..r460): {:?}", dhex);
+
+    // Also read debug value at offset 32 (r230 from lane 31)
+    let mut h_r230 = [0u32; 1];
+    unsafe {
+        hipMemcpyDtoH(h_r230.as_mut_ptr() as _, hipDeviceptr_t((d_out_keys as usize + 32) as _), 4).unwrap();
+    }
+    eprintln!("lane31 r230 (word0 prefix total >> shift): 0x{:08x}", h_r230[0]);
 
     // Assertions at the end (after debug output)
     let test_passed = total >= 27 && block0[1] > 0;
