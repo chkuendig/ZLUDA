@@ -276,6 +276,57 @@ pub(crate) fn launch_kernel(
                 name, f.base.0, grid_dim_x, grid_dim_y, grid_dim_z,
                 block_dim_x, block_dim_y, block_dim_z,
                 shared_mem_bytes));
+            // Dump surface handle for TurbulenceFS kernels (crash investigation)
+            if name.contains("TurbulenceFS_dynamicGrid") {
+                if !kernel_params.is_null() {
+                    unsafe {
+                        // param_5 (index 5) is the surface handle for Clear/Pressure/Collision kernels
+                        let handle = *(*kernel_params.add(5) as *const u64);
+                        let shift = handle >> (64 - 3);
+                        let desc_ptr = ((handle << 3) >> 3) as *const u8;
+                        let mut desc_words = [0u32; 8];
+                        let read_ok = hip_runtime_sys::hipMemcpyDtoH(
+                            desc_words.as_mut_ptr() as *mut _,
+                            hip_runtime_sys::hipDeviceptr_t(desc_ptr as *mut _),
+                            32,
+                        );
+                        let base = (desc_words[0] as u64) | ((desc_words[1] as u64) << 32);
+                        super::driver::zluda_log_err(&format!(
+                            "SURF '{}' handle=0x{:x} shift={} desc_ptr={:p} read={:?} base=0x{:x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                            name, handle, shift, desc_ptr, read_ok, base,
+                            desc_words[0], desc_words[1], desc_words[2], desc_words[3],
+                            desc_words[4], desc_words[5], desc_words[6], desc_words[7]));
+                    }
+                } else if !extra.is_null() && name.contains("ClearKernel") {
+                    // Extract surface handle from extra buffer for Clear kernels
+                    // Params: u64(0), u16(8), u32(10→12), u32(16), u32(20), u64(24), u32(32)
+                    // param_5 (surface handle) is at byte offset 24
+                    unsafe {
+                        let extra_slice = std::slice::from_raw_parts(extra, 5);
+                        let buf_ptr = extra_slice[1] as *const u8;
+                        if !buf_ptr.is_null() {
+                            let handle = *(buf_ptr.add(24) as *const u64);
+                            let shift = handle >> (64 - 3);
+                            let desc_ptr = ((handle << 3) >> 3) as *const u8;
+                            let mut desc_words = [0u32; 8];
+                            let read_ok = hip_runtime_sys::hipMemcpyDtoH(
+                                desc_words.as_mut_ptr() as *mut _,
+                                hip_runtime_sys::hipDeviceptr_t(desc_ptr as *mut _),
+                                32,
+                            );
+                            let base = (desc_words[0] as u64) | ((desc_words[1] as u64) << 32);
+                            super::driver::zluda_log_err(&format!(
+                                "SURF '{}' handle=0x{:x} shift={} desc_ptr={:p} read={:?} base=0x{:x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                                name, handle, shift, desc_ptr, read_ok, base,
+                                desc_words[0], desc_words[1], desc_words[2], desc_words[3],
+                                desc_words[4], desc_words[5], desc_words[6], desc_words[7]));
+                        }
+                    }
+                } else {
+                    super::driver::zluda_log_err(&format!(
+                        "SURF '{}' kernel_params=NULL extra={}", name, !extra.is_null()));
+                }
+            }
             let sync_result = unsafe { hipStreamSynchronize(stream) };
             // After CopyBits2(flag=1) completes, verify key buffer
             if sync_result.is_ok()
