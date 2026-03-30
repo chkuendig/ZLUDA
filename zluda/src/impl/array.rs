@@ -40,6 +40,7 @@ pub(crate) unsafe fn _3d_create_v2(
     hipfix::array_3d_create(&mut desc);
     let mut hip_array = mem::zeroed();
     hipArray3DCreate(&mut hip_array, &mut desc as _)?;
+    super::memory::update_alloc_range(hip_array as u64, 0x10000); // 64KB estimate for array metadata
     *p_handle = hip_array as CUarray;
     Ok(())
 }

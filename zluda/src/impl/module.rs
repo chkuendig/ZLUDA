@@ -515,6 +515,10 @@ pub(crate) fn get_global_v2(
     let dptr_val = unsafe { (*dptr).0 };
     let bytes_val = if bytes.is_null() { 0 } else { unsafe { *bytes } };
     let addr_space = if (dptr_val as u64) < 0x7f0000000000 { "HOST" } else { "DEV" };
+    // Track module global address in alloc range
+    if result.is_ok() {
+        super::memory::update_alloc_range(dptr_val as u64, bytes_val.max(256) as u64);
+    }
     super::driver::zluda_log(&format!(
         "[ZLUDA] cuModuleGetGlobal('{}') -> {:?} dptr={:p} bytes={} [{}]",
         name_str, result, dptr_val, bytes_val, addr_space));

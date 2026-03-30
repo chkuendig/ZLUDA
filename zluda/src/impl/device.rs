@@ -455,7 +455,20 @@ pub(crate) fn total_memory(bytes: &mut ::core::ffi::c_uint, dev: hipDevice_t) ->
 pub(crate) fn total_mem_v2(bytes: *mut usize, dev: hipDevice_t) -> hipError_t {
     let result = unsafe { hipDeviceTotalMem(bytes, dev) };
     if let Ok(()) = result {
-        super::driver::zluda_log(&format!("[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> {} bytes OK", dev, unsafe { *bytes }));
+        let hip_total = unsafe { *bytes };
+        // hipDeviceTotalMem returns VRAM+GTT combined (8GB on Steam Deck APU).
+        // On APUs, the BIOS VRAM carveout (1GB) is too small for PhysX GPU —
+        // it disables GPU physics if it sees only 1GB. Instead, report half the
+        // HIP total (4GB) which is realistic for the GPU-accessible memory pool
+        // and matches what discrete GPUs in this class would have.
+        // This reduces PhysX buffer sizes vs 8GB without disabling GPU physics.
+        let vram_total = hip_total / 2;
+        if vram_total < hip_total {
+            unsafe { *bytes = vram_total };
+        }
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> {} bytes (hip={}, sysfs_vram={})",
+            dev, unsafe { *bytes }, hip_total, vram_total));
     } else {
         super::driver::zluda_log(&format!("[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> ERROR", dev));
     }

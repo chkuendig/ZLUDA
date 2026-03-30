@@ -1713,8 +1713,12 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-/// Test PhysX radix sort histogram compilation.
-/// Compiles the actual radix sort PTX from PhysX and runs the MultiBlock
+
+
+/// Runs the PhysX radix sort multi-block kernel and checks the per-digit histogram.
+/// Uses the game's extracted PTX module (must be present in /tmp/zluda_ptx_dump/).
+/// This test uses an older PhysX-specific sort implementation, not the CUB version.
+/// See `radix_sort_downsweep_xor_flipback_amdgpu` for the CUB Downsweep XOR test.
 /// kernel to verify the per-digit histogram output.
 #[cfg(feature = "has_rocm")]
 #[test]
@@ -2314,6 +2318,132 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 // - Game testing (Arkham Knight) for runtime execution on real hardware
+
+/// Stress test: HIP memory ops in a loop to reproduce GPU page fault.
+/// Run alongside `vkcube --c 100000 &` to test HIP+Vulkan coexistence.
+/// The game crashes with random page faults after ~2-5 min of PhysX.
+/// This test tries to reproduce that WITHOUT Wine/DXVK/Proton.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn hip_vulkan_stress_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    use std::ptr;
+
+    if unsafe { hipInit(0) }.is_err() {
+        eprintln!("hip_vulkan_stress: no GPU, skipping");
+        return Ok(());
+    }
+    unsafe { hipSetDevice(0) }.unwrap();
+
+    const NUM_BUFS: usize = 16;
+    const BUF_SIZE: usize = 64 * 1024 * 1024; // 64MB each = 1GB total (forces GTT spill)
+    const NUM_STREAMS: usize = 4;
+    const NUM_ITERS: usize = 600;
+
+    // Phase 1: Allocate device buffers
+    let mut bufs: Vec<*mut std::ffi::c_void> = Vec::new();
+    for i in 0..NUM_BUFS {
+        let mut ptr = ptr::null_mut();
+        let r = unsafe { hipMalloc(&mut ptr, BUF_SIZE) };
+        eprintln!("hip_vulkan_stress: hipMalloc[{}] -> {:?} ptr={:p}", i, r, ptr);
+        r.unwrap();
+        bufs.push(ptr);
+    }
+
+    // Phase 2: Create streams
+    let mut streams: Vec<hipStream_t> = Vec::new();
+    for _ in 0..NUM_STREAMS {
+        let mut s = unsafe { std::mem::zeroed() };
+        unsafe { hipStreamCreateWithFlags(&mut s, hipStreamNonBlocking) }.unwrap();
+        streams.push(s);
+    }
+
+    // Phase 3: Allocate host buffer for readback
+    let mut host_buf = vec![0u32; 16];
+
+    eprintln!("hip_vulkan_stress: starting {} iterations (run vkcube in background)", NUM_ITERS);
+
+    // Phase 4: Stress loop
+    for i in 0..NUM_ITERS {
+        // Launch memset on all buffers across streams
+        for b in 0..NUM_BUFS {
+            let s = streams[b % NUM_STREAMS];
+            let r = unsafe {
+                hipMemsetD32Async(
+                    hipDeviceptr_t(bufs[b]),
+                    (i * NUM_BUFS + b) as i32,
+                    BUF_SIZE / 4,
+                    s,
+                )
+            };
+            if r.is_err() {
+                eprintln!("hip_vulkan_stress: FAULT at iter {} buf {} memset: {:?}", i, b, r);
+                panic!("hipMemsetD32Async failed: {:?}", r);
+            }
+        }
+
+        // Sync all streams
+        for s in &streams {
+            let r = unsafe { hipStreamSynchronize(*s) };
+            if r.is_err() {
+                eprintln!("hip_vulkan_stress: FAULT at iter {} sync: {:?}", i, r);
+                panic!("hipStreamSynchronize failed: {:?}", r);
+            }
+        }
+
+        // Readback from first buffer to verify
+        unsafe {
+            hipMemcpyDtoH(
+                host_buf.as_mut_ptr() as *mut _,
+                hipDeviceptr_t(bufs[0]),
+                64,
+            )
+        }
+        .unwrap();
+
+        // Every 25 iters: free + realloc 2 buffers (forces TTM eviction)
+        if i % 25 == 0 && i > 0 {
+            let idx1 = NUM_BUFS - 2;
+            let idx2 = NUM_BUFS - 1;
+            unsafe { hipFree(bufs[idx1]) }.unwrap();
+            unsafe { hipFree(bufs[idx2]) }.unwrap();
+            let mut p1 = ptr::null_mut();
+            let mut p2 = ptr::null_mut();
+            unsafe { hipMalloc(&mut p1, BUF_SIZE) }.unwrap();
+            unsafe { hipMalloc(&mut p2, BUF_SIZE) }.unwrap();
+            bufs[idx1] = p1;
+            bufs[idx2] = p2;
+            eprintln!("hip_vulkan_stress: realloc bufs[{},{}] at iter {}", idx1, idx2, i);
+        }
+
+        // Every 10 iters: print memory stats
+        if i % 10 == 0 {
+            let vram = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_used")
+                .unwrap_or_default();
+            let gtt = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_gtt_used")
+                .unwrap_or_default();
+            eprintln!(
+                "hip_vulkan_stress: iter {}/{} val={} VRAM={} GTT={}",
+                i,
+                NUM_ITERS,
+                host_buf[0],
+                vram.trim(),
+                gtt.trim()
+            );
+        }
+    }
+
+    eprintln!("hip_vulkan_stress: PASSED {} iterations with no faults", NUM_ITERS);
+
+    // Cleanup
+    for s in streams {
+        unsafe { hipStreamDestroy(s) }.unwrap();
+    }
+    for b in bufs {
+        unsafe { hipFree(b) }.unwrap();
+    }
+    Ok(())
+}
 
 /// Test hipModuleGetGlobal on a module with 45 kernels + helper (per-kernel emission).
 /// Reproduces the Batman AK FlexFluids crash: hipModuleGetGlobal returns HOST/bytes=0.

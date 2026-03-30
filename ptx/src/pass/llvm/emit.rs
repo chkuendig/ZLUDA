@@ -482,15 +482,15 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
     }
 
     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
-        let value = format!(
-            "+wavefrontsize32,-wavefrontsize64,+cumode{}",
-            if cfg!(debug_assertions) {
-                ",+precise-memory"
-            } else {
-                ""
-            }
-        );
-        self.emit_fn_attribute(fn_, "target-features", &*value)
+        // Always enable +precise-memory. Without it, the AMDGPU backend's machine
+        // scheduler and register allocator can reorder/drop instructions across
+        // memory operations. This causes CUB RadixSort's Downsweep kernel to lose
+        // the XOR 0x80000000 flip-back on tail tile stores, producing corrupt sort
+        // output (bit 31 stuck) that crashes PhysX via signed index sign-extension.
+        // See: LLVM #131386, Codeplay's GROMACS regalloc analysis.
+        // Performance impact: adds s_waitcnt after every memory op (~5-10% slower).
+        let value = "+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory";
+        self.emit_fn_attribute(fn_, "target-features", value)
     }
 
     fn emit_linkage(

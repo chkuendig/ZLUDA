@@ -4,8 +4,18 @@ use crate::r#impl::{
 };
 use cuda_types::cuda::{CUerror, CUresult, CUresultConsts};
 use hip_runtime_sys::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{mem, ptr};
 use zluda_common::FromCuda;
+
+// Global HIP allocation range tracking for pointer validation
+pub(crate) static ALLOC_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static ALLOC_MAX: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn update_alloc_range(addr: u64, size: u64) {
+    ALLOC_MIN.fetch_min(addr, Ordering::Relaxed);
+    ALLOC_MAX.fetch_max(addr + size, Ordering::Relaxed);
+}
 
 struct DropGuard<F: FnMut()>(F);
 
@@ -46,6 +56,8 @@ unsafe fn fill_with_zero_and_register(
         hipStreamSynchronize(context.alloc_stream)?;
     }
     super::driver::zluda_log(&format!("[ZLUDA] cuMemAlloc_v2 -> {:?} OK", dptr.0));
+    super::driver::zluda_log_err(&format!("ALLOC {:?} size={}", dptr.0, bytesize));
+    update_alloc_range(dptr.0 as u64, bytesize as u64);
     add_allocation(dptr.0, bytesize, cu_context)?;
     mem::forget(drop_guard);
     Ok(())
@@ -53,6 +65,7 @@ unsafe fn fill_with_zero_and_register(
 
 pub(crate) unsafe fn free_v2(dptr: hipDeviceptr_t) -> CUresult {
     super::driver::zluda_log(&format!("[ZLUDA] cuMemFree_v2({:?})", dptr.0));
+    super::driver::zluda_log_err(&format!("FREE {:?}", dptr.0));
     let hip_result = hipFree(dptr.0);
     remove_allocation(dptr.0)?;
     Ok(hip_result?)

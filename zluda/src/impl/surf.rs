@@ -15,6 +15,8 @@ pub(crate) unsafe fn object_create(
     }
     let mut surf_obj: hipSurfaceObject_t = mem::zeroed();
     hipCreateSurfaceObject(&mut surf_obj, &desc)?;
+    // Track surface object address in global alloc range
+    super::memory::update_alloc_range(surf_obj as u64, 256);
     let top_reserved_bits = surf_obj as usize >> (usize::BITS - IMAGE_RESERVED_TOP_BITS);
     if top_reserved_bits != 0 {
         super::driver::zluda_log(&format!(

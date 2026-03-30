@@ -51,6 +51,9 @@ members = [
 
 default-members = ["zluda", "zluda_ml", "zluda_inject", "zluda_redirect", "compiler"]
 
+[profile.release]
+debug = 1
+
 [profile.release-lto]
 inherits = "release"
 codegen-units = 1

@@ -195,6 +195,193 @@ pub(crate) fn launch_kernel(
             || name.contains("radixSortMultiBlockLaunch") {
             unsafe { fix_radix_sort_padding(kernel_params, stream); }
         }
+        // After the LAST RadixSort Downsweep pass (flip=1), immediately read
+        // back keys_out to check if the sort itself produces corrupt values
+        // (bit 31 stuck) or if something else corrupts them afterward.
+        if name.contains("RadixSortDownsweep") && !extra.is_null() && kernel_params.is_null() {
+            unsafe {
+                let extra_slice = std::slice::from_raw_parts(extra, 5);
+                let buf_ptr = extra_slice[1] as *const u8;
+                let buf_size = *(extra_slice[3] as *const usize);
+                if !buf_ptr.is_null() && buf_size >= 52 {
+                    let keys_out = *(buf_ptr.add(8) as *const u64);
+                    let count = *(buf_ptr.add(40) as *const u32);
+                    let flip = *(buf_ptr.add(50) as *const u8);
+                    if flip == 1 && count > 0 && count < 100000 {
+                        // This is the last pass — read back keys_out immediately
+                        let n = count as usize;
+                        let mut keys = vec![0u32; n];
+                        let r = hip_runtime_sys::hipDeviceSynchronize();
+                        if r.is_ok() {
+                            let r2 = hip_runtime_sys::hipMemcpyDtoH(
+                                keys.as_mut_ptr() as *mut _,
+                                hip_runtime_sys::hipDeviceptr_t(keys_out as *mut _),
+                                n * 4,
+                            );
+                            if r2.is_ok() {
+                                let bad: Vec<usize> = keys.iter().enumerate()
+                                    .filter(|(_, &v)| v & 0x80000000 != 0)
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                if !bad.is_empty() {
+                                    super::driver::zluda_log_err(&format!(
+                                        "SORT_OUTPUT_CORRUPT keys_out=0x{:x} count={} bad={} first_bad=[{}]=0x{:08x}",
+                                        keys_out, count, bad.len(), bad[0], keys[bad[0]]));
+                                } else {
+                                    super::driver::zluda_log_err(&format!(
+                                        "SORT_OUTPUT_OK keys_out=0x{:x} count={} all_clean", keys_out, count));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Validate CreateGrid input buffer — check for corrupt indices
+        if name.contains("CreateGrid") && !extra.is_null() && kernel_params.is_null() {
+            unsafe {
+                let extra_slice = std::slice::from_raw_parts(extra, 5);
+                let buf_ptr = extra_slice[1] as *const u8;
+                if !buf_ptr.is_null() {
+                    // CreateGrid params: u32 count (offset 0), u64 input_ptr (offset 8)
+                    let count = *(buf_ptr as *const u32);
+                    let input_ptr = *(buf_ptr.add(8) as *const u64);
+                    let output_ptr1 = *(buf_ptr.add(16) as *const u64);
+                    let output_ptr2 = *(buf_ptr.add(24) as *const u64);
+                    // Always log CreateGrid params
+                    super::driver::zluda_log_err(&format!(
+                        "CREATEGRID count={} input=0x{:x} out1=0x{:x} out2=0x{:x} grid={}",
+                        count, input_ptr, output_ptr1, output_ptr2, grid_dim_x));
+                    // Read back first min(count, 128) indices from input buffer
+                    // Check ALL indices (not just first 128) — values with bit 31
+                    // set cause sign-extension in mul.wide.s32 → negative offset → fault
+                    let n = count as usize;
+                    if n > 0 && n < 100_000 && input_ptr > 0x1000 {
+                        let mut indices = vec![0i32; n];
+                        let read_result = hip_runtime_sys::hipMemcpyDtoH(
+                            indices.as_mut_ptr() as *mut _,
+                            hip_runtime_sys::hipDeviceptr_t(input_ptr as *mut _),
+                            n * 4,
+                        );
+                        if read_result.is_ok() {
+                            // Check for out-of-range indices
+                            let max_reasonable = 10_000_000i32; // 10M elements max
+                            let mut bad_count = 0u32;
+                            let mut first_bad_idx = 0usize;
+                            let mut first_bad_val = 0i32;
+                            for (i, &val) in indices.iter().enumerate() {
+                                if val < 0 || val > max_reasonable {
+                                    if bad_count == 0 {
+                                        first_bad_idx = i;
+                                        first_bad_val = val;
+                                    }
+                                    bad_count += 1;
+                                }
+                            }
+                            if bad_count > 0 {
+                                super::driver::zluda_log_err(&format!(
+                                    "CORRUPT_INPUT CreateGrid count={} input=0x{:x} out1=0x{:x} bad_indices={}/{} first_bad=[{}]={} (0x{:08x})",
+                                    count, input_ptr, output_ptr1, bad_count, n, first_bad_idx, first_bad_val, first_bad_val as u32));
+                                // Dump values around the first bad index
+                                let start = first_bad_idx.saturating_sub(4);
+                                let end = (first_bad_idx + 12).min(n);
+                                let dump: Vec<String> = indices[start..end].iter().enumerate().map(|(i, v)| {
+                                    format!("[{}]={} (0x{:08x})", start + i, v, *v as u32)
+                                }).collect();
+                                super::driver::zluda_log_err(&format!("  around bad: {}", dump.join(", ")));
+                                // Save the corrupt sort output for isolated testing
+                                let path = "/tmp/creategrid_input.bin";
+                                let bytes: &[u8] = std::slice::from_raw_parts(
+                                    indices.as_ptr() as *const u8, n * 4);
+                                if let Err(e) = std::fs::write(path, bytes) {
+                                    super::driver::zluda_log_err(&format!("  failed to save: {}", e));
+                                } else {
+                                    super::driver::zluda_log_err(&format!("  saved {} bytes to {}", n * 4, path));
+                                }
+                                // Also save the other buffer (sort input) — RadixSort
+                                // uses double-buffering, output2 is the alternate buffer
+                                let mut sort_input = vec![0i32; n];
+                                let other_buf = output_ptr2; // The other buffer in the pair
+                                let ri = hip_runtime_sys::hipMemcpyDtoH(
+                                    sort_input.as_mut_ptr() as *mut _,
+                                    hip_runtime_sys::hipDeviceptr_t(other_buf as *mut _),
+                                    n * 4,
+                                );
+                                if ri.is_ok() {
+                                    let path2 = "/tmp/radixsort_other_buf.bin";
+                                    let bytes2: &[u8] = std::slice::from_raw_parts(
+                                        sort_input.as_ptr() as *const u8, n * 4);
+                                    let _ = std::fs::write(path2, bytes2);
+                                    super::driver::zluda_log_err(&format!(
+                                        "  saved other buffer (0x{:x}) to {}", other_buf, path2));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Validate TurbulenceFS surface descriptors
+        if name.contains("TurbulenceFS_dynamicGrid") && !extra.is_null() && kernel_params.is_null() {
+            unsafe {
+                let extra_slice = std::slice::from_raw_parts(extra, 5);
+                let buf_ptr = extra_slice[1] as *const u8;
+                let buf_size = *(extra_slice[3] as *const usize);
+                if !buf_ptr.is_null() && buf_size >= 32 {
+                    // param_5 (surface handle) at byte offset 24
+                    let handle = *(buf_ptr.add(24) as *const u64);
+                    let shift = handle >> (64 - 3);
+                    let desc_ptr = ((handle << 3) >> 3) as u64;
+                    let alloc_min = super::memory::ALLOC_MIN.load(std::sync::atomic::Ordering::Relaxed);
+                    let alloc_max = super::memory::ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
+                    if desc_ptr > 0x1000 && (desc_ptr >> 40) == 0x7f {
+                        if desc_ptr < alloc_min.saturating_sub(0x10000000) || desc_ptr > alloc_max.saturating_add(0x10000000) {
+                            super::driver::zluda_log_err(&format!(
+                                "CORRUPT_SURFACE '{}' handle=0x{:x} desc_ptr=0x{:x} range=[0x{:x}..0x{:x}]",
+                                name, handle, desc_ptr, alloc_min, alloc_max));
+                        }
+                    }
+                }
+            }
+        }
+        // Validate CreateParticleShapesIncremental input indices
+        if name.contains("CreateParticleShapesIncremental_MultiStage") && !extra.is_null() && kernel_params.is_null() {
+            unsafe {
+                let extra_slice = std::slice::from_raw_parts(extra, 5);
+                let buf_ptr = extra_slice[1] as *const u8;
+                let buf_size = *(extra_slice[3] as *const usize);
+                if !buf_ptr.is_null() && buf_size >= 48 {
+                    // param_3 (count) at byte offset 24
+                    let count = *(buf_ptr.add(24) as *const u32);
+                    // param_5 (index ptr) at byte offset 40
+                    let index_ptr = *(buf_ptr.add(40) as *const u64);
+                    if count > 0 && count < 100000 && index_ptr > 0x1000 {
+                        let n = count as usize;
+                        let mut indices = vec![0i32; n];
+                        let r = hip_runtime_sys::hipMemcpyDtoH(
+                            indices.as_mut_ptr() as *mut _,
+                            hip_runtime_sys::hipDeviceptr_t(index_ptr as *mut _),
+                            n * 4,
+                        );
+                        if r.is_ok() {
+                            let bad: Vec<(usize, i32)> = indices.iter().enumerate()
+                                .filter(|(_, &v)| v < 0 || v > 10_000_000)
+                                .map(|(i, &v)| (i, v))
+                                .collect();
+                            if !bad.is_empty() {
+                                super::driver::zluda_log_err(&format!(
+                                    "CORRUPT_SHAPES '{}' count={} ptr=0x{:x} bad={}/{} first=[{}]=0x{:08x}",
+                                    name, count, index_ptr, bad.len(), n, bad[0].0, bad[0].1 as u32));
+                                let path = "/tmp/shapes_input.bin";
+                                let bytes: &[u8] = std::slice::from_raw_parts(
+                                    indices.as_ptr() as *const u8, n * 4);
+                                let _ = std::fs::write(path, bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
@@ -260,74 +447,61 @@ pub(crate) fn launch_kernel(
             block_dim_x, block_dim_y, block_dim_z,
             shared_mem_bytes, result));
     }
-    // ZLUDA_SYNC_LAUNCHES: synchronize after every kernel launch to pinpoint GPU faults.
-    // When enabled, any GPU fault will be reported immediately after the faulting kernel
-    // instead of being detected asynchronously later.
+    // Lightweight launch counter + periodic monitoring
     if result.is_ok() {
+        static LAUNCH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = LAUNCH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // VRAM/GTT every 2000 launches
+        if n % 2000 == 0 {
+            let vram = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_used").unwrap_or_default();
+            let gtt = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_gtt_used").unwrap_or_default();
+            super::driver::zluda_log_err(&format!(
+                "MEM#{} VRAM={} GTT={}", n, vram.trim(), gtt.trim()));
+        }
+        // Dump /proc/self/maps every 5000 launches
+        if n % 5000 == 0 {
+            if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+                let relevant: Vec<&str> = maps.lines()
+                    .filter(|l| l.contains("kfd") || l.contains("drm") || l.contains("anon_inode")
+                        || (l.contains("rw") && !l.contains(".so") && !l.contains("[") && l.len() > 40))
+                    .collect();
+                super::driver::zluda_log_err(&format!(
+                    "MAPS#{} {} relevant mappings (total {})", n, relevant.len(), maps.lines().count()));
+                for m in relevant.iter().take(20) {
+                    super::driver::zluda_log_err(&format!("  {}", m));
+                }
+            }
+        }
+        // ZLUDA_SYNC_LAUNCHES: optionally sync after each launch
         static SYNC_LAUNCHES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sync = *SYNC_LAUNCHES.get_or_init(|| {
             std::env::var("ZLUDA_SYNC_LAUNCHES").map_or(false, |v| v == "1")
         });
         if sync {
             let name = lookup_name(f.base);
-            // Log before sync — HSA may kill the process during hipStreamSynchronize on fault
-            super::driver::zluda_log_err(&format!(
-                "SYNC '{}' func={:p} grid=[{},{},{}] block=[{},{},{}] shared={}",
-                name, f.base.0, grid_dim_x, grid_dim_y, grid_dim_z,
-                block_dim_x, block_dim_y, block_dim_z,
-                shared_mem_bytes));
-            // Dump surface handle for TurbulenceFS kernels (crash investigation)
-            if name.contains("TurbulenceFS_dynamicGrid") {
-                if !kernel_params.is_null() {
-                    unsafe {
-                        // param_5 (index 5) is the surface handle for Clear/Pressure/Collision kernels
-                        let handle = *(*kernel_params.add(5) as *const u64);
-                        let shift = handle >> (64 - 3);
-                        let desc_ptr = ((handle << 3) >> 3) as *const u8;
-                        let mut desc_words = [0u32; 8];
-                        let read_ok = hip_runtime_sys::hipMemcpyDtoH(
-                            desc_words.as_mut_ptr() as *mut _,
-                            hip_runtime_sys::hipDeviceptr_t(desc_ptr as *mut _),
-                            32,
-                        );
-                        let base = (desc_words[0] as u64) | ((desc_words[1] as u64) << 32);
-                        super::driver::zluda_log_err(&format!(
-                            "SURF '{}' handle=0x{:x} shift={} desc_ptr={:p} read={:?} base=0x{:x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                            name, handle, shift, desc_ptr, read_ok, base,
-                            desc_words[0], desc_words[1], desc_words[2], desc_words[3],
-                            desc_words[4], desc_words[5], desc_words[6], desc_words[7]));
-                    }
-                } else if !extra.is_null() && name.contains("ClearKernel") {
-                    // Extract surface handle from extra buffer for Clear kernels
-                    // Params: u64(0), u16(8), u32(10→12), u32(16), u32(20), u64(24), u32(32)
-                    // param_5 (surface handle) is at byte offset 24
-                    unsafe {
-                        let extra_slice = std::slice::from_raw_parts(extra, 5);
-                        let buf_ptr = extra_slice[1] as *const u8;
-                        if !buf_ptr.is_null() {
-                            let handle = *(buf_ptr.add(24) as *const u64);
-                            let shift = handle >> (64 - 3);
-                            let desc_ptr = ((handle << 3) >> 3) as *const u8;
-                            let mut desc_words = [0u32; 8];
-                            let read_ok = hip_runtime_sys::hipMemcpyDtoH(
-                                desc_words.as_mut_ptr() as *mut _,
-                                hip_runtime_sys::hipDeviceptr_t(desc_ptr as *mut _),
-                                32,
-                            );
-                            let base = (desc_words[0] as u64) | ((desc_words[1] as u64) << 32);
-                            super::driver::zluda_log_err(&format!(
-                                "SURF '{}' handle=0x{:x} shift={} desc_ptr={:p} read={:?} base=0x{:x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                                name, handle, shift, desc_ptr, read_ok, base,
-                                desc_words[0], desc_words[1], desc_words[2], desc_words[3],
-                                desc_words[4], desc_words[5], desc_words[6], desc_words[7]));
+            // Dump raw extra buffer params (first 8 u64 values) for crash analysis
+            let mut raw_params = String::new();
+            if !extra.is_null() && kernel_params.is_null() {
+                unsafe {
+                    let ep = std::slice::from_raw_parts(extra, 5);
+                    let buf = ep[1] as *const u8;
+                    let sz = *(ep[3] as *const usize);
+                    if !buf.is_null() && sz > 0 {
+                        let n_u64 = (sz / 8).min(8);
+                        for j in 0..n_u64 {
+                            let v = *(buf.add(j * 8) as *const u64);
+                            if !raw_params.is_empty() { raw_params.push(','); }
+                            raw_params.push_str(&format!("{:#x}", v));
                         }
                     }
-                } else {
-                    super::driver::zluda_log_err(&format!(
-                        "SURF '{}' kernel_params=NULL extra={}", name, !extra.is_null()));
                 }
             }
-            let sync_result = unsafe { hipStreamSynchronize(stream) };
+            super::driver::zluda_log_err(&format!(
+                "SYNC#{} '{}' [{}]", n, name, raw_params));
+            // Use hipDeviceSynchronize to catch faults from ALL streams
+            // (PhysX uses multiple threads/streams — TurbulenceFS on 02bc,
+            // RadixSort/CreateGrid on 0130)
+            let sync_result = unsafe { hip_runtime_sys::hipDeviceSynchronize() };
             // After CopyBits2(flag=1) completes, verify key buffer
             if sync_result.is_ok()
                 && name.contains("CopyBits2")
