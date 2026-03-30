@@ -354,6 +354,48 @@ pub(crate) fn launch_kernel(
                 }
             }
         }
+        // Validate surface descriptors only for kernels that use surfaces
+        // (TurbulenceFS + CreateParticleShapes). Check only known surface
+        // param positions to avoid scanning all params (too slow).
+        if (name.contains("TurbulenceFS") || name.contains("CreateParticleShapes"))
+            && !extra.is_null() && kernel_params.is_null()
+        {
+            unsafe {
+                let extra_slice = std::slice::from_raw_parts(extra, 5);
+                let buf_ptr = extra_slice[1] as *const u8;
+                let buf_size = *(extra_slice[3] as *const usize);
+                if !buf_ptr.is_null() && buf_size >= 8 {
+                    // Scan first 32 params only (256 bytes). buf_size can be
+                    // much larger (includes padding/alignment) and scanning
+                    // beyond actual params reads garbage → crash.
+                    let n_params = (buf_size / 8).min(32);
+                    for i in 0..n_params {
+                        let val = *(buf_ptr.add(i * 8) as *const u64);
+                        let top3 = val >> 61;
+                        if top3 >= 1 && top3 <= 7 {
+                            let desc_addr = val & 0x1FFFFFFFFFFFFFFF;
+                            if desc_addr > 0x7f0000000000 && desc_addr < 0x800000000000 {
+                                // Read the 32-byte image descriptor from GPU
+                                let mut desc_now = [0u32; 8];
+                                let r = hip_runtime_sys::hipMemcpyDtoH(
+                                    desc_now.as_mut_ptr() as *mut _,
+                                    hip_runtime_sys::hipDeviceptr_t(desc_addr as *mut _),
+                                    32,
+                                );
+                                if r.is_ok() {
+                                    // base_addr from descriptor
+                                    let base_addr = ((desc_now[1] as u64 & 0xFFFF) << 32) | desc_now[0] as u64;
+                                    // Log every surface we see (not just suspicious ones)
+                                    super::driver::zluda_log_err(&format!(
+                                        "SURFACE kernel='{}' param[{}] handle=0x{:x} base=0x{:x} desc={:08x?}",
+                                        name, i, val, base_addr, desc_now));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Validate CreateParticleShapesIncremental input indices
         if name.contains("CreateParticleShapesIncremental_MultiStage") && !extra.is_null() && kernel_params.is_null() {
             unsafe {
