@@ -452,23 +452,28 @@ pub(crate) fn total_memory(bytes: &mut ::core::ffi::c_uint, dev: hipDevice_t) ->
     result
 }
 
+/// Read the real VRAM size from sysfs. On APUs this is the BIOS carve-out
+/// (e.g. 1024 MiB on Steam Deck). Falls back to hip_total/2 if unavailable.
+pub(crate) fn sysfs_vram_total(fallback: usize) -> usize {
+    std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_total")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(fallback)
+}
+
 pub(crate) fn total_mem_v2(bytes: *mut usize, dev: hipDevice_t) -> hipError_t {
     let result = unsafe { hipDeviceTotalMem(bytes, dev) };
     if let Ok(()) = result {
         let hip_total = unsafe { *bytes };
         // hipDeviceTotalMem returns VRAM+GTT combined (8GB on Steam Deck APU).
-        // On APUs, the BIOS VRAM carveout (1GB) is too small for PhysX GPU —
-        // it disables GPU physics if it sees only 1GB. Instead, report half the
-        // HIP total (4GB) which is realistic for the GPU-accessible memory pool
-        // and matches what discrete GPUs in this class would have.
-        // This reduces PhysX buffer sizes vs 8GB without disabling GPU physics.
+        // On APU with hipMallocManaged, allocations go to GTT (8 GiB) not VRAM
+        // (1 GiB). Report half the HIP total (3 GiB) — enough for PhysX GPU
+        // physics while fitting in GTT. No VRAM pressure since we don't use it.
         let vram_total = hip_total / 2;
-        if vram_total < hip_total {
-            unsafe { *bytes = vram_total };
-        }
+        unsafe { *bytes = vram_total };
         super::driver::zluda_log(&format!(
-            "[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> {} bytes (hip={}, sysfs_vram={})",
-            dev, unsafe { *bytes }, hip_total, vram_total));
+            "[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> {} bytes ({} MiB) (hip={}, sysfs_vram={})",
+            dev, unsafe { *bytes }, vram_total / (1024*1024), hip_total, vram_total));
     } else {
         super::driver::zluda_log(&format!("[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> ERROR", dev));
     }

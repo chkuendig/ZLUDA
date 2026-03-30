@@ -4,6 +4,17 @@ use super::hipfix;
 use cuda_types::cuda::*;
 use hip_runtime_sys::*;
 
+fn format_byte_size(fmt: hipArray_Format) -> usize {
+    match fmt {
+        hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT8 | hipArray_Format::HIP_AD_FORMAT_SIGNED_INT8 => 1,
+        hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT16 | hipArray_Format::HIP_AD_FORMAT_SIGNED_INT16
+        | hipArray_Format::HIP_AD_FORMAT_HALF => 2,
+        hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32 | hipArray_Format::HIP_AD_FORMAT_SIGNED_INT32
+        | hipArray_Format::HIP_AD_FORMAT_FLOAT => 4,
+        _ => 4,
+    }
+}
+
 pub(crate) unsafe fn create_v2(
     p_handle: &mut CUarray,
     p_allocate_array: &CUDA_ARRAY_DESCRIPTOR,
@@ -12,6 +23,11 @@ pub(crate) unsafe fn create_v2(
     desc.Format = hipfix::get_non_broken_format(desc.Format);
     let mut hip_array = ptr::null_mut();
     hipArrayCreate(&mut hip_array, &desc)?;
+    let elem_size = format_byte_size(desc.Format) * desc.NumChannels as usize;
+    let size = desc.Width as usize * desc.Height.max(1) as usize * elem_size;
+    super::driver::zluda_log_err(&format!(
+        "ARRAY_CREATE {}x{} fmt={} ch={} ~{} KiB ptr={:?}",
+        desc.Width, desc.Height, desc.Format.0, desc.NumChannels, size / 1024, hip_array));
     *p_handle = hip_array.cast();
     Ok(())
 }
@@ -40,7 +56,13 @@ pub(crate) unsafe fn _3d_create_v2(
     hipfix::array_3d_create(&mut desc);
     let mut hip_array = mem::zeroed();
     hipArray3DCreate(&mut hip_array, &mut desc as _)?;
-    super::memory::update_alloc_range(hip_array as u64, 0x10000); // 64KB estimate for array metadata
+    let elem_size = format_byte_size(desc.Format) * desc.NumChannels as usize;
+    let size = desc.Width as usize * desc.Height.max(1) as usize * desc.Depth.max(1) as usize * elem_size;
+    super::memory::update_alloc_range(hip_array as u64, size.max(0x10000) as u64);
+    super::driver::zluda_log_err(&format!(
+        "ARRAY3D_CREATE {}x{}x{} fmt={} ch={} flags={} ~{} KiB ptr={:?}",
+        desc.Width, desc.Height, desc.Depth, desc.Format.0, desc.NumChannels,
+        desc.Flags, size / 1024, hip_array));
     *p_handle = hip_array as CUarray;
     Ok(())
 }

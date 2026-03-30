@@ -35,7 +35,26 @@ pub(crate) unsafe fn alloc_v2(dptr: &mut hipDeviceptr_t, bytesize: usize) -> CUr
     // 1-3 elements past the allocation. On NVIDIA, 2MB page granularity makes this
     // safe. On AMD with 4KB pages, it can cross into unmapped memory and fault.
     let alloc_size = (bytesize + 255) & !255;
-    hipMalloc(ptr::from_mut(dptr).cast(), alloc_size)?;
+    // On integrated GPUs (APUs), hipMalloc defaults to VRAM (a small BIOS
+    // carve-out, e.g. 1 GiB on Steam Deck) which causes eviction pressure
+    // with concurrent Vulkan rendering. Use hipMallocManaged to allocate
+    // from GTT (system RAM) — same speed on APU, much larger pool (8 GiB).
+    // On discrete GPUs, use regular hipMalloc (VRAM is fast and separate).
+    let mut is_integrated = 0i32;
+    let _ = hip_runtime_sys::hipDeviceGetAttribute(
+        &mut is_integrated,
+        hip_runtime_sys::hipDeviceAttribute_t::hipDeviceAttributeIntegrated,
+        0,
+    );
+    if is_integrated != 0 {
+        hip_runtime_sys::hipMallocManaged(
+            ptr::from_mut(dptr).cast(),
+            alloc_size,
+            hip_runtime_sys::hipMemAttachGlobal,
+        )?;
+    } else {
+        hipMalloc(ptr::from_mut(dptr).cast(), alloc_size)?;
+    }
     fill_with_zero_and_register(cu_context, context, dptr, alloc_size)?;
     Ok(())
 }
@@ -200,7 +219,24 @@ pub(crate) fn set_d32_async(
 }
 
 pub(crate) fn get_info_v2(free: *mut usize, total: *mut usize) -> hipError_t {
-    unsafe { hipMemGetInfo(free, total) }
+    let result = unsafe { hipMemGetInfo(free, total) };
+    if let Ok(()) = result {
+        let hip_total = unsafe { *total };
+        let hip_free = unsafe { *free };
+        // Match cuDeviceTotalMem (hip_total/2). hipMemGetInfo returns
+        // VRAM+GTT combined; cap to match what we report as total.
+        let reported_total = hip_total / 2;
+        let reported_free = hip_free.min(reported_total);
+        unsafe {
+            *total = reported_total;
+            *free = reported_free;
+        };
+        super::driver::zluda_log_err(&format!(
+            "cuMemGetInfo -> free={} MiB, total={} MiB (hip_free={}, hip_total={})",
+            reported_free / (1024*1024), reported_total / (1024*1024),
+            hip_free / (1024*1024), hip_total / (1024*1024)));
+    }
+    result
 }
 
 pub(crate) unsafe fn free_host(ptr: *mut ::core::ffi::c_void) -> CUresult {
@@ -391,6 +427,10 @@ pub(crate) unsafe fn alloc_pitch_v2(
         height,
         element_size_bytes,
     )?;
+    let size = width_in_bytes * height;
+    super::driver::zluda_log_err(&format!(
+        "ALLOC_PITCH {:?} {}x{} elem={} ~{} KiB",
+        unsafe { *dptr }, width_in_bytes, height, element_size_bytes, size / 1024));
     Ok(())
 }
 

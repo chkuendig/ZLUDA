@@ -227,6 +227,11 @@ pub(crate) fn launch_kernel(
                                     super::driver::zluda_log_err(&format!(
                                         "SORT_OUTPUT_CORRUPT keys_out=0x{:x} count={} bad={} first_bad=[{}]=0x{:08x}",
                                         keys_out, count, bad.len(), bad[0], keys[bad[0]]));
+                                    // Log VRAM usage at time of corruption
+                                    if let Ok(vram) = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_used") {
+                                        super::driver::zluda_log_err(&format!(
+                                            "  VRAM_AT_CORRUPT={} MiB", vram.trim().parse::<usize>().unwrap_or(0) / (1024*1024)));
+                                    }
                                 } else {
                                     super::driver::zluda_log_err(&format!(
                                         "SORT_OUTPUT_OK keys_out=0x{:x} count={} all_clean", keys_out, count));
@@ -314,6 +319,11 @@ pub(crate) fn launch_kernel(
                                     let _ = std::fs::write(path2, bytes2);
                                     super::driver::zluda_log_err(&format!(
                                         "  saved other buffer (0x{:x}) to {}", other_buf, path2));
+                                }
+                                // Log VRAM at CreateGrid corruption time
+                                if let Ok(vram) = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_used") {
+                                    super::driver::zluda_log_err(&format!(
+                                        "  VRAM_AT_CORRUPT={} MiB", vram.trim().parse::<usize>().unwrap_or(0) / (1024*1024)));
                                 }
                             }
                         }

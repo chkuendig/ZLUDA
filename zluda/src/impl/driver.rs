@@ -164,6 +164,363 @@ pub(crate) fn zluda_log_err(msg: &str) {
     }
 }
 
+/// Load the ROCm debug agent library and call its OnLoad entry point.
+///
+/// The debug agent catches GPU faults (memory violations, illegal instructions,
+/// assert traps) and dumps wavefront register state to stderr or a file
+/// (configurable via ROCM_DEBUG_AGENT_OPTIONS env var). It uses amd_dbgapi to
+/// attach to the process as a GPU debugger and receive hardware exceptions.
+///
+/// This bypasses HSA_TOOLS_LIB, which fails inside pressure-vessel Steam
+/// Runtime containers because dlopen can't resolve transitive dependencies.
+/// After hipInit(), the core ROCm libraries (libhsa-runtime64, libamd_comgr,
+/// librocprofiler-register) are already loaded, so the debug agent's
+/// dependencies resolve from the process and its co-located RUNPATH=$ORIGIN dir.
+///
+/// The agent also hooks hsa_executable_freeze and hsa_executable_destroy in the
+/// API table to track loaded code objects for disassembly context. Since we pass
+/// our own copy of the table (not the runtime's internal one), these hooks won't
+/// intercept actual HSA calls -- code object tracking will be incomplete. The
+/// core fault-catching and wavefront-dumping via amd_dbgapi works regardless.
+///
+/// Controlled by ZLUDA_DEBUG_AGENT=1. Options via ROCM_DEBUG_AGENT_OPTIONS
+/// (e.g. "--all --save-code-objects --output=/tmp/rocm_fault.log").
+#[cfg(not(windows))]
+fn load_rocm_debug_agent() {
+    // Path to the debug agent library. RUNPATH=$ORIGIN means its deps
+    // (librocm-dbgapi.so.0, libamd_comgr.so.3) are found in the same dir.
+    // Default path in the self-contained agent dir (all deps co-located).
+    // Override with ZLUDA_DEBUG_AGENT_PATH env var if needed.
+    let default_path = "/home/deck/.local/share/Steam/compatibilitytools.d/proton-cuda/files/lib64/rocm_debug_agent/librocm-debug-agent.so.2";
+    let agent_path = std::env::var("ZLUDA_DEBUG_AGENT_PATH")
+        .unwrap_or_else(|_| default_path.to_string());
+
+    zluda_log_err(&format!(
+        "[ZLUDA] Loading ROCm debug agent from: {}",
+        agent_path
+    ));
+
+    let c_path = match CString::new(agent_path.as_bytes()) {
+        Ok(p) => p,
+        Err(e) => {
+            zluda_log_err(&format!(
+                "[ZLUDA] Debug agent path contains null byte: {}",
+                e
+            ));
+            return;
+        }
+    };
+
+    // RTLD_NOW: resolve all symbols immediately (fail fast if deps missing).
+    // RTLD_GLOBAL: make agent's symbols visible to librocm-dbgapi.so.0.
+    let handle =
+        unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if handle.is_null() {
+        let err = unsafe { CStr::from_ptr(libc::dlerror()) };
+        zluda_log_err(&format!(
+            "[ZLUDA] Failed to dlopen debug agent: {}",
+            err.to_string_lossy()
+        ));
+        return;
+    }
+    zluda_log_err("[ZLUDA] Debug agent library loaded");
+
+    // Look up OnLoad. Signature from ROCr tool ABI (hsa_api_trace.h):
+    //   bool OnLoad(void* api_table, uint64_t runtime_version,
+    //               uint64_t failed_tool_count, const char* const* failed_tool_names)
+    let onload_sym = unsafe {
+        libc::dlsym(handle, c"OnLoad".as_ptr())
+    };
+    if onload_sym.is_null() {
+        zluda_log_err("[ZLUDA] Debug agent has no OnLoad symbol, skipping");
+        return;
+    }
+    type OnLoadFn = unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        u64,
+        *const *const i8,
+    ) -> bool;
+    let onload: OnLoadFn = unsafe { mem::transmute(onload_sym) };
+
+    // Build an HsaApiTable populated with real function pointers resolved from
+    // the already-loaded libhsa-runtime64.so.1 via dlsym(RTLD_DEFAULT, ...).
+    //
+    // The agent modifies the table in-place (installs hooks) and keeps the
+    // pointer for the process lifetime, so these must be static and mutable.
+    //
+    // Layout from ext/rocm/include/hsa/hsa_api_trace.h:
+    //   Each table starts with ApiTableVersion { major_id, minor_id, step_id, reserved }
+    //   (4 x u32 = 16 bytes = 2 usize slots), followed by function pointers.
+    //
+    //   HsaApiTable (root):
+    //     [0..1] ApiTableVersion  (major=3, minor=sizeof, step=1)
+    //     [2]    core_: *mut CoreApiTable       (offset 0x10)
+    //     [3]    amd_ext_: *mut AmdExtTable     (offset 0x18)
+    //     [4]    finalizer_ext_                 (offset 0x20)
+    //     [5]    image_ext_                     (offset 0x28)
+    //     [6]    tools_                         (offset 0x30)
+    //     [7]    pc_sampling_ext_               (offset 0x38)
+
+    // CoreApiTable: 127 entries (version + 125 function pointers) = ~1016 bytes.
+    // Use 128 slots for safety against minor version differences.
+    static mut CORE_TABLE: [usize; 128] = [0; 128];
+    // AmdExtTable: ~74 entries in ROCm 6.4. Use 128 slots.
+    static mut AMD_EXT_TABLE: [usize; 128] = [0; 128];
+    // Root HsaApiTable: 8 entries.
+    static mut HSA_TABLE: [usize; 8] = [0; 8];
+
+    // Resolve an HSA function from the already-loaded runtime.
+    // RTLD_DEFAULT searches all loaded shared objects.
+    macro_rules! resolve {
+        ($name:literal, $table:ident, $idx:expr) => {
+            let ptr = libc::dlsym(libc::RTLD_DEFAULT, concat!($name, "\0").as_ptr() as *const _);
+            if !ptr.is_null() {
+                *$table.add($idx) = ptr as usize;
+            }
+        };
+    }
+
+    unsafe {
+        // Raw pointers to the static tables, avoiding mutable references to
+        // mutable statics (which trigger static_mut_refs warnings in Rust 2024).
+        let hsa_tbl = ptr::addr_of_mut!(HSA_TABLE) as *mut usize;
+        let core_tbl = ptr::addr_of_mut!(CORE_TABLE) as *mut usize;
+        let amd_tbl = ptr::addr_of_mut!(AMD_EXT_TABLE) as *mut usize;
+        // --- Root table version ---
+        let ver = hsa_tbl as *mut u32;
+        *ver.add(0) = 0x03; // HSA_API_TABLE_MAJOR_VERSION
+        *ver.add(1) = mem::size_of::<[usize; 8]>() as u32;
+        *ver.add(2) = 0x01; // HSA_API_TABLE_STEP_VERSION
+        *ver.add(3) = 0;
+        *hsa_tbl.add(2) = core_tbl as usize; // core_
+        *hsa_tbl.add(3) = amd_tbl as usize;  // amd_ext_
+        // finalizer_ext_, image_ext_, tools_, pc_sampling_ext_ left as null --
+        // the agent doesn't access them.
+
+        // --- CoreApiTable version ---
+        let ver = core_tbl as *mut u32;
+        *ver.add(0) = 0x02; // HSA_CORE_API_TABLE_MAJOR_VERSION
+        *ver.add(1) = mem::size_of::<[usize; 128]>() as u32;
+        *ver.add(2) = 0x00; // HSA_CORE_API_TABLE_STEP_VERSION
+        *ver.add(3) = 0;
+
+        // CoreApiTable function pointers (index = byte_offset / 8).
+        // The agent hooks [86] hsa_executable_destroy and [88] hsa_executable_freeze.
+        // We populate all entries so the hooks have valid originals to call through.
+        resolve!("hsa_init", core_tbl, 2);
+        resolve!("hsa_shut_down", core_tbl,3);
+        resolve!("hsa_system_get_info", core_tbl,4);
+        resolve!("hsa_system_extension_supported", core_tbl,5);
+        resolve!("hsa_system_get_extension_table", core_tbl,6);
+        resolve!("hsa_iterate_agents", core_tbl,7);
+        resolve!("hsa_agent_get_info", core_tbl,8);
+        resolve!("hsa_queue_create", core_tbl,9);
+        resolve!("hsa_soft_queue_create", core_tbl,10);
+        resolve!("hsa_queue_destroy", core_tbl,11);
+        resolve!("hsa_queue_inactivate", core_tbl,12);
+        resolve!("hsa_queue_load_read_index_scacquire", core_tbl,13);
+        resolve!("hsa_queue_load_read_index_relaxed", core_tbl,14);
+        resolve!("hsa_queue_load_write_index_scacquire", core_tbl,15);
+        resolve!("hsa_queue_load_write_index_relaxed", core_tbl,16);
+        resolve!("hsa_queue_store_write_index_relaxed", core_tbl,17);
+        resolve!("hsa_queue_store_write_index_screlease", core_tbl,18);
+        resolve!("hsa_queue_cas_write_index_scacq_screl", core_tbl,19);
+        resolve!("hsa_queue_cas_write_index_scacquire", core_tbl,20);
+        resolve!("hsa_queue_cas_write_index_relaxed", core_tbl,21);
+        resolve!("hsa_queue_cas_write_index_screlease", core_tbl,22);
+        resolve!("hsa_queue_add_write_index_scacq_screl", core_tbl,23);
+        resolve!("hsa_queue_add_write_index_scacquire", core_tbl,24);
+        resolve!("hsa_queue_add_write_index_relaxed", core_tbl,25);
+        resolve!("hsa_queue_add_write_index_screlease", core_tbl,26);
+        resolve!("hsa_queue_store_read_index_relaxed", core_tbl,27);
+        resolve!("hsa_queue_store_read_index_screlease", core_tbl,28);
+        resolve!("hsa_agent_iterate_regions", core_tbl,29);
+        resolve!("hsa_region_get_info", core_tbl,30);
+        resolve!("hsa_agent_get_exception_policies", core_tbl,31);
+        resolve!("hsa_agent_extension_supported", core_tbl,32);
+        resolve!("hsa_memory_register", core_tbl,33);
+        resolve!("hsa_memory_deregister", core_tbl,34);
+        resolve!("hsa_memory_allocate", core_tbl,35);
+        resolve!("hsa_memory_free", core_tbl,36);
+        resolve!("hsa_memory_copy", core_tbl,37);
+        resolve!("hsa_memory_assign_agent", core_tbl,38);
+        resolve!("hsa_signal_create", core_tbl,39);
+        resolve!("hsa_signal_destroy", core_tbl,40);
+        resolve!("hsa_signal_load_relaxed", core_tbl,41);
+        resolve!("hsa_signal_load_scacquire", core_tbl,42);
+        resolve!("hsa_signal_store_relaxed", core_tbl,43);
+        resolve!("hsa_signal_store_screlease", core_tbl,44);
+        resolve!("hsa_signal_wait_relaxed", core_tbl,45);
+        resolve!("hsa_signal_wait_scacquire", core_tbl,46);
+        resolve!("hsa_signal_and_relaxed", core_tbl,47);
+        resolve!("hsa_signal_and_scacquire", core_tbl,48);
+        resolve!("hsa_signal_and_screlease", core_tbl,49);
+        resolve!("hsa_signal_and_scacq_screl", core_tbl,50);
+        resolve!("hsa_signal_or_relaxed", core_tbl,51);
+        resolve!("hsa_signal_or_scacquire", core_tbl,52);
+        resolve!("hsa_signal_or_screlease", core_tbl,53);
+        resolve!("hsa_signal_or_scacq_screl", core_tbl,54);
+        resolve!("hsa_signal_xor_relaxed", core_tbl,55);
+        resolve!("hsa_signal_xor_scacquire", core_tbl,56);
+        resolve!("hsa_signal_xor_screlease", core_tbl,57);
+        resolve!("hsa_signal_xor_scacq_screl", core_tbl,58);
+        resolve!("hsa_signal_exchange_relaxed", core_tbl,59);
+        resolve!("hsa_signal_exchange_scacquire", core_tbl,60);
+        resolve!("hsa_signal_exchange_screlease", core_tbl,61);
+        resolve!("hsa_signal_exchange_scacq_screl", core_tbl,62);
+        resolve!("hsa_signal_add_relaxed", core_tbl,63);
+        resolve!("hsa_signal_add_scacquire", core_tbl,64);
+        resolve!("hsa_signal_add_screlease", core_tbl,65);
+        resolve!("hsa_signal_add_scacq_screl", core_tbl,66);
+        resolve!("hsa_signal_subtract_relaxed", core_tbl,67);
+        resolve!("hsa_signal_subtract_scacquire", core_tbl,68);
+        resolve!("hsa_signal_subtract_screlease", core_tbl,69);
+        resolve!("hsa_signal_subtract_scacq_screl", core_tbl,70);
+        resolve!("hsa_signal_cas_relaxed", core_tbl,71);
+        resolve!("hsa_signal_cas_scacquire", core_tbl,72);
+        resolve!("hsa_signal_cas_screlease", core_tbl,73);
+        resolve!("hsa_signal_cas_scacq_screl", core_tbl,74);
+        resolve!("hsa_isa_from_name", core_tbl,75);
+        resolve!("hsa_isa_get_info", core_tbl,76);
+        resolve!("hsa_isa_compatible", core_tbl,77);
+        resolve!("hsa_code_object_serialize", core_tbl,78);
+        resolve!("hsa_code_object_deserialize", core_tbl,79);
+        resolve!("hsa_code_object_destroy", core_tbl,80);
+        resolve!("hsa_code_object_get_info", core_tbl,81);
+        resolve!("hsa_code_object_get_symbol", core_tbl,82);
+        resolve!("hsa_code_symbol_get_info", core_tbl,83);
+        resolve!("hsa_code_object_iterate_symbols", core_tbl,84);
+        resolve!("hsa_executable_create", core_tbl,85);
+        resolve!("hsa_executable_destroy", core_tbl,86);       // agent hooks this
+        resolve!("hsa_executable_load_code_object", core_tbl,87);
+        resolve!("hsa_executable_freeze", core_tbl,88);        // agent hooks this
+        resolve!("hsa_executable_get_info", core_tbl,89);
+        resolve!("hsa_executable_global_variable_define", core_tbl,90);
+        resolve!("hsa_executable_agent_global_variable_define", core_tbl,91);
+        resolve!("hsa_executable_readonly_variable_define", core_tbl,92);
+        resolve!("hsa_executable_validate", core_tbl,93);
+        resolve!("hsa_executable_get_symbol", core_tbl,94);
+        resolve!("hsa_executable_symbol_get_info", core_tbl,95);
+        resolve!("hsa_executable_iterate_symbols", core_tbl,96);
+        resolve!("hsa_status_string", core_tbl,97);
+        // v1.1 additions
+        resolve!("hsa_extension_get_name", core_tbl,98);
+        resolve!("hsa_system_major_extension_supported", core_tbl,99);
+        resolve!("hsa_system_get_major_extension_table", core_tbl,100);
+        resolve!("hsa_agent_major_extension_supported", core_tbl,101);
+        resolve!("hsa_cache_get_info", core_tbl,102);
+        resolve!("hsa_agent_iterate_caches", core_tbl,103);
+        resolve!("hsa_signal_silent_store_relaxed", core_tbl,104);
+        resolve!("hsa_signal_silent_store_screlease", core_tbl,105);
+        resolve!("hsa_signal_group_create", core_tbl,106);
+        resolve!("hsa_signal_group_destroy", core_tbl,107);
+        resolve!("hsa_signal_group_wait_any_scacquire", core_tbl,108);
+        resolve!("hsa_signal_group_wait_any_relaxed", core_tbl,109);
+        resolve!("hsa_agent_iterate_isas", core_tbl,110);
+        resolve!("hsa_isa_get_info_alt", core_tbl,111);
+        resolve!("hsa_isa_get_exception_policies", core_tbl,112);
+        resolve!("hsa_isa_get_round_method", core_tbl,113);
+        resolve!("hsa_wavefront_get_info", core_tbl,114);
+        resolve!("hsa_isa_iterate_wavefronts", core_tbl,115);
+        resolve!("hsa_code_object_get_symbol_from_name", core_tbl,116);
+        resolve!("hsa_code_object_reader_create_from_file", core_tbl,117);
+        resolve!("hsa_code_object_reader_create_from_memory", core_tbl,118);
+        resolve!("hsa_code_object_reader_destroy", core_tbl,119);
+        resolve!("hsa_executable_create_alt", core_tbl,120);
+        resolve!("hsa_executable_load_program_code_object", core_tbl,121);
+        resolve!("hsa_executable_load_agent_code_object", core_tbl,122);
+        resolve!("hsa_executable_validate_alt", core_tbl,123);
+        resolve!("hsa_executable_get_symbol_by_name", core_tbl,124);
+        resolve!("hsa_executable_iterate_agent_symbols", core_tbl,125);
+        resolve!("hsa_executable_iterate_program_symbols", core_tbl,126);
+
+        // --- AmdExtTable version ---
+        let ver = amd_tbl as *mut u32;
+        *ver.add(0) = 0x02; // HSA_AMD_EXT_API_TABLE_MAJOR_VERSION
+        *ver.add(1) = mem::size_of::<[usize; 128]>() as u32;
+        *ver.add(2) = 0x05; // HSA_AMD_EXT_API_TABLE_STEP_VERSION
+        *ver.add(3) = 0;
+
+        // AmdExtTable function pointers. Populate the critical ones the agent
+        // may use during fault handling (e.g. hsa_amd_register_system_event_handler).
+        resolve!("hsa_amd_coherency_get_type", amd_tbl,2);
+        resolve!("hsa_amd_coherency_set_type", amd_tbl,3);
+        resolve!("hsa_amd_profiling_set_profiler_enabled", amd_tbl,4);
+        resolve!("hsa_amd_profiling_async_copy_enable", amd_tbl,5);
+        resolve!("hsa_amd_profiling_get_dispatch_time", amd_tbl,6);
+        resolve!("hsa_amd_profiling_get_async_copy_time", amd_tbl,7);
+        resolve!("hsa_amd_profiling_convert_tick_to_system_domain", amd_tbl,8);
+        resolve!("hsa_amd_signal_async_handler", amd_tbl,9);
+        resolve!("hsa_amd_async_function", amd_tbl,10);
+        resolve!("hsa_amd_signal_wait_any", amd_tbl,11);
+        resolve!("hsa_amd_queue_cu_set_mask", amd_tbl,12);
+        resolve!("hsa_amd_memory_pool_get_info", amd_tbl,13);
+        resolve!("hsa_amd_agent_iterate_memory_pools", amd_tbl,14);
+        resolve!("hsa_amd_memory_pool_allocate", amd_tbl,15);
+        resolve!("hsa_amd_memory_pool_free", amd_tbl,16);
+        resolve!("hsa_amd_memory_async_copy", amd_tbl,17);
+        resolve!("hsa_amd_memory_async_copy_on_engine", amd_tbl,18);
+        resolve!("hsa_amd_memory_copy_engine_status", amd_tbl,19);
+        resolve!("hsa_amd_agent_memory_pool_get_info", amd_tbl,20);
+        resolve!("hsa_amd_agents_allow_access", amd_tbl,21);
+        resolve!("hsa_amd_memory_pool_can_migrate", amd_tbl,22);
+        resolve!("hsa_amd_memory_migrate", amd_tbl,23);
+        resolve!("hsa_amd_memory_lock", amd_tbl,24);
+        resolve!("hsa_amd_memory_unlock", amd_tbl,25);
+        resolve!("hsa_amd_memory_fill", amd_tbl,26);
+        resolve!("hsa_amd_interop_map_buffer", amd_tbl,27);
+        resolve!("hsa_amd_interop_unmap_buffer", amd_tbl,28);
+        resolve!("hsa_amd_image_create", amd_tbl,29);
+        resolve!("hsa_amd_pointer_info", amd_tbl,30);
+        resolve!("hsa_amd_pointer_info_set_userdata", amd_tbl,31);
+        resolve!("hsa_amd_ipc_memory_create", amd_tbl,32);
+        resolve!("hsa_amd_ipc_memory_attach", amd_tbl,33);
+        resolve!("hsa_amd_ipc_memory_detach", amd_tbl,34);
+        resolve!("hsa_amd_signal_create", amd_tbl,35);
+        resolve!("hsa_amd_ipc_signal_create", amd_tbl,36);
+        resolve!("hsa_amd_ipc_signal_attach", amd_tbl,37);
+        resolve!("hsa_amd_register_system_event_handler", amd_tbl,38);
+        resolve!("hsa_amd_queue_intercept_create", amd_tbl,39);
+        resolve!("hsa_amd_queue_intercept_register", amd_tbl,40);
+        resolve!("hsa_amd_queue_set_priority", amd_tbl,41);
+        resolve!("hsa_amd_memory_async_copy_rect", amd_tbl,42);
+        resolve!("hsa_amd_runtime_queue_create_register", amd_tbl,43);
+        resolve!("hsa_amd_memory_lock_to_pool", amd_tbl,44);
+        resolve!("hsa_amd_register_deallocation_callback", amd_tbl,45);
+        resolve!("hsa_amd_deregister_deallocation_callback", amd_tbl,46);
+        resolve!("hsa_amd_signal_value_pointer", amd_tbl,47);
+
+        // Log how many functions we resolved
+        let mut core_count = 0usize;
+        for i in 2..128 {
+            if *core_tbl.add(i) != 0 { core_count += 1; }
+        }
+        let mut amd_count = 0usize;
+        for i in 2..128 {
+            if *amd_tbl.add(i) != 0 { amd_count += 1; }
+        }
+        zluda_log_err(&format!(
+            "[ZLUDA] HSA API table: {} core + {} amd_ext functions resolved",
+            core_count, amd_count
+        ));
+
+        // Call OnLoad(table, runtime_version=0, failed_count=0, failed_names=null)
+        let table_ptr = hsa_tbl as *mut c_void;
+        zluda_log_err("[ZLUDA] Calling debug agent OnLoad...");
+        let result = onload(table_ptr, 0, 0, ptr::null());
+        if result {
+            zluda_log_err("[ZLUDA] Debug agent OnLoad succeeded - GPU fault handler active");
+            zluda_log_err("[ZLUDA] Send SIGQUIT (kill -3 <pid>) to dump all wavefront state");
+        } else {
+            zluda_log_err("[ZLUDA] Debug agent OnLoad returned false (init failed)");
+        }
+    }
+
+    // Intentionally leak the dlopen handle: the debug agent registers signal
+    // handlers and amd_dbgapi callbacks that must persist for the process lifetime.
+    // The static tables above must also remain valid.
+}
 
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log(&format!("[ZLUDA] cuInit({})", flags));
@@ -178,6 +535,13 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     unsafe { libc::setenv(c"HSA_ENABLE_VM_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
     unsafe { libc::setenv(c"HSA_ENABLE_QUEUE_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
     unsafe { hipInit(flags) }?;
+    // Load ROCm debug agent if requested. Must happen after hipInit() so that
+    // libhsa-runtime64.so.1 and other ROCm deps are already in the process,
+    // allowing dlopen to resolve the agent's transitive dependencies.
+    #[cfg(not(windows))]
+    if std::env::var("ZLUDA_DEBUG_AGENT").map_or(false, |v| v == "1") {
+        load_rocm_debug_agent();
+    }
     // Verify HIP runtime version matches what ZLUDA was compiled against.
     // Mismatched versions cause silent GPU failures: hipModuleGetGlobal returns
     // success but doesn't write output parameters, leading to HOST addresses
