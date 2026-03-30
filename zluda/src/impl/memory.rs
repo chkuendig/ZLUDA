@@ -35,26 +35,7 @@ pub(crate) unsafe fn alloc_v2(dptr: &mut hipDeviceptr_t, bytesize: usize) -> CUr
     // 1-3 elements past the allocation. On NVIDIA, 2MB page granularity makes this
     // safe. On AMD with 4KB pages, it can cross into unmapped memory and fault.
     let alloc_size = (bytesize + 255) & !255;
-    // On integrated GPUs (APUs), hipMalloc defaults to VRAM (a small BIOS
-    // carve-out, e.g. 1 GiB on Steam Deck) which causes eviction pressure
-    // with concurrent Vulkan rendering. Use hipMallocManaged to allocate
-    // from GTT (system RAM) — same speed on APU, much larger pool (8 GiB).
-    // On discrete GPUs, use regular hipMalloc (VRAM is fast and separate).
-    let mut is_integrated = 0i32;
-    let _ = hip_runtime_sys::hipDeviceGetAttribute(
-        &mut is_integrated,
-        hip_runtime_sys::hipDeviceAttribute_t::hipDeviceAttributeIntegrated,
-        0,
-    );
-    if is_integrated != 0 {
-        hip_runtime_sys::hipMallocManaged(
-            ptr::from_mut(dptr).cast(),
-            alloc_size,
-            hip_runtime_sys::hipMemAttachGlobal,
-        )?;
-    } else {
-        hipMalloc(ptr::from_mut(dptr).cast(), alloc_size)?;
-    }
+    hipMalloc(ptr::from_mut(dptr).cast(), alloc_size)?;
     fill_with_zero_and_register(cu_context, context, dptr, alloc_size)?;
     Ok(())
 }
