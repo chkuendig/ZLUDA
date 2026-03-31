@@ -4,7 +4,8 @@ use crate::{ffi::LLVMZludaLinkWithLLD, utils::Module};
 use llvm_sys::{
     core::*,
     target::{
-        LLVMInitializeAMDGPUAsmPrinter, LLVMInitializeAMDGPUTarget, LLVMInitializeAMDGPUTargetInfo,
+        LLVMInitializeAMDGPUAsmParser, LLVMInitializeAMDGPUAsmPrinter,
+        LLVMInitializeAMDGPUTarget, LLVMInitializeAMDGPUTargetInfo,
         LLVMInitializeAMDGPUTargetMC,
     },
     target_machine::{
@@ -273,6 +274,7 @@ fn init_globals() -> Result<(), String> {
             unsafe { LLVMInitializeAMDGPUTarget() };
             unsafe { LLVMInitializeAMDGPUTargetMC() };
             unsafe { LLVMInitializeAMDGPUAsmPrinter() };
+            unsafe { LLVMInitializeAMDGPUAsmParser() };
             Ok(())
         })
         .as_ref()

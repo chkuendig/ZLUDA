@@ -785,7 +785,7 @@ extern "C"
 
     // 256-bit image resource descriptor (8 x uint32)
     typedef unsigned int surf_desc __attribute__((ext_vector_type(8)));
-    typedef surf_desc CONSTANT_SPACE *surface_ptr;
+    typedef surf_desc GLOBAL_SPACE *surface_ptr;
 
     const unsigned int IMAGE_RESERVED_TOP_BITS = 3;
 

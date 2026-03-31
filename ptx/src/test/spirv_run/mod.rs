@@ -2020,6 +2020,163 @@ fn sust_3d_b64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
+/// Test: divergent surface writes — different lanes use different surface handles.
+/// Exposes CONSTANT_SPACE bug where scalar load gives all lanes the same descriptor.
+/// Even threads write 0x42420000 to surface A, odd threads write 0x43430000 to surface B.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn sust_divergent_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx = read_test_file!("sust_divergent.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+    eprintln!("sust_divergent: compiled {} bytes ELF", elf.len());
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    // Create two 64x1x1 FLOAT 1-channel surfaces (A and B)
+    let array_desc = HIP_ARRAY3D_DESCRIPTOR {
+        Width: 64,
+        Height: 1,
+        Depth: 1,
+        Format: hipArray_Format::HIP_AD_FORMAT_FLOAT,
+        NumChannels: 1,
+        Flags: 0x02, // CUDA_ARRAY3D_SURFACE_LDST
+    };
+
+    let mut array_a: hipArray_t = std::ptr::null_mut();
+    let mut array_b: hipArray_t = std::ptr::null_mut();
+    unsafe { hipArray3DCreate(&mut array_a, &array_desc) }.unwrap();
+    unsafe { hipArray3DCreate(&mut array_b, &array_desc) }.unwrap();
+
+    // Create surface objects
+    let make_surf = |array: hipArray_t| -> u64 {
+        let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+        let res_desc = hipResourceDesc {
+            resType: hipResourceType::hipResourceTypeArray,
+            res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
+                array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
+                    array,
+                },
+            },
+        };
+        unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
+        // Encode pixel size (float=4, shift=2) in top bits
+        let shift_amount = 2usize << (usize::BITS - 3);
+        (surf_obj as usize | shift_amount) as u64
+    };
+
+    let handle_a = make_surf(array_a);
+    let handle_b = make_surf(array_b);
+    eprintln!("sust_divergent: handle_a={:#x} handle_b={:#x}", handle_a, handle_b);
+
+    // Output marker buffer
+    let mut out_buf = ptr::null_mut();
+    unsafe { hipMalloc(&mut out_buf, 4) }.unwrap();
+    unsafe { hipMemset(out_buf, 0, 4) }.unwrap();
+
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_divergent".as_ptr()) }.unwrap();
+
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+
+    // Launch 64 threads (1 wavefront on AMDGPU)
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        &out_buf as *const _ as *mut _,
+        &handle_a as *const _ as *mut _,
+        &handle_b as *const _ as *mut _,
+    ];
+    eprintln!("sust_divergent: launching 64 threads...");
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel, 1, 1, 1, 64, 1, 1, 0, stream,
+            args.as_mut_ptr(), ptr::null_mut(),
+        )
+    }
+    .unwrap();
+
+    let sync_result = unsafe { hipStreamSynchronize(stream) };
+    eprintln!("sust_divergent: sync -> {:?}", sync_result);
+    sync_result.unwrap();
+
+    // Read back surfaces
+    let mut data_a = vec![0u32; 64];
+    let mut data_b = vec![0u32; 64];
+    unsafe {
+        hipMemcpyFromArray(
+            data_a.as_mut_ptr() as _,
+            array_a, 0, 0,
+            64 * 4,
+            hipMemcpyKind::hipMemcpyDeviceToHost,
+        )
+    }.unwrap();
+    unsafe {
+        hipMemcpyFromArray(
+            data_b.as_mut_ptr() as _,
+            array_b, 0, 0,
+            64 * 4,
+            hipMemcpyKind::hipMemcpyDeviceToHost,
+        )
+    }.unwrap();
+
+    eprintln!("sust_divergent: surface A[0..8] = {:08x?}", &data_a[..8]);
+    eprintln!("sust_divergent: surface B[0..8] = {:08x?}", &data_b[..8]);
+
+    // Verify: even threads wrote to A, odd threads wrote to B
+    let mut a_ok = 0;
+    let mut b_ok = 0;
+    for i in 0..64usize {
+        if i % 2 == 0 {
+            if data_a[i] == 0x42420000 { a_ok += 1; }
+        } else {
+            if data_b[i] == 0x43430000 { b_ok += 1; }
+        }
+    }
+    eprintln!("sust_divergent: A correct={}/32, B correct={}/32", a_ok, b_ok);
+
+    // Cleanup
+    unsafe { hipFree(out_buf) }.unwrap();
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipFreeArray(array_a) }.unwrap();
+    unsafe { hipFreeArray(array_b) }.unwrap();
+
+    // Key assertion: surface B MUST have writes from odd threads.
+    // If CONSTANT_SPACE bug: all threads use surface A, B gets nothing.
+    assert!(b_ok > 0, "surface B should have writes from odd threads (got 0 — CONSTANT_SPACE scalar load bug!)");
+    assert!(a_ok > 0, "surface A should have writes from even threads");
+    Ok(())
+}
+
 /// Regression test: 64x64x64 surface write with byte-scaled x coordinate.
 /// Catches missing pixel size encoding in surface handle top bits.
 /// Without encoding: x stays byte-scaled (max 252) → overflows 64-element row → GPU hang.
