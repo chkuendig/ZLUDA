@@ -164,6 +164,54 @@ pub(crate) fn zluda_log_err(msg: &str) {
     }
 }
 
+/// Global storage for last kernel launch info, written by launch_kernel,
+/// read by the SIGABRT handler. Uses a simple atomic string approach.
+static LAST_KERNEL_INFO: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub(crate) fn set_last_kernel(info: String) {
+    if let Ok(mut s) = LAST_KERNEL_INFO.lock() {
+        *s = info;
+    }
+}
+
+/// SIGABRT handler — fires when HSA runtime kills the process on GPU fault.
+/// Dumps the last kernel launch info to the log before dying.
+#[cfg(not(windows))]
+fn install_fault_signal_handler() {
+    unsafe extern "C" fn sigabrt_handler(sig: i32) {
+        // Minimal async-signal-safe operations only.
+        // Write directly to the log file.
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/zluda_tex.log")
+        {
+            let _ = write!(f, "\n*** SIGABRT (signal {}) — GPU fault likely ***\n", sig);
+            if let Ok(info) = LAST_KERNEL_INFO.lock() {
+                let _ = write!(f, "*** Last kernel: {}\n", *info);
+            }
+            // Read /proc/self/maps to find what's at common fault regions
+            if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+                let _ = write!(f, "*** Process memory maps (0x7f region):\n");
+                for line in maps.lines() {
+                    if line.starts_with("7f") {
+                        let _ = writeln!(f, "***   {}", line);
+                    }
+                }
+            }
+        }
+        // Re-raise with default handler to actually die
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+    unsafe {
+        libc::signal(libc::SIGABRT, sigabrt_handler as libc::sighandler_t);
+        libc::signal(libc::SIGSEGV, sigabrt_handler as libc::sighandler_t);
+    }
+    zluda_log_err("[ZLUDA] Signal handlers installed (SIGABRT+SIGSEGV) for fault capture");
+}
+
 /// Load the ROCm debug agent library and call its OnLoad entry point.
 ///
 /// The debug agent catches GPU faults (memory violations, illegal instructions,
@@ -535,6 +583,11 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     unsafe { libc::setenv(c"HSA_ENABLE_VM_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
     unsafe { libc::setenv(c"HSA_ENABLE_QUEUE_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
     unsafe { hipInit(flags) }?;
+    // Install SIGABRT handler to dump last kernel info before dying.
+    // The HSA runtime sends SIGABRT on GPU page faults — our normal
+    // hipDeviceSynchronize error check doesn't run in time.
+    #[cfg(not(windows))]
+    install_fault_signal_handler();
     // Load ROCm debug agent if requested. Must happen after hipInit() so that
     // libhsa-runtime64.so.1 and other ROCm deps are already in the process,
     // allowing dlopen to resolve the agent's transitive dependencies.

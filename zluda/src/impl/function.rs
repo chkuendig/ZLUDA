@@ -354,48 +354,7 @@ pub(crate) fn launch_kernel(
                 }
             }
         }
-        // Validate surface descriptors only for kernels that use surfaces
-        // (TurbulenceFS + CreateParticleShapes). Check only known surface
-        // param positions to avoid scanning all params (too slow).
-        if (name.contains("TurbulenceFS") || name.contains("CreateParticleShapes"))
-            && !extra.is_null() && kernel_params.is_null()
-        {
-            unsafe {
-                let extra_slice = std::slice::from_raw_parts(extra, 5);
-                let buf_ptr = extra_slice[1] as *const u8;
-                let buf_size = *(extra_slice[3] as *const usize);
-                if !buf_ptr.is_null() && buf_size >= 8 {
-                    // Scan first 32 params only (256 bytes). buf_size can be
-                    // much larger (includes padding/alignment) and scanning
-                    // beyond actual params reads garbage → crash.
-                    let n_params = (buf_size / 8).min(32);
-                    for i in 0..n_params {
-                        let val = *(buf_ptr.add(i * 8) as *const u64);
-                        let top3 = val >> 61;
-                        if top3 >= 1 && top3 <= 7 {
-                            let desc_addr = val & 0x1FFFFFFFFFFFFFFF;
-                            if desc_addr > 0x7f0000000000 && desc_addr < 0x800000000000 {
-                                // Read the 32-byte image descriptor from GPU
-                                let mut desc_now = [0u32; 8];
-                                let r = hip_runtime_sys::hipMemcpyDtoH(
-                                    desc_now.as_mut_ptr() as *mut _,
-                                    hip_runtime_sys::hipDeviceptr_t(desc_addr as *mut _),
-                                    32,
-                                );
-                                if r.is_ok() {
-                                    // base_addr from descriptor
-                                    let base_addr = ((desc_now[1] as u64 & 0xFFFF) << 32) | desc_now[0] as u64;
-                                    // Log every surface we see (not just suspicious ones)
-                                    super::driver::zluda_log_err(&format!(
-                                        "SURFACE kernel='{}' param[{}] handle=0x{:x} base=0x{:x} desc={:08x?}",
-                                        name, i, val, base_addr, desc_now));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Kernel pointer args are already logged in the SYNC block below.
         // Validate CreateParticleShapesIncremental input indices
         if name.contains("CreateParticleShapesIncremental_MultiStage") && !extra.is_null() && kernel_params.is_null() {
             unsafe {
@@ -531,15 +490,17 @@ pub(crate) fn launch_kernel(
         });
         if sync {
             let name = lookup_name(f.base);
-            // Dump raw extra buffer params (first 8 u64 values) for crash analysis
+            // Dump kernel params for crash analysis
             let mut raw_params = String::new();
             if !extra.is_null() && kernel_params.is_null() {
+                // extra buffer: packed params
                 unsafe {
                     let ep = std::slice::from_raw_parts(extra, 5);
                     let buf = ep[1] as *const u8;
                     let sz = *(ep[3] as *const usize);
                     if !buf.is_null() && sz > 0 {
-                        let n_u64 = (sz / 8).min(8);
+                        let max_params = if name.contains("TurbulenceFS") { 48 } else { 8 };
+                        let n_u64 = (sz / 8).min(max_params);
                         for j in 0..n_u64 {
                             let v = *(buf.add(j * 8) as *const u64);
                             if !raw_params.is_empty() { raw_params.push(','); }
@@ -547,13 +508,43 @@ pub(crate) fn launch_kernel(
                         }
                     }
                 }
+            } else if !kernel_params.is_null() {
+                // kernel_params: array of void* pointers to individual param values.
+                // No length indicator. Read carefully with bounds checks.
+                unsafe {
+                    for j in 0..8usize {
+                        let pp = *kernel_params.add(j);
+                        let pp_addr = pp as usize;
+                        // Stop at null or clearly invalid pointer
+                        if pp_addr == 0 || pp_addr < 0x1000 || pp_addr > 0x7fffffffffff { break; }
+                        let v = *(pp as *const u64);
+                        if !raw_params.is_empty() { raw_params.push(','); }
+                        raw_params.push_str(&format!("{:#x}", v));
+                    }
+                }
             }
-            super::driver::zluda_log_err(&format!(
-                "SYNC#{} '{}' [{}]", n, name, raw_params));
+            let sync_info = format!("SYNC#{} '{}' [{}]", n, name, raw_params);
+            super::driver::zluda_log_err(&sync_info);
+            // Store for SIGABRT handler to dump on crash
+            super::driver::set_last_kernel(sync_info);
             // Use hipDeviceSynchronize to catch faults from ALL streams
             // (PhysX uses multiple threads/streams — TurbulenceFS on 02bc,
             // RadixSort/CreateGrid on 0130)
             let sync_result = unsafe { hip_runtime_sys::hipDeviceSynchronize() };
+            if sync_result.is_err() {
+                // GPU fault detected! This kernel (or a preceding async one) faulted.
+                // Log everything we can before the HSA runtime kills us with SIGABRT.
+                super::driver::zluda_log_err(&format!(
+                    "GPU_FAULT after SYNC#{} '{}' sync={:?} params=[{}]",
+                    n, name, sync_result, raw_params));
+                // Read VRAM usage at fault time
+                if let Ok(vram) = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_used") {
+                    super::driver::zluda_log_err(&format!(
+                        "GPU_FAULT VRAM={} MiB", vram.trim().parse::<usize>().unwrap_or(0) / (1024*1024)));
+                }
+                // Log file uses append mode (open/write/close per line),
+                // so data is already on disk.
+            }
             // After CopyBits2(flag=1) completes, verify key buffer
             if sync_result.is_ok()
                 && name.contains("CopyBits2")
