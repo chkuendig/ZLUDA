@@ -101,19 +101,23 @@ pub(crate) fn copy_hto_d_v2(
     }
     let result = unsafe { hipMemcpyHtoD(dst_device, src_host.cast_mut(), byte_count) };
     if result.is_err() {
-        // CUDA unified addressing allows cuMemcpyHtoD to host-mapped pointers.
-        // HIP rejects these. Fallback to memcpy for host→host copies.
+        // hipMemcpyHtoD failed — try hipMemcpy with Default kind which
+        // handles unified/host-mapped pointers correctly via the runtime.
+        // NEVER fall back to raw memcpy: casting a device pointer to a CPU
+        // pointer bypasses GPU page tables and can corrupt GPU memory,
+        // causing surface descriptor corruption and TCP page faults.
         super::driver::zluda_log_err(&format!(
-            "cuMemcpyHtoD_v2 dst={:p} src={:p} size={} -> {:?}, falling back to memcpy",
+            "cuMemcpyHtoD_v2 dst={:p} src={:p} size={} -> {:?}, trying hipMemcpy default",
             dst_device.0, src_host, byte_count, result
         ));
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                src_host.cast::<u8>(),
-                dst_device.0.cast::<u8>(),
+            hip_runtime_sys::hipMemcpy(
+                dst_device.0,
+                src_host.cast_mut(),
                 byte_count,
-            );
-        }
+                hipMemcpyKind::hipMemcpyDefault,
+            )
+        }?;
     }
     Ok(())
 }
@@ -322,33 +326,20 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
     }
     let result = hipMemcpyHtoDAsync(dst_device, src_host.cast_mut(), byte_count, stream);
     if result.is_err() {
-        // CUDA unified addressing allows cuMemcpyHtoD to host-mapped pointers
-        // (e.g. from cuMemHostAlloc with hipHostMallocMapped). HIP rejects
-        // these because the pointer is in host address space, not device.
-        // Try hipMemcpy with hipMemcpyDefault which handles unified pointers.
+        // hipMemcpyHtoDAsync failed — try hipMemcpyAsync with Default kind.
+        // NEVER fall back to raw memcpy: casting a device pointer to a CPU
+        // pointer bypasses GPU page tables and can corrupt GPU memory.
         super::driver::zluda_log_err(&format!(
-            "cuMemcpyHtoDAsync_v2 dst={:p} src={:p} size={} -> {:?}, trying hipMemcpy default",
+            "cuMemcpyHtoDAsync_v2 dst={:p} src={:p} size={} -> {:?}, trying hipMemcpyAsync default",
             dst_device.0, src_host, byte_count, result
         ));
-        let result2 = hipMemcpyAsync(
+        hipMemcpyAsync(
             dst_device.0,
             src_host.cast_mut(),
             byte_count,
             hipMemcpyKind::hipMemcpyDefault,
             stream,
-        );
-        if result2.is_err() {
-            // Last resort: plain memcpy (host→host)
-            super::driver::zluda_log_err(&format!(
-                "cuMemcpyHtoDAsync_v2 hipMemcpy also failed ({:?}), using memcpy",
-                result2
-            ));
-            std::ptr::copy_nonoverlapping(
-                src_host.cast::<u8>(),
-                dst_device.0.cast::<u8>(),
-                byte_count,
-            );
-        }
+        )?;
     }
     Ok(())
 }
@@ -434,6 +425,52 @@ pub(crate) unsafe fn set_d_2d32_v2(
 ) -> hipError_t {
     hipMemset2D(dst_device.0, dst_pitch, value as _, width, height)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that cuMemcpyHtoD correctly copies data to device memory
+    /// that a GPU kernel can read. Previously, a raw memcpy fallback
+    /// bypassed GPU page tables and could corrupt data, causing
+    /// TurbulenceFS surface descriptor corruption and TCP page faults.
+    #[test]
+    fn memcpy_htod_data_integrity() {
+        unsafe {
+            if hipInit(0).is_err() { return; } // Skip if no GPU
+
+            // Allocate device memory
+            let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            hipMalloc(&mut dev_ptr, 256).unwrap();
+
+            // Write a known pattern via hipMemcpyHtoD
+            let host_data: Vec<u64> = (0..32).map(|i| 0xDEAD_BEEF_0000_0000u64 + i).collect();
+            hipMemcpyHtoD(
+                hipDeviceptr_t(dev_ptr),
+                host_data.as_ptr() as *mut _,
+                256,
+            ).unwrap();
+
+            // Read back and verify
+            let mut readback = vec![0u64; 32];
+            hipMemcpyDtoH(
+                readback.as_mut_ptr() as *mut _,
+                hipDeviceptr_t(dev_ptr),
+                256,
+            ).unwrap();
+
+            for i in 0..32 {
+                assert_eq!(
+                    readback[i], host_data[i],
+                    "mismatch at index {}: got 0x{:016x}, expected 0x{:016x}",
+                    i, readback[i], host_data[i]
+                );
+            }
+
+            hipFree(dev_ptr).unwrap();
+        }
+    }
+}
+
 pub(crate) unsafe fn set_d_2d32_async(
     dst_device: hipDeviceptr_t,
     dst_pitch: usize,

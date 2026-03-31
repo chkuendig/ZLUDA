@@ -289,9 +289,7 @@ pub(crate) unsafe fn object_create(
             }
         }
     }
-    if result.is_err() {
-        *p_tex_object = 0;
-    }
+    result?;
     Ok(())
 }
 
