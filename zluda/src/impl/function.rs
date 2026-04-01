@@ -362,6 +362,56 @@ pub(crate) fn launch_kernel(
                 }
             }
         }
+        // Instrument TurbulenceFS_dynamicGridAdvectKernel to diagnose sust.b.3d crash.
+        // This kernel uses 3D surface writes (sust.b.3d) and crashes intermittently
+        // after ~2300 launches. Log surface descriptor pointers and check validity.
+        if name.contains("TurbulenceFS_dynamicGridAdvect") && !extra.is_null() && kernel_params.is_null() {
+            static ADVECT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = ADVECT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                let extra_slice = std::slice::from_raw_parts(extra, 5);
+                let buf = extra_slice[1] as *const u8;
+                let sz = *(extra_slice[3] as *const usize);
+                if !buf.is_null() && sz >= 320 {
+                    // The 456-byte param struct has surface handles at various offsets.
+                    // Surface handles have high 3 bits encoding type (2=read, 3=read-write).
+                    // Scan for pointer-like values with 0x4000/0x6000 prefix.
+                    let alloc_min = super::memory::ALLOC_MIN.load(std::sync::atomic::Ordering::Relaxed);
+                    let alloc_max = super::memory::ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
+                    let n_qwords = (sz / 8).min(57); // 456 bytes = 57 qwords
+                    let mut bad_descs = Vec::new();
+                    for i in 0..n_qwords {
+                        let val = *(buf.add(i * 8) as *const u64);
+                        let type_bits = val >> 61;
+                        if type_bits == 2 || type_bits == 3 {
+                            let desc_ptr = val & 0x1FFFFFFFFFFFFFFF;
+                            if desc_ptr > 0x1000 {
+                                // Check if descriptor points to valid allocation range
+                                if desc_ptr < alloc_min.saturating_sub(0x1000000)
+                                    || desc_ptr > alloc_max.saturating_add(0x1000000) {
+                                    bad_descs.push((i, val, desc_ptr));
+                                }
+                            }
+                        }
+                    }
+                    // Log every 100th launch or when bad descriptors found
+                    if n % 100 == 0 || !bad_descs.is_empty() {
+                        // Extract grid dimensions from param struct
+                        let grid_x = *(buf.add(16) as *const u32);
+                        let grid_y = *(buf.add(20) as *const u32);
+                        let grid_z = *(buf.add(24) as *const u32);
+                        super::driver::zluda_log_err(&format!(
+                            "ADVECT#{} grid=[{},{},{}] sz={} bad_descs={}",
+                            n, grid_x, grid_y, grid_z, sz, bad_descs.len()));
+                        for (i, val, desc) in &bad_descs {
+                            super::driver::zluda_log_err(&format!(
+                                "  BAD_DESC qword[{}]=0x{:016x} desc=0x{:x} range=[0x{:x}..0x{:x}]",
+                                i, val, desc, alloc_min, alloc_max));
+                        }
+                    }
+                }
+            }
+        }
         // Fix PhysX CreateParticleShapesIncremental_MultiStage_4 stale data crash.
         //
         // ROOT CAUSE (confirmed 2026-04-01):
