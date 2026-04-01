@@ -3043,3 +3043,155 @@ fn const_global_perkernel_threshold_amdgpu() -> Result<(), Box<dyn error::Error>
  
 
 
+
+/// Reproduce PhysX stale global memory crash.
+///
+/// Models the CreateParticleShapesIncremental pipeline where Stage_3 writes
+/// sentinel -1 to shape records, then Stage_2_Batched reads those stale
+/// sentinels and computes corrupt counter values (-2) that cause Stage_4
+/// to scatter-write to wild addresses.
+///
+/// The test runs two "frames":
+///   Frame 1: phase1_init (all entries) → phase2_mark (write -1)
+///   Frame 2: phase1_init (partial — skip entries 2,3) → phase3_read
+///            → verify entries 2,3 have corrupt counters (-2)
+///
+/// Entries not reinitialized by phase1_init retain the -1 sentinels from
+/// phase2_mark. This is the exact mechanism that crashes PhysX on AMD.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn stale_global_memory_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx = include_str!("stale_global_memory.ptx");
+    let ast = ptx_parser::parse_module_checked(ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    ).unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str().unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context, gcn_arch, module.llvm_ir, ptx_impl,
+        module.attributes_ir, module.metadata, None,
+    ).unwrap();
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    let mut phase1 = unsafe { mem::zeroed() };
+    let mut phase2 = unsafe { mem::zeroed() };
+    let mut phase3 = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut phase1, hip_mod, c"phase1_init".as_ptr()) }.unwrap();
+    unsafe { hipModuleGetFunction(&mut phase2, hip_mod, c"phase2_mark".as_ptr()) }.unwrap();
+    unsafe { hipModuleGetFunction(&mut phase3, hip_mod, c"phase3_read".as_ptr()) }.unwrap();
+
+    let n: u32 = 4;
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+
+    let mut records_ptr: *mut std::ffi::c_void = ptr::null_mut();
+    let mut counters_ptr: *mut std::ffi::c_void = ptr::null_mut();
+    unsafe { hipMalloc(&mut records_ptr, (n as usize) * 4) }.unwrap();
+    unsafe { hipMalloc(&mut counters_ptr, (n as usize) * 4) }.unwrap();
+    unsafe { hipMemset(records_ptr, 0, (n as usize) * 4) }.unwrap();
+    unsafe { hipMemset(counters_ptr, 0, (n as usize) * 4) }.unwrap();
+
+    // === Frame 1: Initialize ALL entries, then mark as processed ===
+    let reinit_mask_all: u32 = 0xF;
+    {
+        let mut args: [*mut std::ffi::c_void; 3] = [
+            &records_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+            &reinit_mask_all as *const _ as *mut _,
+        ];
+        unsafe { hipModuleLaunchKernel(
+            phase1, 1,1,1, 32,1,1, 0, stream,
+            args.as_mut_ptr() as _, ptr::null_mut(),
+        )}.unwrap();
+        unsafe { hipStreamSynchronize(stream) }.unwrap();
+    }
+    // phase2_mark: write -1 sentinels (simulates Stage_3 marking records)
+    {
+        let mut args: [*mut std::ffi::c_void; 2] = [
+            &records_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+        ];
+        unsafe { hipModuleLaunchKernel(
+            phase2, 1,1,1, 32,1,1, 0, stream,
+            args.as_mut_ptr() as _, ptr::null_mut(),
+        )}.unwrap();
+        unsafe { hipStreamSynchronize(stream) }.unwrap();
+    }
+
+    // === Frame 2: Reinitialize ONLY entries 0,1 (skip 2,3) ===
+    let reinit_mask_partial: u32 = 0x3;
+    {
+        let mut args: [*mut std::ffi::c_void; 3] = [
+            &records_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+            &reinit_mask_partial as *const _ as *mut _,
+        ];
+        unsafe { hipModuleLaunchKernel(
+            phase1, 1,1,1, 32,1,1, 0, stream,
+            args.as_mut_ptr() as _, ptr::null_mut(),
+        )}.unwrap();
+        unsafe { hipStreamSynchronize(stream) }.unwrap();
+    }
+
+    // Verify stale sentinels persist in entries 2,3
+    let mut host_records = vec![0u32; n as usize];
+    unsafe { hipMemcpyDtoH(
+        host_records.as_mut_ptr() as _, hipDeviceptr_t(records_ptr),
+        (n as usize) * 4,
+    )}.unwrap();
+    assert_eq!(host_records[0], 1, "Entry 0 reinitialized");
+    assert_eq!(host_records[1], 2, "Entry 1 reinitialized");
+    assert_eq!(host_records[2], 0xFFFFFFFF, "Entry 2 retains stale -1 sentinel");
+    assert_eq!(host_records[3], 0xFFFFFFFF, "Entry 3 retains stale -1 sentinel");
+
+    // phase3_read: compute counters = records[i] - 1
+    unsafe { hipMemset(counters_ptr, 0, (n as usize) * 4) }.unwrap();
+    {
+        let mut args: [*mut std::ffi::c_void; 3] = [
+            &records_ptr as *const _ as *mut _,
+            &counters_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+        ];
+        unsafe { hipModuleLaunchKernel(
+            phase3, 1,1,1, 32,1,1, 0, stream,
+            args.as_mut_ptr() as _, ptr::null_mut(),
+        )}.unwrap();
+        unsafe { hipStreamSynchronize(stream) }.unwrap();
+    }
+
+    // Verify: entries 0,1 valid, entries 2,3 corrupt (-2)
+    let mut host_counters = vec![0u32; n as usize];
+    unsafe { hipMemcpyDtoH(
+        host_counters.as_mut_ptr() as _, hipDeviceptr_t(counters_ptr),
+        (n as usize) * 4,
+    )}.unwrap();
+    assert_eq!(host_counters[0], 0, "Entry 0: valid counter (1-1=0)");
+    assert_eq!(host_counters[1], 1, "Entry 1: valid counter (2-1=1)");
+    assert_eq!(host_counters[2], 0xFFFFFFFE,
+        "Entry 2: corrupt counter (-1-1=-2) from stale sentinel — crashes PhysX Stage_4");
+    assert_eq!(host_counters[3], 0xFFFFFFFE,
+        "Entry 3: corrupt counter (-1-1=-2) from stale sentinel — crashes PhysX Stage_4");
+
+    eprintln!("stale_global_memory: REPRODUCED — stale sentinels produce corrupt counters");
+
+    unsafe { hipFree(records_ptr) }.unwrap();
+    unsafe { hipFree(counters_ptr) }.unwrap();
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    Ok(())
+}
