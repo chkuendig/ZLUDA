@@ -585,6 +585,22 @@ test_ptx_warp!(
         48u32, 49u32, 50u32, 51u32, 52u32, 53u32, 54u32, 55u32, 56u32, 57u32, 58u32, 59u32, 60u32,
     ]
 );
+// PhysX-style inclusive prefix sum via 5 cascading shfl.up with predicate
+// Each lane starts with 1, output should be lane_id + 1 (for first 32 lanes)
+// Second warp (lanes 32-63) also starts fresh at 1, so same pattern
+test_ptx_warp!(
+    shfl_prefix_sum,
+    [
+        1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32,
+        9u32, 10u32, 11u32, 12u32, 13u32, 14u32, 15u32, 16u32,
+        17u32, 18u32, 19u32, 20u32, 21u32, 22u32, 23u32, 24u32,
+        25u32, 26u32, 27u32, 28u32, 29u32, 30u32, 31u32, 32u32,
+        1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32,
+        9u32, 10u32, 11u32, 12u32, 13u32, 14u32, 15u32, 16u32,
+        17u32, 18u32, 19u32, 20u32, 21u32, 22u32, 23u32, 24u32,
+        25u32, 26u32, 27u32, 28u32, 29u32, 30u32, 31u32, 32u32,
+    ]
+);
 test_ptx_warp!(
     shfl_sync_down_b32_pred,
     [

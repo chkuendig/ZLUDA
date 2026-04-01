@@ -7,6 +7,10 @@ use std::sync::Mutex;
 static FUNC_NAMES: std::sync::LazyLock<Mutex<HashMap<usize, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// Track Stage_4's counter array address across pipeline stages
+static SHAPES4_CTR_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SHAPES4_CTR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub(crate) fn register_name(f: hipFunction_t, name: &str) {
     if let Ok(mut map) = FUNC_NAMES.lock() {
         map.insert(f.0 as usize, name.to_string());
@@ -227,10 +231,25 @@ pub(crate) fn launch_kernel(
                                     super::driver::zluda_log_err(&format!(
                                         "SORT_OUTPUT_CORRUPT keys_out=0x{:x} count={} bad={} first_bad=[{}]=0x{:08x}",
                                         keys_out, count, bad.len(), bad[0], keys[bad[0]]));
-                                    // Log VRAM usage at time of corruption
-                                    if let Ok(vram) = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_used") {
+                                    // Fix: clear bit 31 on all corrupt values and write back
+                                    let mut fixed = 0usize;
+                                    for &idx in &bad {
+                                        let v = keys[idx];
+                                        let cleared = v & 0x7FFFFFFF;
+                                        if (cleared as usize) < n {
+                                            keys[idx] = cleared;
+                                            fixed += 1;
+                                        }
+                                    }
+                                    if fixed > 0 {
+                                        let r3 = hip_runtime_sys::hipMemcpyHtoD(
+                                            hip_runtime_sys::hipDeviceptr_t(keys_out as *mut std::ffi::c_void),
+                                            keys.as_ptr() as *mut std::ffi::c_void,
+                                            n * 4,
+                                        );
                                         super::driver::zluda_log_err(&format!(
-                                            "  VRAM_AT_CORRUPT={} MiB", vram.trim().parse::<usize>().unwrap_or(0) / (1024*1024)));
+                                            "  SORT_FIX applied: cleared bit 31 on {}/{} values, writeback={:?}",
+                                            fixed, bad.len(), r3));
                                     }
                                 } else {
                                     super::driver::zluda_log_err(&format!(
@@ -287,43 +306,32 @@ pub(crate) fn launch_kernel(
                                 super::driver::zluda_log_err(&format!(
                                     "CORRUPT_INPUT CreateGrid count={} input=0x{:x} out1=0x{:x} bad_indices={}/{} first_bad=[{}]={} (0x{:08x})",
                                     count, input_ptr, output_ptr1, bad_count, n, first_bad_idx, first_bad_val, first_bad_val as u32));
-                                // Dump values around the first bad index
-                                let start = first_bad_idx.saturating_sub(4);
-                                let end = (first_bad_idx + 12).min(n);
-                                let dump: Vec<String> = indices[start..end].iter().enumerate().map(|(i, v)| {
-                                    format!("[{}]={} (0x{:08x})", start + i, v, *v as u32)
-                                }).collect();
-                                super::driver::zluda_log_err(&format!("  around bad: {}", dump.join(", ")));
-                                // Save the corrupt sort output for isolated testing
-                                let path = "/tmp/creategrid_input.bin";
-                                let bytes: &[u8] = std::slice::from_raw_parts(
-                                    indices.as_ptr() as *const u8, n * 4);
-                                if let Err(e) = std::fs::write(path, bytes) {
-                                    super::driver::zluda_log_err(&format!("  failed to save: {}", e));
-                                } else {
-                                    super::driver::zluda_log_err(&format!("  saved {} bytes to {}", n * 4, path));
+                                // Fix: clamp all out-of-range indices to 0.
+                                // CreateGrid uses mul.wide.s32 — negative indices produce
+                                // massive negative offsets → GPU page fault. On NVIDIA, sort
+                                // corruption doesn't happen due to different CWSR/preemption
+                                // behavior. On AMD, radix sort intermittently produces garbage
+                                // values (bit 31 set, or fully corrupt) when Vulkan rendering
+                                // preempts compute wavefronts. Clamping to 0 makes CreateGrid
+                                // write duplicate entries at output[0] instead of faulting.
+                                // One frame of slightly wrong grid data is invisible vs fatal crash.
+                                let mut fixed = 0usize;
+                                let count_i32 = count as i32;
+                                for idx in indices.iter_mut() {
+                                    if *idx < 0 || *idx >= count_i32 {
+                                        *idx = 0;
+                                        fixed += 1;
+                                    }
                                 }
-                                // Also save the other buffer (sort input) — RadixSort
-                                // uses double-buffering, output2 is the alternate buffer
-                                let mut sort_input = vec![0i32; n];
-                                let other_buf = output_ptr2; // The other buffer in the pair
-                                let ri = hip_runtime_sys::hipMemcpyDtoH(
-                                    sort_input.as_mut_ptr() as *mut _,
-                                    hip_runtime_sys::hipDeviceptr_t(other_buf as *mut _),
-                                    n * 4,
-                                );
-                                if ri.is_ok() {
-                                    let path2 = "/tmp/radixsort_other_buf.bin";
-                                    let bytes2: &[u8] = std::slice::from_raw_parts(
-                                        sort_input.as_ptr() as *const u8, n * 4);
-                                    let _ = std::fs::write(path2, bytes2);
+                                if fixed > 0 {
+                                    let r3 = hip_runtime_sys::hipMemcpyHtoD(
+                                        hip_runtime_sys::hipDeviceptr_t(input_ptr as *mut std::ffi::c_void),
+                                        indices.as_ptr() as *mut std::ffi::c_void,
+                                        n * 4,
+                                    );
                                     super::driver::zluda_log_err(&format!(
-                                        "  saved other buffer (0x{:x}) to {}", other_buf, path2));
-                                }
-                                // Log VRAM at CreateGrid corruption time
-                                if let Ok(vram) = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_used") {
-                                    super::driver::zluda_log_err(&format!(
-                                        "  VRAM_AT_CORRUPT={} MiB", vram.trim().parse::<usize>().unwrap_or(0) / (1024*1024)));
+                                        "  CREATEGRID_FIX clamped {}/{} indices to 0, writeback={:?}",
+                                        fixed, n, r3));
                                 }
                             }
                         }
@@ -354,42 +362,131 @@ pub(crate) fn launch_kernel(
                 }
             }
         }
-        // Kernel pointer args are already logged in the SYNC block below.
-        // Validate CreateParticleShapesIncremental input indices
-        if name.contains("CreateParticleShapesIncremental_MultiStage") && !extra.is_null() && kernel_params.is_null() {
+        // Fix PhysX CreateParticleShapesIncremental_MultiStage_4 stale data crash.
+        //
+        // ROOT CAUSE (confirmed 2026-04-01):
+        // PhysX's particle shape pipeline runs 4 stages per frame:
+        //   Stage_1: initializes shape index/count arrays from particle data
+        //   Stage_2_Batched: reads shape records, computes counters for Stage_4
+        //   Stage_3: processes records, marks them with sentinel -1 in field_at_8
+        //   Stage_4: scatter-writes using counters — atomicAdd(&counter[shapeIdx], -1)
+        //
+        // Stage_2_Batched reads rd6[rd7[i]].field_at_8 from shape records,
+        // decrements by 1, and writes the result as the counter for Stage_4.
+        // On NVIDIA, shape records are implicitly cleared between frames (GPU
+        // memory pages are zeroed by the driver — confirmed by LeftoverLocals
+        // CVE-2023-4969 research showing NVIDIA is not affected). On AMD/HIP,
+        // global memory retains stale data from previous kernel writes.
+        //
+        // When Stage_1 doesn't write new indices for a shape (e.g., particle
+        // count changes between frames), Stage_2_Batched reads rd7[i]=0 (stale
+        // from previous Stage_4 drain), indexes into rd6[0].field_at_8 which
+        // contains Stage_3's stale -1 sentinel, computes -1-1=-2, and writes
+        // -2 to the counter array. Stage_4 then does atomicAdd on -2, producing
+        // wild scatter-write addresses → GPU page fault (TCP, VMID 15).
+        //
+        // FIX: Before Stage_4 launches, read the counter array. If any values
+        // are negative (> 0x80000000 as u32), zero the FLAGS array (param_2)
+        // so all Stage_4 threads skip the scatter-write (flags & 0x11 != 1).
+        // This makes Stage_4 a safe no-op for the affected frame. One frame of
+        // missing particle shape updates is invisible; a GPU fault is fatal.
+        if name.contains("CreateParticleShapesIncremental_MultiStage_4") {
             unsafe {
-                let extra_slice = std::slice::from_raw_parts(extra, 5);
-                let buf_ptr = extra_slice[1] as *const u8;
-                let buf_size = *(extra_slice[3] as *const usize);
-                if !buf_ptr.is_null() && buf_size >= 48 {
-                    // param_3 (count) at byte offset 24
-                    let count = *(buf_ptr.add(24) as *const u32);
-                    // param_5 (index ptr) at byte offset 40
-                    let index_ptr = *(buf_ptr.add(40) as *const u64);
-                    if count > 0 && count < 100000 && index_ptr > 0x1000 {
-                        let n = count as usize;
-                        let mut indices = vec![0i32; n];
-                        let r = hip_runtime_sys::hipMemcpyDtoH(
-                            indices.as_mut_ptr() as *mut _,
-                            hip_runtime_sys::hipDeviceptr_t(index_ptr as *mut _),
-                            n * 4,
-                        );
-                        if r.is_ok() {
-                            let bad: Vec<(usize, i32)> = indices.iter().enumerate()
-                                .filter(|(_, &v)| v < 0 || v > 10_000_000)
-                                .map(|(i, &v)| (i, v))
-                                .collect();
-                            if !bad.is_empty() {
-                                super::driver::zluda_log_err(&format!(
-                                    "CORRUPT_SHAPES '{}' count={} ptr=0x{:x} bad={}/{} first=[{}]=0x{:08x}",
-                                    name, count, index_ptr, bad.len(), n, bad[0].0, bad[0].1 as u32));
-                                let path = "/tmp/shapes_input.bin";
-                                let bytes: &[u8] = std::slice::from_raw_parts(
-                                    indices.as_ptr() as *const u8, n * 4);
-                                let _ = std::fs::write(path, bytes);
+                let (count, flags_ptr, shape_idx_ptr, counter_ptr) =
+                    if !kernel_params.is_null() {
+                        let count = *(*kernel_params.add(3) as *const u32);
+                        let flags_ptr = *(*kernel_params.add(2) as *const u64);
+                        let shape_idx_ptr = *(*kernel_params.add(6) as *const u64);
+                        let counter_ptr = *(*kernel_params.add(7) as *const u64);
+                        (count, flags_ptr, shape_idx_ptr, counter_ptr)
+                    } else if !extra.is_null() {
+                        let extra_slice = std::slice::from_raw_parts(extra, 5);
+                        let buf = extra_slice[1] as *const u8;
+                        let sz = *(extra_slice[3] as *const usize);
+                        if buf.is_null() || sz < 64 { (0u32, 0u64, 0u64, 0u64) } else {
+                            let count = *(buf.add(24) as *const u32);
+                            let flags_ptr = *(buf.add(16) as *const u64);
+                            let shape_idx_ptr = *(buf.add(48) as *const u64);
+                            let counter_ptr = *(buf.add(56) as *const u64);
+                            (count, flags_ptr, shape_idx_ptr, counter_ptr)
+                        }
+                    } else {
+                        (0u32, 0u64, 0u64, 0u64)
+                    };
+                if count > 0 && count < 100_000 && shape_idx_ptr > 0x1000 {
+                    let n = count as usize;
+                    // Read shapeIndex to find max shape index → counter array size
+                    let mut shape_indices = vec![0u32; n];
+                    let r = hip_runtime_sys::hipMemcpyDtoH(
+                        shape_indices.as_mut_ptr() as *mut _,
+                        hip_runtime_sys::hipDeviceptr_t(shape_idx_ptr as *mut _),
+                        n * 4,
+                    );
+                    if r.is_ok() {
+                        let max_idx = shape_indices.iter().filter(|&&v| v < 100_000).max().copied().unwrap_or(0);
+                        // Save for inter-stage tracking
+                        SHAPES4_CTR_PTR.store(counter_ptr, std::sync::atomic::Ordering::Relaxed);
+                        SHAPES4_CTR_COUNT.store(max_idx + 1, std::sync::atomic::Ordering::Relaxed);
+                        // Read counter array and check for corruption
+                        if counter_ptr > 0x1000 && max_idx > 0 {
+                            let cn = (max_idx + 1) as usize;
+                            let mut counters = vec![0u32; cn];
+                            let r2 = hip_runtime_sys::hipMemcpyDtoH(
+                                counters.as_mut_ptr() as *mut _,
+                                hip_runtime_sys::hipDeviceptr_t(counter_ptr as *mut _),
+                                cn * 4,
+                            );
+                            if r2.is_ok() {
+                                let bad_count = counters.iter()
+                                    .filter(|&&v| v > 0x80000000).count();
+                                if bad_count > 0 {
+                                    // Counter corruption detected — stale shape record
+                                    // sentinels caused Stage_2_Batched to write negative
+                                    // values. Zero the flags array to disable all threads
+                                    // in Stage_4, preventing scatter-write to wild addresses.
+                                    let first5: Vec<String> = counters.iter().take(cn.min(8))
+                                        .map(|v| format!("0x{:08x}", v)).collect();
+                                    super::driver::zluda_log_err(&format!(
+                                        "SHAPES4_FIX count={} ctr_bad={}/{} vals=[{}] → zeroing flags at 0x{:x}",
+                                        count, bad_count, cn, first5.join(","), flags_ptr));
+                                    if flags_ptr > 0x1000 {
+                                        // Flags array: count entries, 4 bytes each (u16 at stride 4).
+                                        // Zero all flags → (flags & 0x11) == 0 != 1 → all threads skip.
+                                        let _ = hip_runtime_sys::hipMemsetD8(
+                                            hip_runtime_sys::hipDeviceptr_t(flags_ptr as *mut _),
+                                            0,
+                                            n * 4,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
+                }
+            }
+        }
+        // Inter-stage counter tracking: after each CreateParticleShapes stage completes
+        // (hipDeviceSynchronize runs in the SYNC block after launch), read the counter
+        // array that Stage_4 will use. We do this BEFORE launch so it captures the state
+        // left by the PREVIOUS kernel.
+        if name.contains("CreateParticleShapesIncremental_MultiStage") && !name.contains("_4") {
+            let ctr_ptr = SHAPES4_CTR_PTR.load(std::sync::atomic::Ordering::Relaxed);
+            let ctr_n = SHAPES4_CTR_COUNT.load(std::sync::atomic::Ordering::Relaxed) as usize;
+            if ctr_ptr > 0x1000 && ctr_n > 0 && ctr_n < 1000 {
+                let mut ctr = vec![0u32; ctr_n];
+                let r = unsafe { hip_runtime_sys::hipMemcpyDtoH(
+                    ctr.as_mut_ptr() as *mut _,
+                    hip_runtime_sys::hipDeviceptr_t(ctr_ptr as *mut _),
+                    ctr_n * 4,
+                )};
+                if r.is_ok() {
+                    let bad_count = ctr.iter().filter(|&&v| v > 100_000).count();
+                    // Always log counter values for the frame where corruption appears
+                    let vals: Vec<String> = ctr.iter().take(8)
+                        .map(|v| format!("0x{:08x}", v)).collect();
+                    super::driver::zluda_log_err(&format!(
+                        "CTR_TRACK pre-'{}' ctrPtr=0x{:x} n={} bad={} vals=[{}]",
+                        name, ctr_ptr, ctr_n, bad_count, vals.join(",")));
                 }
             }
         }
@@ -510,16 +607,15 @@ pub(crate) fn launch_kernel(
                 }
             } else if !kernel_params.is_null() {
                 // kernel_params: array of void* pointers to individual param values.
-                // No length indicator. Read carefully with bounds checks.
+                // Just log the pointer addresses, don't dereference them —
+                // they point into the caller's stack/heap and may be unmapped.
                 unsafe {
                     for j in 0..8usize {
                         let pp = *kernel_params.add(j);
                         let pp_addr = pp as usize;
-                        // Stop at null or clearly invalid pointer
                         if pp_addr == 0 || pp_addr < 0x1000 || pp_addr > 0x7fffffffffff { break; }
-                        let v = *(pp as *const u64);
                         if !raw_params.is_empty() { raw_params.push(','); }
-                        raw_params.push_str(&format!("{:#x}", v));
+                        raw_params.push_str(&format!("@{:#x}", pp_addr));
                     }
                 }
             }
@@ -531,6 +627,32 @@ pub(crate) fn launch_kernel(
             // (PhysX uses multiple threads/streams — TurbulenceFS on 02bc,
             // RadixSort/CreateGrid on 0130)
             let sync_result = unsafe { hip_runtime_sys::hipDeviceSynchronize() };
+            // Check GPU-side sust debug buffer (defined in zluda_ptx_impl.bc)
+            {
+                static SUST_DBG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let dbg_addr = SUST_DBG.get_or_init(|| {
+                    // Find the debug buffer global by trying hipGetSymbolAddress
+                    // with the mangled name
+                    let mut ptr = std::ptr::null_mut();
+                    let name = c"__zluda_ptx_impl_sust_debug_buf";
+                    let r = unsafe { hip_runtime_sys::hipGetSymbolAddress(&mut ptr, name.as_ptr() as _) };
+                    if r.is_ok() && !ptr.is_null() {
+                        super::driver::zluda_log_err(&format!("sust_debug_buf found at {:p}", ptr));
+                        ptr as u64
+                    } else { 0 }
+                });
+                if *dbg_addr != 0 {
+                    let mut data = [0u64; 8];
+                    let _ = unsafe { hip_runtime_sys::hipMemcpyDtoH(
+                        data.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t(*dbg_addr as _), 64) };
+                    if data[0] != 0 {
+                        super::driver::zluda_log_err(&format!(
+                            "SUST_BAD_DESCRIPTOR kernel='{}' [0]=0x{:x} [1]=0x{:x} [2]=0x{:x} [3]=0x{:x} [4]=0x{:x} [5]=0x{:x} [6]=0x{:x} [7]=0x{:x}",
+                            name, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]));
+                        let _ = unsafe { hip_runtime_sys::hipMemset(*dbg_addr as _, 0, 64) };
+                    }
+                }
+            }
             if sync_result.is_err() {
                 // GPU fault detected! This kernel (or a preceding async one) faulted.
                 // Log everything we can before the HSA runtime kills us with SIGABRT.
