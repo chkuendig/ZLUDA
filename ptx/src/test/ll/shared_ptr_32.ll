@@ -1,4 +1,7 @@
 @shared_mem1 = external addrspace(3) global [128 x i8], align 4
+@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
+@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
+@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
 
 define amdgpu_kernel void @shared_ptr_32(ptr addrspace(4) byref(i64) %"44", ptr addrspace(4) byref(i64) %"45") #0 {
   %"46" = alloca i64, align 8, addrspace(5)
@@ -33,7 +36,14 @@ define amdgpu_kernel void @shared_ptr_32(ptr addrspace(4) byref(i64) %"44", ptr 
   %10 = load i64, ptr addrspace(5) %"47", align 8
   %11 = load i64, ptr addrspace(5) %"50", align 8
   %"66" = inttoptr i64 %10 to ptr addrspace(1)
-  store i64 %11, ptr addrspace(1) %"66", align 8
+  %12 = ptrtoint ptr addrspace(1) %"66" to i64
+  %13 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
+  %14 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
+  %15 = icmp uge i64 %12, %13
+  %16 = icmp ule i64 %12, %14
+  %17 = and i1 %15, %16
+  %18 = select i1 %17, ptr addrspace(1) %"66", ptr addrspace(1) @__zluda_scatter_sink
+  store i64 %11, ptr addrspace(1) %18, align 8
   ret void
 }
 

@@ -1,3 +1,7 @@
+@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
+@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
+@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
+
 define amdgpu_kernel void @uint_to_fp_bf16(ptr addrspace(4) byref(i64) %"62", ptr addrspace(4) byref(i64) %"63") #0 {
   %"64" = alloca i64, align 8, addrspace(5)
   %"65" = alloca i64, align 8, addrspace(5)
@@ -54,24 +58,38 @@ define amdgpu_kernel void @uint_to_fp_bf16(ptr addrspace(4) byref(i64) %"62", pt
   %17 = load i64, ptr addrspace(5) %"65", align 8
   %18 = load i32, ptr addrspace(5) %"69", align 4
   %"103" = inttoptr i64 %17 to ptr addrspace(1)
-  store i32 %18, ptr addrspace(1) %"103", align 4
+  %19 = ptrtoint ptr addrspace(1) %"103" to i64
+  %20 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
+  %21 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
+  %22 = icmp uge i64 %19, %20
+  %23 = icmp ule i64 %19, %21
+  %24 = and i1 %22, %23
+  %25 = select i1 %24, ptr addrspace(1) %"103", ptr addrspace(1) @__zluda_scatter_sink
+  store i32 %18, ptr addrspace(1) %25, align 4
   br label %"15"
 
 "14":                                             ; preds = %"27"
-  %19 = load i1, ptr addrspace(5) %"67", align 1
-  %"92" = select i1 %19, i32 1, i32 0
+  %26 = load i1, ptr addrspace(5) %"67", align 1
+  %"92" = select i1 %26, i32 1, i32 0
   store i32 %"92", ptr addrspace(5) %"69", align 4
-  %20 = load i32, ptr addrspace(5) %"69", align 4
-  %"94" = uitofp i32 %20 to float
+  %27 = load i32, ptr addrspace(5) %"69", align 4
+  %"94" = uitofp i32 %27 to float
   store float %"94", ptr addrspace(5) %"70", align 4
-  %21 = load float, ptr addrspace(5) %"70", align 4
-  %22 = fptrunc float %21 to bfloat
-  %"96" = bitcast bfloat %22 to i16
+  %28 = load float, ptr addrspace(5) %"70", align 4
+  %29 = fptrunc float %28 to bfloat
+  %"96" = bitcast bfloat %29 to i16
   store i16 %"96", ptr addrspace(5) %"66", align 2
-  %23 = load i64, ptr addrspace(5) %"65", align 8
-  %24 = load i16, ptr addrspace(5) %"66", align 2
-  %"105" = inttoptr i64 %23 to ptr addrspace(1)
-  store i16 %24, ptr addrspace(1) %"105", align 2
+  %30 = load i64, ptr addrspace(5) %"65", align 8
+  %31 = load i16, ptr addrspace(5) %"66", align 2
+  %"105" = inttoptr i64 %30 to ptr addrspace(1)
+  %32 = ptrtoint ptr addrspace(1) %"105" to i64
+  %33 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
+  %34 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
+  %35 = icmp uge i64 %32, %33
+  %36 = icmp ule i64 %32, %34
+  %37 = and i1 %35, %36
+  %38 = select i1 %37, ptr addrspace(1) %"105", ptr addrspace(1) @__zluda_scatter_sink
+  store i16 %31, ptr addrspace(1) %38, align 2
   br label %"15"
 
 "15":                                             ; preds = %"14", %"13", %"29"

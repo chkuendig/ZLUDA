@@ -1,3 +1,7 @@
+@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
+@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
+@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
+
 define amdgpu_kernel void @cvt_f16x2_f32(ptr addrspace(4) byref(i64) %"43", ptr addrspace(4) byref(i64) %"44") #0 {
   %"45" = alloca i64, align 8, addrspace(5)
   %"46" = alloca i64, align 8, addrspace(5)
@@ -38,7 +42,14 @@ define amdgpu_kernel void @cvt_f16x2_f32(ptr addrspace(4) byref(i64) %"43", ptr 
   %14 = load <2 x half>, ptr addrspace(5) %"49", align 4
   %"67" = inttoptr i64 %13 to ptr addrspace(1)
   %"68" = bitcast <2 x half> %14 to i32
-  store i32 %"68", ptr addrspace(1) %"67", align 4
+  %15 = ptrtoint ptr addrspace(1) %"67" to i64
+  %16 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
+  %17 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
+  %18 = icmp uge i64 %15, %16
+  %19 = icmp ule i64 %15, %17
+  %20 = and i1 %18, %19
+  %21 = select i1 %20, ptr addrspace(1) %"67", ptr addrspace(1) @__zluda_scatter_sink
+  store i32 %"68", ptr addrspace(1) %21, align 4
   ret void
 }
 

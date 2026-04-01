@@ -1,3 +1,7 @@
+@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
+@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
+@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
+
 define amdgpu_kernel void @add_non_coherent(ptr addrspace(4) byref(i64) %"41", ptr addrspace(4) byref(i64) %"42") #0 {
   %"43" = alloca i64, align 8, addrspace(5)
   %"44" = alloca i64, align 8, addrspace(5)
@@ -23,7 +27,14 @@ define amdgpu_kernel void @add_non_coherent(ptr addrspace(4) byref(i64) %"41", p
   %7 = load i64, ptr addrspace(5) %"44", align 8
   %8 = load i64, ptr addrspace(5) %"46", align 8
   %"56" = inttoptr i64 %7 to ptr addrspace(1)
-  store i64 %8, ptr addrspace(1) %"56", align 8
+  %9 = ptrtoint ptr addrspace(1) %"56" to i64
+  %10 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
+  %11 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
+  %12 = icmp uge i64 %9, %10
+  %13 = icmp ule i64 %9, %11
+  %14 = and i1 %12, %13
+  %15 = select i1 %14, ptr addrspace(1) %"56", ptr addrspace(1) @__zluda_scatter_sink
+  store i64 %8, ptr addrspace(1) %15, align 8
   ret void
 }
 

@@ -1,4 +1,7 @@
 @foobar = addrspace(1) externally_initialized global [4 x i32] [i32 1, i32 0, i32 0, i32 0]
+@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
+@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
+@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
 
 define amdgpu_kernel void @global_array(ptr addrspace(4) byref(i64) %"40", ptr addrspace(4) byref(i64) %"41") #0 {
   %"42" = alloca i64, align 8, addrspace(5)
@@ -20,7 +23,14 @@ define amdgpu_kernel void @global_array(ptr addrspace(4) byref(i64) %"40", ptr a
   %5 = load i64, ptr addrspace(5) %"43", align 8
   %6 = load i32, ptr addrspace(5) %"44", align 4
   %"53" = inttoptr i64 %5 to ptr addrspace(1)
-  store i32 %6, ptr addrspace(1) %"53", align 4
+  %7 = ptrtoint ptr addrspace(1) %"53" to i64
+  %8 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
+  %9 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
+  %10 = icmp uge i64 %7, %8
+  %11 = icmp ule i64 %7, %9
+  %12 = and i1 %10, %11
+  %13 = select i1 %12, ptr addrspace(1) %"53", ptr addrspace(1) @__zluda_scatter_sink
+  store i32 %6, ptr addrspace(1) %13, align 4
   ret void
 }
 

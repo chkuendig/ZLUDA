@@ -1,3 +1,7 @@
+@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
+@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
+@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
+
 declare hidden i32 @__zluda_ptx_impl_sreg_tid(i8) #0
 
 define amdgpu_kernel void @stateful_ld_st_ntid_chain(ptr addrspace(4) byref(i64) %"48", ptr addrspace(4) byref(i64) %"49") #1 {
@@ -48,7 +52,14 @@ define amdgpu_kernel void @stateful_ld_st_ntid_chain(ptr addrspace(4) byref(i64)
   %16 = load i64, ptr addrspace(5) %"55", align 8
   %17 = load i64, ptr addrspace(5) %"58", align 8
   %"85" = inttoptr i64 %16 to ptr addrspace(1)
-  store i64 %17, ptr addrspace(1) %"85", align 8
+  %18 = ptrtoint ptr addrspace(1) %"85" to i64
+  %19 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
+  %20 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
+  %21 = icmp uge i64 %18, %19
+  %22 = icmp ule i64 %18, %20
+  %23 = and i1 %21, %22
+  %24 = select i1 %23, ptr addrspace(1) %"85", ptr addrspace(1) @__zluda_scatter_sink
+  store i64 %17, ptr addrspace(1) %24, align 8
   ret void
 }
 

@@ -74,6 +74,15 @@ typedef char s8x4 __attribute__((ext_vector_type(4)));
     extern "C" __attribute__((constant)) CONSTANT_SPACE TYPE ATTR(NAME) \
     __device__
 
+// Scatter-write bounds checking globals.
+// ZLUDA writes allocation bounds here after module load. Kernels check
+// addresses against [alloc_min, alloc_max] before global stores/atomics
+// with computed addresses. Out-of-range writes are redirected to scatter_sink.
+// This prevents GPU page faults from stale sentinel data in PhysX pipelines.
+extern "C" GLOBAL_SPACE uint64_t __zluda_alloc_min __device__ = 0;
+extern "C" GLOBAL_SPACE uint64_t __zluda_alloc_max __device__ = 0xFFFFFFFFFFFFFFFFULL;
+extern "C" GLOBAL_SPACE uint8_t __zluda_scatter_sink[4096] __device__ = {};
+
 extern "C"
 {
     extern "C" __attribute__((constant)) CONSTANT_SPACE uint32_t __oclc_ISA_version __device__;
@@ -787,6 +796,46 @@ extern "C"
     typedef unsigned int surf_desc __attribute__((ext_vector_type(8)));
     typedef surf_desc GLOBAL_SPACE *surface_ptr;
 
+    // GPU-side debug buffer for detecting bad surface descriptors at execution time.
+    // Defined (not extern) so it's self-contained in the .bc — no linker dependency.
+    // Layout: [0]=marker/base, [1]=handle, [2]=coord_x, [3]=coord_y,
+    //         [4]=desc_w0, [5]=desc_w1, [6]=desc_w2/base, [7]=desc_w3/handle_raw
+    __device__ uint64_t FUNC_CALL(sust_debug_buf)[8] = {0};
+
+    // Validate surface inputs before image_store. Returns true if OK.
+    static __device__ bool surf_validate(surface_ptr surface, uint64_t handle,
+                                          int coord_x, int coord_y)
+    {
+        // Check 1: handle top bits (should be 1-7 for pixel shift encoding)
+        uint64_t handle_raw = (uint64_t)(uintptr_t)surface;
+        if (handle_raw == 0) {
+            FUNC_CALL(sust_debug_buf)[0] = 0xBAD0000000000001ULL;
+            FUNC_CALL(sust_debug_buf)[1] = handle;
+            return false;
+        }
+
+        // Check 2: read descriptor base address from words 0-1
+        unsigned int w0 = (*surface)[0];
+        unsigned int w1 = (*surface)[1];
+        uint64_t base = ((uint64_t)(w1 & 0xFFFF) << 32) | w0;
+
+        // Check 3: base address should be in device pointer range (0x7e-0x7f top byte)
+        unsigned int top_byte = (unsigned int)(base >> 40);
+        if (base != 0 && top_byte != 0x7f && top_byte != 0x7e && top_byte != 0x00) {
+            FUNC_CALL(sust_debug_buf)[0] = base;
+            FUNC_CALL(sust_debug_buf)[1] = handle;
+            FUNC_CALL(sust_debug_buf)[2] = (uint64_t)(unsigned int)coord_x;
+            FUNC_CALL(sust_debug_buf)[3] = (uint64_t)(unsigned int)coord_y;
+            FUNC_CALL(sust_debug_buf)[4] = w0;
+            FUNC_CALL(sust_debug_buf)[5] = w1;
+            FUNC_CALL(sust_debug_buf)[6] = (*surface)[2];
+            FUNC_CALL(sust_debug_buf)[7] = (*surface)[3];
+            return false;
+        }
+
+        return true;
+    }
+
     const unsigned int IMAGE_RESERVED_TOP_BITS = 3;
 
     static __device__ unsigned int surf_x_shift(uint64_t s)
@@ -821,6 +870,7 @@ extern "C"
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
+        if (!surf_validate(surface, handle, coord[0], coord[1])) return;
         coord[0] = coord[0] >> shift;
         // AMDGPU dim:2D requires exactly 2 VGPRs for address
         int2_vec coord2 = __builtin_shufflevector(coord, coord, 0, 1);
@@ -847,6 +897,7 @@ extern "C"
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
+        if (!surf_validate(surface, handle, coord[0], coord[1])) return;
         coord[0] = coord[0] >> shift;
         // AMDGPU dim:3D requires exactly 3 VGPRs for address
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
@@ -873,6 +924,7 @@ extern "C"
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
+        if (!surf_validate(surface, handle, coord[0], coord[1])) return;
         coord[0] = coord[0] >> shift;
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         uint2_vec value2 = std::bit_cast<uint2_vec>(value);
@@ -889,6 +941,7 @@ extern "C"
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
+        if (!surf_validate(surface, handle, coord[0], coord[1])) return;
         coord[0] = coord[0] >> shift;
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         uint4_vec value4 = std::bit_cast<uint4_vec>(value);
