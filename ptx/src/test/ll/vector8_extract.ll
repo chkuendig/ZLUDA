@@ -1,7 +1,3 @@
-@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
-@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
-@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
-
 define amdgpu_kernel void @vector8_extract(ptr addrspace(4) byref(i64) %"50", ptr addrspace(4) byref(i64) %"51") #0 {
   %"52" = alloca i64, align 8, addrspace(5)
   %"53" = alloca i64, align 8, addrspace(5)
@@ -108,14 +104,7 @@ define amdgpu_kernel void @vector8_extract(ptr addrspace(4) byref(i64) %"50", pt
   %"48" = insertelement <8 x i8> %35, i8 %"114", i8 7
   %36 = load i64, ptr addrspace(5) %"53", align 8
   %"115" = inttoptr i64 %36 to ptr addrspace(1)
-  %37 = ptrtoint ptr addrspace(1) %"115" to i64
-  %38 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
-  %39 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
-  %40 = icmp uge i64 %37, %38
-  %41 = icmp ule i64 %37, %39
-  %42 = and i1 %40, %41
-  %43 = select i1 %42, ptr addrspace(1) %"115", ptr addrspace(1) @__zluda_scatter_sink
-  store <8 x i8> %"48", ptr addrspace(1) %43, align 8
+  store <8 x i8> %"48", ptr addrspace(1) %"115", align 8
   ret void
 }
 

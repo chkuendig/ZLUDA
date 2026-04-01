@@ -1,7 +1,4 @@
 @shared_mem = external addrspace(3) global [0 x i32], align 4
-@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
-@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
-@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
 
 define hidden void @incr_shared_2_global() #0 {
   %"45" = alloca i64, align 8, addrspace(5)
@@ -50,14 +47,7 @@ define amdgpu_kernel void @extern_shared_call(ptr addrspace(4) byref(i64) %"50",
   %8 = load i64, ptr addrspace(5) %"53", align 8
   %9 = load i64, ptr addrspace(5) %"54", align 8
   %"68" = inttoptr i64 %8 to ptr addrspace(1)
-  %10 = ptrtoint ptr addrspace(1) %"68" to i64
-  %11 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
-  %12 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
-  %13 = icmp uge i64 %10, %11
-  %14 = icmp ule i64 %10, %12
-  %15 = and i1 %13, %14
-  %16 = select i1 %15, ptr addrspace(1) %"68", ptr addrspace(1) @__zluda_scatter_sink
-  store i64 %9, ptr addrspace(1) %16, align 8
+  store i64 %9, ptr addrspace(1) %"68", align 8
   ret void
 }
 

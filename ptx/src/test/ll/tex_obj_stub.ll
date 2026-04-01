@@ -1,7 +1,3 @@
-@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
-@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
-@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
-
 declare hidden <4 x float> @__zluda_ptx_impl_tex_2d_v4_f32_f32_obj(i64, <2 x float>) #0
 
 define amdgpu_kernel void @tex_obj_stub(ptr addrspace(4) byref(i64) %"48") #1 {
@@ -41,14 +37,7 @@ define amdgpu_kernel void @tex_obj_stub(ptr addrspace(4) byref(i64) %"48") #1 {
   %7 = load i64, ptr addrspace(5) %"49", align 8
   %8 = load float, ptr addrspace(5) %"53", align 4
   %"70" = inttoptr i64 %7 to ptr addrspace(1)
-  %9 = ptrtoint ptr addrspace(1) %"70" to i64
-  %10 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
-  %11 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
-  %12 = icmp uge i64 %9, %10
-  %13 = icmp ule i64 %9, %11
-  %14 = and i1 %12, %13
-  %15 = select i1 %14, ptr addrspace(1) %"70", ptr addrspace(1) @__zluda_scatter_sink
-  store float %8, ptr addrspace(1) %15, align 4
+  store float %8, ptr addrspace(1) %"70", align 4
   ret void
 }
 

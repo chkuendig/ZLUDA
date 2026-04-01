@@ -1,7 +1,3 @@
-@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
-@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
-@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
-
 declare hidden void @__zluda_ptx_impl_sust_b_3d_b32_trap(i64, <4 x i32>, i32) #0
 
 define amdgpu_kernel void @sust_stub(ptr addrspace(4) byref(i64) %"51") #1 {
@@ -43,14 +39,7 @@ define amdgpu_kernel void @sust_stub(ptr addrspace(4) byref(i64) %"51") #1 {
   %12 = load i64, ptr addrspace(5) %"52", align 8
   %13 = load i32, ptr addrspace(5) %"58", align 4
   %"76" = inttoptr i64 %12 to ptr addrspace(1)
-  %14 = ptrtoint ptr addrspace(1) %"76" to i64
-  %15 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
-  %16 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
-  %17 = icmp uge i64 %14, %15
-  %18 = icmp ule i64 %14, %16
-  %19 = and i1 %17, %18
-  %20 = select i1 %19, ptr addrspace(1) %"76", ptr addrspace(1) @__zluda_scatter_sink
-  store i32 %13, ptr addrspace(1) %20, align 4
+  store i32 %13, ptr addrspace(1) %"76", align 4
   ret void
 }
 

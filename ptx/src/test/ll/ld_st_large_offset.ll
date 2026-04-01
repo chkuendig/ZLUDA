@@ -1,7 +1,3 @@
-@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
-@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
-@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
-
 define amdgpu_kernel void @ld_st_large_offset(ptr addrspace(4) byref(i64) %"43", ptr addrspace(4) byref(i64) %"44") #0 {
   %"45" = alloca i64, align 8, addrspace(5)
   %"46" = alloca i64, align 8, addrspace(5)
@@ -25,14 +21,7 @@ define amdgpu_kernel void @ld_st_large_offset(ptr addrspace(4) byref(i64) %"43",
   %"55" = inttoptr i64 %6 to ptr addrspace(1)
   %"41" = getelementptr inbounds i8, ptr addrspace(1) %"55", i64 17179869180
   %7 = load i32, ptr addrspace(5) %"47", align 4
-  %8 = ptrtoint ptr addrspace(1) %"41" to i64
-  %9 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
-  %10 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
-  %11 = icmp uge i64 %8, %9
-  %12 = icmp ule i64 %8, %10
-  %13 = and i1 %11, %12
-  %14 = select i1 %13, ptr addrspace(1) %"41", ptr addrspace(1) @__zluda_scatter_sink
-  store i32 %7, ptr addrspace(1) %14, align 4
+  store i32 %7, ptr addrspace(1) %"41", align 4
   ret void
 }
 

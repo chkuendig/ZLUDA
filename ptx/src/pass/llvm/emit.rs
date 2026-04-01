@@ -1350,11 +1350,12 @@ impl<'a> MethodEmitContext<'a> {
                 )
             };
         }
-        // Bounds-check global stores with computed addresses to prevent GPU page
-        // faults from stale sentinel data. Redirects out-of-range writes to sink.
-        if data.state_space == ast::StateSpace::Global {
-            ptr = self.bounds_check_global_ptr(ptr);
-        }
+        // NOTE: Bounds-check pass for st.global was attempted but disabled.
+        // inttoptr is too common (every cvta.to.global), catching ALL global stores
+        // not just scatter-writes. This breaks physics effects and hurts performance.
+        // Per-kernel workarounds in function.rs (SHAPES4_FIX, CREATEGRID_FIX) are
+        // more targeted and correct. The bounds-check infrastructure remains for
+        // future use if we find a way to identify scatter-write patterns specifically.
         let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
         apply_qualifier(store, data.qualifier)?;
         unsafe {
@@ -1452,10 +1453,7 @@ impl<'a> MethodEmitContext<'a> {
     ) -> Result<(), TranslateError> {
         let builder = self.builder;
         let mut src1 = self.resolver.value(arguments.src1)?;
-        // Bounds-check global atomics to prevent scatter-write faults
-        if data.space == ast::StateSpace::Global {
-            src1 = self.bounds_check_global_ptr(src1);
-        }
+        // NOTE: Bounds-check for atom.global disabled — see comment in emit_st.
         let src2 = self.resolver.value(arguments.src2)?;
         let op = match data.op {
             ast::AtomicOp::And => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpAnd,

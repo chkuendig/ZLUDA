@@ -1,7 +1,3 @@
-@__zluda_alloc_min = external addrspace(1) externally_initialized global i64
-@__zluda_alloc_max = external addrspace(1) externally_initialized global i64
-@__zluda_scatter_sink = external addrspace(1) externally_initialized global [4096 x i8]
-
 define hidden i64 @incr(i64 %"52") #0 {
   %"72" = alloca i64, align 8, addrspace(5)
   %"73" = alloca i64, align 8, addrspace(5)
@@ -60,14 +56,7 @@ define amdgpu_kernel void @call(ptr addrspace(4) byref(i64) %"57", ptr addrspace
   %9 = load i64, ptr addrspace(5) %"60", align 8
   %10 = load i64, ptr addrspace(5) %"61", align 8
   %"84" = inttoptr i64 %9 to ptr addrspace(1)
-  %11 = ptrtoint ptr addrspace(1) %"84" to i64
-  %12 = load i64, ptr addrspace(1) @__zluda_alloc_min, align 4
-  %13 = load i64, ptr addrspace(1) @__zluda_alloc_max, align 4
-  %14 = icmp uge i64 %11, %12
-  %15 = icmp ule i64 %11, %13
-  %16 = and i1 %14, %15
-  %17 = select i1 %16, ptr addrspace(1) %"84", ptr addrspace(1) @__zluda_scatter_sink
-  store i64 %10, ptr addrspace(1) %17, align 8
+  store i64 %10, ptr addrspace(1) %"84", align 8
   ret void
 }
 
