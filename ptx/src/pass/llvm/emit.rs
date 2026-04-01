@@ -116,17 +116,6 @@ fn emit_llvm_used(context: LLVMContextRef, module: LLVMModuleRef, globals: &[LLV
     }
 }
 
-/// Lazily-created globals for scatter-write bounds checking.
-/// Only added to the module when the first st.global/atom.global with a
-/// computed address is emitted. This avoids polluting IR for modules that
-/// don't need bounds checking (simple tests, non-scatter kernels).
-/// Uses Cell for interior mutability since globals are created lazily from &self methods.
-struct BoundsCheckGlobals {
-    alloc_min: std::cell::Cell<Option<LLVMValueRef>>,
-    alloc_max: std::cell::Cell<Option<LLVMValueRef>>,
-    scatter_sink: std::cell::Cell<Option<LLVMValueRef>>,
-}
-
 struct ModuleEmitContext<'a, 'input> {
     context: LLVMContextRef,
     module: LLVMModuleRef,
@@ -137,8 +126,6 @@ struct ModuleEmitContext<'a, 'input> {
     /// and .const globals that need to be visible to hipModuleGetGlobal).
     /// These get added to @llvm.used so -amdgpu-internalize-symbols doesn't strip them.
     preserved_globals: Vec<LLVMValueRef>,
-    /// Bounds-check globals for scatter-write protection
-    bounds_check: BoundsCheckGlobals,
 }
 
 impl<'a, 'input> ModuleEmitContext<'a, 'input> {
@@ -154,11 +141,6 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             id_defs,
             resolver: ResolveIdent::new(&id_defs),
             preserved_globals: Vec::new(),
-            bounds_check: BoundsCheckGlobals {
-                alloc_min: std::cell::Cell::new(None),
-                alloc_max: std::cell::Cell::new(None),
-                scatter_sink: std::cell::Cell::new(None),
-            },
         }
     }
 
@@ -597,7 +579,6 @@ struct MethodEmitContext<'a> {
     variables_builder: Builder,
     resolver: &'a mut ResolveIdent,
     carry_flag: Option<LLVMValueRef>,
-    bounds_check: &'a BoundsCheckGlobals,
 }
 
 impl<'a> MethodEmitContext<'a> {
@@ -614,7 +595,6 @@ impl<'a> MethodEmitContext<'a> {
             resolver: &mut parent.resolver,
             method,
             carry_flag: None,
-            bounds_check: &parent.bounds_check,
         }
     }
 
@@ -1275,60 +1255,6 @@ impl<'a> MethodEmitContext<'a> {
             mul_result,
             src3,
         )
-    }
-
-    /// Lazily create a bounds-check global in the module (external, addrspace 1).
-    fn get_or_create_bounds_global(
-        module: LLVMModuleRef,
-        name: &CStr,
-        ty: LLVMTypeRef,
-        cached: &std::cell::Cell<Option<LLVMValueRef>>,
-    ) -> LLVMValueRef {
-        if let Some(g) = cached.get() {
-            return g;
-        }
-        let g = unsafe {
-            let existing = LLVMGetNamedGlobal(module, name.as_ptr());
-            if !existing.is_null() {
-                existing
-            } else {
-                let g = LLVMAddGlobalInAddressSpace(module, ty, name.as_ptr(), GLOBAL_ADDRESS_SPACE);
-                LLVMSetLinkage(g, LLVMLinkage::LLVMExternalLinkage);
-                LLVMSetExternallyInitialized(g, 1);
-                g
-            }
-        };
-        cached.set(Some(g));
-        g
-    }
-
-    /// Bounds-check a global pointer: if addr is outside [alloc_min, alloc_max],
-    /// redirect to scatter_sink. Returns the safe pointer. Branchless (uses select).
-    /// Cost: 2 global loads (hoisted by O3) + 1 icmp + 1 select per call.
-    fn bounds_check_global_ptr(&self, ptr: LLVMValueRef) -> LLVMValueRef {
-        unsafe {
-            let i64_type = LLVMInt64TypeInContext(self.context);
-            let i8_type = LLVMInt8TypeInContext(self.context);
-            let sink_type = LLVMArrayType2(i8_type, 4096);
-            let alloc_min = Self::get_or_create_bounds_global(
-                self.module, c"__zluda_alloc_min", i64_type, &self.bounds_check.alloc_min);
-            let alloc_max = Self::get_or_create_bounds_global(
-                self.module, c"__zluda_alloc_max", i64_type, &self.bounds_check.alloc_max);
-            let scatter_sink = Self::get_or_create_bounds_global(
-                self.module, c"__zluda_scatter_sink", sink_type, &self.bounds_check.scatter_sink);
-
-            let addr = LLVMBuildPtrToInt(self.builder, ptr, i64_type, LLVM_UNNAMED.as_ptr());
-            let min_val = LLVMBuildLoad2(self.builder, i64_type, alloc_min, LLVM_UNNAMED.as_ptr());
-            let max_val = LLVMBuildLoad2(self.builder, i64_type, alloc_max, LLVM_UNNAMED.as_ptr());
-            let ge_min = LLVMBuildICmp(self.builder,
-                LLVMIntPredicate::LLVMIntUGE, addr, min_val, LLVM_UNNAMED.as_ptr());
-            let le_max = LLVMBuildICmp(self.builder,
-                LLVMIntPredicate::LLVMIntULE, addr, max_val, LLVM_UNNAMED.as_ptr());
-            let in_range = LLVMBuildAnd(self.builder, ge_min, le_max, LLVM_UNNAMED.as_ptr());
-            let sink_ptr = LLVMBuildPointerCast(self.builder, scatter_sink,
-                LLVMTypeOf(ptr), LLVM_UNNAMED.as_ptr());
-            LLVMBuildSelect(self.builder, in_range, ptr, sink_ptr, LLVM_UNNAMED.as_ptr())
-        }
     }
 
     fn emit_st(

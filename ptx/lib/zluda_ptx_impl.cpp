@@ -74,15 +74,6 @@ typedef char s8x4 __attribute__((ext_vector_type(4)));
     extern "C" __attribute__((constant)) CONSTANT_SPACE TYPE ATTR(NAME) \
     __device__
 
-// Scatter-write bounds checking globals.
-// ZLUDA writes allocation bounds here after module load. Kernels check
-// addresses against [alloc_min, alloc_max] before global stores/atomics
-// with computed addresses. Out-of-range writes are redirected to scatter_sink.
-// This prevents GPU page faults from stale sentinel data in PhysX pipelines.
-extern "C" GLOBAL_SPACE uint64_t __zluda_alloc_min __device__ = 0;
-extern "C" GLOBAL_SPACE uint64_t __zluda_alloc_max __device__ = 0xFFFFFFFFFFFFFFFFULL;
-extern "C" GLOBAL_SPACE uint8_t __zluda_scatter_sink[4096] __device__ = {};
-
 extern "C"
 {
     extern "C" __attribute__((constant)) CONSTANT_SPACE uint32_t __oclc_ISA_version __device__;

@@ -246,31 +246,6 @@ fn get_best_ptx_and_compile(
     super::driver::zluda_log("[ZLUDA]   calling hipModuleLoadData");
     unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) }?;
     super::driver::zluda_log("[ZLUDA]   hipModuleLoadData OK");
-    // Write allocation bounds to module globals for scatter-write bounds checking.
-    // The emit pass inserts branchless checks: if addr is outside [min, max],
-    // redirect to __zluda_scatter_sink. We write current bounds here; the defaults
-    // (min=0, max=u64::MAX) accept all addresses until the first allocation.
-    unsafe {
-        let alloc_min = super::memory::ALLOC_MIN.load(std::sync::atomic::Ordering::Relaxed);
-        let alloc_max = super::memory::ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
-        // Only write if we have valid bounds (at least one allocation has happened)
-        if alloc_min < alloc_max {
-            let mut min_dptr: hipDeviceptr_t = hipDeviceptr_t(std::ptr::null_mut());
-            let mut min_size = 0usize;
-            let mut max_dptr: hipDeviceptr_t = hipDeviceptr_t(std::ptr::null_mut());
-            let mut max_size = 0usize;
-            let r1 = hipModuleGetGlobal(
-                &mut min_dptr, &mut min_size, hip_module,
-                c"__zluda_alloc_min".as_ptr());
-            let r2 = hipModuleGetGlobal(
-                &mut max_dptr, &mut max_size, hip_module,
-                c"__zluda_alloc_max".as_ptr());
-            if r1.is_ok() && r2.is_ok() && min_size >= 8 && max_size >= 8 {
-                let _ = hipMemcpyHtoD(min_dptr, &alloc_min as *const _ as *mut _, 8);
-                let _ = hipMemcpyHtoD(max_dptr, &alloc_max as *const _ as *mut _, 8);
-            }
-        }
-    }
     Ok((hip_module, sm_version))
 }
 
