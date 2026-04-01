@@ -803,10 +803,14 @@ extern "C"
     __device__ uint64_t FUNC_CALL(sust_debug_buf)[8] = {0};
 
     // Validate surface inputs before image_store. Returns true if OK.
+    // Checks handle validity, descriptor base address, and coordinate bounds.
+    // On AMDGPU, out-of-bounds image stores can fault (unlike NVIDIA which
+    // silently drops them), so we must validate coordinates against the
+    // image dimensions encoded in the descriptor.
     static __device__ bool surf_validate(surface_ptr surface, uint64_t handle,
                                           int coord_x, int coord_y)
     {
-        // Check 1: handle top bits (should be 1-7 for pixel shift encoding)
+        // Check 1: null handle
         uint64_t handle_raw = (uint64_t)(uintptr_t)surface;
         if (handle_raw == 0) {
             FUNC_CALL(sust_debug_buf)[0] = 0xBAD0000000000001ULL;
@@ -819,7 +823,7 @@ extern "C"
         unsigned int w1 = (*surface)[1];
         uint64_t base = ((uint64_t)(w1 & 0xFFFF) << 32) | w0;
 
-        // Check 3: base address should be in device pointer range (0x7e-0x7f top byte)
+        // Check 3: base address should be in device pointer range
         unsigned int top_byte = (unsigned int)(base >> 40);
         if (base != 0 && top_byte != 0x7f && top_byte != 0x7e && top_byte != 0x00) {
             FUNC_CALL(sust_debug_buf)[0] = base;
@@ -830,6 +834,49 @@ extern "C"
             FUNC_CALL(sust_debug_buf)[5] = w1;
             FUNC_CALL(sust_debug_buf)[6] = (*surface)[2];
             FUNC_CALL(sust_debug_buf)[7] = (*surface)[3];
+            return false;
+        }
+
+        // Check 4: coordinate bounds against image dimensions from descriptor
+        // AMDGPU image descriptor word[2]: WIDTH[13:0], HEIGHT[27:14]
+        unsigned int w2 = (*surface)[2];
+        unsigned int width = (w2 & 0x3FFF) + 1;
+        unsigned int height = ((w2 >> 14) & 0x3FFF) + 1;
+        if (coord_x < 0 || (unsigned int)coord_x >= width ||
+            coord_y < 0 || (unsigned int)coord_y >= height) {
+            FUNC_CALL(sust_debug_buf)[0] = 0xBAD0000000000003ULL; // OOB marker
+            FUNC_CALL(sust_debug_buf)[1] = handle;
+            FUNC_CALL(sust_debug_buf)[2] = (uint64_t)(unsigned int)coord_x;
+            FUNC_CALL(sust_debug_buf)[3] = (uint64_t)(unsigned int)coord_y;
+            FUNC_CALL(sust_debug_buf)[4] = width;
+            FUNC_CALL(sust_debug_buf)[5] = height;
+            FUNC_CALL(sust_debug_buf)[6] = w2;
+            FUNC_CALL(sust_debug_buf)[7] = (*surface)[4]; // depth info
+            return false;
+        }
+
+        return true;
+    }
+
+    // Validate 3D surface coordinates including depth dimension.
+    static __device__ bool surf_validate_3d(surface_ptr surface, uint64_t handle,
+                                             int coord_x, int coord_y, int coord_z)
+    {
+        if (!surf_validate(surface, handle, coord_x, coord_y))
+            return false;
+
+        // AMDGPU image descriptor word[4]: DEPTH[12:0]
+        unsigned int w4 = (*surface)[4];
+        unsigned int depth = (w4 & 0x1FFF) + 1;
+        if (coord_z < 0 || (unsigned int)coord_z >= depth) {
+            FUNC_CALL(sust_debug_buf)[0] = 0xBAD0000000000004ULL; // 3D OOB marker
+            FUNC_CALL(sust_debug_buf)[1] = handle;
+            FUNC_CALL(sust_debug_buf)[2] = (uint64_t)(unsigned int)coord_x;
+            FUNC_CALL(sust_debug_buf)[3] = (uint64_t)(unsigned int)coord_y;
+            FUNC_CALL(sust_debug_buf)[4] = (uint64_t)(unsigned int)coord_z;
+            FUNC_CALL(sust_debug_buf)[5] = depth;
+            FUNC_CALL(sust_debug_buf)[6] = w4;
+            FUNC_CALL(sust_debug_buf)[7] = (*surface)[2]; // width/height
             return false;
         }
 
@@ -897,7 +944,7 @@ extern "C"
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
-        if (!surf_validate(surface, handle, coord[0], coord[1])) return;
+        if (!surf_validate_3d(surface, handle, coord[0] >> shift, coord[1], coord[2])) return;
         coord[0] = coord[0] >> shift;
         // AMDGPU dim:3D requires exactly 3 VGPRs for address
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
@@ -924,7 +971,7 @@ extern "C"
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
-        if (!surf_validate(surface, handle, coord[0], coord[1])) return;
+        if (!surf_validate_3d(surface, handle, coord[0] >> shift, coord[1], coord[2])) return;
         coord[0] = coord[0] >> shift;
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         uint2_vec value2 = std::bit_cast<uint2_vec>(value);
@@ -941,7 +988,7 @@ extern "C"
     {
         unsigned int shift = surf_x_shift(handle);
         surface_ptr surface = surf_get_ptr(handle);
-        if (!surf_validate(surface, handle, coord[0], coord[1])) return;
+        if (!surf_validate_3d(surface, handle, coord[0] >> shift, coord[1], coord[2])) return;
         coord[0] = coord[0] >> shift;
         int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
         uint4_vec value4 = std::bit_cast<uint4_vec>(value);
