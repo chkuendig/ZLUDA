@@ -279,24 +279,56 @@ pub(crate) unsafe fn object_create(
         }
         ok => (ok, "full"),
     };
-    // Lightweight log to separate file (always on, only for tex creates)
+    // Log tex creates only when ZLUDA_LOG_ALL=1 to avoid unnecessary HIP
+    // operations that can trigger ROCm ProfilingSignal pool race conditions.
     {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-            match result {
-                Ok(()) => { let _ = writeln!(f, "texObj OK ({}) obj={:#x}", path, *p_tex_object); }
-                Err(ref e) => { let _ = writeln!(f, "texObj FAIL ({}) {:?}", path, e); *p_tex_object = 0; }
+        static LOG_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let log_all = *LOG_ALL.get_or_init(|| {
+            std::env::var("ZLUDA_LOG_ALL").map_or(false, |v| v == "1")
+        });
+        if log_all {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
+                match result {
+                    Ok(()) => { let _ = writeln!(f, "texObj OK ({}) obj={:#x}", path, *p_tex_object); }
+                    Err(ref e) => { let _ = writeln!(f, "texObj FAIL ({}) {:?}", path, e); }
+                }
             }
         }
     }
+    if result.is_err() {
+        *p_tex_object = 0;
+    }
     result?;
+    // Encode pixel shift in top 3 bits of the handle, same as cuSurfObjectCreate.
+    // On NVIDIA, texture and surface handles are interchangeable — PhysX uses
+    // texture objects for surface writes (sust). Our sust helpers extract the
+    // shift from the top 3 bits. Without encoding, shift=0 → wrong x-offset → crash.
+    if p_res_desc.resType == CUresourcetype::CU_RESOURCE_TYPE_ARRAY {
+        let array = p_res_desc.res.array.hArray as hip_runtime_sys::hipArray_t;
+        if !array.is_null() {
+            let mut arr_desc: hip_runtime_sys::HIP_ARRAY_DESCRIPTOR = mem::zeroed();
+            if hip_runtime_sys::hipArrayGetDescriptor(&mut arr_desc, array).is_ok() {
+                let fmt_size = super::surf::format_size(arr_desc.Format).unwrap_or(4);
+                let num_ch = if arr_desc.NumChannels == 0 { 1 } else { arr_desc.NumChannels as usize };
+                let pixel_size = fmt_size * num_ch;
+                if pixel_size > 0 {
+                    let shift = pixel_size.trailing_zeros() as usize;
+                    let shift_amount = shift << (usize::BITS as usize - 3);
+                    *p_tex_object = (*p_tex_object as usize | shift_amount) as CUtexObject;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
 pub(crate) unsafe fn object_destroy(
     tex_object: CUtexObject,
 ) -> CUresult {
-    hipTexObjectDestroy(tex_object as hipTextureObject_t)?;
+    // Strip top 3 bits (shift encoding) before passing to HIP
+    let raw = ((tex_object as usize) << 3) >> 3;
+    hipTexObjectDestroy(raw as hipTextureObject_t)?;
     Ok(())
 }
 
@@ -457,9 +489,9 @@ mod tests {
     unsafe fn texref_set_address_zero_bytes(api: impl CudaApi) {
         setup(&api);
         // Allocate a small device buffer (non-null dptr)
-        let mut dptr: CUdeviceptr = 0;
+        let mut dptr: CUdeviceptr = unsafe { mem::zeroed() };
         api.cuMemAlloc_v2(&mut dptr, 256);
-        assert_ne!(dptr, 0);
+        assert_ne!(dptr.0, std::ptr::null_mut());
         // Call cuTexRefSetAddress_v2 with bytes=0 — should return CUDA_SUCCESS,
         // not crash or return an error. This reproduces the PhysX/FleX
         // CollideParticles scenario where empty particle arrays use bytes=0.

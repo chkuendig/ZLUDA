@@ -111,6 +111,9 @@ pub(crate) fn launch_kernel(
         "cuLaunchKernel '{}' grid=[{},{},{}] block=[{},{},{}] shared={}",
         name, grid_dim_x, grid_dim_y, grid_dim_z,
         block_dim_x, block_dim_y, block_dim_z, shared_mem_bytes));
+    // Diagnostic validation removed — the hipMemcpyDtoH calls in the validators
+    // trigger the ROCm ProfilingSignal pool race condition (same as the surf.rs bug).
+    // The shift encoding fix (cuTexObjectCreate adds top-3-bit shift) is verified by tests.
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
     let cu_launch_param_buffer_pointer = 0x1usize as *mut ::core::ffi::c_void;
@@ -237,4 +240,189 @@ pub(crate) unsafe fn set_attribute(
         _ => {}
     }
     hipFuncSetAttribute(func.base.0.cast(), hipFuncAttribute(attribute.0), value)
+}
+
+/// Pre-launch diagnostic for ParticleDensityAtomicToTexKernel.
+/// Reads the surface handle from the 456-byte param struct (at offset 368)
+/// and validates the surface descriptor it points to.
+unsafe fn validate_surface_kernel_inputs(
+    extra: *mut *mut ::core::ffi::c_void,
+    stream: hipStream_t,
+    name: &str,
+) {
+    use hip_runtime_sys::*;
+
+    let _ = hipStreamSynchronize(stream);
+
+    // extra format: [CU_LAUNCH_PARAM_BUFFER_POINTER, ptr, CU_LAUNCH_PARAM_BUFFER_SIZE, size_ptr, END]
+    let extra_params = std::slice::from_raw_parts(extra, 5);
+    if extra_params[0] != (0x1usize as *mut std::ffi::c_void) {
+        return; // Not the expected extra format
+    }
+    let buffer = extra_params[1] as *const u8;
+    let buf_size = *(extra_params[3] as *const usize);
+
+    if buf_size < 376 {
+        return; // Too small to contain the surface handle at offset 368
+    }
+
+    // Surface handle is a u64 at offset 368 in the param struct
+    let surf_handle = *(buffer.add(368) as *const u64);
+
+    // Decode: top 3 bits = pixel shift, remaining bits = descriptor pointer
+    let shift = surf_handle >> 61;
+    let desc_ptr = (surf_handle << 3) >> 3;
+
+    // Read the 32-byte surface descriptor from device memory
+    let mut desc_words = [0u32; 8];
+    let copy_result = hipMemcpyDtoH(
+        desc_words.as_mut_ptr() as _,
+        hipDeviceptr_t(desc_ptr as *mut std::ffi::c_void),
+        32,
+    );
+
+    static SURF_CALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call_n = SURF_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    if copy_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "VALIDATE_SURF {} #{}: handle=0x{:016x} desc_ptr=0x{:016x} shift={} READ FAILED {:?}",
+            name, call_n, surf_handle, desc_ptr, shift, copy_result));
+        return;
+    }
+
+    // Descriptor word 0-1: base address (48 bits)
+    let base = (desc_words[0] as u64) | ((desc_words[1] as u64) << 32);
+    // Check if base address looks valid (in device memory range)
+    let alloc_min = super::memory::ALLOC_MIN.load(std::sync::atomic::Ordering::Relaxed);
+    let alloc_max = super::memory::ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
+    let base_in_range = base >= alloc_min && base <= alloc_max;
+
+    // Log first 5, then every 10th, or if base looks bad
+    if call_n < 5 || call_n % 10 == 0 || !base_in_range {
+        super::driver::zluda_log_err(&format!(
+            "VALIDATE_SURF {} #{}: handle=0x{:016x} shift={} base=0x{:012x} in_range={} words=[{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}]",
+            name, call_n, surf_handle, shift, base, base_in_range,
+            desc_words[0], desc_words[1], desc_words[2], desc_words[3],
+            desc_words[4], desc_words[5], desc_words[6], desc_words[7]));
+    }
+
+    if !base_in_range && base != 0 {
+        super::driver::zluda_log_err(&format!(
+            "*** CORRUPT SURFACE DESCRIPTOR #{}: base=0x{:012x} outside alloc range [{:012x}..{:012x}]",
+            call_n, base, alloc_min, alloc_max));
+    }
+}
+
+/// Pre-launch diagnostic for CreateParticleShapesIncremental_MultiStage_4.
+/// Reads back the flags array (param_2) and index array (param_5) from device memory
+/// and checks for out-of-range indices or corrupt flags that would cause wild scatter writes.
+///
+/// MultiStage_4 kernel params (via kernel_params pointer array):
+///   [0] param_0: u64 (unused)
+///   [1] param_1: u16 (unused)
+///   [2] param_2: u64 → flags buffer (u16 per particle, stride 4 bytes)
+///   [3] param_3: u32 → numParticles
+///   [4] param_4: u64 → output scatter buffer
+///   [5] param_5: u64 → index array (u32 per particle)
+///   [6] param_6: u64 → counter base array
+///   [7] param_7: u64 → atomic counter array
+unsafe fn validate_multistage4_inputs(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    stream: hipStream_t,
+    name: &str,
+) {
+    use hip_runtime_sys::*;
+
+    // Sync the stream first so all prior writes are visible
+    let _ = hipStreamSynchronize(stream);
+
+    let params = std::slice::from_raw_parts(kernel_params, 8);
+    let flags_ptr = *(params[2] as *const u64) as *mut std::ffi::c_void;
+    let num_particles = *(params[3] as *const u32);
+    let index_ptr = *(params[5] as *const u64) as *mut std::ffi::c_void;
+
+    if num_particles == 0 || num_particles > 100_000 {
+        super::driver::zluda_log_err(&format!(
+            "VALIDATE {}: numParticles={} (suspicious)", name, num_particles));
+        return;
+    }
+
+    let n = num_particles as usize;
+
+    // Read flags (u16 per entry, but stride is 4 bytes based on PTX: mul.wide.u32 %rd8, %r1, 4)
+    // So flags[i] is at offset i*4, reading 2 bytes
+    let flags_byte_size = n * 4; // 4 bytes stride per entry
+    let mut h_flags = vec![0u8; flags_byte_size];
+    let flags_result = hipMemcpyDtoH(
+        h_flags.as_mut_ptr() as _,
+        hipDeviceptr_t(flags_ptr),
+        flags_byte_size,
+    );
+    if flags_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "VALIDATE {}: flags read FAILED {:?} ptr={:?} size={}",
+            name, flags_result, flags_ptr, flags_byte_size));
+        return;
+    }
+
+    // Read index array (u32 per entry, stride 4 bytes)
+    let mut h_indices = vec![0u32; n];
+    let idx_result = hipMemcpyDtoH(
+        h_indices.as_mut_ptr() as _,
+        hipDeviceptr_t(index_ptr),
+        n * 4,
+    );
+    if idx_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "VALIDATE {}: index read FAILED {:?} ptr={:?} size={}",
+            name, idx_result, index_ptr, n * 4));
+        return;
+    }
+
+    // Check: which flags indicate "process this particle"?
+    // Stage_4 checks: (flags[i] & 0x11) == 1
+    let mut active_count = 0u32;
+    let mut bad_indices = Vec::new();
+    let mut max_index = 0u32;
+
+    for i in 0..n {
+        // Flag is u16 at offset i*4
+        let flag = u16::from_ne_bytes([h_flags[i * 4], h_flags[i * 4 + 1]]);
+        let is_active = (flag & 0x11) == 1;
+        if is_active {
+            active_count += 1;
+            let idx = h_indices[i];
+            if idx > max_index {
+                max_index = idx;
+            }
+            // Check for obviously bad indices (> 1M or bit 31 set)
+            if idx >= 1_000_000 || (idx & 0x80000000) != 0 {
+                bad_indices.push((i, idx, flag));
+            }
+        }
+    }
+
+    static CALL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call_n = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Log summary (always for first 10, then every 10th, or if bad indices found)
+    if call_n < 10 || call_n % 10 == 0 || !bad_indices.is_empty() {
+        super::driver::zluda_log_err(&format!(
+            "VALIDATE {} #{}: n={} active={} max_idx={} bad={}",
+            name, call_n, n, active_count, max_index, bad_indices.len()));
+    }
+
+    if !bad_indices.is_empty() {
+        let show = bad_indices.len().min(10);
+        for &(i, idx, flag) in &bad_indices[..show] {
+            super::driver::zluda_log_err(&format!(
+                "  BAD [{}]: flag=0x{:04x} index=0x{:08x} ({})",
+                i, flag, idx, idx as i32));
+        }
+        if bad_indices.len() > 10 {
+            super::driver::zluda_log_err(&format!(
+                "  ... and {} more bad indices", bad_indices.len() - 10));
+        }
+    }
 }

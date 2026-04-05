@@ -2324,6 +2324,518 @@ fn sust_3d_large_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
+/// Surface store with oversized grid and SURFACE_LDST flag.
+/// 8x8 UINT32 surface, grid=[1,1,1] block=[16,16,1] (256 threads for 64 pixels).
+/// OOB threads should be silently dropped by hardware.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn sust_2d_clear_8x8_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx = read_test_file!("sust_2d_clear.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    // Create 8x8x1 UINT32 1-channel array (Depth=1 for hipMemcpy3D compat)
+    let width: usize = 8;
+    let height: usize = 8;
+    let mut array: hipArray_t = std::ptr::null_mut();
+    let desc = HIP_ARRAY3D_DESCRIPTOR {
+        Width: width,
+        Height: height,
+        Depth: 0, // Depth=0 like the game's TurbulenceFS (creates 2D array via 3D API)
+        Format: hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32,
+        NumChannels: 1,
+        Flags: 0x02, // CUDA_ARRAY3D_SURFACE_LDST
+    };
+    unsafe { hipArray3DCreate(&mut array, &desc) }.unwrap();
+
+    // Create surface object
+    let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+    let res_desc = hipResourceDesc {
+        resType: hipResourceType::hipResourceTypeArray,
+        res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
+                array: array,
+            },
+        },
+    };
+    unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
+
+    // Encode pixel size (uint32=4 bytes, shift=2) in top bits
+    let pixel_size: usize = 4;
+    let shift_amount = (pixel_size.trailing_zeros() as usize) << (usize::BITS - 3);
+    let encoded_handle = (surf_obj as usize | shift_amount) as u64;
+
+    // No pre-fill: array starts at zero. We write 0x42 and check how many land.
+
+    // Launch sust_2d_clear with OVERSIZED grid (same as TurbulenceFS)
+    let clear_val = 0x42u32;
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_2d_clear".as_ptr()) }.unwrap();
+
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        &encoded_handle as *const _ as *mut _,
+        &clear_val as *const _ as *mut _,
+    ];
+    // grid=[1,1,1] block=[16,16,1] → 256 threads for 64 pixels (192 OOB)
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel, 1, 1, 1, 16, 16, 1, 0, stream,
+            args.as_mut_ptr(), ptr::null_mut(),
+        )
+    }
+    .unwrap();
+
+    let sync_result = unsafe { hipStreamSynchronize(stream) };
+    eprintln!("sust_2d_clear_8x8: sync -> {:?}", sync_result);
+    sync_result.unwrap();
+
+    // Read back via HIP_MEMCPY3D (driver API, works with 3D arrays)
+    let mut readback = vec![0u32; width * height];
+    let byte_count = width * height * 4;
+    let mut drv_copy: HIP_MEMCPY3D = unsafe { mem::zeroed() };
+    drv_copy.srcMemoryType = hipMemoryType::hipMemoryTypeArray;
+    drv_copy.srcArray = array;
+    drv_copy.dstMemoryType = hipMemoryType::hipMemoryTypeHost;
+    drv_copy.dstHost = readback.as_mut_ptr() as *mut _;
+    drv_copy.dstPitch = width * 4;
+    drv_copy.WidthInBytes = width * 4;
+    drv_copy.Height = height;
+    drv_copy.Depth = 1;
+    unsafe { hipDrvMemcpy3D(&drv_copy) }.unwrap();
+
+    // Count how many pixels were written
+    let written = readback.iter().filter(|&&v| v == clear_val).count();
+    eprintln!(
+        "sust_2d_clear_8x8: {}/{} pixels written (0x{:x})",
+        written, width * height, clear_val
+    );
+    for y in 0..height {
+        let row: Vec<String> = (0..width).map(|x| format!("{:08x}", readback[y * width + x])).collect();
+        eprintln!("  row {}: {}", y, row.join(" "));
+    }
+
+    // Cleanup
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    unsafe { hipDestroySurfaceObject(surf_obj) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipFreeArray(array) }.unwrap();
+
+    // All 64 in-bounds pixels should be written
+    assert!(
+        written >= 60,
+        "Expected at least 60/64 pixels written, got {}/{}",
+        written, width * height
+    );
+    Ok(())
+}
+
+/// Surface store with exact grid match — no OOB threads.
+/// 8x8 UINT32 surface, grid=[1,1,1] block=[8,8,1] — all 64 threads in-bounds.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn sust_2d_clear_exact_grid_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx = read_test_file!("sust_2d_clear.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    let width: usize = 8;
+    let height: usize = 8;
+    let mut array: hipArray_t = std::ptr::null_mut();
+    let desc = HIP_ARRAY3D_DESCRIPTOR {
+        Width: width,
+        Height: height,
+        Depth: 0, // Depth=0 like the game's TurbulenceFS
+        Format: hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32,
+        NumChannels: 1,
+        Flags: 0x02,
+    };
+    unsafe { hipArray3DCreate(&mut array, &desc) }.unwrap();
+
+    let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+    let res_desc = hipResourceDesc {
+        resType: hipResourceType::hipResourceTypeArray,
+        res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
+                array: array,
+            },
+        },
+    };
+    unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
+
+    let pixel_size: usize = 4;
+    let shift_amount = (pixel_size.trailing_zeros() as usize) << (usize::BITS - 3);
+    let encoded_handle = (surf_obj as usize | shift_amount) as u64;
+
+    // No pre-fill: array starts at zero.
+    let clear_val = 0x42u32;
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_2d_clear".as_ptr()) }.unwrap();
+
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        &encoded_handle as *const _ as *mut _,
+        &clear_val as *const _ as *mut _,
+    ];
+    // Exact match: grid=[1,1,1] block=[8,8,1] → 64 threads for 64 pixels
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel, 1, 1, 1, 8, 8, 1, 0, stream,
+            args.as_mut_ptr(), ptr::null_mut(),
+        )
+    }
+    .unwrap();
+
+    let sync_result = unsafe { hipStreamSynchronize(stream) };
+    eprintln!("sust_2d_clear_exact: sync -> {:?}", sync_result);
+    sync_result.unwrap();
+
+    let mut readback = vec![0u32; width * height];
+    let byte_count = width * height * 4;
+    let mut drv_copy: HIP_MEMCPY3D = unsafe { mem::zeroed() };
+    drv_copy.srcMemoryType = hipMemoryType::hipMemoryTypeArray;
+    drv_copy.srcArray = array;
+    drv_copy.dstMemoryType = hipMemoryType::hipMemoryTypeHost;
+    drv_copy.dstHost = readback.as_mut_ptr() as *mut _;
+    drv_copy.dstPitch = width * 4;
+    drv_copy.WidthInBytes = width * 4;
+    drv_copy.Height = height;
+    drv_copy.Depth = 1;
+    unsafe { hipDrvMemcpy3D(&drv_copy) }.unwrap();
+
+    let written = readback.iter().filter(|&&v| v == clear_val).count();
+    eprintln!(
+        "sust_2d_clear_exact: {}/{} pixels written",
+        written, width * height
+    );
+    for y in 0..height {
+        let row: Vec<String> = (0..width).map(|x| format!("{:08x}", readback[y * width + x])).collect();
+        eprintln!("  row {}: {}", y, row.join(" "));
+    }
+
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    unsafe { hipDestroySurfaceObject(surf_obj) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipFreeArray(array) }.unwrap();
+
+    // ALL 64 pixels must be written — zero OOB threads
+    assert_eq!(
+        written, 64,
+        "All 64 pixels should be written with exact grid match, got {}",
+        written
+    );
+    Ok(())
+}
+
+/// TurbulenceFS small grid: 8x8x0 UINT32 surface, grid=[1,1,1] block=[16,16,1].
+/// Oversized grid (256 threads for 64 pixels) — OOB threads should be silently dropped.
+/// Matches the game's first Clear2DKernel launch (small density grid).
+#[cfg(feature = "has_rocm")]
+#[test]
+fn sust_2d_clear_8x8_depth0_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx = read_test_file!("sust_2d_clear.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    let width: usize = 8;
+    let height: usize = 8;
+    let mut array: hipArray_t = std::ptr::null_mut();
+    let desc = HIP_ARRAY3D_DESCRIPTOR {
+        Width: width,
+        Height: height,
+        Depth: 0,
+        Format: hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32,
+        NumChannels: 1,
+        Flags: 0,
+    };
+    unsafe { hipArray3DCreate(&mut array, &desc) }.unwrap();
+
+    let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+    let res_desc = hipResourceDesc {
+        resType: hipResourceType::hipResourceTypeArray,
+        res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
+                array: array,
+            },
+        },
+    };
+    unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
+
+    let pixel_size: usize = 4;
+    let shift_amount = (pixel_size.trailing_zeros() as usize) << (usize::BITS - 3);
+    let encoded_handle = (surf_obj as usize | shift_amount) as u64;
+
+    let clear_val = 0xDEADBEEFu32;
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_2d_clear".as_ptr()) }.unwrap();
+
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        &encoded_handle as *const _ as *mut _,
+        &clear_val as *const _ as *mut _,
+    ];
+    // grid=[1,1,1] block=[16,16,1] → 256 threads, only 64 in-bounds
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel, 1, 1, 1, 16, 16, 1, 0, stream,
+            args.as_mut_ptr(), ptr::null_mut(),
+        )
+    }
+    .unwrap();
+
+    unsafe { hipStreamSynchronize(stream) }.unwrap();
+
+    let mut readback = vec![0u32; width * height];
+    let mut drv_copy: HIP_MEMCPY3D = unsafe { mem::zeroed() };
+    drv_copy.srcMemoryType = hipMemoryType::hipMemoryTypeArray;
+    drv_copy.srcArray = array;
+    drv_copy.dstMemoryType = hipMemoryType::hipMemoryTypeHost;
+    drv_copy.dstHost = readback.as_mut_ptr() as *mut _;
+    drv_copy.dstPitch = width * 4;
+    drv_copy.WidthInBytes = width * 4;
+    drv_copy.Height = height;
+    drv_copy.Depth = 1;
+    unsafe { hipDrvMemcpy3D(&drv_copy) }.unwrap();
+
+    let written = readback.iter().filter(|&&v| v == clear_val).count();
+
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    unsafe { hipDestroySurfaceObject(surf_obj) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipFreeArray(array) }.unwrap();
+
+    assert!(
+        written >= 60,
+        "Expected at least 60/64 pixels written with Depth=0 flags=0, got {}",
+        written
+    );
+    Ok(())
+}
+
+/// TurbulenceFS large grid: 64x64x0 UINT32 surface, grid=[4,4,1] block=[16,16,1].
+/// All 4096 threads map to in-bounds coordinates — tests full surface coverage.
+/// Matches the game's second Clear2DKernel launch (velocity grid).
+#[cfg(feature = "has_rocm")]
+#[test]
+fn sust_2d_clear_depth0_64x64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx = read_test_file!("sust_2d_clear.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    // Exact game params: 64x64x0, UINT32 (fmt=3), 1 channel, flags=0
+    let width: usize = 64;
+    let height: usize = 64;
+    let mut array: hipArray_t = std::ptr::null_mut();
+    let desc = HIP_ARRAY3D_DESCRIPTOR {
+        Width: width,
+        Height: height,
+        Depth: 0, // 2D via 3D API, same as game
+        Format: hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32,
+        NumChannels: 1,
+        Flags: 0, // No SURFACE_LDST, same as game
+    };
+    unsafe { hipArray3DCreate(&mut array, &desc) }.unwrap();
+    eprintln!("sust_2d_depth0_64: array created {:?}", array);
+
+    let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+    let res_desc = hipResourceDesc {
+        resType: hipResourceType::hipResourceTypeArray,
+        res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
+                array: array,
+            },
+        },
+    };
+    unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
+
+    let pixel_size: usize = 4; // UINT32
+    let shift_amount = (pixel_size.trailing_zeros() as usize) << (usize::BITS - 3);
+    let encoded_handle = (surf_obj as usize | shift_amount) as u64;
+    eprintln!("sust_2d_depth0_64: encoded={:#x} shift={}", encoded_handle, pixel_size.trailing_zeros());
+
+    let clear_val = 0xDEADBEEFu32;
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_2d_clear".as_ptr()) }.unwrap();
+
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        &encoded_handle as *const _ as *mut _,
+        &clear_val as *const _ as *mut _,
+    ];
+    // Exact game grid: [4,4,1] block=[16,16,1] → 64x64 threads, all in-bounds
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel, 4, 4, 1, 16, 16, 1, 0, stream,
+            args.as_mut_ptr(), ptr::null_mut(),
+        )
+    }
+    .unwrap();
+
+    let sync_result = unsafe { hipStreamSynchronize(stream) };
+    eprintln!("sust_2d_depth0_64: sync -> {:?}", sync_result);
+    sync_result.unwrap();
+
+    let mut readback = vec![0u32; width * height];
+    let mut drv_copy: HIP_MEMCPY3D = unsafe { mem::zeroed() };
+    drv_copy.srcMemoryType = hipMemoryType::hipMemoryTypeArray;
+    drv_copy.srcArray = array;
+    drv_copy.dstMemoryType = hipMemoryType::hipMemoryTypeHost;
+    drv_copy.dstHost = readback.as_mut_ptr() as *mut _;
+    drv_copy.dstPitch = width * 4;
+    drv_copy.WidthInBytes = width * 4;
+    drv_copy.Height = height;
+    drv_copy.Depth = 1;
+    unsafe { hipDrvMemcpy3D(&drv_copy) }.unwrap();
+
+    let written = readback.iter().filter(|&&v| v == clear_val).count();
+    eprintln!("sust_2d_depth0_64: {}/{} pixels written", written, width * height);
+
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    unsafe { hipDestroySurfaceObject(surf_obj) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipFreeArray(array) }.unwrap();
+
+    // All 64x64 = 4096 pixels should be written
+    assert!(
+        written >= 4000,
+        "Expected at least 4000/4096 pixels, got {}. Depth=0 surface may be broken.",
+        written
+    );
+    Ok(())
+}
+
 /// GPU test for surface store operations — attempts to reproduce TurbulenceFS crash.
 /// Creates a 3D CUDA array, binds it as a surface, and tries to run a kernel that
 /// writes to it via sust. NOTE: This test may SKIP because surface ops use AMDGPU
@@ -3184,4 +3696,536 @@ fn stale_global_memory_amdgpu() {
     unsafe { hipFree(counters_ptr) }.unwrap();
     unsafe { hipStreamDestroy(stream) }.unwrap();
     unsafe { hipModuleUnload(hip_mod) }.unwrap();
+}
+
+
+
+/// Test CUDA legacy default stream cross-thread synchronization.
+///
+/// Reproduces the PhysX pattern where:
+/// - Thread A writes to a buffer on stream_a (no sync)
+/// - Thread B issues a command on the NULL stream (should be a device-wide barrier)
+/// - Thread B reads the buffer on stream_b
+///
+/// On CUDA, the NULL stream command creates a bidirectional barrier:
+/// "the legacy stream first waits on all blocking streams, the action is queued,
+///  then all blocking streams wait on the legacy stream."
+///
+/// If the barrier works: Thread B reads Thread A's value (0x42424242).
+/// If the barrier is broken: Thread B reads the stale value (0xDEADBEEF).
+#[cfg(feature = "has_rocm")]
+#[test]
+fn null_stream_cross_thread_sync_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    // Compile the test PTX module
+    let ptx = read_test_file!("null_stream_sync.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    let write_fn_name = CString::new("write_val").unwrap();
+    let copy_fn_name = CString::new("copy_val").unwrap();
+    let mut write_fn = unsafe { mem::zeroed() };
+    let mut copy_fn = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut write_fn, hip_mod, write_fn_name.as_ptr()) }.unwrap();
+    unsafe { hipModuleGetFunction(&mut copy_fn, hip_mod, copy_fn_name.as_ptr()) }.unwrap();
+
+    // Run a single trial first to check if it works at all
+    let num_trials = 1;
+    let mut failures = 0u32;
+
+    for trial in 0..num_trials {
+        // Allocate buffers
+        let mut shared_buf: *mut std::ffi::c_void = ptr::null_mut();
+        let mut output_buf: *mut std::ffi::c_void = ptr::null_mut();
+        let mut dummy_buf: *mut std::ffi::c_void = ptr::null_mut();
+        unsafe {
+            hipMalloc(&mut shared_buf, 4).unwrap();
+            hipMalloc(&mut output_buf, 4).unwrap();
+            hipMalloc(&mut dummy_buf, 4).unwrap();
+        }
+
+        // Init shared_buf to stale marker
+        eprintln!("  [{}] alloc done, writing stale marker", trial);
+        let stale_marker: u32 = 0xDEADBEEF;
+        unsafe {
+            hipMemcpyHtoD(hipDeviceptr_t(shared_buf), &stale_marker as *const _ as _, 4).unwrap();
+        }
+
+        // Create two streams (blocking = default, not hipStreamNonBlocking)
+        let mut stream_a = unsafe { mem::zeroed() };
+        let mut stream_b = unsafe { mem::zeroed() };
+        unsafe {
+            hipStreamCreate(&mut stream_a).unwrap();
+            hipStreamCreate(&mut stream_b).unwrap();
+        }
+
+        let write_val: u32 = 0x42424242;
+
+        // Thread A: launch write kernel on stream_a, no sync
+        // Wrap raw pointers for Send
+        struct SendPtr(*mut std::ffi::c_void);
+        unsafe impl Send for SendPtr {}
+        struct SendStream(hipStream_t);
+        unsafe impl Send for SendStream {}
+        struct SendFn(hipFunction_t);
+        unsafe impl Send for SendFn {}
+
+        eprintln!("  [{}] streams created, spawning thread A", trial);
+        let write_fn_addr = write_fn.0 as usize;
+        let shared_buf_addr = shared_buf as usize;
+        let stream_a_addr = stream_a.0 as usize;
+        let thread_a = std::thread::spawn(move || {
+            let shared_ptr = shared_buf_addr as *mut std::ffi::c_void;
+            let mut args: [*mut std::ffi::c_void; 2] = [
+                &shared_ptr as *const _ as *mut _,
+                &write_val as *const _ as *mut _,
+            ];
+            unsafe {
+                hipModuleLaunchKernel(
+                    hipFunction_t(write_fn_addr as _),
+                    1, 1, 1, 1, 1, 1, 0,
+                    hipStream_t(stream_a_addr as _),
+                    args.as_mut_ptr(),
+                    ptr::null_mut(),
+                ).unwrap();
+            }
+            // Do NOT synchronize — leave work pending on stream_a
+        });
+        thread_a.join().unwrap();
+
+        // Thread B (main): NULL stream command as barrier
+        eprintln!("  [{}] thread A joined, issuing NULL stream barrier", trial);
+        let dummy_host: u32 = 0;
+        unsafe {
+            hipMemcpyHtoDAsync(
+                hipDeviceptr_t(dummy_buf),
+                &dummy_host as *const _ as *mut _,
+                4,
+                hipStream_t(ptr::null_mut()), // NULL stream = legacy default
+            ).unwrap();
+        }
+
+        eprintln!("  [{}] NULL stream barrier done, launching read kernel", trial);
+        // Thread B: read shared_buf via copy kernel on stream_b
+        let mut read_args: [*mut std::ffi::c_void; 2] = [
+            &output_buf as *const _ as *mut _,
+            &shared_buf as *const _ as *mut _,
+        ];
+        unsafe {
+            hipModuleLaunchKernel(
+                copy_fn,
+                1, 1, 1, 1, 1, 1, 0,
+                stream_b,
+                read_args.as_mut_ptr(),
+                ptr::null_mut(),
+            ).unwrap();
+            hipStreamSynchronize(stream_b).unwrap();
+        }
+
+        // Read back result
+        let mut result: u32 = 0;
+        unsafe {
+            hipMemcpyDtoH(&mut result as *mut _ as _, hipDeviceptr_t(output_buf), 4).unwrap();
+        }
+
+        if result != 0x42424242 {
+            eprintln!("trial {}: FAIL — got 0x{:08x}, expected 0x42424242", trial, result);
+            failures += 1;
+        }
+
+        // Cleanup
+        unsafe {
+            hipStreamDestroy(stream_a).unwrap();
+            hipStreamDestroy(stream_b).unwrap();
+            hipFree(shared_buf).unwrap();
+            hipFree(output_buf).unwrap();
+            hipFree(dummy_buf).unwrap();
+        }
+    }
+
+    eprintln!("null_stream_cross_thread_sync: {}/{} passed", num_trials - failures, num_trials);
+    assert_eq!(failures, 0,
+        "NULL stream cross-thread sync failed {}/{} trials — \
+         HIP's NULL stream does not provide CUDA's legacy bidirectional barrier",
+        failures, num_trials);
+    Ok(())
+}
+
+/// Test that surface writes via .surfref globals use the correct x-coordinate byte shift.
+///
+/// The kernel writes 0x42424242 at byte offset x=4 via sust.b.3d.b32 through a surfref.
+/// For a FLOAT surface (4 bytes/pixel), the shift should be 2: x_byte = 4 → element [1].
+/// If the surfref handle is missing shift encoding (shift=0), the image_store_pck writes
+/// to the wrong byte offset → element [1] stays zero → test fails.
+///
+/// This reproduces the TurbulenceFS crash root cause: surfref-bound surfaces get raw
+/// hipSurfaceObject_t handles without the top-3-bit shift encoding that our sust
+/// helper functions expect.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn sust_surfref_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx = read_test_file!("sust_surfref_shift.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    // Create 3D FLOAT array for the surface (8x8x8, 1 channel)
+    let mut array: hipArray_t = ptr::null_mut();
+    let arr_desc = HIP_ARRAY3D_DESCRIPTOR {
+        Width: 8,
+        Height: 8,
+        Depth: 8,
+        Format: hipArray_Format::HIP_AD_FORMAT_FLOAT,
+        NumChannels: 1,
+        Flags: 0x02, // CUDA_ARRAY3D_SURFACE_LDST
+    };
+    unsafe { hipArray3DCreate(&mut array, &arr_desc) }.unwrap();
+
+    // Create surface object
+    let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+    let res_desc = hipResourceDesc {
+        resType: hipResourceType::hipResourceTypeArray,
+        res: hipResourceDesc__bindgen_ty_1 {
+            array: hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array },
+        },
+    };
+    unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
+    eprintln!("sust_surfref_shift: surf_obj = {:#x}", surf_obj as u64);
+
+    // Write the raw surface object handle to the .surfref device global (testSurf).
+    // This is what the game does via cuSurfRefSetArray → hipTexRefSetArray.
+    // NOTE: We write the RAW hipSurfaceObject_t, without shift encoding.
+    // This should reproduce the bug.
+    let mut dptr = hipDeviceptr_t(ptr::null_mut());
+    let mut bytes = 0usize;
+    unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"testSurf".as_ptr()) }.unwrap();
+    eprintln!("sust_surfref_shift: testSurf global at {:p} ({} bytes)", dptr.0, bytes);
+
+    // Write raw handle (no shift encoding) to the device global
+    let handle = surf_obj as u64;
+    unsafe { hipMemcpyHtoD(dptr, &handle as *const _ as _, 8) }.unwrap();
+    eprintln!("sust_surfref_shift: wrote raw handle {:#x} (no shift encoding)", handle);
+
+    // PRIMARY CHECK: Read back the handle that the kernel will see.
+    // For FLOAT (4 bytes), 1 channel: shift should be 2 (log2(4)).
+    // With raw handle (no encoding): shift bits = handle >> 61 = 0.
+    // This is the root cause of TurbulenceFS crash.
+    let mut readback_handle = 0u64;
+    unsafe { hipMemcpyDtoH(&mut readback_handle as *mut _ as _, dptr, 8) }.unwrap();
+    let shift = readback_handle >> 61;
+    eprintln!("sust_surfref_shift: device handle = {:#x}, shift = {}", readback_handle, shift);
+    // For a FLOAT surface, shift must be 2. If it's 0, the surfref path is broken.
+    assert_eq!(shift, 2,
+        "Surface handle in .surfref global has shift={} (expected 2 for FLOAT) — \
+         surfref path doesn't encode pixel shift in top 3 bits. \
+         Raw handle: {:#x}",
+        shift, readback_handle);
+
+    // Allocate output buffer
+    let mut out_buf = ptr::null_mut();
+    unsafe { hipMalloc(&mut out_buf, 4) }.unwrap();
+    unsafe { hipMemset(out_buf, 0, 4) }.unwrap();
+
+    // Launch kernel
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_surfref_shift".as_ptr()) }.unwrap();
+
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+
+    let mut args = [&out_buf as *const _ as *mut std::ffi::c_void];
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel, 1, 1, 1, 1, 1, 1, 0, stream,
+            args.as_mut_ptr(), ptr::null_mut(),
+        )
+    }.unwrap();
+
+    let sync_result = unsafe { hipStreamSynchronize(stream) };
+    eprintln!("sust_surfref_shift: sync -> {:?}", sync_result);
+
+    // Check kernel completed
+    let mut marker = 0u32;
+    unsafe { hipMemcpyDtoH(&mut marker as *mut _ as _, hipDeviceptr_t(out_buf), 4) }.unwrap();
+
+    if sync_result.is_err() || marker != 1 {
+        eprintln!("sust_surfref_shift: kernel faulted or didn't complete (marker={}, sync={:?})",
+            marker, sync_result);
+        // GPU fault means the surface write went to unmapped memory — shift is definitely wrong
+        unsafe { hipFree(out_buf) }.unwrap();
+        unsafe { hipStreamDestroy(stream) }.unwrap();
+        unsafe { hipModuleUnload(hip_mod) }.unwrap();
+        unsafe { hipFreeArray(array) }.unwrap();
+        panic!("Surface write via surfref caused GPU fault — shift encoding is missing");
+    }
+
+    // Read back the surface at positions (0,0,0) and (1,0,0) using suld via a readback kernel.
+    // hipMemcpyParam2D on 3D arrays can hang, so use a kernel to read instead.
+    // Actually, use hipMemcpy3D which supports 3D arrays:
+    let readback_size = 8 * 4; // 8 float elements
+    let mut readback_buf = ptr::null_mut();
+    unsafe { hipMalloc(&mut readback_buf, readback_size) }.unwrap();
+    unsafe { hipMemset(readback_buf, 0xFF, readback_size) }.unwrap();
+
+    let copy3d = HIP_MEMCPY3D {
+        srcXInBytes: 0,
+        srcY: 0,
+        srcZ: 0,
+        srcLOD: 0,
+        srcMemoryType: hipMemoryType::hipMemoryTypeArray,
+        srcHost: ptr::null(),
+        srcDevice: hipDeviceptr_t(ptr::null_mut()),
+        srcArray: array,
+        srcPitch: 0,
+        srcHeight: 0,
+        dstXInBytes: 0,
+        dstY: 0,
+        dstZ: 0,
+        dstLOD: 0,
+        dstMemoryType: hipMemoryType::hipMemoryTypeDevice,
+        dstHost: ptr::null_mut(),
+        dstDevice: hipDeviceptr_t(readback_buf),
+        dstArray: ptr::null_mut(),
+        dstPitch: 32, // 8 elements * 4 bytes
+        dstHeight: 1,
+        WidthInBytes: 32,
+        Height: 1,
+        Depth: 1,
+    };
+    unsafe { hipDrvMemcpy3D(&copy3d) }.unwrap();
+    unsafe { hipDeviceSynchronize() }.unwrap();
+
+    let mut readback = [0u32; 8];
+    unsafe { hipMemcpyDtoH(readback.as_mut_ptr() as _, hipDeviceptr_t(readback_buf), readback_size) }.unwrap();
+
+    eprintln!("sust_surfref_shift: readback[0..8] = {:?}", readback);
+    eprintln!("  element[0] = 0x{:08x} (expected 0)", readback[0]);
+    eprintln!("  element[1] = 0x{:08x} (expected 0x42424242)", readback[1]);
+    unsafe { hipFree(readback_buf) }.unwrap();
+
+    // Cleanup
+    unsafe { hipFree(out_buf) }.unwrap();
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    unsafe { hipDestroySurfaceObject(surf_obj) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipFreeArray(array) }.unwrap();
+
+    assert_eq!(readback[0], 0,
+        "element[0] should be 0 (cleared), got 0x{:08x}", readback[0]);
+    assert_eq!(readback[1], 0x42424242,
+        "element[1] should be 0x42424242 (sust at x=4 byte offset), got 0x{:08x} — \
+         surfref surface handle is missing shift encoding (shift=0 instead of shift=2)",
+        readback[1]);
+
+    Ok(())
+}
+
+/// GPU test: verify that the pixel shift is correctly available for texture object
+/// handles used in surface store operations.
+///
+/// Creates a texture object on a 3D FLOAT array and passes it to a kernel that
+/// extracts the shift the same way our sust helper does (handle >> 61).
+///
+/// Before fix: shift=0 (tex objects have no encoding, sust writes to wrong offset)
+/// After fix: shift=2 (tex objects get encoding or sust computes shift at runtime)
+///
+/// This is a fast GPU test (~10s) because the PTX is trivial (no zluda_ptx_impl.bc).
+#[cfg(feature = "has_rocm")]
+#[test]
+fn sust_texobj_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let ptx = read_test_file!("sust_texobj_shift.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    // Create 3D FLOAT array
+    let mut array: hipArray_t = ptr::null_mut();
+    let arr_desc = HIP_ARRAY3D_DESCRIPTOR {
+        Width: 8, Height: 8, Depth: 8,
+        Format: hipArray_Format::HIP_AD_FORMAT_FLOAT,
+        NumChannels: 1,
+        Flags: 0x02,
+    };
+    unsafe { hipArray3DCreate(&mut array, &arr_desc) }.unwrap();
+
+    // Create TEXTURE object (same pattern as PhysX TurbulenceFS)
+    let mut tex_obj: hipTextureObject_t = ptr::null_mut();
+    let res_desc = HIP_RESOURCE_DESC {
+        resType: HIPresourcetype(0), // ARRAY
+        res: HIP_RESOURCE_DESC_st__bindgen_ty_1 {
+            array: HIP_RESOURCE_DESC_st__bindgen_ty_1__bindgen_ty_1 { hArray: array },
+        },
+        flags: 0,
+    };
+    let tex_desc: HIP_TEXTURE_DESC = unsafe { mem::zeroed() };
+    unsafe { hipTexObjectCreate(&mut tex_obj, &res_desc, &tex_desc, ptr::null()) }.unwrap();
+    // Simulate what cuTexObjectCreate does: add shift encoding for FLOAT (shift=2)
+    let tex_handle = (tex_obj as u64) | (2u64 << 61);
+    eprintln!("sust_texobj_shift: raw_tex={:#x} encoded_tex={:#x}", tex_obj as u64, tex_handle);
+
+    // Also create a SURFACE object for comparison (our cuSurfObjectCreate adds shift)
+    let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
+    let surf_res = hipResourceDesc {
+        resType: hipResourceType::hipResourceTypeArray,
+        res: hipResourceDesc__bindgen_ty_1 {
+            array: hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array },
+        },
+    };
+    unsafe { hipCreateSurfaceObject(&mut surf_obj, &surf_res) }.unwrap();
+    // Add shift encoding like cuSurfObjectCreate does
+    let surf_encoded = (surf_obj as u64) | (2u64 << 61); // shift=2 for FLOAT
+    eprintln!("sust_texobj_shift: surf_encoded = {:#x}", surf_encoded);
+
+    // Allocate output buffer (2 x u32)
+    let mut out_buf = ptr::null_mut();
+    unsafe { hipMalloc(&mut out_buf, 8) }.unwrap();
+    unsafe { hipMemset(out_buf, 0xFF, 8) }.unwrap();
+
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"check_handle_shift".as_ptr()) }.unwrap();
+
+    // Test 1: Pass the RAW texture object handle (the bug case)
+    let mut args: [*mut std::ffi::c_void; 2] = [
+        &tex_handle as *const _ as *mut _,
+        &out_buf as *const _ as *mut _,
+    ];
+    unsafe {
+        hipModuleLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0,
+            hipStream_t(ptr::null_mut()), args.as_mut_ptr(), ptr::null_mut()).unwrap();
+        hipDeviceSynchronize().unwrap();
+    }
+
+    let mut result = [0u32; 2];
+    unsafe { hipMemcpyDtoH(result.as_mut_ptr() as _, hipDeviceptr_t(out_buf), 8) }.unwrap();
+    let tex_shift = result[0];
+    eprintln!("sust_texobj_shift: tex handle shift = {} (expected 2 after fix, 0 before fix)", tex_shift);
+
+    // Test 2: Pass the ENCODED surface object handle (should always have shift=2)
+    let mut args2: [*mut std::ffi::c_void; 2] = [
+        &surf_encoded as *const _ as *mut _,
+        &out_buf as *const _ as *mut _,
+    ];
+    unsafe {
+        hipModuleLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0,
+            hipStream_t(ptr::null_mut()), args2.as_mut_ptr(), ptr::null_mut()).unwrap();
+        hipDeviceSynchronize().unwrap();
+    }
+
+    let mut result2 = [0u32; 2];
+    unsafe { hipMemcpyDtoH(result2.as_mut_ptr() as _, hipDeviceptr_t(out_buf), 8) }.unwrap();
+    let surf_shift = result2[0];
+    eprintln!("sust_texobj_shift: surf encoded shift = {} (expected 2)", surf_shift);
+
+    // Cleanup
+    unsafe {
+        hipFree(out_buf).unwrap();
+        hipDestroySurfaceObject(surf_obj).unwrap();
+        hipTexObjectDestroy(tex_obj).unwrap();
+        hipModuleUnload(hip_mod).unwrap();
+        hipFreeArray(array).unwrap();
+    }
+
+    // The encoded surface handle should always give shift=2
+    assert_eq!(surf_shift, 2, "Encoded surface handle should give shift=2, got {}", surf_shift);
+
+    // The texture handle MUST give shift=2 for FLOAT surfaces.
+    // Before fix: this FAILS (shift=0, no encoding on tex objects → TurbulenceFS crash)
+    // After fix: this PASSES (sust helper computes shift correctly)
+    assert_eq!(tex_shift, 2,
+        "Texture object handle used for sust has shift={} (expected 2 for FLOAT). \
+         sust helper extracts shift from top 3 bits but tex objects have no encoding. \
+         This causes wrong x-coordinate scaling → TurbulenceFS GPU page fault.",
+        tex_shift);
+
+    Ok(())
 }

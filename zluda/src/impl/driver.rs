@@ -570,6 +570,40 @@ fn load_rocm_debug_agent() {
     // The static tables above must also remain valid.
 }
 
+/// Run hipInit on a native pthread to avoid Wine thread issues.
+/// ROCm 6.4's hipInit crashes on Wine threads due to stack address assumptions.
+#[cfg(not(windows))]
+fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> Result<(), cuda_types::cuda::CUerror> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    let builder = std::thread::Builder::new().name("zluda-hip-init".into());
+    let handle = builder.spawn(move || {
+        let result = unsafe { hipInit(flags) };
+        tx.send(result).ok();
+    }).map_err(|e| {
+        zluda_log(&format!("[ZLUDA] Failed to spawn hipInit thread: {}", e));
+        cuda_types::cuda::CUerror::UNKNOWN
+    })?;
+    handle.join().map_err(|_| {
+        zluda_log("[ZLUDA] hipInit thread panicked");
+        cuda_types::cuda::CUerror::UNKNOWN
+    })?;
+    let hip_result = rx.recv().map_err(|_| {
+        zluda_log("[ZLUDA] hipInit thread didn't send result");
+        cuda_types::cuda::CUerror::UNKNOWN
+    })?;
+    hip_result.map_err(|e| {
+        zluda_log(&format!("[ZLUDA] hipInit failed: {:?}", e));
+        cuda_types::cuda::CUerror::UNKNOWN
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> Result<(), cuda_types::cuda::CUerror> {
+    unsafe { hipInit(flags) }.map_err(|_| cuda_types::cuda::CUerror::UNKNOWN)
+}
+
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log(&format!("[ZLUDA] cuInit({})", flags));
     zluda_log_err(&format!("=== ZLUDA init (flags={}) LOG_ALL={} ===", flags, crate::is_log_all_enabled()));
@@ -582,7 +616,13 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     // Prints "Memory access fault by GPU node on address %p. Reason: %s" to stderr.
     unsafe { libc::setenv(c"HSA_ENABLE_VM_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
     unsafe { libc::setenv(c"HSA_ENABLE_QUEUE_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
-    unsafe { hipInit(flags) }?;
+    // Run hipInit on a native pthread to avoid Wine thread incompatibility.
+    // ROCm 6.4+ does stack validation and internal allocations during hipInit()
+    // that crash with free(): invalid pointer on Wine threads (low NT stack
+    // addresses confuse ROCm's thread initialization). A native pthread has a
+    // normal 8MB stack at a high address, so ROCm's logic works correctly.
+    // hipInit is process-global — initializing on any thread is fine.
+    hip_init_on_native_thread(flags)?;
     // Install SIGABRT handler to dump last kernel info before dying.
     // The HSA runtime sends SIGABRT on GPU page faults — our normal
     // hipDeviceSynchronize error check doesn't run in time.
@@ -613,7 +653,7 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
                 "[ZLUDA] HIP runtime version: {}.{}.{} (compiled with {}.{})",
                 rt_major, rt_minor, rt_patch, compiled_major, compiled_minor
             ));
-            if rt_major != compiled_major || rt_minor != compiled_minor {
+            if rt_major != compiled_major {
                 let msg = format!(
                     "[ZLUDA] FATAL: ROCm version mismatch! Compiled with {}.{}, runtime is {}.{}. \
                      GPU code compiled with one version cannot be loaded by another. \

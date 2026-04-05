@@ -775,238 +775,475 @@ extern "C"
     }
 
     // ===================== SURFACE LOAD/STORE =====================
+    // Template-based surface ops from lshqqytiger/ZLUDA v3.
     // Uses AMDGPU ISA inline assembly (image_store_pck/image_load_pck).
+    // No software bounds checking — AMDGPU hardware silently drops OOB writes.
+} // close extern "C" for template code
 
-    typedef int int4_vec __attribute__((ext_vector_type(4)));
-    typedef int int3_vec __attribute__((ext_vector_type(3)));
-    typedef int int2_vec __attribute__((ext_vector_type(2)));
-    typedef unsigned int uint4_vec __attribute__((ext_vector_type(4)));
-    typedef unsigned int uint2_vec __attribute__((ext_vector_type(2)));
+typedef uint32_t uint8 __attribute__((ext_vector_type(8)));
+typedef uint32_t zluda_uint3 __attribute__((ext_vector_type(3)));
+// GLOBAL_SPACE is required here: CONSTANT_SPACE (addrspace 4) causes our LLVM build
+// (vosen/llvm-project) to hang during compilation of large game PTX modules.
+// surf_to_sgpr uses readfirstlane to move the descriptor from VGPRs to SGPRs,
+// which is required for the "s" constraint on image_store_pck/image_load_pck.
+typedef uint8 GLOBAL_SPACE *surface_ptr;
 
-    // 256-bit image resource descriptor (8 x uint32)
-    typedef unsigned int surf_desc __attribute__((ext_vector_type(8)));
-    typedef surf_desc GLOBAL_SPACE *surface_ptr;
+// Move surface descriptor from VGPRs to SGPRs via readfirstlane.
+// The "s" constraint on image_store/load requires the descriptor in SGPRs,
+// but loading from GLOBAL_SPACE puts it in VGPRs.
+static __device__ uint8 surf_to_sgpr(uint8 desc) {
+    uint8 result;
+    result[0] = __builtin_amdgcn_readfirstlane(desc[0]);
+    result[1] = __builtin_amdgcn_readfirstlane(desc[1]);
+    result[2] = __builtin_amdgcn_readfirstlane(desc[2]);
+    result[3] = __builtin_amdgcn_readfirstlane(desc[3]);
+    result[4] = __builtin_amdgcn_readfirstlane(desc[4]);
+    result[5] = __builtin_amdgcn_readfirstlane(desc[5]);
+    result[6] = __builtin_amdgcn_readfirstlane(desc[6]);
+    result[7] = __builtin_amdgcn_readfirstlane(desc[7]);
+    return result;
+}
 
-    // GPU-side debug buffer for detecting bad surface descriptors at execution time.
-    // Defined (not extern) so it's self-contained in the .bc — no linker dependency.
-    // Layout: [0]=marker/base, [1]=handle, [2]=coord_x, [3]=coord_y,
-    //         [4]=desc_w0, [5]=desc_w1, [6]=desc_w2/base, [7]=desc_w3/handle_raw
-    __device__ uint64_t FUNC_CALL(sust_debug_buf)[8] = {0};
-
-    // Validate surface inputs before image_store. Returns true if OK.
-    // Checks handle validity, descriptor base address, and coordinate bounds.
-    // On AMDGPU, out-of-bounds image stores can fault (unlike NVIDIA which
-    // silently drops them), so we must validate coordinates against the
-    // image dimensions encoded in the descriptor.
-    static __device__ bool surf_validate(surface_ptr surface, uint64_t handle,
-                                          int coord_x, int coord_y)
+template <typename To, typename From>
+    static __device__ To transmute(From f)
     {
-        // Check 1: null handle
-        uint64_t handle_raw = (uint64_t)(uintptr_t)surface;
-        if (handle_raw == 0) {
-            FUNC_CALL(sust_debug_buf)[0] = 0xBAD0000000000001ULL;
-            FUNC_CALL(sust_debug_buf)[1] = handle;
-            return false;
+        if constexpr (sizeof(To) == sizeof(From))
+        {
+            return std::bit_cast<To>(f);
         }
-
-        // Check 2: read descriptor base address from words 0-1
-        unsigned int w0 = (*surface)[0];
-        unsigned int w1 = (*surface)[1];
-        uint64_t base = ((uint64_t)(w1 & 0xFFFF) << 32) | w0;
-
-        // Check 3: base address should be in device pointer range
-        unsigned int top_byte = (unsigned int)(base >> 40);
-        if (base != 0 && top_byte != 0x7f && top_byte != 0x7e && top_byte != 0x00) {
-            FUNC_CALL(sust_debug_buf)[0] = base;
-            FUNC_CALL(sust_debug_buf)[1] = handle;
-            FUNC_CALL(sust_debug_buf)[2] = (uint64_t)(unsigned int)coord_x;
-            FUNC_CALL(sust_debug_buf)[3] = (uint64_t)(unsigned int)coord_y;
-            FUNC_CALL(sust_debug_buf)[4] = w0;
-            FUNC_CALL(sust_debug_buf)[5] = w1;
-            FUNC_CALL(sust_debug_buf)[6] = (*surface)[2];
-            FUNC_CALL(sust_debug_buf)[7] = (*surface)[3];
-            return false;
+        else if constexpr (sizeof(To) > sizeof(From))
+        {
+            union
+            {
+                To t;
+                From f;
+            } u = {To{0}};
+            u.f = f;
+            return u.t;
         }
-
-        // Check 4: coordinate bounds against image dimensions from descriptor
-        // AMDGPU image descriptor word[2]: WIDTH[13:0], HEIGHT[27:14]
-        unsigned int w2 = (*surface)[2];
-        unsigned int width = (w2 & 0x3FFF) + 1;
-        unsigned int height = ((w2 >> 14) & 0x3FFF) + 1;
-        if (coord_x < 0 || (unsigned int)coord_x >= width ||
-            coord_y < 0 || (unsigned int)coord_y >= height) {
-            FUNC_CALL(sust_debug_buf)[0] = 0xBAD0000000000003ULL; // OOB marker
-            FUNC_CALL(sust_debug_buf)[1] = handle;
-            FUNC_CALL(sust_debug_buf)[2] = (uint64_t)(unsigned int)coord_x;
-            FUNC_CALL(sust_debug_buf)[3] = (uint64_t)(unsigned int)coord_y;
-            FUNC_CALL(sust_debug_buf)[4] = width;
-            FUNC_CALL(sust_debug_buf)[5] = height;
-            FUNC_CALL(sust_debug_buf)[6] = w2;
-            FUNC_CALL(sust_debug_buf)[7] = (*surface)[4]; // depth info
-            return false;
+        else if constexpr (sizeof(To) < sizeof(From))
+        {
+            union
+            {
+                From f;
+                To t;
+            } u = {From{f}};
+            return u.t;
         }
-
-        return true;
+        else
+        {
+            static_assert(sizeof(To) == 0);
+        }
     }
 
-    // Validate 3D surface coordinates including depth dimension.
-    static __device__ bool surf_validate_3d(surface_ptr surface, uint64_t handle,
-                                             int coord_x, int coord_y, int coord_z)
+    enum class ImageGeometry
     {
-        if (!surf_validate(surface, handle, coord_x, coord_y))
-            return false;
+        _1D,
+        _2D,
+        _3D,
+        A1D,
+        A2D
+    };
 
-        // AMDGPU image descriptor word[4]: DEPTH[12:0]
-        unsigned int w4 = (*surface)[4];
-        unsigned int depth = (w4 & 0x1FFF) + 1;
-        if (coord_z < 0 || (unsigned int)coord_z >= depth) {
-            FUNC_CALL(sust_debug_buf)[0] = 0xBAD0000000000004ULL; // 3D OOB marker
-            FUNC_CALL(sust_debug_buf)[1] = handle;
-            FUNC_CALL(sust_debug_buf)[2] = (uint64_t)(unsigned int)coord_x;
-            FUNC_CALL(sust_debug_buf)[3] = (uint64_t)(unsigned int)coord_y;
-            FUNC_CALL(sust_debug_buf)[4] = (uint64_t)(unsigned int)coord_z;
-            FUNC_CALL(sust_debug_buf)[5] = depth;
-            FUNC_CALL(sust_debug_buf)[6] = w4;
-            FUNC_CALL(sust_debug_buf)[7] = (*surface)[2]; // width/height
-            return false;
+    // clang-format off
+    template <ImageGeometry> struct Coordinates;
+    template <> struct Coordinates<ImageGeometry::_1D> { using type = uint1::Native_vec_; };
+    template <> struct Coordinates<ImageGeometry::_2D> { using type = uint2::Native_vec_; };
+    template <> struct Coordinates<ImageGeometry::_3D> { using type = uint4::Native_vec_; };
+    template <> struct Coordinates<ImageGeometry::A1D>
+    {
+        using type = uint2::Native_vec_; using arg_type = uint1::Native_vec_;
+        static __device__ type pack_layer(uint32_t layer, arg_type coord)
+        {
+            return type { coord.x, layer };
         }
-
-        return true;
-    }
-
-    const unsigned int IMAGE_RESERVED_TOP_BITS = 3;
-
-    static __device__ unsigned int surf_x_shift(uint64_t s)
+    };
+    template <> struct Coordinates<ImageGeometry::A2D>
     {
-        return (unsigned int)(s >> (64 - IMAGE_RESERVED_TOP_BITS));
+        using type = zluda_uint3; using arg_type = uint2::Native_vec_;
+        static __device__ type pack_layer(uint32_t layer, arg_type coord)
+        {
+            return type { coord.x, coord.y, layer };
+        }
+    };
+    // clang-format on
+
+    template <typename T, ImageGeometry geo>
+    static __device__ void image_store_pck(T value, typename Coordinates<geo>::type coord, surface_ptr surface)
+    {
+        if constexpr (sizeof(T) <= sizeof(uint))
+        {
+            uint value_dword = transmute<uint>(value);
+            if constexpr (geo == ImageGeometry::_1D)
+                asm("image_store_pck %0, %1, %2 dmask:0x1 dim:1D unorm" : : "v"(value_dword), "v"(coord.x), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_2D)
+                asm("image_store_pck %0, %1, %2 dmask:0x1 dim:2D unorm" : : "v"(value_dword), "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_3D)
+                asm("image_store_pck %0, %1, %2 dmask:0x1 dim:3D unorm" : : "v"(value_dword), "v"(transmute<zluda_uint3>(coord)), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A1D)
+                asm("image_store_pck %0, %1, %2 dmask:0x1 dim:1D_ARRAY unorm" : : "v"(value_dword), "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A2D)
+                asm("image_store_pck %0, %1, %2 dmask:0x1 dim:2D_ARRAY unorm" : : "v"(value_dword), "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else
+                static_assert(sizeof(T) == 0, "Invalid geometry");
+        }
+        else if constexpr (sizeof(T) == sizeof(uint2::Native_vec_))
+        {
+            uint2::Native_vec_ value_dword2 = transmute<uint2::Native_vec_>(value);
+            if constexpr (geo == ImageGeometry::_1D)
+                asm("image_store_pck %0, %1, %2 dmask:0x3 dim:1D unorm" : : "v"(value_dword2), "v"(coord.x), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_2D)
+                asm("image_store_pck %0, %1, %2 dmask:0x3 dim:2D unorm" : : "v"(value_dword2), "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_3D)
+                asm("image_store_pck %0, %1, %2 dmask:0x3 dim:3D unorm" : : "v"(value_dword2), "v"(transmute<zluda_uint3>(coord)), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A1D)
+                asm("image_store_pck %0, %1, %2 dmask:0x3 dim:1D_ARRAY unorm" : : "v"(value_dword2), "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A2D)
+                asm("image_store_pck %0, %1, %2 dmask:0x3 dim:2D_ARRAY unorm" : : "v"(value_dword2), "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else
+                static_assert(sizeof(T) == 0, "Invalid geometry");
+        }
+        else if constexpr (sizeof(T) == sizeof(uint4::Native_vec_))
+        {
+            uint4::Native_vec_ value_dword4 = transmute<uint4::Native_vec_>(value);
+            if constexpr (geo == ImageGeometry::_1D)
+                asm("image_store_pck %0, %1, %2 dmask:0xf dim:1D unorm" : : "v"(value_dword4), "v"(coord.x), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_2D)
+                asm("image_store_pck %0, %1, %2 dmask:0xf dim:2D unorm" : : "v"(value_dword4), "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_3D)
+                asm("image_store_pck %0, %1, %2 dmask:0xf dim:3D unorm" : : "v"(value_dword4), "v"(transmute<zluda_uint3>(coord)), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A1D)
+                asm("image_store_pck %0, %1, %2 dmask:0xf dim:1D_ARRAY unorm" : : "v"(value_dword4), "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A2D)
+                asm("image_store_pck %0, %1, %2 dmask:0xf dim:2D_ARRAY unorm" : : "v"(value_dword4), "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else
+                static_assert(sizeof(T) == 0, "Invalid geometry");
+        }
+        else
+        {
+            static_assert(sizeof(T) == 0, "Invalid vector size");
+        }
     }
 
-    static __device__ surface_ptr surf_get_ptr(uint64_t s)
+    template <typename T, ImageGeometry geo>
+    static __device__ T image_load_pck(typename Coordinates<geo>::type coord, surface_ptr surface)
+    {
+        if constexpr (sizeof(T) <= sizeof(uint))
+        {
+            uint data;
+            if constexpr (geo == ImageGeometry::_1D)
+                asm("image_load_pck %0, %1, %2 dmask:0x1 dim:1D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord.x), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_2D)
+                asm("image_load_pck %0, %1, %2 dmask:0x1 dim:2D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_3D)
+                asm("image_load_pck %0, %1, %2 dmask:0x1 dim:3D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(transmute<zluda_uint3>(coord)), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A1D)
+                asm("image_load_pck %0, %1, %2 dmask:0x1 dim:1D_ARRAY unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A2D)
+                asm("image_load_pck %0, %1, %2 dmask:0x1 dim:2D_ARRAY unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else
+                static_assert(sizeof(ImageGeometry) == 0, "Invalid geometry");
+            return transmute<T>(data);
+        }
+        else if constexpr (sizeof(T) == sizeof(uint2::Native_vec_))
+        {
+            uint2::Native_vec_ data;
+            if constexpr (geo == ImageGeometry::_1D)
+                asm("image_load_pck %0, %1, %2 dmask:0x3 dim:1D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord.x), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_2D)
+                asm("image_load_pck %0, %1, %2 dmask:0x3 dim:2D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_3D)
+                asm("image_load_pck %0, %1, %2 dmask:0x3 dim:3D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(transmute<zluda_uint3>(coord)), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A1D)
+                asm("image_load_pck %0, %1, %2 dmask:0x3 dim:1D_ARRAY unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A2D)
+                asm("image_load_pck %0, %1, %2 dmask:0x3 dim:2D_ARRAY unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else
+                static_assert(sizeof(ImageGeometry) == 0, "Invalid geometry");
+            return transmute<T>(data);
+        }
+        else if constexpr (sizeof(T) == sizeof(uint4::Native_vec_))
+        {
+            uint4::Native_vec_ data;
+            if constexpr (geo == ImageGeometry::_1D)
+                asm("image_load_pck %0, %1, %2 dmask:0xf dim:1D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord.x), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_2D)
+                asm("image_load_pck %0, %1, %2 dmask:0xf dim:2D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::_3D)
+                asm("image_load_pck %0, %1, %2 dmask:0xf dim:3D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(transmute<zluda_uint3>(coord)), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A1D)
+                asm("image_load_pck %0, %1, %2 dmask:0xf dim:1D_ARRAY unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else if constexpr (geo == ImageGeometry::A2D)
+                asm("image_load_pck %0, %1, %2 dmask:0xf dim:2D_ARRAY unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+            else
+                static_assert(sizeof(ImageGeometry) == 0, "Invalid geometry");
+            return transmute<T>(data);
+        }
+        else
+        {
+            static_assert(sizeof(T) == 0, "Invalid vector size");
+        }
+    }
+
+    template <ImageGeometry geo>
+    static __device__ uint4::Native_vec_ image_load_pck_full(typename Coordinates<geo>::type coord, surface_ptr surface)
+    {
+        uint4::Native_vec_ data;
+        if constexpr (geo == ImageGeometry::_1D)
+            asm("image_load_pck %0, %1, %2 dmask:0xf dim:1D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord.x), "s"(surf_to_sgpr(*surface)) : "memory");
+        else if constexpr (geo == ImageGeometry::_2D)
+            asm("image_load_pck %0, %1, %2 dmask:0xf dim:2D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+        else if constexpr (geo == ImageGeometry::_3D)
+            asm("image_load_pck %0, %1, %2 dmask:0xf dim:3D unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(transmute<zluda_uint3>(coord)), "s"(surf_to_sgpr(*surface)) : "memory");
+        else if constexpr (geo == ImageGeometry::A1D)
+            asm("image_load_pck %0, %1, %2 dmask:0xf dim:1D_ARRAY unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+        else if constexpr (geo == ImageGeometry::A2D)
+            asm("image_load_pck %0, %1, %2 dmask:0xf dim:2D_ARRAY unorm\ns_waitcnt vmcnt(0)" : "=v"(data) : "v"(coord), "s"(surf_to_sgpr(*surface)) : "memory");
+        else
+            static_assert(sizeof(ImageGeometry) == 0, "Invalid geometry");
+        return data;
+    }
+
+    template <typename T, ImageGeometry geo>
+    static __device__ void image_store_pck_full_with(uint4::Native_vec_ data, T value, typename Coordinates<geo>::type coord, surface_ptr surface)
+    {
+        if constexpr (sizeof(T) == sizeof(uint8_t))
+        {
+            uint32_t x = uint32_t(std::bit_cast<uint8_t>(value));
+            uint32_t data_0 = ((data[0]) >> 8) << 8;
+            data[0] = data_0 | x;
+        }
+        else if constexpr (sizeof(T) == sizeof(uint16_t))
+        {
+            uint32_t x = uint32_t(std::bit_cast<uint16_t>(value));
+            uint32_t data_0 = ((data[0]) >> 16) << 16;
+            data[0] = data_0 | x;
+        }
+        else
+        {
+            union
+            {
+                uint4::Native_vec_ full_vec;
+                T value;
+            } u = {0};
+            u.full_vec = data;
+            u.value = value;
+            data = u.full_vec;
+        }
+        image_store_pck<uint4::Native_vec_, geo>(data, coord, surface);
+    }
+
+    constexpr auto IMAGE_RESERVED_TOP_BITS = 3;
+
+    static __device__ surface_ptr get_surface_pointer(uint64_t s)
     {
         return (surface_ptr)((s << IMAGE_RESERVED_TOP_BITS) >> IMAGE_RESERVED_TOP_BITS);
     }
 
-    // Move surface descriptor from VGPRs to SGPRs via readfirstlane.
-    // The "s" constraint on image_store/load inline asm requires the descriptor
-    // in SGPRs, but after inlining the descriptor may be in VGPRs.
-    static __device__ surf_desc surf_to_sgpr(surf_desc desc) {
-        surf_desc result;
-        result[0] = __builtin_amdgcn_readfirstlane(desc[0]);
-        result[1] = __builtin_amdgcn_readfirstlane(desc[1]);
-        result[2] = __builtin_amdgcn_readfirstlane(desc[2]);
-        result[3] = __builtin_amdgcn_readfirstlane(desc[3]);
-        result[4] = __builtin_amdgcn_readfirstlane(desc[4]);
-        result[5] = __builtin_amdgcn_readfirstlane(desc[5]);
-        result[6] = __builtin_amdgcn_readfirstlane(desc[6]);
-        result[7] = __builtin_amdgcn_readfirstlane(desc[7]);
-        return result;
-    }
-
-    // --- sust_b_2d_b32 (single 32-bit store, 2D, all clamp modes) ---
-
-    void FUNC(sust_b_2d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
+    static __device__ surface_ptr get_surface_pointer(struct textureReference GLOBAL_SPACE *surf_ref)
     {
-        unsigned int shift = surf_x_shift(handle);
-        surface_ptr surface = surf_get_ptr(handle);
-        if (!surf_validate(surface, handle, coord[0], coord[1])) return;
-        coord[0] = coord[0] >> shift;
-        // AMDGPU dim:2D requires exactly 2 VGPRs for address
-        int2_vec coord2 = __builtin_shufflevector(coord, coord, 0, 1);
-        surf_desc surface_sgpr = surf_to_sgpr(*surface);
-        asm volatile("image_store_pck %0, %1, %2 dmask:0x1 dim:2D unorm"
-                     :
-                     : "v"(value), "v"(coord2), "s"(surface_sgpr)
-                     : "memory");
+        return (surface_ptr)(surf_ref->textureObject);
     }
 
-    void FUNC(sust_b_2d_b32_clamp)(uint64_t handle, int4_vec coord, unsigned int value)
+    static __device__ uint32_t x_coordinate_shift(uint64_t s)
     {
-        FUNC_CALL(sust_b_2d_b32_zero)(handle, coord, value);
+        return uint32_t(s >> (64 - IMAGE_RESERVED_TOP_BITS));
     }
 
-    void FUNC(sust_b_2d_b32_trap)(uint64_t handle, int4_vec coord, unsigned int value)
+    static __device__ uint32_t x_coordinate_shift(struct textureReference GLOBAL_SPACE *ptr)
     {
-        FUNC_CALL(sust_b_2d_b32_zero)(handle, coord, value);
+        uint32_t channels = uint32_t(ptr->numChannels);
+        uint32_t format_width = 0;
+        hipArray_Format format = ptr->format;
+        switch (format)
+        {
+        case hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT8:
+        case hipArray_Format::HIP_AD_FORMAT_SIGNED_INT8:
+            format_width = 1;
+            break;
+        case hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT16:
+        case hipArray_Format::HIP_AD_FORMAT_SIGNED_INT16:
+        case hipArray_Format::HIP_AD_FORMAT_HALF:
+            format_width = 2;
+            break;
+        case hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32:
+        case hipArray_Format::HIP_AD_FORMAT_SIGNED_INT32:
+        case hipArray_Format::HIP_AD_FORMAT_FLOAT:
+            format_width = 4;
+            break;
+        default:
+            __builtin_unreachable();
+        }
+        return uint32_t(__builtin_ctz(format_width * channels));
     }
 
-    // --- sust_b_3d_b32 (single 32-bit store, all clamp modes) ---
-
-    void FUNC(sust_b_3d_b32_zero)(uint64_t handle, int4_vec coord, unsigned int value)
+    template <typename T, ImageGeometry geo, typename Surface>
+    static __device__ T suld_b_zero(Surface surf_arg, typename Coordinates<geo>::type coord)
     {
-        unsigned int shift = surf_x_shift(handle);
-        surface_ptr surface = surf_get_ptr(handle);
-        if (!surf_validate_3d(surface, handle, coord[0] >> shift, coord[1], coord[2])) return;
-        coord[0] = coord[0] >> shift;
-        // AMDGPU dim:3D requires exactly 3 VGPRs for address
-        int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
-        surf_desc surface_sgpr = surf_to_sgpr(*surface);
-        asm volatile("image_store_pck %0, %1, %2 dmask:0x1 dim:3D unorm"
-                     :
-                     : "v"(value), "v"(coord3), "s"(surface_sgpr)
-                     : "memory");
+        surface_ptr surface = get_surface_pointer(surf_arg);
+        uint32_t shift_x = x_coordinate_shift(surf_arg);
+        coord.x = coord.x >> shift_x;
+        return image_load_pck<T, geo>(coord, surface);
     }
 
-    void FUNC(sust_b_3d_b32_clamp)(uint64_t handle, int4_vec coord, unsigned int value)
+    template <typename T, ImageGeometry geo, typename Surface>
+    static __device__ void sust_b_zero(Surface surf_arg, typename Coordinates<geo>::type coord, T data)
     {
-        FUNC_CALL(sust_b_3d_b32_zero)(handle, coord, value);
+        surface_ptr surface = get_surface_pointer(surf_arg);
+        uint32_t shift_x = x_coordinate_shift(surf_arg);
+        coord.x = coord.x >> shift_x;
+        if (shift_x <= __builtin_ctz(sizeof(T))) [[likely]]
+        {
+            image_store_pck<T, geo>(data, coord, surface);
+        }
+        else
+        {
+            uint4::Native_vec_ pixel = image_load_pck_full<geo>(coord, surface);
+            image_store_pck_full_with<T, geo>(pixel, data, coord, surface);
+        }
     }
 
-    void FUNC(sust_b_3d_b32_trap)(uint64_t handle, int4_vec coord, unsigned int value)
-    {
-        FUNC_CALL(sust_b_3d_b32_zero)(handle, coord, value);
-    }
+extern "C"
+{
 
-    // --- sust_b_3d_b64 (64-bit store) ---
+#define SUST_B_ZERO(TYPE, GEOMETRY, HIP_TYPE) \
+HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_zero)(uint64_t surf_arg, typename Coordinates<GEOMETRY>::type coord) \
+    { return suld_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord); } \
+void FUNC(sust_b_##TYPE##_zero)(uint64_t surf_arg, typename Coordinates<GEOMETRY>::type coord, HIP_TYPE::Native_vec_ data) \
+    { sust_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord, data); } \
+HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_clamp)(uint64_t surf_arg, typename Coordinates<GEOMETRY>::type coord) \
+    { return suld_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord); } \
+void FUNC(sust_b_##TYPE##_clamp)(uint64_t surf_arg, typename Coordinates<GEOMETRY>::type coord, HIP_TYPE::Native_vec_ data) \
+    { sust_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord, data); } \
+HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_trap)(uint64_t surf_arg, typename Coordinates<GEOMETRY>::type coord) \
+    { return suld_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord); } \
+void FUNC(sust_b_##TYPE##_trap)(uint64_t surf_arg, typename Coordinates<GEOMETRY>::type coord, HIP_TYPE::Native_vec_ data) \
+    { sust_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord, data); }
 
-    void FUNC(sust_b_3d_b64_zero)(uint64_t handle, int4_vec coord, uint64_t value)
-    {
-        unsigned int shift = surf_x_shift(handle);
-        surface_ptr surface = surf_get_ptr(handle);
-        if (!surf_validate_3d(surface, handle, coord[0] >> shift, coord[1], coord[2])) return;
-        coord[0] = coord[0] >> shift;
-        int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
-        uint2_vec value2 = std::bit_cast<uint2_vec>(value);
-        surf_desc surface_sgpr = surf_to_sgpr(*surface);
-        asm volatile("image_store_pck %0, %1, %2 dmask:0x3 dim:3D unorm"
-                     :
-                     : "v"(value2), "v"(coord3), "s"(surface_sgpr)
-                     : "memory");
-    }
+#define SUST_B_ZERO_ARRAY(TYPE, GEOMETRY, HIP_TYPE) \
+HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_zero)(uint64_t surf_arg, uint32_t layer, typename Coordinates<GEOMETRY>::arg_type coord) \
+    { auto c = Coordinates<GEOMETRY>::pack_layer(layer, coord); return suld_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, c); } \
+void FUNC(sust_b_##TYPE##_zero)(uint64_t surf_arg, uint32_t layer, typename Coordinates<GEOMETRY>::arg_type coord, HIP_TYPE::Native_vec_ data) \
+    { auto c = Coordinates<GEOMETRY>::pack_layer(layer, coord); sust_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, c, data); } \
+HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_clamp)(uint64_t surf_arg, uint32_t layer, typename Coordinates<GEOMETRY>::arg_type coord) \
+    { auto c = Coordinates<GEOMETRY>::pack_layer(layer, coord); return suld_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, c); } \
+void FUNC(sust_b_##TYPE##_clamp)(uint64_t surf_arg, uint32_t layer, typename Coordinates<GEOMETRY>::arg_type coord, HIP_TYPE::Native_vec_ data) \
+    { auto c = Coordinates<GEOMETRY>::pack_layer(layer, coord); sust_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, c, data); } \
+HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_trap)(uint64_t surf_arg, uint32_t layer, typename Coordinates<GEOMETRY>::arg_type coord) \
+    { auto c = Coordinates<GEOMETRY>::pack_layer(layer, coord); return suld_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, c); } \
+void FUNC(sust_b_##TYPE##_trap)(uint64_t surf_arg, uint32_t layer, typename Coordinates<GEOMETRY>::arg_type coord, HIP_TYPE::Native_vec_ data) \
+    { auto c = Coordinates<GEOMETRY>::pack_layer(layer, coord); sust_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, c, data); }
 
-    // --- sust_b_3d_v4_b32 (4-component 32-bit store) ---
+// Surfref variants: accept textureReference* instead of uint64_t.
+// The textureReference struct has format/numChannels fields that allow
+// computing the pixel shift at runtime on the GPU, instead of relying
+// on the top-3-bit encoding that cuSurfObjectCreate adds.
+// These are used when PTX code accesses surfaces via .surfref globals.
+#define SUST_B_ZERO_SURFREF(TYPE, GEOMETRY, HIP_TYPE) \
+HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_zero_surfref)(struct textureReference GLOBAL_SPACE *surf_arg, typename Coordinates<GEOMETRY>::type coord) \
+    { return suld_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord); } \
+void FUNC(sust_b_##TYPE##_zero_surfref)(struct textureReference GLOBAL_SPACE *surf_arg, typename Coordinates<GEOMETRY>::type coord, HIP_TYPE::Native_vec_ data) \
+    { sust_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord, data); } \
+HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_clamp_surfref)(struct textureReference GLOBAL_SPACE *surf_arg, typename Coordinates<GEOMETRY>::type coord) \
+    { return suld_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord); } \
+void FUNC(sust_b_##TYPE##_clamp_surfref)(struct textureReference GLOBAL_SPACE *surf_arg, typename Coordinates<GEOMETRY>::type coord, HIP_TYPE::Native_vec_ data) \
+    { sust_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord, data); } \
+HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_trap_surfref)(struct textureReference GLOBAL_SPACE *surf_arg, typename Coordinates<GEOMETRY>::type coord) \
+    { return suld_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord); } \
+void FUNC(sust_b_##TYPE##_trap_surfref)(struct textureReference GLOBAL_SPACE *surf_arg, typename Coordinates<GEOMETRY>::type coord, HIP_TYPE::Native_vec_ data) \
+    { sust_b_zero<HIP_TYPE::Native_vec_, GEOMETRY>(surf_arg, coord, data); }
 
-    void FUNC(sust_b_3d_v4_b32_zero)(uint64_t handle, int4_vec coord, int4_vec value)
-    {
-        unsigned int shift = surf_x_shift(handle);
-        surface_ptr surface = surf_get_ptr(handle);
-        if (!surf_validate_3d(surface, handle, coord[0] >> shift, coord[1], coord[2])) return;
-        coord[0] = coord[0] >> shift;
-        int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
-        uint4_vec value4 = std::bit_cast<uint4_vec>(value);
-        surf_desc surface_sgpr = surf_to_sgpr(*surface);
-        asm volatile("image_store_pck %0, %1, %2 dmask:0xf dim:3D unorm"
-                     :
-                     : "v"(value4), "v"(coord3), "s"(surface_sgpr)
-                     : "memory");
-    }
+    // Surface object variants (uint64_t handle with shift in top 3 bits)
+    SUST_B_ZERO(1d_b8, ImageGeometry::_1D, uchar1);
+    SUST_B_ZERO(1d_b16, ImageGeometry::_1D, ushort1);
+    SUST_B_ZERO(1d_b32, ImageGeometry::_1D, uint1);
+    SUST_B_ZERO(1d_b64, ImageGeometry::_1D, ulong1);
+    SUST_B_ZERO(1d_v2_b8, ImageGeometry::_1D, uchar2);
+    SUST_B_ZERO(1d_v2_b16, ImageGeometry::_1D, ushort2);
+    SUST_B_ZERO(1d_v2_b32, ImageGeometry::_1D, uint2);
+    SUST_B_ZERO(1d_v2_b64, ImageGeometry::_1D, ulong2);
+    SUST_B_ZERO(1d_v4_b8, ImageGeometry::_1D, uchar4);
+    SUST_B_ZERO(1d_v4_b16, ImageGeometry::_1D, ushort4);
+    SUST_B_ZERO(1d_v4_b32, ImageGeometry::_1D, uint4);
+    SUST_B_ZERO(2d_b8, ImageGeometry::_2D, uchar1);
+    SUST_B_ZERO(2d_b16, ImageGeometry::_2D, ushort1);
+    SUST_B_ZERO(2d_b32, ImageGeometry::_2D, uint1);
+    SUST_B_ZERO(2d_b64, ImageGeometry::_2D, ulong1);
+    SUST_B_ZERO(2d_v2_b8, ImageGeometry::_2D, uchar2);
+    SUST_B_ZERO(2d_v2_b16, ImageGeometry::_2D, ushort2);
+    SUST_B_ZERO(2d_v2_b32, ImageGeometry::_2D, uint2);
+    SUST_B_ZERO(2d_v2_b64, ImageGeometry::_2D, ulong2);
+    SUST_B_ZERO(2d_v4_b8, ImageGeometry::_2D, uchar4);
+    SUST_B_ZERO(2d_v4_b16, ImageGeometry::_2D, ushort4);
+    SUST_B_ZERO(2d_v4_b32, ImageGeometry::_2D, uint4);
+    SUST_B_ZERO(3d_b8, ImageGeometry::_3D, uchar1);
+    SUST_B_ZERO(3d_b16, ImageGeometry::_3D, ushort1);
+    SUST_B_ZERO(3d_b32, ImageGeometry::_3D, uint1);
+    SUST_B_ZERO(3d_b64, ImageGeometry::_3D, ulong1);
+    SUST_B_ZERO(3d_v2_b8, ImageGeometry::_3D, uchar2);
+    SUST_B_ZERO(3d_v2_b16, ImageGeometry::_3D, ushort2);
+    SUST_B_ZERO(3d_v2_b32, ImageGeometry::_3D, uint2);
+    SUST_B_ZERO(3d_v2_b64, ImageGeometry::_3D, ulong2);
+    SUST_B_ZERO(3d_v4_b8, ImageGeometry::_3D, uchar4);
+    SUST_B_ZERO(3d_v4_b16, ImageGeometry::_3D, ushort4);
+    SUST_B_ZERO(3d_v4_b32, ImageGeometry::_3D, uint4);
+    SUST_B_ZERO_ARRAY(a1d_b8, ImageGeometry::A1D, uchar1);
+    SUST_B_ZERO_ARRAY(a1d_b16, ImageGeometry::A1D, ushort1);
+    SUST_B_ZERO_ARRAY(a1d_b32, ImageGeometry::A1D, uint1);
+    SUST_B_ZERO_ARRAY(a1d_b64, ImageGeometry::A1D, ulong1);
+    SUST_B_ZERO_ARRAY(a1d_v2_b8, ImageGeometry::A1D, uchar2);
+    SUST_B_ZERO_ARRAY(a1d_v2_b16, ImageGeometry::A1D, ushort2);
+    SUST_B_ZERO_ARRAY(a1d_v2_b32, ImageGeometry::A1D, uint2);
+    SUST_B_ZERO_ARRAY(a1d_v2_b64, ImageGeometry::A1D, ulong2);
+    SUST_B_ZERO_ARRAY(a1d_v4_b8, ImageGeometry::A1D, uchar4);
+    SUST_B_ZERO_ARRAY(a1d_v4_b16, ImageGeometry::A1D, ushort4);
+    SUST_B_ZERO_ARRAY(a1d_v4_b32, ImageGeometry::A1D, uint4);
+    SUST_B_ZERO_ARRAY(a2d_b8, ImageGeometry::A2D, uchar1);
+    SUST_B_ZERO_ARRAY(a2d_b16, ImageGeometry::A2D, ushort1);
+    SUST_B_ZERO_ARRAY(a2d_b32, ImageGeometry::A2D, uint1);
+    SUST_B_ZERO_ARRAY(a2d_b64, ImageGeometry::A2D, ulong1);
+    SUST_B_ZERO_ARRAY(a2d_v2_b8, ImageGeometry::A2D, uchar2);
+    SUST_B_ZERO_ARRAY(a2d_v2_b16, ImageGeometry::A2D, ushort2);
+    SUST_B_ZERO_ARRAY(a2d_v2_b32, ImageGeometry::A2D, uint2);
+    SUST_B_ZERO_ARRAY(a2d_v2_b64, ImageGeometry::A2D, ulong2);
+    SUST_B_ZERO_ARRAY(a2d_v4_b8, ImageGeometry::A2D, uchar4);
+    SUST_B_ZERO_ARRAY(a2d_v4_b16, ImageGeometry::A2D, ushort4);
+    SUST_B_ZERO_ARRAY(a2d_v4_b32, ImageGeometry::A2D, uint4);
 
-    // --- suld_b_3d_b32 (single 32-bit load) ---
-
-    unsigned int FUNC(suld_b_3d_b32_zero)(uint64_t handle, int4_vec coord)
-    {
-        unsigned int shift = surf_x_shift(handle);
-        surface_ptr surface = surf_get_ptr(handle);
-        coord[0] = coord[0] >> shift;
-        // AMDGPU dim:3D requires exactly 3 VGPRs for address
-        int3_vec coord3 = __builtin_shufflevector(coord, coord, 0, 1, 2);
-        surf_desc surface_sgpr = surf_to_sgpr(*surface);
-        unsigned int result;
-        asm volatile("image_load_pck %0, %1, %2 dmask:0x1 dim:3D unorm\n\ts_waitcnt vmcnt(0)"
-                     : "=v"(result)
-                     : "v"(coord3), "s"(surface_sgpr)
-                     : "memory");
-        return result;
-    }
+    // Surface reference variants (textureReference* with runtime shift computation)
+    SUST_B_ZERO_SURFREF(1d_b8, ImageGeometry::_1D, uchar1);
+    SUST_B_ZERO_SURFREF(1d_b16, ImageGeometry::_1D, ushort1);
+    SUST_B_ZERO_SURFREF(1d_b32, ImageGeometry::_1D, uint1);
+    SUST_B_ZERO_SURFREF(1d_b64, ImageGeometry::_1D, ulong1);
+    SUST_B_ZERO_SURFREF(1d_v2_b8, ImageGeometry::_1D, uchar2);
+    SUST_B_ZERO_SURFREF(1d_v2_b16, ImageGeometry::_1D, ushort2);
+    SUST_B_ZERO_SURFREF(1d_v2_b32, ImageGeometry::_1D, uint2);
+    SUST_B_ZERO_SURFREF(1d_v2_b64, ImageGeometry::_1D, ulong2);
+    SUST_B_ZERO_SURFREF(1d_v4_b8, ImageGeometry::_1D, uchar4);
+    SUST_B_ZERO_SURFREF(1d_v4_b16, ImageGeometry::_1D, ushort4);
+    SUST_B_ZERO_SURFREF(1d_v4_b32, ImageGeometry::_1D, uint4);
+    SUST_B_ZERO_SURFREF(2d_b8, ImageGeometry::_2D, uchar1);
+    SUST_B_ZERO_SURFREF(2d_b16, ImageGeometry::_2D, ushort1);
+    SUST_B_ZERO_SURFREF(2d_b32, ImageGeometry::_2D, uint1);
+    SUST_B_ZERO_SURFREF(2d_b64, ImageGeometry::_2D, ulong1);
+    SUST_B_ZERO_SURFREF(2d_v2_b8, ImageGeometry::_2D, uchar2);
+    SUST_B_ZERO_SURFREF(2d_v2_b16, ImageGeometry::_2D, ushort2);
+    SUST_B_ZERO_SURFREF(2d_v2_b32, ImageGeometry::_2D, uint2);
+    SUST_B_ZERO_SURFREF(2d_v2_b64, ImageGeometry::_2D, ulong2);
+    SUST_B_ZERO_SURFREF(2d_v4_b8, ImageGeometry::_2D, uchar4);
+    SUST_B_ZERO_SURFREF(2d_v4_b16, ImageGeometry::_2D, ushort4);
+    SUST_B_ZERO_SURFREF(2d_v4_b32, ImageGeometry::_2D, uint4);
+    SUST_B_ZERO_SURFREF(3d_b8, ImageGeometry::_3D, uchar1);
+    SUST_B_ZERO_SURFREF(3d_b16, ImageGeometry::_3D, ushort1);
+    SUST_B_ZERO_SURFREF(3d_b32, ImageGeometry::_3D, uint1);
+    SUST_B_ZERO_SURFREF(3d_b64, ImageGeometry::_3D, ulong1);
+    SUST_B_ZERO_SURFREF(3d_v2_b8, ImageGeometry::_3D, uchar2);
+    SUST_B_ZERO_SURFREF(3d_v2_b16, ImageGeometry::_3D, ushort2);
+    SUST_B_ZERO_SURFREF(3d_v2_b32, ImageGeometry::_3D, uint2);
+    SUST_B_ZERO_SURFREF(3d_v2_b64, ImageGeometry::_3D, ulong2);
+    SUST_B_ZERO_SURFREF(3d_v4_b8, ImageGeometry::_3D, uchar4);
+    SUST_B_ZERO_SURFREF(3d_v4_b16, ImageGeometry::_3D, ushort4);
+    SUST_B_ZERO_SURFREF(3d_v4_b32, ImageGeometry::_3D, uint4);
 }
 
 template <typename Acc, typename T>
@@ -1282,11 +1519,21 @@ extern "C"
     // --- Texture object (bindless) variants ---
     // These take hipTextureObject_t directly instead of textureReference*.
 
+    // Strip top 3 bits (shift encoding) from texture object handles.
+    // cuTexObjectCreate encodes pixel shift in the top 3 bits so that
+    // sust helpers can extract it. tex_*_obj functions must strip these
+    // bits before passing to HIP tex functions which dereference as pointers.
+    static __device__ hipTextureObject_t strip_tex_shift(hipTextureObject_t obj) {
+        auto raw = reinterpret_cast<uintptr_t>(obj);
+        raw = (raw << IMAGE_RESERVED_TOP_BITS) >> IMAGE_RESERVED_TOP_BITS;
+        return reinterpret_cast<hipTextureObject_t>(raw);
+    }
+
 #define tex_1d_obj(CHANNEL_TYPE, HIP_CHANNEL_TYPE, COORD_TYPE, HIP_COORD_TYPE, TEX_FN)                              \
     HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_1d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##1 ::Native_vec_ x)                                        \
     {                                                                                                               \
-        return TEX_FN<HIP_CHANNEL_TYPE##4>(textureObject, x.x).data;                                                \
+        return TEX_FN<HIP_CHANNEL_TYPE##4>(strip_tex_shift(textureObject), x.x).data;                               \
     }
 
     tex_1d_obj(u32, uint, s32, int, tex1Dfetch);
@@ -1315,7 +1562,7 @@ extern "C"
     HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_2d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##2 ::Native_vec_ coord)                                    \
     {                                                                                                               \
-        return tex2D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y)).data;                       \
+        return tex2D<HIP_CHANNEL_TYPE##4>(strip_tex_shift(textureObject), float(coord.x), float(coord.y)).data;      \
     }
 
     tex_2d_obj(u32, uint, s32, int);
@@ -1344,7 +1591,7 @@ extern "C"
     HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_3d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##4 ::Native_vec_ coord)                                    \
     {                                                                                                               \
-        return tex3D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y), float(coord.z)).data;       \
+        return tex3D<HIP_CHANNEL_TYPE##4>(strip_tex_shift(textureObject), float(coord.x), float(coord.y), float(coord.z)).data; \
     }
 
     tex_3d_obj(u32, uint, s32, int);
