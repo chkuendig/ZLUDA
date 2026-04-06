@@ -116,17 +116,6 @@ pub(crate) fn global_state() -> Result<&'static GlobalState, CUerror> {
         .map_err(|e| *e)
 }
 
-fn should_zero_allocations() -> Option<bool> {
-    let current_exe_path = std::env::current_exe().ok()?;
-    let current_exe_file = current_exe_path.file_name()?;
-    let current_exe_file = current_exe_file.to_str()?.to_ascii_lowercase();
-    Some(
-        current_exe_file.contains("geekbench")
-            || current_exe_file.starts_with("train_gpt")
-            || current_exe_file.starts_with("test_gpt"),
-    )
-}
-
 // Global log file handles, opened once on first write and protected by a mutex so
 // concurrent writers don't interleave at the byte level. Previously each call opened
 // the file fresh and used `writeln!`, which issues multiple write() syscalls per
