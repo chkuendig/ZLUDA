@@ -261,18 +261,21 @@ pub(crate) fn set_d32_async(
 }
 
 pub(crate) fn get_info_v2(free: *mut usize, total: *mut usize) -> hipError_t {
-    // B.4 bisection: pass hipMemGetInfo through unchanged. Previously we
-    // halved the reported total to match cuDeviceTotalMem (which we also
-    // halve), reasoning that hipMemGetInfo returns VRAM+GTT combined while
-    // cuDeviceTotalMem reports a smaller pool. The halving was cosmetic
-    // for consistency; testing whether removing it changes the
-    // TurbulenceFS-zeros-counter signature.
     let result = unsafe { hipMemGetInfo(free, total) };
     if let Ok(()) = result {
         let hip_total = unsafe { *total };
         let hip_free = unsafe { *free };
+        // Match cuDeviceTotalMem (hip_total/2). hipMemGetInfo returns
+        // VRAM+GTT combined; cap to match what we report as total.
+        let reported_total = hip_total / 2;
+        let reported_free = hip_free.min(reported_total);
+        unsafe {
+            *total = reported_total;
+            *free = reported_free;
+        };
         super::driver::zluda_log_err(&format!(
-            "cuMemGetInfo -> free={} MiB, total={} MiB (passthrough)",
+            "cuMemGetInfo -> free={} MiB, total={} MiB (hip_free={}, hip_total={})",
+            reported_free / (1024*1024), reported_total / (1024*1024),
             hip_free / (1024*1024), hip_total / (1024*1024)));
     }
     result
