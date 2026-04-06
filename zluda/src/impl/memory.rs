@@ -84,20 +84,31 @@ pub(crate) fn copy_hto_d_v2(
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
 ) -> hipError_t {
-    // Log gParams writes (496 bytes) to see texture handle at offset 328
+    // Log gParams writes (496 bytes) — validate texture handles and device pointers
     if byte_count == 496 {
         let data = src_host as *const u64;
-        let tex_handle = unsafe { *data.add(41) }; // offset 328 = u64 index 41
+        // Texture object handles at known offsets in gParams (from CollideConvexes PTX)
+        let tex_offsets: &[(usize, &str)] = &[
+            (40, "320:positions"), (41, "328:SDFTex"), (47, "376:grid"),
+            (48, "384:convexIdx"), (49, "392:convexPlanes1"), (50, "400:convexPlanes2"),
+            (51, "408:convexNormals"), (52, "416:convexPos"), (53, "424:convexRot"),
+        ];
+        let alloc_min = ALLOC_MIN.load(std::sync::atomic::Ordering::Relaxed);
+        let alloc_max = ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
+        let mut bad_ptrs = Vec::new();
+        for &(idx, label) in tex_offsets {
+            let val = unsafe { *data.add(idx) };
+            // Strip top 3 bits (texture shift encoding) for range check
+            let stripped = (val << 3) >> 3;
+            if stripped != 0 && (stripped < alloc_min || stripped > alloc_max) {
+                bad_ptrs.push(format!("{}=0x{:x}(OOB)", label, val));
+            }
+        }
+        let num_convexes = unsafe { *(src_host as *const u32).add(32) }; // offset 128 = u32 index 32
         super::driver::zluda_log_err(&format!(
-            "cuMemcpyHtoD gParams? dst={:p} size={} tex_handle@328=0x{:x}",
-            dst_device.0, byte_count, tex_handle
+            "cuMemcpyHtoD gParams dst={:p} numConvex={} bad_ptrs={}",
+            dst_device.0, num_convexes, if bad_ptrs.is_empty() { "none".to_string() } else { bad_ptrs.join(", ") }
         ));
-        // Dump u64 values around offset 320-352
-        let vals: Vec<String> = (40..44).map(|i| {
-            let v = unsafe { *data.add(i) };
-            format!("[{}]=0x{:x}", i*8, v)
-        }).collect();
-        super::driver::zluda_log_err(&format!("  gParams dump: {}", vals.join(" ")));
     }
     let result = unsafe { hipMemcpyHtoD(dst_device, src_host.cast_mut(), byte_count) };
     if result.is_err() {
@@ -315,13 +326,28 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
-    // Log gParams writes for diagnosis (496 bytes = Flex solver params)
+    // Log gParams writes (496 bytes = Flex solver params) — validate texture handles
     if byte_count == 496 {
         let data = src_host as *const u64;
-        let tex_handle = unsafe { *data.add(41) }; // offset 328 = u64 index 41
+        let alloc_min = ALLOC_MIN.load(std::sync::atomic::Ordering::Relaxed);
+        let alloc_max = ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
+        // Check texture object handles at known gParams offsets
+        let tex_offsets: &[(usize, &str)] = &[
+            (40, "320:pos"), (41, "328:sdf"), (47, "376:grid"),
+            (48, "384:cidx"), (49, "392:cp1"), (50, "400:cp2"),
+        ];
+        let mut bad = Vec::new();
+        for &(idx, label) in tex_offsets {
+            let val = *data.add(idx);
+            let stripped = (val << 3) >> 3;
+            if stripped != 0 && (stripped < alloc_min || stripped > alloc_max) {
+                bad.push(format!("{}=0x{:x}", label, val));
+            }
+        }
+        let num_convex = *(src_host as *const u32).add(32); // offset 128
         super::driver::zluda_log_err(&format!(
-            "cuMemcpyHtoDAsync gParams dst={:p} tex@328=0x{:x}",
-            dst_device.0, tex_handle
+            "cuMemcpyHtoDAsync gParams dst={:p} nConvex={} bad={}",
+            dst_device.0, num_convex, if bad.is_empty() { "none".to_string() } else { bad.join(",") }
         ));
     }
     let result = hipMemcpyHtoDAsync(dst_device, src_host.cast_mut(), byte_count, stream);
