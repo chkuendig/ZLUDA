@@ -256,12 +256,32 @@ pub(crate) unsafe fn object_create(
     hip_tex_desc.maxMipmapLevelClamp = p_tex_desc.maxMipmapLevelClamp;
     hip_tex_desc.borderColor = p_tex_desc.borderColor;
 
+    // If the underlying array was created with a transformed format
+    // (HALF→UINT16 etc. via hipfix::get_non_broken_format), build a
+    // HIP_RESOURCE_VIEW_DESC that tells the sampler the ORIGINAL format so
+    // tex.3d/tex.2d reads interpret the bytes correctly. Without this the
+    // sampler reads e.g. half-float bytes as raw integers, which silently
+    // corrupts kernels that read TurbulenceFS density/velocity grids.
+    // See plan snug-launching-milner.md Phase D and the missing-from-us
+    // lsh helpers in hipfix.rs::maybe_build_view_desc.
+    let view_desc = super::hipfix::maybe_build_view_desc(p_res_desc);
+    let view_desc_ptr: *const HIP_RESOURCE_VIEW_DESC = match &view_desc {
+        Some(v) => v as *const _,
+        None => std::ptr::null(),
+    };
+    if view_desc.is_some() {
+        super::driver::zluda_log_err(&format!(
+            "texObj: applying format-hack view desc for array={:?}",
+            p_res_desc.res.array.hArray
+        ));
+    }
+
     // Try with caller's full tex desc first
     let result = hipTexObjectCreate(
         p_tex_object as *mut CUtexObject as *mut hipTextureObject_t,
         &hip_res_desc,
         &hip_tex_desc,
-        std::ptr::null(),
+        view_desc_ptr,
     );
     // If that fails, retry with minimal tex desc (zeroed borderColor, no extras)
     let (result, path) = match result {
@@ -274,7 +294,7 @@ pub(crate) unsafe fn object_create(
                 p_tex_object as *mut CUtexObject as *mut hipTextureObject_t,
                 &hip_res_desc,
                 &minimal_tex,
-                std::ptr::null(),
+                view_desc_ptr,
             ), "minimal")
         }
         ok => (ok, "full"),
@@ -287,12 +307,11 @@ pub(crate) unsafe fn object_create(
             std::env::var("ZLUDA_LOG_ALL").map_or(false, |v| v == "1")
         });
         if log_all {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-                match result {
-                    Ok(()) => { let _ = writeln!(f, "texObj OK ({}) obj={:#x}", path, *p_tex_object); }
-                    Err(ref e) => { let _ = writeln!(f, "texObj FAIL ({}) {:?}", path, e); }
-                }
+            match result {
+                Ok(()) => super::driver::zluda_log_err(&format!(
+                    "texObj OK ({}) obj={:#x}", path, *p_tex_object)),
+                Err(ref e) => super::driver::zluda_log_err(&format!(
+                    "texObj FAIL ({}) {:?}", path, e)),
             }
         }
     }

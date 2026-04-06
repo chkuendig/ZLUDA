@@ -20,21 +20,37 @@ pub(crate) unsafe fn create_v2(
     p_allocate_array: &CUDA_ARRAY_DESCRIPTOR,
 ) -> CUresult {
     let mut desc = *(p_allocate_array as *const CUDA_ARRAY_DESCRIPTOR as *const HIP_ARRAY_DESCRIPTOR);
-    desc.Format = hipfix::get_non_broken_format(desc.Format);
+    let (hack_flag, new_format) = hipfix::get_non_broken_format(desc.Format);
+    desc.Format = new_format;
     let vram_before = super::memory::vram_used_bytes();
     let mut hip_array = ptr::null_mut();
     hipArrayCreate(&mut hip_array, &desc)?;
     let elem_size = format_byte_size(desc.Format) * desc.NumChannels as usize;
     let size = desc.Width as usize * desc.Height.max(1) as usize * elem_size;
     super::memory::log_vram_delta("hipArrayCreate", vram_before, super::memory::vram_used_bytes(), size);
+    // Record the format-transformation hack so cuTexObjectCreate can build a
+    // HIP_RESOURCE_VIEW_DESC that re-interprets the bytes as the original format.
+    if hack_flag != 0 {
+        hipfix::set_array_hack(
+            hip_array,
+            hipfix::ArrayHack {
+                hack_flag,
+                num_channels: desc.NumChannels,
+                width: desc.Width as usize,
+                height: desc.Height as usize,
+                depth: 0,
+            },
+        );
+    }
     super::driver::zluda_log_err(&format!(
-        "ARRAY_CREATE {}x{} fmt={} ch={} ~{} KiB ptr={:?}",
-        desc.Width, desc.Height, desc.Format.0, desc.NumChannels, size / 1024, hip_array));
+        "ARRAY_CREATE {}x{} fmt={} ch={} ~{} KiB ptr={:?} hack={}",
+        desc.Width, desc.Height, desc.Format.0, desc.NumChannels, size / 1024, hip_array, hack_flag));
     *p_handle = hip_array.cast();
     Ok(())
 }
 
 pub(crate) unsafe fn destroy(h_array: CUarray) -> CUresult {
+    hipfix::forget_array_hack(h_array as hipArray_t);
     hipArrayDestroy(h_array as hipArray_t)?;
     Ok(())
 }
@@ -54,7 +70,8 @@ pub(crate) unsafe fn _3d_create_v2(
     p_allocate_array: &CUDA_ARRAY3D_DESCRIPTOR,
 ) -> CUresult {
     let mut desc = *(p_allocate_array as *const CUDA_ARRAY3D_DESCRIPTOR as *const HIP_ARRAY3D_DESCRIPTOR);
-    desc.Format = hipfix::get_non_broken_format(desc.Format);
+    let (hack_flag, new_format) = hipfix::get_non_broken_format(desc.Format);
+    desc.Format = new_format;
     hipfix::array_3d_create(&mut desc);
     let vram_before = super::memory::vram_used_bytes();
     let mut hip_array = mem::zeroed();
@@ -63,10 +80,22 @@ pub(crate) unsafe fn _3d_create_v2(
     let size = desc.Width as usize * desc.Height.max(1) as usize * desc.Depth.max(1) as usize * elem_size;
     super::memory::log_vram_delta("hipArray3DCreate", vram_before, super::memory::vram_used_bytes(), size);
     super::memory::update_alloc_range(hip_array as u64, size.max(0x10000) as u64);
+    if hack_flag != 0 {
+        hipfix::set_array_hack(
+            hip_array,
+            hipfix::ArrayHack {
+                hack_flag,
+                num_channels: desc.NumChannels,
+                width: desc.Width as usize,
+                height: desc.Height as usize,
+                depth: desc.Depth as usize,
+            },
+        );
+    }
     super::driver::zluda_log_err(&format!(
-        "ARRAY3D_CREATE {}x{}x{} fmt={} ch={} flags={} ~{} KiB ptr={:?}",
+        "ARRAY3D_CREATE {}x{}x{} fmt={} ch={} flags={} ~{} KiB ptr={:?} hack={}",
         desc.Width, desc.Height, desc.Depth, desc.Format.0, desc.NumChannels,
-        desc.Flags, size / 1024, hip_array));
+        desc.Flags, size / 1024, hip_array, hack_flag));
     *p_handle = hip_array as CUarray;
     Ok(())
 }
@@ -87,16 +116,30 @@ pub(crate) unsafe fn mipmapped_create(
     num_mipmap_levels: u32,
 ) -> CUresult {
     let mut desc = *(p_mipmapped_array_desc as *const CUDA_ARRAY3D_DESCRIPTOR as *const HIP_ARRAY3D_DESCRIPTOR);
-    desc.Format = hipfix::get_non_broken_format(desc.Format);
+    let (hack_flag, new_format) = hipfix::get_non_broken_format(desc.Format);
+    desc.Format = new_format;
     let vram_before = super::memory::vram_used_bytes();
     let mut hip_array = ptr::null_mut();
     hipMipmappedArrayCreate(&mut hip_array, &mut desc, num_mipmap_levels)?;
     super::memory::log_vram_delta("hipMipmappedArrayCreate", vram_before, super::memory::vram_used_bytes(), 0);
+    if hack_flag != 0 {
+        hipfix::set_mipmapped_hack(
+            hip_array,
+            hipfix::ArrayHack {
+                hack_flag,
+                num_channels: desc.NumChannels,
+                width: desc.Width as usize,
+                height: desc.Height as usize,
+                depth: desc.Depth as usize,
+            },
+        );
+    }
     *p_handle = hip_array.cast();
     Ok(())
 }
 
 pub(crate) unsafe fn mipmapped_destroy(h_mipmapped_array: CUmipmappedArray) -> CUresult {
+    hipfix::forget_mipmapped_hack(h_mipmapped_array as hipMipmappedArray_t);
     hipMipmappedArrayDestroy(h_mipmapped_array as hipMipmappedArray_t)?;
     Ok(())
 }
