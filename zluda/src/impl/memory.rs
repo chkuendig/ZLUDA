@@ -300,14 +300,11 @@ pub(crate) unsafe fn host_alloc(
     flags: ::std::os::raw::c_uint,
 ) -> CUresult {
     let context = context::get_current_context()?;
-    // B.3 bisection: pass flags through unchanged. Previously we OR'd in
-    // hipHostMallocMapped (0x02) on every host allocation, justifying it as
-    // "PhysX requires it for pinned-memory spinWait." That force-mapping
-    // changes GTT/VRAM placement for every host alloc and is a candidate
-    // suspect for the TurbulenceFS-zeros-counter cross-allocation corruption.
-    // If PhysX truly needs mapping for spinWait it will pass the flag itself
-    // (or fail with a clear error pointing back here).
-    let hip_flags = flags;
+    // In CUDA, all page-locked host memory is implicitly device-mapped.
+    // In HIP, hipHostMallocMapped must be set explicitly for
+    // hipHostGetDevicePointer to work. PhysX requires this for its
+    // GPU→CPU signaling pattern (pinned memory spinWait).
+    let hip_flags = flags | 0x02; // hipHostMallocMapped
     // Round up for vectorized over-read headroom (same as alloc_v2 — 16 bytes
     // covers one ld.global.v4.u32 over-read; reduced from 256 bytes as part of
     // plan B.2 bisection).
