@@ -21,10 +21,12 @@ pub(crate) unsafe fn create_v2(
 ) -> CUresult {
     let mut desc = *(p_allocate_array as *const CUDA_ARRAY_DESCRIPTOR as *const HIP_ARRAY_DESCRIPTOR);
     desc.Format = hipfix::get_non_broken_format(desc.Format);
+    let vram_before = super::memory::vram_used_bytes();
     let mut hip_array = ptr::null_mut();
     hipArrayCreate(&mut hip_array, &desc)?;
     let elem_size = format_byte_size(desc.Format) * desc.NumChannels as usize;
     let size = desc.Width as usize * desc.Height.max(1) as usize * elem_size;
+    super::memory::log_vram_delta("hipArrayCreate", vram_before, super::memory::vram_used_bytes(), size);
     super::driver::zluda_log_err(&format!(
         "ARRAY_CREATE {}x{} fmt={} ch={} ~{} KiB ptr={:?}",
         desc.Width, desc.Height, desc.Format.0, desc.NumChannels, size / 1024, hip_array));
@@ -54,10 +56,12 @@ pub(crate) unsafe fn _3d_create_v2(
     let mut desc = *(p_allocate_array as *const CUDA_ARRAY3D_DESCRIPTOR as *const HIP_ARRAY3D_DESCRIPTOR);
     desc.Format = hipfix::get_non_broken_format(desc.Format);
     hipfix::array_3d_create(&mut desc);
+    let vram_before = super::memory::vram_used_bytes();
     let mut hip_array = mem::zeroed();
     hipArray3DCreate(&mut hip_array, &mut desc as _)?;
     let elem_size = format_byte_size(desc.Format) * desc.NumChannels as usize;
     let size = desc.Width as usize * desc.Height.max(1) as usize * desc.Depth.max(1) as usize * elem_size;
+    super::memory::log_vram_delta("hipArray3DCreate", vram_before, super::memory::vram_used_bytes(), size);
     super::memory::update_alloc_range(hip_array as u64, size.max(0x10000) as u64);
     super::driver::zluda_log_err(&format!(
         "ARRAY3D_CREATE {}x{}x{} fmt={} ch={} flags={} ~{} KiB ptr={:?}",
@@ -84,8 +88,10 @@ pub(crate) unsafe fn mipmapped_create(
 ) -> CUresult {
     let mut desc = *(p_mipmapped_array_desc as *const CUDA_ARRAY3D_DESCRIPTOR as *const HIP_ARRAY3D_DESCRIPTOR);
     desc.Format = hipfix::get_non_broken_format(desc.Format);
+    let vram_before = super::memory::vram_used_bytes();
     let mut hip_array = ptr::null_mut();
     hipMipmappedArrayCreate(&mut hip_array, &mut desc, num_mipmap_levels)?;
+    super::memory::log_vram_delta("hipMipmappedArrayCreate", vram_before, super::memory::vram_used_bytes(), 0);
     *p_handle = hip_array.cast();
     Ok(())
 }

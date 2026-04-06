@@ -17,6 +17,47 @@ pub(crate) fn update_alloc_range(addr: u64, size: u64) {
     ALLOC_MAX.fetch_max(addr + size, Ordering::Relaxed);
 }
 
+/// Check whether VRAM placement diagnostics are enabled. Gated behind
+/// `ZLUDA_VRAM_LOG=1` because the sysfs read on every allocation has a
+/// non-negligible runtime cost we don't want to pay in normal operation.
+fn vram_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZLUDA_VRAM_LOG").map_or(false, |v| v == "1")
+    })
+}
+
+/// Read current VRAM usage from sysfs. Returns bytes used, or 0 on error
+/// OR when `ZLUDA_VRAM_LOG` is unset. The gate is here (not at the call
+/// sites) so callers can freely `let vram_before = vram_used_bytes();`
+/// without conditional bracketing — when logging is off this is a single
+/// atomic-load + early return, so the allocation hot path pays almost
+/// nothing.
+pub(crate) fn vram_used_bytes() -> u64 {
+    if !vram_log_enabled() {
+        return 0;
+    }
+    std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_used")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Log VRAM delta for an allocation. Returns (vram_before, vram_after).
+/// No-op when `ZLUDA_VRAM_LOG` is unset.
+pub(crate) fn log_vram_delta(label: &str, vram_before: u64, vram_after: u64, size: usize) {
+    if !vram_log_enabled() {
+        return;
+    }
+    let delta = vram_after as i64 - vram_before as i64;
+    let placement = if delta > 1024 { "VRAM" } else { "GTT/other" };
+    super::driver::zluda_log_err(&format!(
+        "{} size={} KiB vram_delta={:+} KiB total_vram={} MiB ({})",
+        label, size / 1024, delta / 1024,
+        vram_after / (1024 * 1024), placement
+    ));
+}
+
 struct DropGuard<F: FnMut()>(F);
 
 impl<F: FnMut()> Drop for DropGuard<F> {
@@ -29,6 +70,7 @@ pub(crate) unsafe fn alloc_v2(dptr: &mut hipDeviceptr_t, bytesize: usize) -> CUr
     super::driver::zluda_log(&format!("[ZLUDA] cuMemAlloc_v2({} bytes)", bytesize));
     let cu_context = context::get_current_context()?;
     let context: &context::Context = FromCuda::<_, CUerror>::from_cuda(&cu_context)?;
+    let vram_before = vram_used_bytes();
     // Round up to 256-byte boundary to provide headroom for vectorized over-reads.
     // CUDA kernels (e.g. PhysX radix sort) use ld.global.v4.u32 to load 4 elements
     // at a time. When the element count isn't a multiple of 4, the last load reads
@@ -36,6 +78,7 @@ pub(crate) unsafe fn alloc_v2(dptr: &mut hipDeviceptr_t, bytesize: usize) -> CUr
     // safe. On AMD with 4KB pages, it can cross into unmapped memory and fault.
     let alloc_size = (bytesize + 255) & !255;
     hipMalloc(ptr::from_mut(dptr).cast(), alloc_size)?;
+    log_vram_delta("hipMalloc", vram_before, vram_used_bytes(), alloc_size);
     fill_with_zero_and_register(cu_context, context, dptr, alloc_size)?;
     Ok(())
 }
@@ -426,6 +469,7 @@ pub(crate) unsafe fn alloc_pitch_v2(
     height: usize,
     element_size_bytes: ::core::ffi::c_uint,
 ) -> CUresult {
+    let vram_before = vram_used_bytes();
     hipMemAllocPitch(
         dptr.cast(),
         p_pitch,
@@ -434,6 +478,7 @@ pub(crate) unsafe fn alloc_pitch_v2(
         element_size_bytes,
     )?;
     let size = width_in_bytes * height;
+    log_vram_delta("hipMemAllocPitch", vram_before, vram_used_bytes(), size);
     super::driver::zluda_log_err(&format!(
         "ALLOC_PITCH {:?} {}x{} elem={} ~{} KiB",
         unsafe { *dptr }, width_in_bytes, height, element_size_bytes, size / 1024));
