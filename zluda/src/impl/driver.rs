@@ -127,6 +127,38 @@ fn should_zero_allocations() -> Option<bool> {
     )
 }
 
+// Global log file handles, opened once on first write and protected by a mutex so
+// concurrent writers don't interleave at the byte level. Previously each call opened
+// the file fresh and used `writeln!`, which issues multiple write() syscalls per
+// format argument — concurrent threads produced output like
+// `[[10721821072182ms #ms #531716531717] OK ] OK cuLaunchKernelcuLaunchKernel`,
+// corrupting diagnostics during exactly the races we need to investigate.
+//
+// The SIGABRT handler in `install_fault_signal_handler` deliberately does NOT use
+// these — Mutex is not async-signal-safe, so the crash path keeps its own per-call
+// open-append pattern and accepts a small risk of one corrupted crash line.
+static LOG_FILE: std::sync::LazyLock<Mutex<Option<std::fs::File>>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/zluda_tex.log")
+                .ok(),
+        )
+    });
+
+static DEBUG_LOG_FILE: std::sync::LazyLock<Mutex<Option<std::fs::File>>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/zluda_debug.log")
+                .ok(),
+        )
+    });
+
 pub(crate) fn zluda_log(msg: &str) {
     use std::io::Write;
     // Check ZLUDA_DEBUG env var (cached after first check)
@@ -143,53 +175,84 @@ pub(crate) fn zluda_log(msg: &str) {
     if !enabled {
         return;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/zluda_debug.log")
-    {
-        let _ = writeln!(f, "{}", msg);
+    // Pre-format into a String so the whole line goes out in one write_all.
+    let line = format!("{}\n", msg);
+    if let Ok(mut guard) = DEBUG_LOG_FILE.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 }
 
 pub(crate) fn zluda_log_err(msg: &str) {
     use std::io::Write;
     let ms = crate::elapsed_ms();
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/zluda_tex.log")
-    {
-        let _ = writeln!(f, "[{}ms] {}", ms, msg);
+    // Pre-format into a String so the whole line goes out in a single write_all —
+    // avoids inter-thread interleaving of the timestamp prefix and message body.
+    let line = format!("[{}ms] {}\n", ms, msg);
+    if let Ok(mut guard) = LOG_FILE.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 }
 
-/// Global storage for last kernel launch info, written by launch_kernel,
-/// read by the SIGABRT handler. Uses a simple atomic string approach.
-static LAST_KERNEL_INFO: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Ring buffer of last N kernel names — the SIGABRT handler dumps all of them
+/// so we see the crash context, not just the racy "last" slot. The fault is
+/// asynchronous on Van Gogh APU, so the actually-faulting kernel is usually
+/// NOT the single most recent one.
+const KERNEL_RING_SIZE: usize = 32;
+static KERNEL_RING: std::sync::Mutex<(
+    [Option<String>; KERNEL_RING_SIZE],
+    usize, // write index
+    u64,   // total push count
+)> = std::sync::Mutex::new(([const { None }; KERNEL_RING_SIZE], 0, 0));
 
 pub(crate) fn set_last_kernel(info: String) {
-    if let Ok(mut s) = LAST_KERNEL_INFO.lock() {
-        *s = info;
+    if let Ok(mut guard) = KERNEL_RING.lock() {
+        let (ref mut buf, ref mut idx, ref mut total) = *guard;
+        buf[*idx] = Some(info);
+        *idx = (*idx + 1) % KERNEL_RING_SIZE;
+        *total += 1;
     }
 }
 
-/// SIGABRT handler — fires when HSA runtime kills the process on GPU fault.
-/// Dumps the last kernel launch info to the log before dying.
+/// SIGABRT/SIGSEGV handler — fires when HSA runtime kills the process on GPU fault.
+/// Dumps the last N kernel launches to the log so we can see the crash context.
 #[cfg(not(windows))]
 fn install_fault_signal_handler() {
     unsafe extern "C" fn sigabrt_handler(sig: i32) {
         // Minimal async-signal-safe operations only.
         // Write directly to the log file.
         use std::io::Write;
+        let sig_name = match sig {
+            6 => "SIGABRT",
+            11 => "SIGSEGV",
+            _ => "signal",
+        };
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open("/tmp/zluda_tex.log")
         {
-            let _ = write!(f, "\n*** SIGABRT (signal {}) — GPU fault likely ***\n", sig);
-            if let Ok(info) = LAST_KERNEL_INFO.lock() {
-                let _ = write!(f, "*** Last kernel: {}\n", *info);
+            let _ = write!(f, "\n*** {} (signal {}) — GPU fault likely ***\n", sig_name, sig);
+            if let Ok(guard) = KERNEL_RING.lock() {
+                let (ref buf, idx, total) = *guard;
+                let _ = write!(f, "*** Kernel launch history (total={}, newest last):\n", total);
+                // Iterate from oldest to newest entry in the ring.
+                let start = if total >= KERNEL_RING_SIZE as u64 { idx } else { 0 };
+                let count = if total >= KERNEL_RING_SIZE as u64 {
+                    KERNEL_RING_SIZE
+                } else {
+                    total as usize
+                };
+                for i in 0..count {
+                    let slot = (start + i) % KERNEL_RING_SIZE;
+                    if let Some(ref name) = buf[slot] {
+                        let launch_n = total.saturating_sub((count - i) as u64);
+                        let _ = write!(f, "***   #{} {}\n", launch_n, name);
+                    }
+                }
             }
             // Read /proc/self/maps to find what's at common fault regions
             if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
