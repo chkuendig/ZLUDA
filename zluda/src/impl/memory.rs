@@ -71,12 +71,15 @@ pub(crate) unsafe fn alloc_v2(dptr: &mut hipDeviceptr_t, bytesize: usize) -> CUr
     let cu_context = context::get_current_context()?;
     let context: &context::Context = FromCuda::<_, CUerror>::from_cuda(&cu_context)?;
     let vram_before = vram_used_bytes();
-    // Round up to 256-byte boundary to provide headroom for vectorized over-reads.
+    // Round up to 16-byte boundary to provide headroom for vectorized over-reads.
     // CUDA kernels (e.g. PhysX radix sort) use ld.global.v4.u32 to load 4 elements
-    // at a time. When the element count isn't a multiple of 4, the last load reads
-    // 1-3 elements past the allocation. On NVIDIA, 2MB page granularity makes this
-    // safe. On AMD with 4KB pages, it can cross into unmapped memory and fault.
-    let alloc_size = (bytesize + 255) & !255;
+    // (16 bytes) at a time. When the element count isn't a multiple of 4, the last
+    // load reads 1-3 elements past the allocation. On NVIDIA, 2MB page granularity
+    // makes this safe. On AMD with 4KB pages, it can cross into unmapped memory.
+    // 16 bytes covers exactly one v4.u32 vector load — the previous 256-byte pad
+    // was 16x the minimum and is being bisected as a possible suspect for the
+    // TurbulenceFS-zeros-counter cross-allocation corruption (see plan B.2).
+    let alloc_size = (bytesize + 15) & !15;
     hipMalloc(ptr::from_mut(dptr).cast(), alloc_size)?;
     log_vram_delta("hipMalloc", vram_before, vram_used_bytes(), alloc_size);
     fill_with_zero_and_register(cu_context, context, dptr, alloc_size)?;
@@ -302,8 +305,10 @@ pub(crate) unsafe fn host_alloc(
     // hipHostGetDevicePointer to work. PhysX requires this for its
     // GPU→CPU signaling pattern (pinned memory spinWait).
     let hip_flags = flags | 0x02; // hipHostMallocMapped
-    // Round up for vectorized over-read headroom (same as alloc_v2).
-    let alloc_size = (bytesize + 255) & !255;
+    // Round up for vectorized over-read headroom (same as alloc_v2 — 16 bytes
+    // covers one ld.global.v4.u32 over-read; reduced from 256 bytes as part of
+    // plan B.2 bisection).
+    let alloc_size = (bytesize + 15) & !15;
     hipHostMalloc(pp, alloc_size, hip_flags)?;
     // Log host alloc addresses — Flex may pass these directly as kernel args
     // expecting CUDA UVA (host pointer = device pointer). On HIP, the device
