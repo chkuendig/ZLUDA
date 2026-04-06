@@ -353,6 +353,14 @@ pub(crate) unsafe fn copy_dto_h_async_v2(
     hipMemcpyDtoHAsync(dst_host, src_device, byte_count, stream)
 }
 
+pub(crate) unsafe fn copy_dto_d_v2(
+    dst_device: hipDeviceptr_t,
+    src_device: hipDeviceptr_t,
+    byte_count: usize,
+) -> hipError_t {
+    hipMemcpyDtoD(dst_device, src_device, byte_count)
+}
+
 pub(crate) unsafe fn copy_dto_d_async_v2(
     dst_device: hipDeviceptr_t,
     src_device: hipDeviceptr_t,
