@@ -51,6 +51,7 @@ define amdgpu_kernel void @pred_not(ptr addrspace(4) byref(i64) %"50", ptr addrs
   %16 = load i64, ptr addrspace(5) %"56", align 8
   %"77" = inttoptr i64 %15 to ptr
   store i64 %16, ptr %"77", align 8
+  fence seq_cst
   ret void
 }
 

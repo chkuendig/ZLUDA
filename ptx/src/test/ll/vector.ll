@@ -70,6 +70,7 @@ define amdgpu_kernel void @vector(ptr addrspace(4) byref(i64) %"76", ptr addrspa
   %9 = load <2 x i32>, ptr addrspace(5) %"80", align 8
   %"96" = inttoptr i64 %8 to ptr
   store <2 x i32> %9, ptr %"96", align 8
+  fence seq_cst
   ret void
 }
 

@@ -15,6 +15,7 @@ define hidden void @incr_shared_2_global() #0 {
   store i64 %"47", ptr addrspace(5) %"45", align 8
   %4 = load i64, ptr addrspace(5) %"45", align 8
   store i64 %4, ptr addrspace(3) @shared_mem, align 8
+  fence seq_cst
   ret void
 }
 
@@ -48,6 +49,7 @@ define amdgpu_kernel void @extern_shared_call(ptr addrspace(4) byref(i64) %"50",
   %9 = load i64, ptr addrspace(5) %"54", align 8
   %"68" = inttoptr i64 %8 to ptr addrspace(1)
   store i64 %9, ptr addrspace(1) %"68", align 8
+  fence seq_cst
   ret void
 }
 

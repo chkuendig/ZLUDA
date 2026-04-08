@@ -46,6 +46,7 @@ define amdgpu_kernel void @const_multi_zero_init(ptr addrspace(4) byref(i64) %"5
   %"52" = getelementptr inbounds i8, ptr %"83", i64 24
   %15 = load i64, ptr addrspace(5) %"61", align 8
   store i64 %15, ptr %"52", align 8
+  fence seq_cst
   ret void
 }
 

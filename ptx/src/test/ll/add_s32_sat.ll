@@ -41,6 +41,7 @@ define amdgpu_kernel void @add_s32_sat(ptr addrspace(4) byref(i64) %"46", ptr ad
   %"44" = getelementptr inbounds i8, ptr %"73", i64 4
   %15 = load i32, ptr addrspace(5) %"53", align 4
   store i32 %15, ptr %"44", align 4
+  fence seq_cst
   ret void
 }
 

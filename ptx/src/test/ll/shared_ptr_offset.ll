@@ -39,6 +39,7 @@ define amdgpu_kernel void @shared_ptr_offset(ptr addrspace(4) byref(i64) %"43", 
   %14 = load i64, ptr addrspace(5) %"49", align 8
   %"69" = inttoptr i64 %13 to ptr addrspace(1)
   store i64 %14, ptr addrspace(1) %"69", align 8
+  fence seq_cst
   ret void
 }
 

@@ -24,6 +24,7 @@ define amdgpu_kernel void @b64tof64(ptr addrspace(4) byref(i64) %"40", ptr addrs
   %8 = load i64, ptr addrspace(5) %"45", align 8
   %"57" = inttoptr i64 %7 to ptr
   store i64 %8, ptr %"57", align 8
+  fence seq_cst
   ret void
 }
 

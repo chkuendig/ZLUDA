@@ -36,6 +36,7 @@ define amdgpu_kernel void @extern_func(ptr addrspace(4) byref(i64) %"53", ptr ad
   %10 = load i64, ptr addrspace(5) %"58", align 8
   %"73" = inttoptr i64 %9 to ptr
   store i64 %10, ptr %"73", align 8
+  fence seq_cst
   ret void
 }
 

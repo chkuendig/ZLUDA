@@ -176,6 +176,7 @@ define amdgpu_kernel void @histogram_word1(ptr addrspace(4) byref(i64) %"86", pt
   %73 = load i32, ptr addrspace(5) %"110", align 4
   %"252" = inttoptr i64 %72 to ptr
   store i32 %73, ptr %"252", align 4
+  fence seq_cst
   ret void
 }
 

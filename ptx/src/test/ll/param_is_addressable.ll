@@ -28,6 +28,7 @@ define amdgpu_kernel void @param_is_addressable(ptr addrspace(4) byref(i64) %"39
   %10 = load i64, ptr addrspace(5) %"43", align 8
   %"59" = inttoptr i64 %9 to ptr
   store i64 %10, ptr %"59", align 8
+  fence seq_cst
   ret void
 }
 

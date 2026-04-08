@@ -38,6 +38,7 @@ define amdgpu_kernel void @atom_cas(ptr addrspace(4) byref(i64) %"47", ptr addrs
   %"45" = getelementptr inbounds i8, ptr %"72", i64 4
   %14 = load i32, ptr addrspace(5) %"52", align 4
   store i32 %14, ptr %"45", align 4
+  fence seq_cst
   ret void
 }
 

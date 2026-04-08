@@ -37,6 +37,7 @@ define amdgpu_kernel void @fma(ptr addrspace(4) byref(i64) %"45", ptr addrspace(
   %14 = load float, ptr addrspace(5) %"49", align 4
   %"69" = inttoptr i64 %13 to ptr
   store float %14, ptr %"69", align 4
+  fence seq_cst
   ret void
 }
 

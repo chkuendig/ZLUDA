@@ -29,6 +29,7 @@ define amdgpu_kernel void @tid(ptr addrspace(4) byref(i64) %"42") #1 {
   %10 = load i8, ptr addrspace(5) %"46", align 1
   %"58" = inttoptr i64 %9 to ptr
   store i8 %10, ptr %"58", align 1
+  fence seq_cst
   ret void
 }
 

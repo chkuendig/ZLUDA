@@ -54,6 +54,7 @@ define amdgpu_kernel void @div_noftz(ptr addrspace(4) byref(i64) %"69", ptr addr
   %"43" = getelementptr inbounds i8, ptr %"97", i64 4
   %18 = load float, ptr addrspace(5) %"75", align 4
   store float %18, ptr %"43", align 4
+  fence seq_cst
   ret void
 }
 

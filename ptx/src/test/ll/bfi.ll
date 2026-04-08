@@ -46,6 +46,7 @@ define amdgpu_kernel void @bfi(ptr addrspace(4) byref(i64) %"48", ptr addrspace(
   %17 = load i32, ptr addrspace(5) %"52", align 4
   %"80" = inttoptr i64 %16 to ptr
   store i32 %17, ptr %"80", align 4
+  fence seq_cst
   ret void
 }
 

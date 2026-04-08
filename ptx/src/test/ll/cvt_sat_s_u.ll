@@ -28,6 +28,7 @@ define amdgpu_kernel void @cvt_sat_s_u(ptr addrspace(4) byref(i64) %"41", ptr ad
   %11 = load i32, ptr addrspace(5) %"47", align 4
   %"59" = inttoptr i64 %10 to ptr
   store i32 %11, ptr %"59", align 4
+  fence seq_cst
   ret void
 }
 

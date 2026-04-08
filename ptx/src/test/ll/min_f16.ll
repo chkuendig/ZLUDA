@@ -33,6 +33,7 @@ define amdgpu_kernel void @min_f16(ptr addrspace(4) byref(i64) %"42", ptr addrsp
   %"63" = inttoptr i64 %11 to ptr
   %"64" = bitcast half %12 to i16
   store i16 %"64", ptr %"63", align 2
+  fence seq_cst
   ret void
 }
 

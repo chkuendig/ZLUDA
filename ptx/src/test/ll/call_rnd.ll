@@ -144,6 +144,7 @@ define amdgpu_kernel void @call_rnd(ptr addrspace(4) byref(i64) %"101", ptr addr
   %"74" = getelementptr inbounds i8, ptr %"168", i64 4
   %25 = load float, ptr addrspace(5) %"110", align 4
   store float %25, ptr %"74", align 4
+  fence seq_cst
   ret void
 }
 

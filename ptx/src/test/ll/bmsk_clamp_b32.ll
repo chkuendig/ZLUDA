@@ -33,6 +33,7 @@ define amdgpu_kernel void @bmsk_clamp_b32(ptr addrspace(4) byref(i64) %"43", ptr
   %11 = load i32, ptr addrspace(5) %"49", align 4
   %"66" = inttoptr i64 %10 to ptr
   store i32 %11, ptr %"66", align 4
+  fence seq_cst
   ret void
 }
 

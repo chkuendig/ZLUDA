@@ -83,6 +83,7 @@ define amdgpu_kernel void @shl_overflow(ptr addrspace(4) byref(i64) %"60", ptr a
   %"58" = getelementptr inbounds i8, ptr %"119", i64 12
   %35 = load i32, ptr addrspace(5) %"71", align 4
   store i32 %35, ptr %"58", align 4
+  fence seq_cst
   ret void
 }
 

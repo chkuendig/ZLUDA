@@ -154,6 +154,7 @@ define amdgpu_kernel void @ldmatrix_trans(ptr addrspace(4) byref(i64) %"91") #1 
   br label %"14"
 
 "14":                                             ; preds = %"34", %"89"
+  fence seq_cst
   ret void
 }
 

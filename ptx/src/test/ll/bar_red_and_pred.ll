@@ -111,6 +111,7 @@ define amdgpu_kernel void @bar_red_and_pred(ptr addrspace(4) byref(i64) %"81", p
   %27 = load i32, ptr addrspace(5) %"89", align 4
   %"134" = inttoptr i64 %26 to ptr
   store i32 %27, ptr %"134", align 4
+  fence seq_cst
   ret void
 }
 

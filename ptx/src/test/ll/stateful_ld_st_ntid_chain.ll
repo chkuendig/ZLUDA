@@ -49,6 +49,7 @@ define amdgpu_kernel void @stateful_ld_st_ntid_chain(ptr addrspace(4) byref(i64)
   %17 = load i64, ptr addrspace(5) %"58", align 8
   %"85" = inttoptr i64 %16 to ptr addrspace(1)
   store i64 %17, ptr addrspace(1) %"85", align 8
+  fence seq_cst
   ret void
 }
 

@@ -10,6 +10,7 @@ define amdgpu_kernel void @mov_address(ptr addrspace(4) byref(i64) %"38", ptr ad
   %2 = ptrtoint ptr addrspace(5) %"13" to i32
   %"42" = zext i32 %2 to i64
   store i64 %"42", ptr addrspace(5) %"40", align 8
+  fence seq_cst
   ret void
 }
 

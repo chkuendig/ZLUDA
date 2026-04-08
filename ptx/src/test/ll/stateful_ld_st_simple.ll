@@ -30,6 +30,7 @@ define amdgpu_kernel void @stateful_ld_st_simple(ptr addrspace(4) byref(i64) %"4
   %11 = load i64, ptr addrspace(5) %"47", align 8
   %"63" = inttoptr i64 %10 to ptr addrspace(1)
   store i64 %11, ptr addrspace(1) %"63", align 8
+  fence seq_cst
   ret void
 }
 

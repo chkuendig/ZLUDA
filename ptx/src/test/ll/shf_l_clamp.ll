@@ -40,6 +40,7 @@ define amdgpu_kernel void @shf_l_clamp(ptr addrspace(4) byref(i64) %"46", ptr ad
   %16 = load i32, ptr addrspace(5) %"53", align 4
   %"72" = inttoptr i64 %15 to ptr
   store i32 %16, ptr %"72", align 4
+  fence seq_cst
   ret void
 }
 

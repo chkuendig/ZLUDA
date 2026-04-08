@@ -1291,7 +1291,27 @@ impl<'a> MethodEmitContext<'a> {
     }
 
     fn emit_ret(&self, _data: ast::RetData) {
-        unsafe { LLVMBuildRetVoid(self.builder) };
+        // Insert a system-scope fence before the kernel exit to ensure
+        // all pending stores are globally visible before the next kernel
+        // launches. This compensates for PhysX MemCopyBatchedAsync (and
+        // other PTX kernels) whose zero-fill `bra.uni` exit path is
+        // missing the `membar.sys` that the memcpy exit path emits.
+        // NVIDIA forgives the missing fence (write-through L1 / stronger
+        // implicit kernel-end barrier); AMDGPU exposes it as a stale L1
+        // cache line that occasionally causes the next kernel to read the
+        // pre-store value (Batman: Arkham Knight Bug A — see
+        // project_batman_30_run_dataset.md). Empty scope string is what
+        // AMDGPU LLVM expects for system-scope fence (matches the trick
+        // in get_scope_membar for ast::MemScope::Sys).
+        unsafe {
+            LLVMZludaBuildFence(
+                self.builder,
+                LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                c"".as_ptr(),
+                LLVM_UNNAMED.as_ptr(),
+            );
+            LLVMBuildRetVoid(self.builder)
+        };
     }
 
     fn emit_call(
@@ -1751,10 +1771,22 @@ impl<'a> MethodEmitContext<'a> {
         _data: ptx_parser::ScalarType,
         arguments: ptx_parser::XorArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
+        // Wrap the XOR result in `llvm.freeze` to defeat the LLVM
+        // optimizer's poison/undef tracking on AMDGPU. CUB DeviceRadixSort
+        // Downsweep's `TwiddleOut` (`key ^ 0x80000000` for signed-int
+        // sort) occasionally has its XOR value lost on rare workgroups,
+        // leaving the output with bit-31 stuck. PR-145902 (BITCAST POISON)
+        // partial-fixed Upsweep but not Downsweep. Freeze is a no-op at
+        // codegen time but blocks SimplifyDemandedBits / DAG combiners
+        // from speculating undef bits across the XOR. Mirrors the existing
+        // FP→int poison-freeze pattern at the bottom of this file. See
+        // project_batman_30_run_dataset.md for the Bug B repro evidence.
         let src1 = self.resolver.value(arguments.src1)?;
         let src2 = self.resolver.value(arguments.src2)?;
+        let xor_result =
+            unsafe { LLVMBuildXor(self.builder, src1, src2, LLVM_UNNAMED.as_ptr()) };
         self.resolver.with_result(arguments.dst, |dst| unsafe {
-            LLVMBuildXor(self.builder, src1, src2, dst)
+            LLVMBuildFreeze(self.builder, xor_result, dst)
         });
         Ok(())
     }

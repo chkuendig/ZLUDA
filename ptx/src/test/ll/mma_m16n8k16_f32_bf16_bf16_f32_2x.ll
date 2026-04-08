@@ -238,6 +238,7 @@ define amdgpu_kernel void @mma_m16n8k16_f32_bf16_bf16_f32_2x(ptr addrspace(4) by
   %"93" = getelementptr inbounds i8, ptr %"246", i64 28
   %106 = load float, ptr addrspace(5) %"123", align 4
   store float %106, ptr %"93", align 4
+  fence seq_cst
   ret void
 }
 

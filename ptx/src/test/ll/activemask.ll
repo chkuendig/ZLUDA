@@ -17,6 +17,7 @@ define amdgpu_kernel void @activemask(ptr addrspace(4) byref(i64) %"38", ptr add
   %4 = load i32, ptr addrspace(5) %"41", align 4
   %"46" = inttoptr i64 %3 to ptr
   store i32 %4, ptr %"46", align 4
+  fence seq_cst
   ret void
 }
 

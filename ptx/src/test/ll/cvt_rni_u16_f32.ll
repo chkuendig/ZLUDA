@@ -25,6 +25,7 @@ define amdgpu_kernel void @cvt_rni_u16_f32(ptr addrspace(4) byref(i64) %"40", pt
   %9 = load i16, ptr addrspace(5) %"45", align 2
   %"55" = inttoptr i64 %8 to ptr
   store i16 %9, ptr %"55", align 2
+  fence seq_cst
   ret void
 }
 

@@ -128,6 +128,7 @@ define amdgpu_kernel void @sub_extended(ptr addrspace(4) byref(i64) %"70", ptr a
   %"68" = getelementptr inbounds i8, ptr %"135", i64 12
   %66 = load i32, ptr addrspace(5) %"85", align 4
   store i32 %66, ptr %"68", align 4
+  fence seq_cst
   ret void
 }
 

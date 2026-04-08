@@ -50,6 +50,7 @@ define amdgpu_kernel void @setp_leu(ptr addrspace(4) byref(i64) %"48", ptr addrs
   %16 = load float, ptr addrspace(5) %"54", align 4
   %"75" = inttoptr i64 %15 to ptr
   store float %16, ptr %"75", align 4
+  fence seq_cst
   ret void
 }
 

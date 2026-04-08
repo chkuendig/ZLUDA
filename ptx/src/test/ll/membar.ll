@@ -21,6 +21,7 @@ define amdgpu_kernel void @membar(ptr addrspace(4) byref(i64) %"39", ptr addrspa
   %7 = load i32, ptr addrspace(5) %"43", align 4
   %"52" = inttoptr i64 %6 to ptr
   store i32 %7, ptr %"52", align 4
+  fence seq_cst
   ret void
 }
 

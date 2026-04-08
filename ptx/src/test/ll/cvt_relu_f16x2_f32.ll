@@ -73,6 +73,7 @@ define amdgpu_kernel void @cvt_relu_f16x2_f32(ptr addrspace(4) byref(i64) %"52",
   %29 = load <2 x half>, ptr addrspace(5) %"61", align 4
   %"97" = bitcast <2 x half> %29 to i32
   store i32 %"97", ptr addrspace(1) %"50", align 4
+  fence seq_cst
   ret void
 }
 

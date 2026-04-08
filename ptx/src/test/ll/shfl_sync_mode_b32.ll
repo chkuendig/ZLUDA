@@ -64,6 +64,7 @@ define amdgpu_kernel void @shfl_sync_mode_b32(ptr addrspace(4) byref(i64) %"56")
   %20 = load i32, ptr addrspace(5) %"61", align 4
   %"100" = inttoptr i64 %19 to ptr
   store i32 %20, ptr %"100", align 4
+  fence seq_cst
   ret void
 }
 

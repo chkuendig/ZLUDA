@@ -51,6 +51,7 @@ define amdgpu_kernel void @stateful_ld_st_ntid_sub(ptr addrspace(4) byref(i64) %
   %"49" = getelementptr inbounds i8, ptr addrspace(1) %"91", i64 0
   %17 = load i64, ptr addrspace(5) %"62", align 8
   store i64 %17, ptr addrspace(1) %"49", align 8
+  fence seq_cst
   ret void
 }
 

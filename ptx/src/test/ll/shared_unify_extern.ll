@@ -77,6 +77,7 @@ define amdgpu_kernel void @shared_unify_extern(ptr addrspace(4) byref(i64) %"65"
   %11 = load i64, ptr addrspace(5) %"70", align 8
   %"92" = inttoptr i64 %10 to ptr
   store i64 %11, ptr %"92", align 8
+  fence seq_cst
   ret void
 }
 

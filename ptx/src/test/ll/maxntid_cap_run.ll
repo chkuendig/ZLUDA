@@ -40,6 +40,7 @@ define amdgpu_kernel void @maxntid_cap_run(ptr addrspace(4) byref(i64) %"50", pt
   br label %"13"
 
 "13":                                             ; preds = %"21", %"48"
+  fence seq_cst
   ret void
 }
 

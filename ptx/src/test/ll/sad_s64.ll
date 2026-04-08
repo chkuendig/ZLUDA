@@ -57,6 +57,7 @@ define amdgpu_kernel void @sad_s64(ptr addrspace(4) byref(i64) %"49", ptr addrsp
   %"47" = getelementptr inbounds i8, ptr %"82", i64 8
   %27 = load i64, ptr addrspace(5) %"57", align 8
   store i64 %27, ptr %"47", align 8
+  fence seq_cst
   ret void
 }
 

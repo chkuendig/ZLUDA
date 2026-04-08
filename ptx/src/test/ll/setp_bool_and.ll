@@ -48,6 +48,7 @@ define amdgpu_kernel void @setp_bool_and(ptr addrspace(4) byref(i64) %"51", ptr 
   %20 = load i32, ptr addrspace(5) %"58", align 4
   %"82" = inttoptr i64 %19 to ptr
   store i32 %20, ptr %"82", align 4
+  fence seq_cst
   ret void
 }
 

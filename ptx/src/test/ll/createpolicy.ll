@@ -7,6 +7,7 @@ define amdgpu_kernel void @createpolicy(ptr addrspace(4) byref(i64) %"37", ptr a
 
 "36":                                             ; preds = %1
   store i64 0, ptr addrspace(5) %"39", align 8
+  fence seq_cst
   ret void
 }
 

@@ -21,6 +21,7 @@ define amdgpu_kernel void @global_array(ptr addrspace(4) byref(i64) %"40", ptr a
   %6 = load i32, ptr addrspace(5) %"44", align 4
   %"53" = inttoptr i64 %5 to ptr addrspace(1)
   store i32 %6, ptr addrspace(1) %"53", align 4
+  fence seq_cst
   ret void
 }
 

@@ -30,6 +30,7 @@ define amdgpu_kernel void @selp_true(ptr addrspace(4) byref(i64) %"43", ptr addr
   %11 = load i16, ptr addrspace(5) %"47", align 2
   %"62" = inttoptr i64 %10 to ptr
   store i16 %11, ptr %"62", align 2
+  fence seq_cst
   ret void
 }
 

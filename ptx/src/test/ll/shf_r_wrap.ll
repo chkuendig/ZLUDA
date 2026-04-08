@@ -38,6 +38,7 @@ define amdgpu_kernel void @shf_r_wrap(ptr addrspace(4) byref(i64) %"46", ptr add
   %14 = load i32, ptr addrspace(5) %"53", align 4
   %"72" = inttoptr i64 %13 to ptr
   store i32 %14, ptr %"72", align 4
+  fence seq_cst
   ret void
 }
 

@@ -471,6 +471,7 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32_interleave(ptr addrspace(4
   %"164" = getelementptr inbounds i8, ptr %"506", i64 60
   %181 = load i32, ptr addrspace(5) %"245", align 4
   store i32 %181, ptr %"164", align 4
+  fence seq_cst
   ret void
 }
 

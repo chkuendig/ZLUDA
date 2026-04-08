@@ -25,6 +25,7 @@ define amdgpu_kernel void @shr(ptr addrspace(4) byref(i64) %"40", ptr addrspace(
   %10 = load i32, ptr addrspace(5) %"44", align 4
   %"54" = inttoptr i64 %9 to ptr
   store i32 %10, ptr %"54", align 4
+  fence seq_cst
   ret void
 }
 

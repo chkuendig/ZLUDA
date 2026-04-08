@@ -25,6 +25,7 @@ define amdgpu_kernel void @sqrt_rn_ftz(ptr addrspace(4) byref(i64) %"39", ptr ad
   %8 = load float, ptr addrspace(5) %"43", align 4
   %"53" = inttoptr i64 %7 to ptr
   store float %8, ptr %"53", align 4
+  fence seq_cst
   ret void
 }
 

@@ -34,6 +34,7 @@ define amdgpu_kernel void @shared_ptr_32(ptr addrspace(4) byref(i64) %"44", ptr 
   %11 = load i64, ptr addrspace(5) %"50", align 8
   %"66" = inttoptr i64 %10 to ptr addrspace(1)
   store i64 %11, ptr addrspace(1) %"66", align 8
+  fence seq_cst
   ret void
 }
 

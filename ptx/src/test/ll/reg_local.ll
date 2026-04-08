@@ -30,6 +30,7 @@ define amdgpu_kernel void @reg_local(ptr addrspace(4) byref(i64) %"46", ptr addr
   %"44" = getelementptr inbounds i8, ptr addrspace(1) %"65", i64 0
   %9 = load i64, ptr addrspace(5) %"50", align 8
   store i64 %9, ptr addrspace(1) %"44", align 8
+  fence seq_cst
   ret void
 }
 

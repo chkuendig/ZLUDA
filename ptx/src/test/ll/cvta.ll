@@ -28,6 +28,7 @@ define amdgpu_kernel void @cvta(ptr addrspace(4) byref(i64) %"39", ptr addrspace
   %11 = load float, ptr addrspace(5) %"43", align 4
   %"59" = inttoptr i64 %10 to ptr addrspace(1)
   store float %11, ptr addrspace(1) %"59", align 4
+  fence seq_cst
   ret void
 }
 

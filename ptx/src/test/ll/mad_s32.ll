@@ -39,6 +39,7 @@ define amdgpu_kernel void @mad_s32(ptr addrspace(4) byref(i64) %"46", ptr addrsp
   %15 = load i32, ptr addrspace(5) %"50", align 4
   %"71" = inttoptr i64 %14 to ptr
   store i32 %15, ptr %"71", align 4
+  fence seq_cst
   ret void
 }
 

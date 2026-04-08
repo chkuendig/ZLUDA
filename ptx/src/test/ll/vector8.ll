@@ -45,6 +45,7 @@ define amdgpu_kernel void @vector8(ptr addrspace(4) byref(i64) %"48", ptr addrsp
   %8 = load i32, ptr addrspace(5) %"60", align 4
   %"79" = inttoptr i64 %7 to ptr
   store i32 %8, ptr %"79", align 4
+  fence seq_cst
   ret void
 }
 

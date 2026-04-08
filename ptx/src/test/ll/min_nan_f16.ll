@@ -35,6 +35,7 @@ define amdgpu_kernel void @min_nan_f16(ptr addrspace(4) byref(i64) %"42", ptr ad
   %"63" = inttoptr i64 %12 to ptr
   %"64" = bitcast half %13 to i16
   store i16 %"64", ptr %"63", align 2
+  fence seq_cst
   ret void
 }
 

@@ -91,6 +91,7 @@ define amdgpu_kernel void @ldmatrix(ptr addrspace(4) byref(i64) %"60") #1 {
   %"57" = getelementptr inbounds i8, ptr %"128", i64 4
   %32 = load i32, ptr addrspace(5) %"69", align 4
   store i32 %32, ptr %"57", align 4
+  fence seq_cst
   ret void
 }
 

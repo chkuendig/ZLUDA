@@ -20,6 +20,7 @@ define amdgpu_kernel void @red_add_f32(ptr addrspace(4) byref(i64) %"39", ptr ad
   %7 = load float, ptr addrspace(5) %"43", align 4
   %"51" = inttoptr i64 %6 to ptr addrspace(1)
   %8 = atomicrmw fadd ptr addrspace(1) %"51", float %7 syncscope("agent-one-as") monotonic, align 4
+  fence seq_cst
   ret void
 }
 

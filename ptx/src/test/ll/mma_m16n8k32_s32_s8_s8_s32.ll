@@ -316,6 +316,7 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %106 = load i32, ptr addrspace(5) %"185", align 4
   %"342" = bitcast i32 %106 to float
   store float %"342", ptr %"116", align 4
+  fence seq_cst
   ret void
 }
 

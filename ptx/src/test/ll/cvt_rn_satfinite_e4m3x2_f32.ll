@@ -33,6 +33,7 @@ define amdgpu_kernel void @cvt_rn_satfinite_e4m3x2_f32(ptr addrspace(4) byref(i6
   %11 = load i16, ptr addrspace(5) %"49", align 2
   %"64" = inttoptr i64 %10 to ptr
   store i16 %11, ptr %"64", align 2
+  fence seq_cst
   ret void
 }
 

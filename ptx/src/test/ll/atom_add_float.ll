@@ -40,6 +40,7 @@ define amdgpu_kernel void @atom_add_float(ptr addrspace(4) byref(i64) %"45", ptr
   %"43" = getelementptr inbounds i8, ptr %"71", i64 4
   %15 = load float, ptr addrspace(5) %"50", align 4
   store float %15, ptr %"43", align 4
+  fence seq_cst
   ret void
 }
 

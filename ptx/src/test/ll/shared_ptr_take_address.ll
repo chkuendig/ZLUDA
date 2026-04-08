@@ -36,6 +36,7 @@ define amdgpu_kernel void @shared_ptr_take_address(ptr addrspace(4) byref(i64) %
   %13 = load i64, ptr addrspace(5) %"48", align 8
   %"64" = inttoptr i64 %12 to ptr addrspace(1)
   store i64 %13, ptr addrspace(1) %"64", align 8
+  fence seq_cst
   ret void
 }
 

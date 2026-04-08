@@ -63,6 +63,7 @@ define amdgpu_kernel void @multiple_return(ptr addrspace(4) byref(i64) %"59", pt
   br label %"23"
 
 "23":                                             ; preds = %"22", %"54"
+  fence seq_cst
   ret void
 }
 

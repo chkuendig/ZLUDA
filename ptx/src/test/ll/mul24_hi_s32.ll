@@ -33,6 +33,7 @@ define amdgpu_kernel void @mul24_hi_s32(ptr addrspace(4) byref(i64) %"41", ptr a
   %14 = load i32, ptr addrspace(5) %"47", align 4
   %"60" = inttoptr i64 %13 to ptr
   store i32 %14, ptr %"60", align 4
+  fence seq_cst
   ret void
 }
 

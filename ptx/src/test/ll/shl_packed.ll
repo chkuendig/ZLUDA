@@ -115,6 +115,7 @@ define amdgpu_kernel void @shl_packed(ptr addrspace(4) byref(i64) %"72", ptr add
   %"70" = getelementptr inbounds i8, ptr %"167", i64 12
   %47 = load i32, ptr addrspace(5) %"87", align 4
   store i32 %47, ptr %"70", align 4
+  fence seq_cst
   ret void
 }
 

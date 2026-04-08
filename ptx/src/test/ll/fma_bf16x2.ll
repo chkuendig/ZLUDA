@@ -41,6 +41,7 @@ define amdgpu_kernel void @fma_bf16x2(ptr addrspace(4) byref(i64) %"45", ptr add
   %14 = load i32, ptr addrspace(5) %"49", align 4
   %"73" = inttoptr i64 %13 to ptr
   store i32 %14, ptr %"73", align 4
+  fence seq_cst
   ret void
 }
 

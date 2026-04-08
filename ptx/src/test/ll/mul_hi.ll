@@ -27,6 +27,7 @@ define amdgpu_kernel void @mul_hi(ptr addrspace(4) byref(i64) %"41", ptr addrspa
   %11 = load i64, ptr addrspace(5) %"46", align 8
   %"56" = inttoptr i64 %10 to ptr
   store i64 %11, ptr %"56", align 8
+  fence seq_cst
   ret void
 }
 

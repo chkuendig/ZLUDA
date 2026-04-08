@@ -24,6 +24,7 @@ define amdgpu_kernel void @cvt_s64_s32(ptr addrspace(4) byref(i64) %"40", ptr ad
   %9 = load i64, ptr addrspace(5) %"45", align 8
   %"56" = inttoptr i64 %8 to ptr
   store i64 %9, ptr %"56", align 8
+  fence seq_cst
   ret void
 }
 

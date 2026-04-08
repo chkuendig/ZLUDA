@@ -57,6 +57,7 @@ define amdgpu_kernel void @redux_sync_op_s32(ptr addrspace(4) byref(i64) %"51") 
   %16 = load i32, ptr addrspace(5) %"57", align 4
   %"84" = inttoptr i64 %15 to ptr
   store i32 %16, ptr %"84", align 4
+  fence seq_cst
   ret void
 }
 

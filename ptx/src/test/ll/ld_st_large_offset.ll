@@ -22,6 +22,7 @@ define amdgpu_kernel void @ld_st_large_offset(ptr addrspace(4) byref(i64) %"43",
   %"41" = getelementptr inbounds i8, ptr addrspace(1) %"55", i64 17179869180
   %7 = load i32, ptr addrspace(5) %"47", align 4
   store i32 %7, ptr addrspace(1) %"41", align 4
+  fence seq_cst
   ret void
 }
 

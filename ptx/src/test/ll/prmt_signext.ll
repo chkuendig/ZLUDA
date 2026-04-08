@@ -33,6 +33,7 @@ define amdgpu_kernel void @prmt_signext(ptr addrspace(4) byref(i64) %"44", ptr a
   %11 = load i32, ptr addrspace(5) %"50", align 4
   %"67" = inttoptr i64 %10 to ptr
   store i32 %11, ptr %"67", align 4
+  fence seq_cst
   ret void
 }
 

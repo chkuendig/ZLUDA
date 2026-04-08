@@ -23,6 +23,7 @@ define amdgpu_kernel void @constant_f32(ptr addrspace(4) byref(i64) %"40", ptr a
   %8 = load float, ptr addrspace(5) %"44", align 4
   %"54" = inttoptr i64 %7 to ptr
   store float %8, ptr %"54", align 4
+  fence seq_cst
   ret void
 }
 

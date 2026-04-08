@@ -43,6 +43,7 @@ define amdgpu_kernel void @shfl_broadcast_31(ptr addrspace(4) byref(i64) %"49") 
   %12 = load i32, ptr addrspace(5) %"54", align 4
   %"74" = inttoptr i64 %11 to ptr
   store i32 %12, ptr %"74", align 4
+  fence seq_cst
   ret void
 }
 

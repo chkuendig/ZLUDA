@@ -57,6 +57,7 @@ define amdgpu_kernel void @assertfail(ptr addrspace(4) byref(i64) %"95", ptr add
   %18 = load i64, ptr addrspace(5) %"100", align 8
   %"132" = inttoptr i64 %17 to ptr
   store i64 %18, ptr %"132", align 8
+  fence seq_cst
   ret void
 }
 

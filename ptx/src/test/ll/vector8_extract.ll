@@ -105,6 +105,7 @@ define amdgpu_kernel void @vector8_extract(ptr addrspace(4) byref(i64) %"50", pt
   %36 = load i64, ptr addrspace(5) %"53", align 8
   %"115" = inttoptr i64 %36 to ptr addrspace(1)
   store <8 x i8> %"48", ptr addrspace(1) %"115", align 8
+  fence seq_cst
   ret void
 }
 

@@ -23,6 +23,7 @@ define amdgpu_kernel void @rsqrt(ptr addrspace(4) byref(i64) %"39", ptr addrspac
   %8 = load double, ptr addrspace(5) %"43", align 8
   %"53" = inttoptr i64 %7 to ptr
   store double %8, ptr %"53", align 8
+  fence seq_cst
   ret void
 }
 

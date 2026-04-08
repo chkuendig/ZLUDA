@@ -67,6 +67,7 @@ define amdgpu_kernel void @cvt_pack(ptr addrspace(4) byref(i64) %"49", ptr addrs
   %"47" = getelementptr inbounds i8, ptr %"87", i64 4
   %37 = load i32, ptr addrspace(5) %"57", align 4
   store i32 %37, ptr %"47", align 4
+  fence seq_cst
   ret void
 }
 

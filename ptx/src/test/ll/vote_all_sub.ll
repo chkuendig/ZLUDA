@@ -52,6 +52,7 @@ define amdgpu_kernel void @vote_all_sub(ptr addrspace(4) byref(i64) %"57") #1 {
   %12 = load i32, ptr addrspace(5) %"62", align 4
   %"82" = inttoptr i64 %11 to ptr
   store i32 %12, ptr %"82", align 4
+  fence seq_cst
   ret void
 }
 

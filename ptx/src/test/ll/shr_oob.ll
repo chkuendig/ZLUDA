@@ -25,6 +25,7 @@ define amdgpu_kernel void @shr_oob(ptr addrspace(4) byref(i64) %"40", ptr addrsp
   %10 = load i16, ptr addrspace(5) %"44", align 2
   %"54" = inttoptr i64 %9 to ptr
   store i16 %10, ptr %"54", align 2
+  fence seq_cst
   ret void
 }
 

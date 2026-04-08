@@ -64,6 +64,7 @@ define amdgpu_kernel void @shfl_sync_idx_multi_reg(ptr addrspace(4) byref(i64) %
   %"56" = getelementptr inbounds i8, ptr %"99", i64 4
   %18 = load i32, ptr addrspace(5) %"66", align 4
   store i32 %18, ptr %"56", align 4
+  fence seq_cst
   ret void
 }
 

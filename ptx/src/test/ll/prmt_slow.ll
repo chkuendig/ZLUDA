@@ -39,6 +39,7 @@ define amdgpu_kernel void @prmt_slow(ptr addrspace(4) byref(i64) %"45", ptr addr
   %14 = load i32, ptr addrspace(5) %"50", align 4
   %"73" = inttoptr i64 %13 to ptr
   store i32 %14, ptr %"73", align 4
+  fence seq_cst
   ret void
 }
 

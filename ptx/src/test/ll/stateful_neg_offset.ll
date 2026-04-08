@@ -39,6 +39,7 @@ define amdgpu_kernel void @stateful_neg_offset(ptr addrspace(4) byref(i64) %"42"
   %15 = load i64, ptr addrspace(5) %"49", align 8
   %"71" = inttoptr i64 %14 to ptr addrspace(1)
   store i64 %15, ptr addrspace(1) %"71", align 8
+  fence seq_cst
   ret void
 }
 

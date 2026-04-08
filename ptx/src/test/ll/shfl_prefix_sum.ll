@@ -124,6 +124,7 @@ define amdgpu_kernel void @shfl_prefix_sum(ptr addrspace(4) byref(i64) %"66") #1
   %34 = load i32, ptr addrspace(5) %"70", align 4
   %"130" = inttoptr i64 %33 to ptr
   store i32 %34, ptr %"130", align 4
+  fence seq_cst
   ret void
 }
 

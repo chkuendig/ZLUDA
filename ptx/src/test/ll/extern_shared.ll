@@ -26,6 +26,7 @@ define amdgpu_kernel void @extern_shared(ptr addrspace(4) byref(i64) %"40", ptr 
   %9 = load i64, ptr addrspace(5) %"44", align 8
   %"56" = inttoptr i64 %8 to ptr addrspace(1)
   store i64 %9, ptr addrspace(1) %"56", align 8
+  fence seq_cst
   ret void
 }
 

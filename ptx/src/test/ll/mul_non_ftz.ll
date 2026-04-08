@@ -30,6 +30,7 @@ define amdgpu_kernel void @mul_non_ftz(ptr addrspace(4) byref(i64) %"42", ptr ad
   %11 = load float, ptr addrspace(5) %"46", align 4
   %"61" = inttoptr i64 %10 to ptr
   store float %11, ptr %"61", align 4
+  fence seq_cst
   ret void
 }
 

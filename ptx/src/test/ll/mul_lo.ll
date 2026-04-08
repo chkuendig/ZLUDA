@@ -24,6 +24,7 @@ define amdgpu_kernel void @mul_lo(ptr addrspace(4) byref(i64) %"41", ptr addrspa
   %8 = load i64, ptr addrspace(5) %"46", align 8
   %"56" = inttoptr i64 %7 to ptr
   store i64 %8, ptr %"56", align 8
+  fence seq_cst
   ret void
 }
 

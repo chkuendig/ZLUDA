@@ -74,6 +74,7 @@ define amdgpu_kernel void @shared_unify_local(ptr addrspace(4) byref(i64) %"63",
   %11 = load i64, ptr addrspace(5) %"68", align 8
   %"88" = inttoptr i64 %10 to ptr
   store i64 %11, ptr %"88", align 8
+  fence seq_cst
   ret void
 }
 

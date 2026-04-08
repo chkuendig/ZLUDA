@@ -27,6 +27,7 @@ define amdgpu_kernel void @malformed_label(ptr addrspace(4) byref(i64) %"43", pt
   %8 = load i64, ptr addrspace(5) %"48", align 8
   %"58" = inttoptr i64 %7 to ptr
   store i64 %8, ptr %"58", align 8
+  fence seq_cst
   ret void
 }
 

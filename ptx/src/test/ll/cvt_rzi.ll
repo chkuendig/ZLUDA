@@ -37,6 +37,7 @@ define amdgpu_kernel void @cvt_rzi(ptr addrspace(4) byref(i64) %"44", ptr addrsp
   %"42" = getelementptr inbounds i8, ptr %"67", i64 4
   %15 = load float, ptr addrspace(5) %"49", align 4
   store float %15, ptr %"42", align 4
+  fence seq_cst
   ret void
 }
 

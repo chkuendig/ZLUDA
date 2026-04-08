@@ -40,6 +40,7 @@ define amdgpu_kernel void @dp2a(ptr addrspace(4) byref(i64) %"46", ptr addrspace
   %14 = load i32, ptr addrspace(5) %"53", align 4
   %"75" = inttoptr i64 %13 to ptr
   store i32 %14, ptr %"75", align 4
+  fence seq_cst
   ret void
 }
 
