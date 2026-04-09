@@ -18,3 +18,4 @@ test_ptx_invalid.rs
 test_ptx_parse.sh
 *.core
 gpucore.*
+ext/dbgapi-src/
