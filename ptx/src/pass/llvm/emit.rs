@@ -647,6 +647,43 @@ impl<'a> MethodEmitContext<'a> {
             ..
         }) = kernel_attrs
         {
+            // Insert a system-scope acquire fence at the start of every
+            // kernel. This pairs with the release fence in `emit_ret` to
+            // give proper cross-kernel release-acquire ordering on AMDGPU.
+            //
+            // On gfx10, AMDGPU's `SIGfx10CacheControl::insertAcquire`
+            // (in SIMemoryLegalizer.cpp) lowers system-scope acquire to
+            // `BUFFER_GL1_INV; BUFFER_GL0_INV` — invalidating the new
+            // wavefront's L0/L1 caches BEFORE the first read. Without
+            // this, a wavefront landing on a WGP that previously ran a
+            // different kernel can read stale L0/L1 cache lines from
+            // before the previous kernel's writes hit L2.
+            //
+            // This is the missing half of the Bug A fix. The exit fence
+            // alone (release + writer-side acquire) only invalidates the
+            // WRITER's L0/L1; it doesn't help the READER on a different
+            // wavefront. Bug A came back in runs 39/40 after the F.6
+            // tracker was disabled, because F.6's `hipMemcpyDtoD` after
+            // every kernel was inadvertently providing the queue-level
+            // acquire/release that's needed. See plan
+            // ~/.claude/plans/eventual-rolling-thunder.md (Phase 6) and
+            // memory project_complete_run_catalog.md.
+            //
+            // Only fires for kernel entries (`kernel_attrs.is_some()`),
+            // not for device function entries — those are called from
+            // within a kernel and inherit its cache state.
+            //
+            // Empty scope string is what AMDGPU LLVM expects for system
+            // scope (matches `get_scope_membar` for `ast::MemScope::Sys`
+            // and matches the `emit_ret` exit fence).
+            unsafe {
+                LLVMZludaBuildFence(
+                    self.builder,
+                    LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                    c"".as_ptr(),
+                    LLVM_UNNAMED.as_ptr(),
+                );
+            }
             if rounding_mode_f32 != ast::RoundingMode::NearestEven
                 || rounding_mode_f16f64 != ast::RoundingMode::NearestEven
             {
