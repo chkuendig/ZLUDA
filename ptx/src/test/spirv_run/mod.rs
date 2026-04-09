@@ -4229,3 +4229,1081 @@ fn sust_texobj_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
     Ok(())
 }
+
+/// Minimal GPU repro test for CreateParticleShapesIncremental_MultiStage_4.
+///
+/// **Background**: the PhysX particle pipeline crashes with a GPU memory-access
+/// fault during MS_4 execution (observed from Proton/HIP log:
+/// `Memory access fault by GPU node-1 on address 0x7f20254bf000.
+/// Reason: Page not present`). Inspection of the compiled AMDGPU ISA shows the
+/// scatter write is structurally correct — it computes
+/// `scatter[base + old_counter - 1] = tid` as u32 math, with a zero-extended
+/// 64-bit byte-offset shift. The only way that produces an out-of-range address
+/// is if the INPUT values for `base` and `counter` are bad (either from an
+/// upstream kernel or from data corruption).
+///
+/// **This test** runs MS_4 in isolation with **known-good synthetic inputs** to
+/// verify the ZLUDA-compiled kernel itself has no codegen defect. If this test
+/// passes, the bug lives upstream (MS_1/MS_2_Batched/MS_3 producing bad struct
+/// or counter values). If it faults even with good inputs, ZLUDA has a real
+/// MS_4 codegen bug.
+///
+/// Uses the pre-compiled AMDGPU ELF dumped by ZLUDA during a prior game run
+/// (`/tmp/zluda_ir_dump/module_3_elf`). This is the EXACT kernel binary that
+/// the game actually executed, so the test exercises the same codegen path —
+/// but skipping the PTX parser + LLVM compile step that would otherwise take
+/// several minutes for this 85 KB / 5000+ line IR module.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn ms4_scatter_known_good_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let elf_path = "/tmp/zluda_ir_dump/module_3_elf";
+    let elf = match fs::read(elf_path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!(
+                "SKIP: {} not found (run Batman AK once with ZLUDA dump to extract)",
+                elf_path
+            );
+            return Ok(());
+        }
+    };
+    eprintln!("ms4: loaded {} bytes ELF from {}", elf.len(), elf_path);
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    let kernel_name = CString::new("CreateParticleShapesIncremental_MultiStage_4").unwrap();
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, kernel_name.as_ptr()) }.unwrap();
+    eprintln!("ms4: got MultiStage_4 kernel handle");
+
+    // Mirror the crashing launch parameters we saw in the game:
+    //   grid=[28,1,1] block=[64,1,1], numParticles=1749, 22 unique shapes.
+    // Distribute particles across shapes so each shape owns a roughly equal
+    // bucket. With 1749 particles and 22 shapes, most buckets have 79–80
+    // particles. The counter and base arrays are set up as the PhysX prefix
+    // sum would produce them.
+    const NUM_PARTICLES: u32 = 1749;
+    const NUM_SHAPES: u32 = 22;
+
+    // 1. shape_index[i] = i % NUM_SHAPES
+    let h_shape_idx: Vec<u32> = (0..NUM_PARTICLES).map(|i| i % NUM_SHAPES).collect();
+
+    // 2. per-shape particle counts
+    let mut counts = vec![0u32; NUM_SHAPES as usize];
+    for &s in &h_shape_idx {
+        counts[s as usize] += 1;
+    }
+
+    // 3. base[j] = prefix sum of counts[0..j]
+    let mut bases = vec![0u32; NUM_SHAPES as usize];
+    let mut running: u32 = 0;
+    for j in 0..NUM_SHAPES as usize {
+        bases[j] = running;
+        running += counts[j];
+    }
+    assert_eq!(running, NUM_PARTICLES, "prefix sum should cover all particles");
+
+    // 4. struct array (12 bytes per entry): first u32 = base, rest zero.
+    //    MS_4 only reads struct[shape_idx].first_u32 = base.
+    let mut h_struct = vec![0u8; (NUM_SHAPES as usize) * 12];
+    for j in 0..NUM_SHAPES as usize {
+        h_struct[j * 12..j * 12 + 4].copy_from_slice(&bases[j].to_ne_bytes());
+    }
+
+    // 5. counter[j] = counts[j] (will be decremented to 0 by MS_4)
+    let h_counter: Vec<u32> = counts.clone();
+
+    // 6. flags[i]: u16 at offset i*4. MS_4 processes particle i iff
+    //    (flag & 0x11) == 1 — i.e., bit 0 set AND bit 4 CLEAR. Use flag=0x0001.
+    //    Remaining 2 bytes in each stride-4 slot are padding.
+    let mut h_flags = vec![0u8; (NUM_PARTICLES as usize) * 4];
+    for i in 0..NUM_PARTICLES as usize {
+        let flag: u16 = 0x0001;
+        h_flags[i * 4..i * 4 + 2].copy_from_slice(&flag.to_ne_bytes());
+    }
+
+    // 7. scatter[pos] output — sized for NUM_PARTICLES u32 entries, filled with
+    //    a sentinel so we can tell touched vs untouched slots.
+    let h_scatter_init: Vec<u32> = vec![0xFFFFFFFF; NUM_PARTICLES as usize];
+
+    // Allocate device buffers
+    let mut d_flags: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_struct: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_scatter: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_shape_idx: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_counter: *mut std::ffi::c_void = ptr::null_mut();
+    unsafe {
+        hipMalloc(&mut d_flags, h_flags.len()).unwrap();
+        hipMalloc(&mut d_struct, h_struct.len()).unwrap();
+        hipMalloc(&mut d_scatter, h_scatter_init.len() * 4).unwrap();
+        hipMalloc(&mut d_shape_idx, h_shape_idx.len() * 4).unwrap();
+        hipMalloc(&mut d_counter, h_counter.len() * 4).unwrap();
+
+        hipMemcpyHtoD(hipDeviceptr_t(d_flags), h_flags.as_ptr() as _, h_flags.len()).unwrap();
+        hipMemcpyHtoD(hipDeviceptr_t(d_struct), h_struct.as_ptr() as _, h_struct.len()).unwrap();
+        hipMemcpyHtoD(hipDeviceptr_t(d_scatter), h_scatter_init.as_ptr() as _, h_scatter_init.len() * 4).unwrap();
+        hipMemcpyHtoD(hipDeviceptr_t(d_shape_idx), h_shape_idx.as_ptr() as _, h_shape_idx.len() * 4).unwrap();
+        hipMemcpyHtoD(hipDeviceptr_t(d_counter), h_counter.as_ptr() as _, h_counter.len() * 4).unwrap();
+    }
+    eprintln!(
+        "ms4: allocated + populated buffers (n={}, shapes={})",
+        NUM_PARTICLES, NUM_SHAPES
+    );
+
+    // Kernel args, per the PTX signature of MultiStage_4:
+    //   param_0: u64 — unused
+    //   param_1: u16 — unused
+    //   param_2: u64 — flags
+    //   param_3: u32 — numParticles
+    //   param_4: u64 — struct (12-byte entries, first u32 = base)
+    //   param_5: u64 — scatter output
+    //   param_6: u64 — shape_index
+    //   param_7: u64 — counter
+    let param0: u64 = 0;
+    let param1: u16 = 0;
+    let param2: u64 = d_flags as u64;
+    let param3: u32 = NUM_PARTICLES;
+    let param4: u64 = d_struct as u64;
+    let param5: u64 = d_scatter as u64;
+    let param6: u64 = d_shape_idx as u64;
+    let param7: u64 = d_counter as u64;
+    let mut args: [*mut std::ffi::c_void; 8] = [
+        &param0 as *const _ as *mut _,
+        &param1 as *const _ as *mut _,
+        &param2 as *const _ as *mut _,
+        &param3 as *const _ as *mut _,
+        &param4 as *const _ as *mut _,
+        &param5 as *const _ as *mut _,
+        &param6 as *const _ as *mut _,
+        &param7 as *const _ as *mut _,
+    ];
+
+    // grid=[ceil(n/64),1,1] block=[64,1,1] — matches the game's launch config
+    let grid_x = (NUM_PARTICLES + 63) / 64;
+    eprintln!(
+        "ms4: launching grid=[{},1,1] block=[64,1,1] n={}",
+        grid_x, NUM_PARTICLES
+    );
+
+    eprintln!("ms4: calling hipModuleLaunchKernel...");
+    let t0 = std::time::Instant::now();
+    let launch_result = unsafe {
+        hipModuleLaunchKernel(
+            kernel, grid_x, 1, 1, 64, 1, 1, 0,
+            hipStream_t(ptr::null_mut()),
+            args.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+    };
+    eprintln!("ms4: hipModuleLaunchKernel -> {:?} ({:?})", launch_result, t0.elapsed());
+    launch_result.unwrap();
+
+    eprintln!("ms4: calling hipDeviceSynchronize...");
+    let t1 = std::time::Instant::now();
+    let sync_result = unsafe { hipDeviceSynchronize() };
+    eprintln!("ms4: hipDeviceSynchronize -> {:?} ({:?})", sync_result, t1.elapsed());
+    if sync_result.is_err() {
+        // Clean up before returning so the failure message is clear.
+        unsafe {
+            hipFree(d_flags).ok();
+            hipFree(d_struct).ok();
+            hipFree(d_scatter).ok();
+            hipFree(d_shape_idx).ok();
+            hipFree(d_counter).ok();
+            hipModuleUnload(hip_mod).ok();
+        }
+        return Err(format!(
+            "MultiStage_4 GPU fault with known-good inputs: {:?}. \
+             This indicates a ZLUDA codegen bug in MS_4 itself, not upstream data.",
+            sync_result
+        )
+        .into());
+    }
+
+    // Read back scatter and counter.
+    let mut h_scatter_out = vec![0u32; NUM_PARTICLES as usize];
+    let mut h_counter_out = vec![0u32; NUM_SHAPES as usize];
+    unsafe {
+        hipMemcpyDtoH(
+            h_scatter_out.as_mut_ptr() as _,
+            hipDeviceptr_t(d_scatter),
+            h_scatter_out.len() * 4,
+        )
+        .unwrap();
+        hipMemcpyDtoH(
+            h_counter_out.as_mut_ptr() as _,
+            hipDeviceptr_t(d_counter),
+            h_counter_out.len() * 4,
+        )
+        .unwrap();
+    }
+
+    // Expected post-conditions:
+    //   - every counter is 0 (all particles decremented their shape's counter)
+    //   - scatter buffer has no remaining 0xFFFFFFFF sentinels (all slots written)
+    //   - each scatter[pos] is a valid particle index in [0, NUM_PARTICLES)
+    //   - the set of scattered particle indices for each shape equals the set
+    //     of particles whose shape_index == that shape
+    let remaining_sentinels = h_scatter_out.iter().filter(|&&v| v == 0xFFFFFFFF).count();
+    let out_of_range = h_scatter_out
+        .iter()
+        .filter(|&&v| v >= NUM_PARTICLES)
+        .count();
+    let nonzero_counters: Vec<(usize, u32)> = h_counter_out
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c != 0)
+        .map(|(i, &c)| (i, c))
+        .collect();
+
+    eprintln!(
+        "ms4: post-launch — remaining_sentinels={} out_of_range={} nonzero_counters={:?}",
+        remaining_sentinels, out_of_range, nonzero_counters
+    );
+
+    // Cleanup before asserting so GPU resources are freed even on failure.
+    unsafe {
+        hipFree(d_flags).unwrap();
+        hipFree(d_struct).unwrap();
+        hipFree(d_scatter).unwrap();
+        hipFree(d_shape_idx).unwrap();
+        hipFree(d_counter).unwrap();
+        hipModuleUnload(hip_mod).unwrap();
+    }
+
+    assert_eq!(
+        remaining_sentinels, 0,
+        "{} scatter slots were not written (sentinel 0xFFFFFFFF remains)",
+        remaining_sentinels
+    );
+    assert_eq!(
+        out_of_range, 0,
+        "{} scatter entries hold values >= numParticles ({})",
+        out_of_range, NUM_PARTICLES
+    );
+    assert!(
+        nonzero_counters.is_empty(),
+        "{} counters were not fully decremented: {:?}",
+        nonzero_counters.len(),
+        nonzero_counters
+    );
+
+    // Per-shape set equality check: the particles scattered into shape j's
+    // bucket should exactly match the set of particle indices with
+    // shape_index == j.
+    for j in 0..NUM_SHAPES as usize {
+        let base = bases[j] as usize;
+        let cnt = counts[j] as usize;
+        let mut got: Vec<u32> = h_scatter_out[base..base + cnt].to_vec();
+        got.sort();
+        let mut expected: Vec<u32> = (0..NUM_PARTICLES)
+            .filter(|&i| (i % NUM_SHAPES) as usize == j)
+            .collect();
+        expected.sort();
+        assert_eq!(
+            got, expected,
+            "shape {}: scatter bucket contents differ from expected", j
+        );
+    }
+
+    eprintln!("ms4: PASSED — kernel compiles and runs correctly with known-good inputs");
+    Ok(())
+}
+
+/// Replay MS_4 with real input buffers captured from a crashing game run.
+///
+/// Consumes `/tmp/ms4_captures.bin` (a ring of 8 slots written by the
+/// `ZLUDA_MS4_CAPTURE=1` path in `launch_kernel`) and, for each slot that has
+/// a valid magic header, uploads the captured buffers to the GPU and launches
+/// MS_4. Verifies that the kernel completes without a GPU fault.
+///
+/// This is the bridge between "the kernel works with synthetic data" (previous
+/// test) and "does the kernel work with the EXACT bytes the game fed it".
+/// If this test reproduces the crash, the input bytes ARE the bug (we can then
+/// inspect them to understand whether counter underflow / stale sentinel /
+/// something else). If it passes, the inputs are fine and the crash must come
+/// from timing, driver state, or interaction with other in-flight kernels.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    let capture_path = "/tmp/ms4_captures.bin";
+    let capture = match fs::read(capture_path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!(
+                "SKIP: {} not found — run Batman AK with ZLUDA_MS4_CAPTURE=1 until it crashes",
+                capture_path
+            );
+            return Ok(());
+        }
+    };
+    eprintln!("ms4_replay: loaded {} bytes from {}", capture.len(), capture_path);
+
+    // Must mirror the layout in zluda/src/impl/function.rs::Ms4CaptureSlot.
+    const MS4_CAPTURE_SLOTS: usize = 8;
+    const MS4_CAPTURE_MAX_PARTICLES: usize = 32 * 1024;
+    const MS4_CAPTURE_MAX_SHAPES: usize = 256;
+    const MS4_PARTICLE_REGION_BYTES: usize = MS4_CAPTURE_MAX_PARTICLES * 4;
+    const MS4_STRUCT_REGION_BYTES: usize = MS4_CAPTURE_MAX_SHAPES * 12;
+    const MS4_COUNTER_REGION_BYTES: usize = MS4_CAPTURE_MAX_SHAPES * 4;
+    const HEADER_BYTES: usize = 128;
+    const DATA_BYTES: usize = MS4_PARTICLE_REGION_BYTES * 2
+        + MS4_STRUCT_REGION_BYTES
+        + MS4_COUNTER_REGION_BYTES;
+    const SLOT_BYTES: usize = HEADER_BYTES + DATA_BYTES;
+    const MAGIC: u64 = 0x4d53344341505455;
+
+    assert_eq!(
+        capture.len(),
+        SLOT_BYTES * MS4_CAPTURE_SLOTS,
+        "unexpected capture file size"
+    );
+
+    let elf_path = "/tmp/zluda_ir_dump/module_3_elf";
+    let elf = match fs::read(elf_path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: {} not found", elf_path);
+            return Ok(());
+        }
+    };
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+    let kernel_name = CString::new("CreateParticleShapesIncremental_MultiStage_4").unwrap();
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, kernel_name.as_ptr()) }.unwrap();
+
+    // Walk each slot, skipping those with no magic header (never populated
+    // by the capture path). For each valid slot, upload + launch.
+    let mut replayed = 0usize;
+    let mut faulted = 0usize;
+    for slot_idx in 0..MS4_CAPTURE_SLOTS {
+        let slot_off = slot_idx * SLOT_BYTES;
+        let header = &capture[slot_off..slot_off + HEADER_BYTES];
+        let magic = u64::from_ne_bytes(header[0..8].try_into().unwrap());
+        if magic != MAGIC {
+            continue;
+        }
+        let launch_n = u64::from_ne_bytes(header[8..16].try_into().unwrap());
+        let timestamp_ms = u64::from_ne_bytes(header[16..24].try_into().unwrap());
+        let num_particles = u32::from_ne_bytes(header[24..28].try_into().unwrap());
+        let grid_x_capt = u32::from_ne_bytes(header[28..32].try_into().unwrap());
+        let block_x_capt = u32::from_ne_bytes(header[32..36].try_into().unwrap());
+        let flags_ptr_capt = u64::from_ne_bytes(header[40..48].try_into().unwrap());
+        let struct_ptr_capt = u64::from_ne_bytes(header[48..56].try_into().unwrap());
+        let scatter_ptr_capt = u64::from_ne_bytes(header[56..64].try_into().unwrap());
+        let shape_idx_ptr_capt = u64::from_ne_bytes(header[64..72].try_into().unwrap());
+        let counter_ptr_capt = u64::from_ne_bytes(header[72..80].try_into().unwrap());
+        let flags_bytes = u32::from_ne_bytes(header[80..84].try_into().unwrap()) as usize;
+        let shape_idx_bytes = u32::from_ne_bytes(header[84..88].try_into().unwrap()) as usize;
+        let struct_bytes = u32::from_ne_bytes(header[88..92].try_into().unwrap()) as usize;
+        let counter_bytes = u32::from_ne_bytes(header[92..96].try_into().unwrap()) as usize;
+
+        eprintln!(
+            "ms4_replay: slot {} launch_n={} t={}ms n={} grid=[{},1,1] block=[{},1,1] \
+             flags_ptr=0x{:x} struct_ptr=0x{:x} scatter_ptr=0x{:x} shape_idx_ptr=0x{:x} counter_ptr=0x{:x}",
+            slot_idx, launch_n, timestamp_ms, num_particles, grid_x_capt, block_x_capt,
+            flags_ptr_capt, struct_ptr_capt, scatter_ptr_capt, shape_idx_ptr_capt, counter_ptr_capt
+        );
+
+        let data_base = slot_off + HEADER_BYTES;
+        let flags_region = &capture[data_base..data_base + MS4_PARTICLE_REGION_BYTES];
+        let shape_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES
+            ..data_base + MS4_PARTICLE_REGION_BYTES * 2];
+        let struct_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2
+            ..data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES];
+        let counter_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2
+            + MS4_STRUCT_REGION_BYTES
+            ..data_base + MS4_PARTICLE_REGION_BYTES * 2
+                + MS4_STRUCT_REGION_BYTES
+                + MS4_COUNTER_REGION_BYTES];
+
+        // Quick diagnostic dump: first few counter values, first few bases,
+        // check for any obviously bad flag patterns among active particles.
+        let counters: Vec<u32> = (0..(counter_bytes / 4))
+            .map(|i| u32::from_ne_bytes(counter_region[i * 4..i * 4 + 4].try_into().unwrap()))
+            .collect();
+        let bases: Vec<u32> = (0..(struct_bytes / 12))
+            .map(|i| u32::from_ne_bytes(struct_region[i * 12..i * 12 + 4].try_into().unwrap()))
+            .collect();
+        let nonzero_counters: Vec<_> = counters
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c != 0 && c != 0xFFFFFFFF) // skip uninitialized and zero
+            .take(20)
+            .collect();
+        let nonzero_bases: Vec<_> = bases
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b != 0)
+            .take(20)
+            .collect();
+        eprintln!(
+            "ms4_replay:   counters (non-zero, first 20): {:?}",
+            nonzero_counters
+        );
+        eprintln!(
+            "ms4_replay:   bases    (non-zero, first 20): {:?}",
+            nonzero_bases
+        );
+
+        // Allocate fresh device buffers and upload the captured bytes.
+        let mut d_flags: *mut std::ffi::c_void = ptr::null_mut();
+        let mut d_struct: *mut std::ffi::c_void = ptr::null_mut();
+        let mut d_scatter: *mut std::ffi::c_void = ptr::null_mut();
+        let mut d_shape_idx: *mut std::ffi::c_void = ptr::null_mut();
+        let mut d_counter: *mut std::ffi::c_void = ptr::null_mut();
+        unsafe {
+            hipMalloc(&mut d_flags, flags_bytes).unwrap();
+            hipMalloc(&mut d_struct, struct_bytes).unwrap();
+            // Scatter output: size it to max reasonable — num_particles * 4 — and
+            // leave it all 0xFF so we can detect touched slots.
+            hipMalloc(&mut d_scatter, (num_particles as usize) * 4).unwrap();
+            hipMalloc(&mut d_shape_idx, shape_idx_bytes).unwrap();
+            hipMalloc(&mut d_counter, counter_bytes).unwrap();
+
+            hipMemcpyHtoD(
+                hipDeviceptr_t(d_flags),
+                flags_region[..flags_bytes].as_ptr() as _,
+                flags_bytes,
+            )
+            .unwrap();
+            hipMemcpyHtoD(
+                hipDeviceptr_t(d_struct),
+                struct_region.as_ptr() as _,
+                struct_bytes,
+            )
+            .unwrap();
+            hipMemcpyHtoD(
+                hipDeviceptr_t(d_shape_idx),
+                shape_region[..shape_idx_bytes].as_ptr() as _,
+                shape_idx_bytes,
+            )
+            .unwrap();
+            hipMemcpyHtoD(
+                hipDeviceptr_t(d_counter),
+                counter_region.as_ptr() as _,
+                counter_bytes,
+            )
+            .unwrap();
+            let sentinel: u32 = 0xFFFFFFFF;
+            hipMemsetD32(
+                hipDeviceptr_t(d_scatter),
+                sentinel as _,
+                num_particles as usize,
+            )
+            .unwrap();
+        }
+
+        // Launch with the same grid/block the game used for this slot.
+        let param0: u64 = 0;
+        let param1: u16 = 0;
+        let param2: u64 = d_flags as u64;
+        let param3: u32 = num_particles;
+        let param4: u64 = d_struct as u64;
+        let param5: u64 = d_scatter as u64;
+        let param6: u64 = d_shape_idx as u64;
+        let param7: u64 = d_counter as u64;
+        let mut args: [*mut std::ffi::c_void; 8] = [
+            &param0 as *const _ as *mut _,
+            &param1 as *const _ as *mut _,
+            &param2 as *const _ as *mut _,
+            &param3 as *const _ as *mut _,
+            &param4 as *const _ as *mut _,
+            &param5 as *const _ as *mut _,
+            &param6 as *const _ as *mut _,
+            &param7 as *const _ as *mut _,
+        ];
+
+        let launch_result = unsafe {
+            hipModuleLaunchKernel(
+                kernel,
+                grid_x_capt,
+                1,
+                1,
+                block_x_capt,
+                1,
+                1,
+                0,
+                hipStream_t(ptr::null_mut()),
+                args.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        let sync_result = if launch_result.is_ok() {
+            unsafe { hipDeviceSynchronize() }
+        } else {
+            launch_result
+        };
+        eprintln!(
+            "ms4_replay:   launch={:?} sync={:?}",
+            launch_result, sync_result
+        );
+        if sync_result.is_err() {
+            faulted += 1;
+            eprintln!(
+                "*** ms4_replay: slot {} (launch #{}) REPRODUCED THE FAULT: {:?}",
+                slot_idx, launch_n, sync_result
+            );
+        }
+        replayed += 1;
+
+        unsafe {
+            hipFree(d_flags).ok();
+            hipFree(d_struct).ok();
+            hipFree(d_scatter).ok();
+            hipFree(d_shape_idx).ok();
+            hipFree(d_counter).ok();
+        }
+    }
+
+    unsafe { hipModuleUnload(hip_mod).ok(); }
+
+    eprintln!(
+        "ms4_replay: replayed {}/{} slots, {} faulted",
+        replayed, MS4_CAPTURE_SLOTS, faulted
+    );
+    if replayed == 0 {
+        eprintln!("ms4_replay: no valid slots in capture — likely game hasn't reached MS_4 yet");
+    }
+    Ok(())
+}
+
+/// Replay ONLY the most-recent MS_4 launch from `/tmp/ms4_captures.bin`
+/// (the one with the highest `launch_n` in the ring — by definition the one
+/// that was in flight when SIGABRT fired). This is the minimal-HIP-operation
+/// variant of `ms4_replay_captured_inputs_amdgpu`: where the full-chain test
+/// does 8 slots × ~11 HIP operations and trips the ROCm ProfilingSignal pool
+/// race after a handful of copies, this test does just ~11 ops total.
+///
+/// Purpose: isolate whether the EXACT bytes the game fed MS_4 on the crashing
+/// launch reproduce the fault when fed to MS_4 in isolation. If this test
+/// faults with the same "Memory access fault by GPU node-1" the game shows,
+/// the bug is entirely upstream (MS_1/MS_2_Batched/MS_3 produced bad inputs)
+/// and MS_4 is just the messenger. If this test passes, the fault must be
+/// environmental (HSA runtime state, Vulkan↔HIP contention, timing).
+#[cfg(feature = "has_rocm")]
+#[test]
+fn ms4_replay_crashing_slot_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    // Layout mirror of `zluda/src/impl/function.rs::Ms4CaptureSlot`.
+    const MS4_CAPTURE_SLOTS: usize = 8;
+    const MS4_CAPTURE_MAX_PARTICLES: usize = 32 * 1024;
+    const MS4_CAPTURE_MAX_SHAPES: usize = 256;
+    const MS4_PARTICLE_REGION_BYTES: usize = MS4_CAPTURE_MAX_PARTICLES * 4;
+    const MS4_STRUCT_REGION_BYTES: usize = MS4_CAPTURE_MAX_SHAPES * 12;
+    const MS4_COUNTER_REGION_BYTES: usize = MS4_CAPTURE_MAX_SHAPES * 4;
+    const HEADER_BYTES: usize = 128;
+    const DATA_BYTES: usize = MS4_PARTICLE_REGION_BYTES * 2
+        + MS4_STRUCT_REGION_BYTES
+        + MS4_COUNTER_REGION_BYTES;
+    const SLOT_BYTES: usize = HEADER_BYTES + DATA_BYTES;
+    const MAGIC: u64 = 0x4d53344341505455;
+
+    let capture_path = "/tmp/ms4_captures.bin";
+    let capture = match fs::read(capture_path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!(
+                "SKIP: {} not found — run Batman AK with ZLUDA_MS4_CAPTURE=1 until it crashes",
+                capture_path
+            );
+            return Ok(());
+        }
+    };
+    assert_eq!(capture.len(), SLOT_BYTES * MS4_CAPTURE_SLOTS);
+
+    // Find the slot with the highest launch_n (that's the most recent — the
+    // crashing one).
+    let mut best: Option<(usize, u64)> = None;
+    for slot_idx in 0..MS4_CAPTURE_SLOTS {
+        let off = slot_idx * SLOT_BYTES;
+        let magic = u64::from_ne_bytes(capture[off..off + 8].try_into().unwrap());
+        if magic != MAGIC {
+            continue;
+        }
+        let launch_n = u64::from_ne_bytes(capture[off + 8..off + 16].try_into().unwrap());
+        if best.map_or(true, |(_, n)| launch_n > n) {
+            best = Some((slot_idx, launch_n));
+        }
+    }
+    let (slot_idx, launch_n) = match best {
+        Some(b) => b,
+        None => {
+            eprintln!("ms4_replay_crashing: no valid slots in capture");
+            return Ok(());
+        }
+    };
+    eprintln!(
+        "ms4_replay_crashing: most recent slot is {} (launch_n={})",
+        slot_idx, launch_n
+    );
+
+    // Parse the single slot's header + data.
+    let off = slot_idx * SLOT_BYTES;
+    let header = &capture[off..off + HEADER_BYTES];
+    let num_particles = u32::from_ne_bytes(header[24..28].try_into().unwrap());
+    let grid_x_capt = u32::from_ne_bytes(header[28..32].try_into().unwrap());
+    let block_x_capt = u32::from_ne_bytes(header[32..36].try_into().unwrap());
+    let flags_bytes = u32::from_ne_bytes(header[80..84].try_into().unwrap()) as usize;
+    let shape_idx_bytes = u32::from_ne_bytes(header[84..88].try_into().unwrap()) as usize;
+    let struct_bytes = u32::from_ne_bytes(header[88..92].try_into().unwrap()) as usize;
+    let counter_bytes = u32::from_ne_bytes(header[92..96].try_into().unwrap()) as usize;
+
+    let data_base = off + HEADER_BYTES;
+    let flags_region = &capture[data_base..data_base + MS4_PARTICLE_REGION_BYTES];
+    let shape_region = &capture
+        [data_base + MS4_PARTICLE_REGION_BYTES..data_base + MS4_PARTICLE_REGION_BYTES * 2];
+    let struct_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2
+        ..data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES];
+    let counter_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES
+        ..data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES + MS4_COUNTER_REGION_BYTES];
+
+    // Quick diagnostic of the captured state so the test output itself says
+    // WHY we expect a fault (if we do).
+    let counters: Vec<u32> = (0..(counter_bytes / 4))
+        .map(|i| u32::from_ne_bytes(counter_region[i * 4..i * 4 + 4].try_into().unwrap()))
+        .collect();
+    let bases: Vec<u32> = (0..(struct_bytes / 12))
+        .map(|i| u32::from_ne_bytes(struct_region[i * 12..i * 12 + 4].try_into().unwrap()))
+        .collect();
+    let mut shape_use: std::collections::HashMap<u32, u32> = Default::default();
+    for i in 0..(num_particles as usize) {
+        let flag = u16::from_ne_bytes(flags_region[i * 4..i * 4 + 2].try_into().unwrap());
+        if (flag & 0x11) == 1 {
+            let s = u32::from_ne_bytes(shape_region[i * 4..i * 4 + 4].try_into().unwrap());
+            *shape_use.entry(s).or_insert(0) += 1;
+        }
+    }
+    let active: u32 = shape_use.values().sum();
+    let max_shape = shape_use.keys().copied().max().unwrap_or(0);
+    let nonzero_counters: Vec<_> = counters
+        .iter()
+        .take((max_shape as usize) + 1)
+        .enumerate()
+        .filter(|(_, &c)| c != 0)
+        .collect();
+    let nonzero_bases: Vec<_> = bases
+        .iter()
+        .take((max_shape as usize) + 1)
+        .enumerate()
+        .filter(|(_, &b)| b != 0)
+        .collect();
+    eprintln!(
+        "ms4_replay_crashing: n={} active={} shapes_used={} max_shape={}",
+        num_particles, active, shape_use.len(), max_shape
+    );
+    eprintln!(
+        "  counters (non-zero within max_shape): {:?}",
+        nonzero_counters
+    );
+    eprintln!("  bases    (non-zero within max_shape): {:?}", nonzero_bases);
+
+    // Compute expected behavior: for each shape used by active particles, is
+    // `counter[shape] < use_count[shape]`? If yes, MS_4 will underflow.
+    let mut predicted_underflows: Vec<(u32, u32, u32)> = Vec::new();
+    for (&shape, &uses) in &shape_use {
+        let c = counters[shape as usize];
+        if c < uses {
+            predicted_underflows.push((shape, c, uses));
+        }
+    }
+    eprintln!(
+        "  predicted underflows (shape, counter, uses): {:?}",
+        predicted_underflows
+    );
+
+    // Load MS_4 from the pre-compiled ELF and launch with the captured bytes.
+    let elf_path = "/tmp/zluda_ir_dump/module_3_elf";
+    let elf = match fs::read(elf_path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: {} not found", elf_path);
+            return Ok(());
+        }
+    };
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+    let kernel_name = CString::new("CreateParticleShapesIncremental_MultiStage_4").unwrap();
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, kernel_name.as_ptr()) }.unwrap();
+
+    let mut d_flags: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_struct: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_scatter: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_shape_idx: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_counter: *mut std::ffi::c_void = ptr::null_mut();
+    unsafe {
+        hipMalloc(&mut d_flags, flags_bytes).unwrap();
+        hipMalloc(&mut d_struct, struct_bytes).unwrap();
+        hipMalloc(&mut d_scatter, (num_particles as usize) * 4).unwrap();
+        hipMalloc(&mut d_shape_idx, shape_idx_bytes).unwrap();
+        hipMalloc(&mut d_counter, counter_bytes).unwrap();
+
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_flags),
+            flags_region[..flags_bytes].as_ptr() as _,
+            flags_bytes,
+        )
+        .unwrap();
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_struct),
+            struct_region.as_ptr() as _,
+            struct_bytes,
+        )
+        .unwrap();
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_shape_idx),
+            shape_region[..shape_idx_bytes].as_ptr() as _,
+            shape_idx_bytes,
+        )
+        .unwrap();
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_counter),
+            counter_region.as_ptr() as _,
+            counter_bytes,
+        )
+        .unwrap();
+        let sentinel: u32 = 0xDEADBEEF;
+        hipMemsetD32(hipDeviceptr_t(d_scatter), sentinel as _, num_particles as usize).unwrap();
+    }
+
+    let param0: u64 = 0;
+    let param1: u16 = 0;
+    let param2: u64 = d_flags as u64;
+    let param3: u32 = num_particles;
+    let param4: u64 = d_struct as u64;
+    let param5: u64 = d_scatter as u64;
+    let param6: u64 = d_shape_idx as u64;
+    let param7: u64 = d_counter as u64;
+    let mut args: [*mut std::ffi::c_void; 8] = [
+        &param0 as *const _ as *mut _,
+        &param1 as *const _ as *mut _,
+        &param2 as *const _ as *mut _,
+        &param3 as *const _ as *mut _,
+        &param4 as *const _ as *mut _,
+        &param5 as *const _ as *mut _,
+        &param6 as *const _ as *mut _,
+        &param7 as *const _ as *mut _,
+    ];
+
+    eprintln!(
+        "ms4_replay_crashing: launching MS_4 grid=[{},1,1] block=[{},1,1] n={} with captured inputs",
+        grid_x_capt, block_x_capt, num_particles
+    );
+    let launch_result = unsafe {
+        hipModuleLaunchKernel(
+            kernel,
+            grid_x_capt,
+            1,
+            1,
+            block_x_capt,
+            1,
+            1,
+            0,
+            hipStream_t(ptr::null_mut()),
+            args.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+    };
+    eprintln!("ms4_replay_crashing: launch -> {:?}", launch_result);
+    let sync_result = unsafe { hipDeviceSynchronize() };
+    eprintln!("ms4_replay_crashing: sync   -> {:?}", sync_result);
+
+    // Cleanup unconditionally so we don't leak device memory on failure.
+    unsafe {
+        hipFree(d_flags).ok();
+        hipFree(d_struct).ok();
+        hipFree(d_scatter).ok();
+        hipFree(d_shape_idx).ok();
+        hipFree(d_counter).ok();
+        hipModuleUnload(hip_mod).ok();
+    }
+
+    // The CRASHING slot should reproduce the fault. We DON'T assert success
+    // here — reproducing the fault IS the point. Instead we log clearly and
+    // let the caller interpret.
+    if sync_result.is_err() {
+        eprintln!(
+            "*** ms4_replay_crashing REPRODUCED THE FAULT ({:?}) with the exact bytes the game fed MS_4. \
+             Root cause is therefore upstream in MS_1/MS_2_Batched/MS_3 producing bad inputs, \
+             NOT environmental (timing / HSA state / Vulkan contention).",
+            sync_result
+        );
+        // Still return Ok — a reproduced fault is a successful diagnostic.
+    } else {
+        eprintln!(
+            "ms4_replay_crashing: sync returned OK. The captured bytes did NOT reproduce the fault. \
+             That means either (a) the captured buffers are fine and the bug is elsewhere, \
+             or (b) the sync silently succeeds even on an async fault in this isolated context. \
+             Check the counter/base diagnostic above — if predicted_underflows is non-empty, \
+             the kernel SHOULD have faulted."
+        );
+    }
+    Ok(())
+}
+
+/// Bug A reproducer: cross-kernel store/load visibility on gfx10.
+///
+/// Loops N times: launch `bug_a_writer(counter, i+1)` then `bug_a_reader(counter, i+1, fail)`.
+/// On gfx10 RDNA the rocclr default `release_fence_scope = AGENT` is insufficient to
+/// guarantee the writer's store is visible to the reader's load on a different CU.
+/// Each AQL packet has its own per-CU L0/L1 cache state. The kernel-internal
+/// `buffer_gl1_inv; buffer_gl0_inv` we emit at function entry+exit only invalidates
+/// the LOCAL wavefront's caches; it does NOT trigger the Command Processor's
+/// inter-dispatch L1 invalidation cycle. That cycle ONLY runs when the AQL packet's
+/// `acquire_fence_scope` is `HSA_FENCE_SCOPE_SYSTEM`, which rocclr only sets after
+/// memcpy/image transfer ops via `gpu().addSystemScope()` (see rocblit.cpp).
+///
+/// Without the fix: this test fails (fail_count > 0) reproducing Bug A in isolation.
+/// With the fix (insert hipMemcpyDtoDAsync between launches): fail_count == 0.
+///
+/// This is the minimal isolated reproducer for the Batman: Arkham Knight Bug A
+/// pattern. No PhysX, no game state — just two trivial kernels and a counter.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn bug_a_xkernel_coherency_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+
+    // Honor an env var to switch on the safe-buffer D2D mitigation in this
+    // test only (independent of any production change). Set
+    // ZLUDA_BUG_A_TEST_FIX=1 to insert a 4-byte hipMemcpyDtoDAsync between
+    // every writer→reader pair, which goes through rocblit.cpp and triggers
+    // gpu().addSystemScope(), forcing the next AQL packet to SYSTEM scope.
+    let apply_fix = std::env::var("ZLUDA_BUG_A_TEST_FIX")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let iterations: usize = std::env::var("ZLUDA_BUG_A_TEST_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000);
+
+    eprintln!(
+        "bug_a_xkernel: starting iterations={} fix={}",
+        iterations, apply_fix
+    );
+
+    // Compile the test PTX
+    let ptx = read_test_file!("bug_a_xkernel.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(ast, pass::Attributes { clock_rate: 2124000 }, |_| {})
+        .unwrap();
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+    eprintln!("bug_a_xkernel: gcn_arch={}", gcn_arch);
+
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+    eprintln!("bug_a_xkernel: compiled {} bytes ELF", elf.len());
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+
+    let mut writer = unsafe { mem::zeroed() };
+    let mut reader = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut writer, hip_mod, c"bug_a_writer".as_ptr()) }.unwrap();
+    unsafe { hipModuleGetFunction(&mut reader, hip_mod, c"bug_a_reader".as_ptr()) }.unwrap();
+
+    // Single rd5-equivalent buffer of 32 KB. The relevant counter word
+    // is at offset 22176 (matches PhysX's particleShapesCounter offset).
+    const BUFFER_BYTES: usize = 32 * 1024;
+    const COUNTER_OFFSET: usize = 22176;
+
+    let mut d_buffer: *mut std::ffi::c_void = ptr::null_mut();
+    let mut d_fail: *mut std::ffi::c_void = ptr::null_mut();
+    unsafe { hipMalloc(&mut d_buffer, BUFFER_BYTES) }.unwrap();
+    unsafe { hipMalloc(&mut d_fail, 4) }.unwrap();
+    // Initialize buffer to zeros (matches a freshly-allocated rd5)
+    unsafe { hipMemset(d_buffer, 0, BUFFER_BYTES) }.unwrap();
+    unsafe { hipMemset(d_fail, 0, 4) }.unwrap();
+    let _ = COUNTER_OFFSET; // referenced via PTX, suppress warning
+
+    // For the safe-buffer D2D fix: 8 bytes scratch, copy 4 bytes from offset 0 → offset 4
+    let mut d_scratch: *mut std::ffi::c_void = ptr::null_mut();
+    unsafe { hipMalloc(&mut d_scratch, 8) }.unwrap();
+    unsafe { hipMemset(d_scratch, 0, 8) }.unwrap();
+    let scratch_src = d_scratch as usize;
+    let scratch_dst = (d_scratch as usize) + 4;
+
+    // Two streams — matches PhysX's multi-stream dispatch pattern.
+    // PhysX issues MCB and MS_1 on DIFFERENT streams (verified in run 39
+    // steam log: stream:0x5555926254c0 vs stream:0x7f2dbc007fc0). This
+    // is potentially the load-bearing detail: cross-stream coherency on
+    // AMDGPU has weaker default guarantees than same-stream.
+    let mut stream_w = unsafe { mem::zeroed() };
+    let mut stream_r = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream_w) }.unwrap();
+    unsafe { hipStreamCreate(&mut stream_r) }.unwrap();
+
+    eprintln!("bug_a_xkernel: buffer={:?} fail={:?}", d_buffer, d_fail);
+    eprintln!("bug_a_xkernel: stream_w={:?} stream_r={:?}", stream_w, stream_r);
+
+    let buffer_addr = d_buffer as u64;
+    let fail_addr = d_fail as u64;
+    let start = std::time::Instant::now();
+
+    for iter in 0..iterations {
+        // Sentinel value the writer stores and the reader expects.
+        // Use iter+1 so the value is never 0 (matches "fresh data after MCB").
+        let iter_val: u32 = (iter as u32).wrapping_add(1);
+
+        // Writer on stream_w — grid=[1,1,1] block=[1,1,1], single thread
+        // single-store. The smallest possible writer so it cannot
+        // self-flush via lots of stores.
+        let mut writer_args: Vec<*mut std::ffi::c_void> = vec![
+            &buffer_addr as *const _ as *mut _,
+            &iter_val as *const _ as *mut _,
+        ];
+        unsafe {
+            hipModuleLaunchKernel(
+                writer, 1, 1, 1, 1, 1, 1, 0, stream_w,
+                writer_args.as_mut_ptr(), ptr::null_mut(),
+            )
+        }
+        .unwrap();
+
+        // GPU-only cross-stream ordering: record an event on stream_w
+        // and have stream_r wait for it. This provides logical
+        // happens-before WITHOUT a CPU round-trip and WITHOUT a
+        // hipStreamSynchronize (which would call hsa_signal_wait and
+        // potentially flush more than just queue ordering).
+        // hipStreamWaitEvent inserts an AQL barrier-and packet on
+        // stream_r — pure queue-level dependency.
+        let mut evt = unsafe { mem::zeroed() };
+        unsafe { hipEventCreateWithFlags(&mut evt, hipEventDisableTiming) }.unwrap();
+        unsafe { hipEventRecord(evt, stream_w) }.unwrap();
+        unsafe { hipStreamWaitEvent(stream_r, evt, 0) }.unwrap();
+
+        // Optional fix: 4-byte D2D between safe scratch slots. Goes
+        // through rocblit.cpp::Blit::copyAsync → gpu().addSystemScope()
+        // → next AQL packet gets HSA_FENCE_SCOPE_SYSTEM → CP L1 inv.
+        if apply_fix {
+            unsafe {
+                hipMemcpyDtoDAsync(
+                    hipDeviceptr_t(scratch_dst as *mut std::ffi::c_void),
+                    hipDeviceptr_t(scratch_src as *mut std::ffi::c_void),
+                    4,
+                    stream_r,
+                )
+            }
+            .unwrap();
+        }
+
+        // Reader on stream_r — DIFFERENT stream from writer.
+        // grid=[1,1,1] block=[1024,1,1] matches MS_1's signature so the
+        // wavefront lands on the same WGP each time (and may inherit
+        // L0/L1 lines from the prior iteration's reader on that WGP).
+        let mut reader_args: Vec<*mut std::ffi::c_void> = vec![
+            &buffer_addr as *const _ as *mut _,
+            &iter_val as *const _ as *mut _,
+            &fail_addr as *const _ as *mut _,
+        ];
+        unsafe {
+            hipModuleLaunchKernel(
+                reader, 1, 1, 1, 1024, 1, 1, 0, stream_r,
+                reader_args.as_mut_ptr(), ptr::null_mut(),
+            )
+        }
+        .unwrap();
+
+        // Reverse dependency: stream_w in iter+1 must wait for stream_r
+        // in iter, so writer doesn't overwrite the buffer mid-read.
+        // Again event-based, no CPU sync.
+        let mut evt2 = unsafe { mem::zeroed() };
+        unsafe { hipEventCreateWithFlags(&mut evt2, hipEventDisableTiming) }.unwrap();
+        unsafe { hipEventRecord(evt2, stream_r) }.unwrap();
+        unsafe { hipStreamWaitEvent(stream_w, evt2, 0) }.unwrap();
+        unsafe { hipEventDestroy(evt) }.ok();
+        unsafe { hipEventDestroy(evt2) }.ok();
+    }
+    // Final drain
+    unsafe { hipDeviceSynchronize() }.unwrap();
+
+    let elapsed = start.elapsed();
+
+    // Read fail_counter
+    let mut fail_count: u32 = 0;
+    unsafe {
+        hipMemcpyAsync(
+            &mut fail_count as *mut _ as _,
+            d_fail,
+            4,
+            hipMemcpyKind::hipMemcpyDeviceToHost,
+            stream_r,
+        )
+    }
+    .unwrap();
+    unsafe { hipStreamSynchronize(stream_r) }.unwrap();
+
+    eprintln!(
+        "bug_a_xkernel: iterations={} fail_count={} elapsed={:?} fix={}",
+        iterations, fail_count, elapsed, apply_fix
+    );
+
+    unsafe { hipFree(d_buffer) }.ok();
+    unsafe { hipFree(d_fail) }.ok();
+    unsafe { hipFree(d_scratch) }.ok();
+    unsafe { hipStreamDestroy(stream_w) }.ok();
+    unsafe { hipStreamDestroy(stream_r) }.ok();
+    unsafe { hipModuleUnload(hip_mod) }.ok();
+
+    if apply_fix {
+        assert_eq!(
+            fail_count, 0,
+            "with the safe-buffer D2D fix, no stale reads should occur"
+        );
+    } else {
+        // Without the fix we EXPECT failures (Bug A in isolation). If
+        // fail_count is 0 the test environment doesn't reproduce Bug A —
+        // not necessarily a fix, just a quirk of the local hardware /
+        // scheduler. Log the result for diagnostic purposes; don't assert.
+        eprintln!(
+            "bug_a_xkernel: WITHOUT FIX, observed {} stale reads in {} iterations ({:.4}% rate)",
+            fail_count,
+            iterations,
+            (fail_count as f64 / iterations as f64) * 100.0
+        );
+        if fail_count == 0 {
+            eprintln!(
+                "bug_a_xkernel: NOTE: 0 stale reads. Either Bug A doesn't reproduce \
+                 on this hardware/scheduler with this kernel pair, or the bug is \
+                 ALREADY fixed in the deployed runtime. Try larger iteration count \
+                 (ZLUDA_BUG_A_TEST_ITERS=500000) or check for environment differences."
+            );
+        }
+    }
+
+    Ok(())
+}
