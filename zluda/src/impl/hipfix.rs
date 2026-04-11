@@ -55,15 +55,18 @@ use hip_runtime_sys::{
 
 #[must_use]
 pub(crate) fn get_non_broken_format(format: hipArray_Format) -> (u32, hipArray_Format) {
-    use hipArray_Format as F;
-    // hack_flag values are intentionally the same as lsh's so any future port
-    // of the array.textureType encoding stays compatible.
-    match format {
-        F::HIP_AD_FORMAT_HALF => (2, F::HIP_AD_FORMAT_UNSIGNED_INT16),
-        F::HIP_AD_FORMAT_SIGNED_INT16 => (1, F::HIP_AD_FORMAT_UNSIGNED_INT16),
-        F::HIP_AD_FORMAT_SIGNED_INT8 => (1, F::HIP_AD_FORMAT_UNSIGNED_INT8),
-        f => (0, f),
-    }
+    // PASSTHROUGH TEST (2026-04-11): earlier runs showed that current ROCm
+    // accepts HALF format at `hipTexRefSetFormat` (res=Ok(())), and the legacy
+    // `cuTexRef` path has no `HIP_RESOURCE_VIEW_DESC` equivalent to invert
+    // the substitution. If `hipArrayCreate` also accepts these formats, the
+    // whole substitution machinery is unnecessary and actively breaks
+    // TurbulenceFS HALF4 texref sampling. Revert this to the match below if
+    // `hipArrayCreate(HALF)` fails:
+    //
+    //     F::HIP_AD_FORMAT_HALF => (2, F::HIP_AD_FORMAT_UNSIGNED_INT16),
+    //     F::HIP_AD_FORMAT_SIGNED_INT16 => (1, F::HIP_AD_FORMAT_UNSIGNED_INT16),
+    //     F::HIP_AD_FORMAT_SIGNED_INT8 => (1, F::HIP_AD_FORMAT_UNSIGNED_INT8),
+    (0, format)
 }
 
 /// Inverse: given a hack_flag and the (possibly already-transformed) format,
@@ -278,3 +281,339 @@ pub(crate) unsafe fn maybe_build_view_desc(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    //! Synthetic regression tests for the format inverse-transform machinery
+    //! ported from lshqqytiger/master in commit 3a203a3c. These do not require
+    //! a GPU and exercise the pure logic + side-table behavior.
+    //!
+    //! The bug they guard against: HIP silently rejects HALF / SIGNED_INT8 /
+    //! SIGNED_INT16 array formats. We rewrite them to the matching UNSIGNED
+    //! variant at hipArrayCreate time, then UN-rewrite at cuTexObjectCreate
+    //! time via a HIP_RESOURCE_VIEW_DESC so the sampler interprets the bytes
+    //! correctly. If either half of the transform regresses, TurbulenceFS
+    //! grids in PhysX will read garbage and games will scatter-write OOB.
+    //!
+    //! See `project_physx_ms4_root_cause_turbulencefs.md` for the original
+    //! crash this fixed.
+    use super::*;
+    use hip_runtime_sys::hipArray_Format as F;
+    use hip_runtime_sys::HIPresourceViewFormat_enum as V;
+
+    // ----- get_non_broken_format ---------------------------------------------
+
+    // PASSTHROUGH TEST (2026-04-11): these three tests assert the legacy
+    // substitution behavior. The function now passes all formats through
+    // unchanged — revert the `#[ignore]`s and the function body together
+    // if `hipArrayCreate(HALF)` actually requires substitution.
+    #[test]
+    #[ignore]
+    fn forward_transform_half_to_uint16() {
+        assert_eq!(
+            get_non_broken_format(F::HIP_AD_FORMAT_HALF),
+            (2, F::HIP_AD_FORMAT_UNSIGNED_INT16)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn forward_transform_signed_int16_to_uint16() {
+        assert_eq!(
+            get_non_broken_format(F::HIP_AD_FORMAT_SIGNED_INT16),
+            (1, F::HIP_AD_FORMAT_UNSIGNED_INT16)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn forward_transform_signed_int8_to_uint8() {
+        assert_eq!(
+            get_non_broken_format(F::HIP_AD_FORMAT_SIGNED_INT8),
+            (1, F::HIP_AD_FORMAT_UNSIGNED_INT8)
+        );
+    }
+
+    #[test]
+    fn forward_transform_passthrough_for_safe_formats() {
+        // Formats HIP handles natively must NOT be transformed; otherwise we
+        // would corrupt the format <-> view-desc agreement for plain arrays.
+        for fmt in [
+            F::HIP_AD_FORMAT_UNSIGNED_INT8,
+            F::HIP_AD_FORMAT_UNSIGNED_INT16,
+            F::HIP_AD_FORMAT_UNSIGNED_INT32,
+            F::HIP_AD_FORMAT_SIGNED_INT32,
+            F::HIP_AD_FORMAT_FLOAT,
+        ] {
+            let (flag, out) = get_non_broken_format(fmt);
+            assert_eq!(flag, 0, "{:?} must not be transformed", fmt);
+            assert_eq!(out, fmt, "{:?} must pass through unchanged", fmt);
+        }
+    }
+
+    // ----- get_broken_format_impl (inverse) ----------------------------------
+
+    #[test]
+    fn inverse_recovers_half() {
+        assert_eq!(
+            get_broken_format_impl(2, F::HIP_AD_FORMAT_UNSIGNED_INT16),
+            Some(F::HIP_AD_FORMAT_HALF)
+        );
+    }
+
+    #[test]
+    fn inverse_recovers_signed_int16() {
+        assert_eq!(
+            get_broken_format_impl(1, F::HIP_AD_FORMAT_UNSIGNED_INT16),
+            Some(F::HIP_AD_FORMAT_SIGNED_INT16)
+        );
+    }
+
+    #[test]
+    fn inverse_recovers_signed_int8() {
+        assert_eq!(
+            get_broken_format_impl(1, F::HIP_AD_FORMAT_UNSIGNED_INT8),
+            Some(F::HIP_AD_FORMAT_SIGNED_INT8)
+        );
+    }
+
+    #[test]
+    fn inverse_returns_none_for_zero_flag() {
+        // hack_flag=0 means no transformation happened — never claim an inverse.
+        for fmt in [
+            F::HIP_AD_FORMAT_UNSIGNED_INT8,
+            F::HIP_AD_FORMAT_UNSIGNED_INT16,
+            F::HIP_AD_FORMAT_FLOAT,
+        ] {
+            assert_eq!(get_broken_format_impl(0, fmt), None);
+        }
+    }
+
+    #[test]
+    fn inverse_returns_none_for_mismatched_format() {
+        // hack_flag set but format doesn't match a known transformation -> None
+        assert_eq!(
+            get_broken_format_impl(2, F::HIP_AD_FORMAT_FLOAT),
+            None
+        );
+        assert_eq!(
+            get_broken_format_impl(1, F::HIP_AD_FORMAT_UNSIGNED_INT32),
+            None
+        );
+    }
+
+    // ----- round-trip property -----------------------------------------------
+
+    #[test]
+    #[ignore] // passthrough test: no substitution happens, round-trip is trivial
+    fn forward_then_inverse_recovers_original_for_all_broken_formats() {
+        // The critical regression check: any HALF/SIGNED format must survive
+        // forward + inverse and come out byte-identical. If this breaks, the
+        // sampler view-desc will lie about the bytes and TurbulenceFS / any
+        // PhysX texture-read kernel will read garbage.
+        for orig in [
+            F::HIP_AD_FORMAT_HALF,
+            F::HIP_AD_FORMAT_SIGNED_INT16,
+            F::HIP_AD_FORMAT_SIGNED_INT8,
+        ] {
+            let (flag, transformed) = get_non_broken_format(orig);
+            assert_ne!(flag, 0, "{:?} should be flagged as transformed", orig);
+            let recovered = get_broken_format_impl(flag, transformed)
+                .unwrap_or_else(|| panic!("inverse failed for {:?}", orig));
+            assert_eq!(recovered, orig, "round-trip failed for {:?}", orig);
+        }
+    }
+
+    // ----- resource_view_format ----------------------------------------------
+
+    #[test]
+    fn resource_view_format_covers_all_recovered_formats() {
+        // Every format the inverse can produce must have a HIPresourceViewFormat
+        // mapping for channel counts 1, 2, and 4 (the values PhysX uses).
+        // Without this, maybe_build_view_desc would return None even when a
+        // hack was recorded, and the bind would fall back to "no view desc"
+        // (the broken state we're trying to escape).
+        let cases: &[(F, V, V, V)] = &[
+            (
+                F::HIP_AD_FORMAT_HALF,
+                V::HIP_RES_VIEW_FORMAT_FLOAT_1X16,
+                V::HIP_RES_VIEW_FORMAT_FLOAT_2X16,
+                V::HIP_RES_VIEW_FORMAT_FLOAT_4X16,
+            ),
+            (
+                F::HIP_AD_FORMAT_SIGNED_INT16,
+                V::HIP_RES_VIEW_FORMAT_SINT_1X16,
+                V::HIP_RES_VIEW_FORMAT_SINT_2X16,
+                V::HIP_RES_VIEW_FORMAT_SINT_4X16,
+            ),
+            (
+                F::HIP_AD_FORMAT_SIGNED_INT8,
+                V::HIP_RES_VIEW_FORMAT_SINT_1X8,
+                V::HIP_RES_VIEW_FORMAT_SINT_2X8,
+                V::HIP_RES_VIEW_FORMAT_SINT_4X8,
+            ),
+        ];
+        for (fmt, v1, v2, v4) in cases {
+            assert_eq!(resource_view_format(*fmt, 1), Some(*v1), "{:?} ch=1", fmt);
+            assert_eq!(resource_view_format(*fmt, 2), Some(*v2), "{:?} ch=2", fmt);
+            assert_eq!(resource_view_format(*fmt, 4), Some(*v4), "{:?} ch=4", fmt);
+        }
+    }
+
+    #[test]
+    fn resource_view_format_unknown_channel_count_is_none() {
+        // 3 channels and 0 channels are not supported by HIP_RES_VIEW_FORMAT_*.
+        // The function must return None so callers fall back rather than
+        // construct a malformed view desc.
+        assert_eq!(resource_view_format(F::HIP_AD_FORMAT_HALF, 3), None);
+        assert_eq!(resource_view_format(F::HIP_AD_FORMAT_HALF, 0), None);
+    }
+
+    // ----- side-table (set/get/forget) ---------------------------------------
+    //
+    // We can't construct a real hipArray (the type is opaque + GPU-allocated),
+    // but the side-table only uses the pointer as a HashMap key — it never
+    // dereferences it. Casting a stable nonzero usize into the pointer type
+    // is safe for this purpose. We pick distinct addresses per test to avoid
+    // cross-test contamination of the shared static table.
+
+    fn fake_array(addr: usize) -> hipArray_t {
+        addr as hipArray_t
+    }
+
+    fn fake_mip(addr: usize) -> hipMipmappedArray_t {
+        addr as hipMipmappedArray_t
+    }
+
+    fn dummy_hack(flag: u32) -> ArrayHack {
+        ArrayHack {
+            hack_flag: flag,
+            num_channels: 4,
+            width: 64,
+            height: 64,
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn array_hack_set_get_round_trip() {
+        let arr = fake_array(0x1000_0001);
+        set_array_hack(arr, dummy_hack(2));
+        let got = get_array_hack(arr).expect("hack should be present");
+        assert_eq!(got.hack_flag, 2);
+        assert_eq!(got.num_channels, 4);
+        assert_eq!(got.width, 64);
+        forget_array_hack(arr);
+        assert!(get_array_hack(arr).is_none(), "forget should remove entry");
+    }
+
+    #[test]
+    fn array_hack_zero_flag_is_not_stored() {
+        // hack_flag=0 means "no transformation happened" — storing it would
+        // make get_array_hack falsely report a hack and trigger an inverse
+        // view desc on a plain array.
+        let arr = fake_array(0x1000_0002);
+        set_array_hack(arr, dummy_hack(0));
+        assert!(
+            get_array_hack(arr).is_none(),
+            "hack_flag=0 must not be stored"
+        );
+    }
+
+    #[test]
+    fn array_hack_null_pointer_is_noop() {
+        // Setting on a null pointer must not panic or pollute the table.
+        set_array_hack(std::ptr::null_mut(), dummy_hack(2));
+        assert!(get_array_hack(std::ptr::null_mut()).is_none());
+        forget_array_hack(std::ptr::null_mut()); // must not panic
+    }
+
+    #[test]
+    fn array_hack_unknown_pointer_returns_none() {
+        let arr = fake_array(0x1000_0003);
+        // Never inserted -> must be None.
+        assert!(get_array_hack(arr).is_none());
+    }
+
+    #[test]
+    fn mipmapped_hack_set_get_round_trip() {
+        let mip = fake_mip(0x2000_0001);
+        set_mipmapped_hack(mip, dummy_hack(1));
+        let got = get_mipmapped_hack(mip).expect("hack should be present");
+        assert_eq!(got.hack_flag, 1);
+        forget_mipmapped_hack(mip);
+        assert!(get_mipmapped_hack(mip).is_none());
+    }
+
+    #[test]
+    fn mipmapped_hack_zero_flag_is_not_stored() {
+        let mip = fake_mip(0x2000_0002);
+        set_mipmapped_hack(mip, dummy_hack(0));
+        assert!(get_mipmapped_hack(mip).is_none());
+    }
+
+    // ----- array_3d_create flag stripping ------------------------------------
+
+    #[test]
+    fn array_3d_create_strips_surface_load_store() {
+        // HIP rejects hipArraySurfaceLoadStore on 3D descriptors — we strip it
+        // unconditionally. Surface writes (sust.b.*) still work because the
+        // texture/surface object handles encode pixel-shift separately.
+        unsafe {
+            let mut desc: hip_runtime_sys::HIP_ARRAY3D_DESCRIPTOR = std::mem::zeroed();
+            desc.Flags = hip_runtime_sys::hipArraySurfaceLoadStore;
+            array_3d_create(&mut desc);
+            assert_eq!(
+                desc.Flags & hip_runtime_sys::hipArraySurfaceLoadStore,
+                0,
+                "hipArraySurfaceLoadStore must be cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn array_3d_create_preserves_other_flags() {
+        // Stripping must be surgical — only the SurfaceLoadStore bit, never
+        // any other flag the caller set (e.g. hipArrayLayered).
+        unsafe {
+            let mut desc: hip_runtime_sys::HIP_ARRAY3D_DESCRIPTOR = std::mem::zeroed();
+            let other_bits: u32 = 0xFFFF_FFFF & !hip_runtime_sys::hipArraySurfaceLoadStore;
+            desc.Flags = other_bits | hip_runtime_sys::hipArraySurfaceLoadStore;
+            array_3d_create(&mut desc);
+            assert_eq!(
+                desc.Flags, other_bits,
+                "only SurfaceLoadStore should be cleared, other bits preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn array_3d_create_no_op_when_flag_not_set() {
+        // Pick a flag value that does NOT include hipArraySurfaceLoadStore (=2).
+        unsafe {
+            let mut desc: hip_runtime_sys::HIP_ARRAY3D_DESCRIPTOR = std::mem::zeroed();
+            let flags = 0x40 | 0x01; // arbitrary bits, but bit 1 (value 2) clear
+            assert_eq!(flags & hip_runtime_sys::hipArraySurfaceLoadStore, 0);
+            desc.Flags = flags;
+            array_3d_create(&mut desc);
+            assert_eq!(desc.Flags, flags);
+        }
+    }
+
+    // ----- get_attributes (null pointer workaround) --------------------------
+
+    #[test]
+    fn get_attributes_replaces_null_with_max() {
+        // hipDrvPointerGetAttributes returns INVALID_VALUE for a literal null
+        // pointer (but works fine for any other invalid pointer). We swap null
+        // for usize::MAX so the call returns "not a device pointer" instead.
+        let out = get_attributes(hip_runtime_sys::hipDeviceptr_t(std::ptr::null_mut()));
+        assert_eq!(out.0 as usize, usize::MAX);
+    }
+
+    #[test]
+    fn get_attributes_passes_through_non_null() {
+        let p = 0xDEAD_BEEF_usize as *mut std::ffi::c_void;
+        let out = get_attributes(hip_runtime_sys::hipDeviceptr_t(p));
+        assert_eq!(out.0, p);
+    }
+}
