@@ -12,6 +12,29 @@ use zluda_common::FromCuda;
 pub(crate) static ALLOC_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
 pub(crate) static ALLOC_MAX: AtomicU64 = AtomicU64::new(0);
 
+/// Table of host allocations created via `cuMemAllocHost` / `cuMemHostAlloc`.
+/// Each entry is `(host_ptr, device_ptr, size)`. The MS_4 dump matches
+/// kernel arg device pointers against `[device_ptr, device_ptr + size)`
+/// to identify which tracked buffer a kernel reads from, then reads
+/// contents via the host pointer (no GPU ops, no ProfilingSignal race).
+pub(crate) static SMALL_HOST_ALLOCS: std::sync::Mutex<Vec<(usize, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn track_host_alloc(host: *mut ::core::ffi::c_void, dev: *mut ::core::ffi::c_void, size: usize) {
+    if size == 0 {
+        return;
+    }
+    if let Ok(mut t) = SMALL_HOST_ALLOCS.lock() {
+        t.push((host as usize, dev as usize, size));
+    }
+}
+
+fn untrack_host_alloc(host: *mut ::core::ffi::c_void) {
+    if let Ok(mut t) = SMALL_HOST_ALLOCS.lock() {
+        t.retain(|(p, _, _)| *p != host as usize);
+    }
+}
+
 pub(crate) fn update_alloc_range(addr: u64, size: u64) {
     ALLOC_MIN.fetch_min(addr, Ordering::Relaxed);
     ALLOC_MAX.fetch_max(addr + size, Ordering::Relaxed);
@@ -283,6 +306,7 @@ pub(crate) fn get_info_v2(free: *mut usize, total: *mut usize) -> hipError_t {
 
 pub(crate) unsafe fn free_host(ptr: *mut ::core::ffi::c_void) -> CUresult {
     let hip_result = hipFreeHost(ptr);
+    untrack_host_alloc(ptr);
     remove_allocation(ptr)?;
     Ok(hip_result?)
 }
@@ -322,6 +346,7 @@ pub(crate) unsafe fn host_alloc(
         "cuMemHostAlloc size={} host={:p} dev={:p} same={}",
         bytesize, *pp, dev_ptr, *pp == dev_ptr
     ));
+    track_host_alloc(*pp, dev_ptr, bytesize);
     add_allocation(*pp, bytesize, context)?;
     Ok(())
 }
