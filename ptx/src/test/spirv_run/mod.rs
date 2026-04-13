@@ -585,6 +585,18 @@ test_ptx_warp!(
         48u32, 49u32, 50u32, 51u32, 52u32, 53u32, 54u32, 55u32, 56u32, 57u32, 58u32, 59u32, 60u32,
     ]
 );
+// LDS exchange test: 128 threads write to smem[tid], barrier, read smem[(tid+1)%128]
+// This is the core operation of CUB's block exchange used in RadixSort Downsweep.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_exchange_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_exchange.ptx");
+    let input: Vec<u32> = (0..128).collect();
+    let mut expected: Vec<u32> = (1..128).collect();
+    expected.push(0); // thread 127 reads from smem[0]
+    test_hip_assert("lds_exchange_test", &ptx, Some(input.as_slice()), &expected, 128)
+}
+
 // PhysX-style inclusive prefix sum via 5 cascading shfl.up with predicate
 // Each lane starts with 1, output should be lane_id + 1 (for first 32 lanes)
 // Second warp (lanes 32-63) also starts fresh at 1, so same pattern
