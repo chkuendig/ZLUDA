@@ -1814,22 +1814,51 @@ impl<'a> MethodEmitContext<'a> {
         _data: ptx_parser::ScalarType,
         arguments: ptx_parser::XorArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        // Wrap the XOR result in `llvm.freeze` to defeat the LLVM
-        // optimizer's poison/undef tracking on AMDGPU. CUB DeviceRadixSort
-        // Downsweep's `TwiddleOut` (`key ^ 0x80000000` for signed-int
-        // sort) occasionally has its XOR value lost on rare workgroups,
-        // leaving the output with bit-31 stuck. PR-145902 (BITCAST POISON)
-        // partial-fixed Upsweep but not Downsweep. Freeze is a no-op at
-        // codegen time but blocks SimplifyDemandedBits / DAG combiners
-        // from speculating undef bits across the XOR. Mirrors the existing
-        // FP→int poison-freeze pattern at the bottom of this file. See
-        // project_batman_30_run_dataset.md for the Bug B repro evidence.
+        // Make the XOR result OPAQUE to prevent LLVM from eliminating
+        // paired XOR-XOR sequences. CUB RadixSort for signed integers
+        // XORs keys with 0x80000000 before sorting (TwiddleIn) and after
+        // (TwiddleOut). LLVM recognizes `xor(xor(x, c), c) = x` and
+        // eliminates both XORs, breaking the signed sort.
+        //
+        // Previous approaches that FAILED:
+        // - `freeze(xor(x, c))`: LLVM distributes freeze before XOR →
+        //   `xor(freeze(x), c)` → double-XOR still visible → eliminated.
+        // - volatile alloca: AMDGPU backend can't handle 275+ stack slots.
+        //
+        // Fix: pass the XOR result through an empty inline asm with
+        // sideeffect. LLVM treats inline asm as a black box — it can't
+        // see that the output equals the input, so it can't pair two
+        // XORs across an asm barrier. The empty asm string generates
+        // zero machine instructions (just a register copy at most).
         let src1 = self.resolver.value(arguments.src1)?;
         let src2 = self.resolver.value(arguments.src2)?;
         let xor_result =
             unsafe { LLVMBuildXor(self.builder, src1, src2, LLVM_UNNAMED.as_ptr()) };
+
+        // Pass through inline asm barrier: `asm sideeffect "", "=r,0"(xor_result)`
+        let xor_type = unsafe { LLVMTypeOf(xor_result) };
         self.resolver.with_result(arguments.dst, |dst| unsafe {
-            LLVMBuildFreeze(self.builder, xor_result, dst)
+            // Build function type: (i32) -> i32 (or whatever the XOR type is)
+            let fn_type = LLVMFunctionType(xor_type, [xor_type].as_mut_ptr(), 1, 0);
+            let asm_val = LLVMGetInlineAsm(
+                fn_type,
+                c"".as_ptr() as *mut _,     // empty asm string
+                0,                           // asm string length
+                c"=v,0".as_ptr() as *mut _,  // constraints: output=VGPR, input=same as output
+                4,                           // constraints length
+                1,                           // has side effects
+                0,                           // is align stack
+                LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+                0,                           // can unwind
+            );
+            LLVMBuildCall2(
+                self.builder,
+                fn_type,
+                asm_val,
+                [xor_result].as_mut_ptr(),
+                1,
+                dst,
+            )
         });
         Ok(())
     }
