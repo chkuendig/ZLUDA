@@ -16,6 +16,7 @@ define amdgpu_kernel void @div_ftz(ptr addrspace(4) byref(i64) %"69", ptr addrsp
   br label %"63"
 
 "63":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"69", align 8
   store i64 %2, ptr addrspace(5) %"71", align 8
   %3 = load i64, ptr addrspace(4) %"70", align 8

@@ -12,6 +12,7 @@ define amdgpu_kernel void @prmt_signext(ptr addrspace(4) byref(i64) %"44", ptr a
   br label %"43"
 
 "43":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"44", align 8
   store i64 %2, ptr addrspace(5) %"46", align 8
   %3 = load i64, ptr addrspace(4) %"45", align 8

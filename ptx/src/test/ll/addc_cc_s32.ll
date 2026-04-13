@@ -12,6 +12,7 @@ define amdgpu_kernel void @addc_cc_s32(ptr addrspace(4) byref(i64) %"49", ptr ad
   br label %"48"
 
 "48":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"49", align 8
   store i64 %2, ptr addrspace(5) %"51", align 8
   %3 = load i64, ptr addrspace(4) %"50", align 8
@@ -49,7 +50,7 @@ define amdgpu_kernel void @addc_cc_s32(ptr addrspace(4) byref(i64) %"49", ptr ad
   store i32 %24, ptr addrspace(5) %"54", align 4
   %25 = load i32, ptr addrspace(5) %"53", align 4
   %26 = load i32, ptr addrspace(5) %"54", align 4
-  %27 = insertelement <2 x i32> undef, i32 %25, i8 0
+  %27 = insertelement <2 x i32> zeroinitializer, i32 %25, i8 0
   %"47" = insertelement <2 x i32> %27, i32 %26, i8 1
   %"80" = bitcast <2 x i32> %"47" to i64
   store i64 %"80", ptr addrspace(5) %"55", align 8

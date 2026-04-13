@@ -17,6 +17,7 @@ define amdgpu_kernel void @setp_nan(ptr addrspace(4) byref(i64) %"92", ptr addrs
   br label %"91"
 
 "91":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"92", align 8
   store i64 %2, ptr addrspace(5) %"94", align 8
   %3 = load i64, ptr addrspace(4) %"93", align 8

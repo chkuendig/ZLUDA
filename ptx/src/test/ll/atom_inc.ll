@@ -10,17 +10,18 @@ define amdgpu_kernel void @atom_inc(ptr addrspace(4) byref(i64) %"47", ptr addrs
   br label %"46"
 
 "46":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"47", align 8
   store i64 %2, ptr addrspace(5) %"49", align 8
   %3 = load i64, ptr addrspace(4) %"48", align 8
   store i64 %3, ptr addrspace(5) %"50", align 8
   %4 = load i64, ptr addrspace(5) %"49", align 8
   %"68" = inttoptr i64 %4 to ptr
-  %5 = atomicrmw uinc_wrap ptr %"68", i32 101 syncscope("agent-one-as") monotonic, align 4
+  %5 = atomicrmw uinc_wrap ptr %"68", i32 101 syncscope("agent-one-as") acq_rel, align 4
   store i32 %5, ptr addrspace(5) %"51", align 4
   %6 = load i64, ptr addrspace(5) %"49", align 8
   %"69" = inttoptr i64 %6 to ptr addrspace(1)
-  %7 = atomicrmw uinc_wrap ptr addrspace(1) %"69", i32 101 syncscope("agent-one-as") monotonic, align 4
+  %7 = atomicrmw uinc_wrap ptr addrspace(1) %"69", i32 101 syncscope("agent-one-as") acq_rel, align 4
   store i32 %7, ptr addrspace(5) %"52", align 4
   %8 = load i64, ptr addrspace(5) %"49", align 8
   %"70" = inttoptr i64 %8 to ptr

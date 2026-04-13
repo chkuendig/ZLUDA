@@ -11,6 +11,7 @@ define amdgpu_kernel void @atom_add_float(ptr addrspace(4) byref(i64) %"45", ptr
   br label %"44"
 
 "44":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"45", align 8
   store i64 %2, ptr addrspace(5) %"47", align 8
   %3 = load i64, ptr addrspace(4) %"46", align 8
@@ -27,7 +28,7 @@ define amdgpu_kernel void @atom_add_float(ptr addrspace(4) byref(i64) %"45", ptr
   %8 = load float, ptr addrspace(5) %"49", align 4
   store float %8, ptr addrspace(3) @shared_mem, align 4
   %9 = load float, ptr addrspace(5) %"50", align 4
-  %10 = atomicrmw fadd ptr addrspace(3) @shared_mem, float %9 syncscope("agent-one-as") monotonic, align 4
+  %10 = atomicrmw fadd ptr addrspace(3) @shared_mem, float %9 syncscope("agent-one-as") acq_rel, align 4
   store float %10, ptr addrspace(5) %"49", align 4
   %11 = load float, ptr addrspace(3) @shared_mem, align 4
   store float %11, ptr addrspace(5) %"50", align 4

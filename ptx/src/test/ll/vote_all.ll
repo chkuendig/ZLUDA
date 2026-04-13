@@ -18,6 +18,7 @@ define amdgpu_kernel void @vote_all(ptr addrspace(4) byref(i64) %"55") #1 {
   br label %"52"
 
 "52":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"55", align 8
   store i64 %2, ptr addrspace(5) %"61", align 8
   %"43" = call i32 @__zluda_ptx_impl_sreg_laneid()

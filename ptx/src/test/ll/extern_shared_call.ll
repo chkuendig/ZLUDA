@@ -29,6 +29,7 @@ define amdgpu_kernel void @extern_shared_call(ptr addrspace(4) byref(i64) %"50",
   br label %"43"
 
 "43":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"50", align 8
   store i64 %2, ptr addrspace(5) %"52", align 8
   %3 = load i64, ptr addrspace(4) %"51", align 8

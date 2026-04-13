@@ -11,6 +11,7 @@ define amdgpu_kernel void @shf_l_wrap(ptr addrspace(4) byref(i64) %"46", ptr add
   br label %"45"
 
 "45":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"46", align 8
   store i64 %2, ptr addrspace(5) %"48", align 8
   %3 = load i64, ptr addrspace(4) %"47", align 8

@@ -14,6 +14,7 @@ define amdgpu_kernel void @shfl_sync_up_b32_pred(ptr addrspace(4) byref(i64) %"5
   br label %"48"
 
 "48":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"50", align 8
   store i64 %2, ptr addrspace(5) %"51", align 8
   %"42" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)

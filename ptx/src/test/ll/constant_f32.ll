@@ -8,6 +8,7 @@ define amdgpu_kernel void @constant_f32(ptr addrspace(4) byref(i64) %"40", ptr a
   br label %"39"
 
 "39":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"40", align 8
   store i64 %2, ptr addrspace(5) %"42", align 8
   %3 = load i64, ptr addrspace(4) %"41", align 8

@@ -11,6 +11,7 @@ define amdgpu_kernel void @setp_gt(ptr addrspace(4) byref(i64) %"48", ptr addrsp
   br label %"47"
 
 "47":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"48", align 8
   store i64 %2, ptr addrspace(5) %"50", align 8
   %3 = load i64, ptr addrspace(4) %"49", align 8

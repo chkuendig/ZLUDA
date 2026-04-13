@@ -15,6 +15,7 @@ define amdgpu_kernel void @shfl_prefix_sum(ptr addrspace(4) byref(i64) %"66") #1
   br label %"64"
 
 "64":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"66", align 8
   store i64 %2, ptr addrspace(5) %"67", align 8
   %"51" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)

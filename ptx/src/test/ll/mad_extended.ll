@@ -18,6 +18,7 @@ define amdgpu_kernel void @mad_extended(ptr addrspace(4) byref(i64) %"64", ptr a
   br label %"63"
 
 "63":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"64", align 8
   store i64 %2, ptr addrspace(5) %"66", align 8
   %3 = load i64, ptr addrspace(4) %"65", align 8

@@ -10,6 +10,7 @@ define amdgpu_kernel void @global_array(ptr addrspace(4) byref(i64) %"40", ptr a
   br label %"39"
 
 "39":                                             ; preds = %1
+  fence seq_cst
   store i64 ptrtoint (ptr addrspace(1) @foobar to i64), ptr addrspace(5) %"42", align 8
   %2 = load i64, ptr addrspace(4) %"41", align 8
   store i64 %2, ptr addrspace(5) %"43", align 8

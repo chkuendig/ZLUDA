@@ -15,6 +15,7 @@ define amdgpu_kernel void @vector8_extract(ptr addrspace(4) byref(i64) %"50", pt
   br label %"49"
 
 "49":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"50", align 8
   store i64 %2, ptr addrspace(5) %"52", align 8
   %3 = load i64, ptr addrspace(4) %"51", align 8
@@ -54,7 +55,7 @@ define amdgpu_kernel void @vector8_extract(ptr addrspace(4) byref(i64) %"50", pt
   %11 = load i16, ptr addrspace(5) %"54", align 2
   %12 = load i16, ptr addrspace(5) %"55", align 2
   %13 = load i16, ptr addrspace(5) %"56", align 2
-  %14 = insertelement <8 x i16> undef, i16 %6, i8 0
+  %14 = insertelement <8 x i16> zeroinitializer, i16 %6, i8 0
   %15 = insertelement <8 x i16> %14, i16 %7, i8 1
   %16 = insertelement <8 x i16> %15, i16 %8, i8 2
   %17 = insertelement <8 x i16> %16, i16 %9, i8 3
@@ -94,7 +95,7 @@ define amdgpu_kernel void @vector8_extract(ptr addrspace(4) byref(i64) %"50", pt
   %"112" = trunc i16 %26 to i8
   %"113" = trunc i16 %27 to i8
   %"114" = trunc i16 %28 to i8
-  %29 = insertelement <8 x i8> undef, i8 %"107", i8 0
+  %29 = insertelement <8 x i8> zeroinitializer, i8 %"107", i8 0
   %30 = insertelement <8 x i8> %29, i8 %"108", i8 1
   %31 = insertelement <8 x i8> %30, i8 %"109", i8 2
   %32 = insertelement <8 x i8> %31, i8 %"110", i8 3

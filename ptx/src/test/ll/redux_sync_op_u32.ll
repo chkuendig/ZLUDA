@@ -20,6 +20,7 @@ define amdgpu_kernel void @redux_sync_op_u32(ptr addrspace(4) byref(i64) %"49") 
   br label %"47"
 
 "47":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"49", align 8
   store i64 %2, ptr addrspace(5) %"55", align 8
   %"42" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)

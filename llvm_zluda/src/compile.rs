@@ -162,6 +162,43 @@ pub fn compile(
         return Err(message.to_str().to_string());
     }
 
+    // Post-optimization pass: replace `undef` in phi node incoming values
+    // with zero constants. LLVM's optimizer introduces undef at phi nodes
+    // through Mem2Reg, SimplifyCFG, and loop transforms. On NVIDIA hardware,
+    // uninitialized registers happen to be zero, so the undef is benign.
+    // On AMDGPU, registers contain leftover data from prior wavefronts,
+    // turning the undef into garbage that corrupts sort kernels' output
+    // (Batman: AK IOFX_actorRangeKernel crash, MS_4 bf000 crash family).
+    //
+    // This pass walks every phi node in the optimized module and replaces
+    // any undef incoming value with zero of the matching type, preventing
+    // the backend from using uninitialized register values.
+    unsafe {
+        let mut func = LLVMGetFirstFunction(linked.get());
+        while !func.is_null() {
+            let mut bb = LLVMGetFirstBasicBlock(func);
+            while !bb.is_null() {
+                let mut inst = LLVMGetFirstInstruction(bb);
+                while !inst.is_null() {
+                    if !LLVMIsAPHINode(inst).is_null() {
+                        let count = LLVMCountIncoming(inst);
+                        for i in 0..count {
+                            let val = LLVMGetIncomingValue(inst, i);
+                            if LLVMIsUndef(val) != 0 {
+                                let ty = LLVMTypeOf(val);
+                                let zero = LLVMConstNull(ty);
+                                LLVMSetOperand(inst, i, zero);
+                            }
+                        }
+                    }
+                    inst = LLVMGetNextInstruction(inst);
+                }
+                bb = LLVMGetNextBasicBlock(bb);
+            }
+            func = LLVMGetNextFunction(func);
+        }
+    }
+
     if let Some(hook) = compiler_hook {
         // Run compiler hook on optimized human-readable LLVM IR
         let message = linked.print_module_to_string();

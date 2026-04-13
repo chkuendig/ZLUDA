@@ -50,6 +50,7 @@ define amdgpu_kernel void @shared_unify_local(ptr addrspace(4) byref(i64) %"63",
   br label %"54"
 
 "54":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"63", align 8
   store i64 %2, ptr addrspace(5) %"65", align 8
   %3 = load i64, ptr addrspace(4) %"64", align 8

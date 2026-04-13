@@ -15,6 +15,7 @@ define amdgpu_kernel void @uint_to_fp_bf16(ptr addrspace(4) byref(i64) %"62", pt
   br label %"61"
 
 "61":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"62", align 8
   store i64 %2, ptr addrspace(5) %"64", align 8
   %3 = load i64, ptr addrspace(4) %"63", align 8

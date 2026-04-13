@@ -15,6 +15,7 @@ define amdgpu_kernel void @const_multi_zero_init(ptr addrspace(4) byref(i64) %"5
   br label %"53"
 
 "53":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"54", align 8
   store i64 %2, ptr addrspace(5) %"56", align 8
   %3 = load i64, ptr addrspace(4) %"55", align 8

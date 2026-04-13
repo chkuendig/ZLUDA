@@ -26,6 +26,7 @@ define amdgpu_kernel void @histogram_accum(ptr addrspace(4) byref(i64) %"78", pt
   br label %"77"
 
 "77":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"78", align 8
   store i64 %2, ptr addrspace(5) %"80", align 8
   %3 = load i64, ptr addrspace(4) %"79", align 8

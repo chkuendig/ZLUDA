@@ -11,6 +11,7 @@ define amdgpu_kernel void @stateful_neg_offset(ptr addrspace(4) byref(i64) %"42"
   br label %"41"
 
 "41":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"42", align 8
   store i64 %2, ptr addrspace(5) %"44", align 8
   %3 = load i64, ptr addrspace(4) %"43", align 8

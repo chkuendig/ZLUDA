@@ -12,6 +12,7 @@ define amdgpu_kernel void @lanemask_lt(ptr addrspace(4) byref(i64) %"44", ptr ad
   br label %"42"
 
 "42":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"44", align 8
   store i64 %2, ptr addrspace(5) %"46", align 8
   %3 = load i64, ptr addrspace(4) %"45", align 8

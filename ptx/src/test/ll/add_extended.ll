@@ -20,6 +20,7 @@ define amdgpu_kernel void @add_extended(ptr addrspace(4) byref(i64) %"70", ptr a
   br label %"69"
 
 "69":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"70", align 8
   store i64 %2, ptr addrspace(5) %"72", align 8
   %3 = load i64, ptr addrspace(4) %"71", align 8

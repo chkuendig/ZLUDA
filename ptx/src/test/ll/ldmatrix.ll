@@ -21,6 +21,7 @@ define amdgpu_kernel void @ldmatrix(ptr addrspace(4) byref(i64) %"60") #1 {
   br label %"58"
 
 "58":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"60", align 8
   store i64 %2, ptr addrspace(5) %"61", align 8
   %"46" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)

@@ -7,6 +7,7 @@ define amdgpu_kernel void @nanosleep(ptr addrspace(4) byref(i64) %"37", ptr addr
   br label %"36"
 
 "36":                                             ; preds = %1
+  fence seq_cst
   call void @__zluda_ptx_impl_nanosleep_u32(i32 1)
   fence seq_cst
   ret void

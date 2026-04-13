@@ -16,6 +16,7 @@ define amdgpu_kernel void @shl_overflow(ptr addrspace(4) byref(i64) %"60", ptr a
   br label %"59"
 
 "59":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"60", align 8
   store i64 %2, ptr addrspace(5) %"62", align 8
   %3 = load i64, ptr addrspace(4) %"61", align 8

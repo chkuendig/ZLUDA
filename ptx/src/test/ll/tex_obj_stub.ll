@@ -15,6 +15,7 @@ define amdgpu_kernel void @tex_obj_stub(ptr addrspace(4) byref(i64) %"48") #1 {
   br label %"47"
 
 "47":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"48", align 8
   store i64 %2, ptr addrspace(5) %"49", align 8
   store i64 0, ptr addrspace(5) %"50", align 8
@@ -22,7 +23,7 @@ define amdgpu_kernel void @tex_obj_stub(ptr addrspace(4) byref(i64) %"48") #1 {
   store float 0.000000e+00, ptr addrspace(5) %"52", align 4
   %3 = load float, ptr addrspace(5) %"51", align 4
   %4 = load float, ptr addrspace(5) %"52", align 4
-  %5 = insertelement <2 x float> undef, float %3, i8 0
+  %5 = insertelement <2 x float> zeroinitializer, float %3, i8 0
   %"46" = insertelement <2 x float> %5, float %4, i8 1
   %6 = load i64, ptr addrspace(5) %"50", align 8
   %"45" = call <4 x float> @__zluda_ptx_impl_tex_2d_v4_f32_f32_obj(i64 %6, <2 x float> %"46")

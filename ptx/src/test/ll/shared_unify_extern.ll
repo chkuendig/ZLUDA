@@ -52,6 +52,7 @@ define amdgpu_kernel void @shared_unify_extern(ptr addrspace(4) byref(i64) %"65"
   br label %"53"
 
 "53":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"65", align 8
   store i64 %2, ptr addrspace(5) %"67", align 8
   %3 = load i64, ptr addrspace(4) %"66", align 8

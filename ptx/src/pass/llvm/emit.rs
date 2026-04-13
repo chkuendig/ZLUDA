@@ -697,10 +697,11 @@ impl<'a> MethodEmitContext<'a> {
     }
 
     fn emit_variable(&mut self, var: ast::Variable<SpirvWord>) -> Result<(), TranslateError> {
+        let llvm_type = get_type(self.context, &var.info.v_type)?;
         let alloca = unsafe {
             LLVMZludaBuildAlloca(
                 self.variables_builder.get(),
-                get_type(self.context, &var.info.v_type)?,
+                llvm_type,
                 get_state_space(var.info.state_space)?,
                 self.resolver.get_or_add_raw(var.name),
             )
@@ -1596,7 +1597,12 @@ impl<'a> MethodEmitContext<'a> {
             loads => {
                 let struct_type =
                     get_or_create_struct_type(self.context, loads.iter().map(|(_, type_)| *type_))?;
-                let mut value = unsafe { LLVMGetUndef(struct_type) };
+                // Use zeroinitializer instead of undef to prevent LLVM's
+                // optimizer from propagating undef through phi nodes. See
+                // the IOFX sort undef-amplification analysis (2026-04-13):
+                // 3 insertelement-undef seeds → 63 post-opt undefs that
+                // corrupt radix sort output → OOB scatter → GPU page fault.
+                let mut value = unsafe { LLVMConstNull(struct_type) };
                 for (i, (load, _)) in loads.iter().enumerate() {
                     value = unsafe {
                         LLVMBuildInsertValue(
@@ -1876,7 +1882,12 @@ impl<'a> MethodEmitContext<'a> {
                 self.context,
                 &ast::Type::Vector(repack.unpacked.len() as u8, repack.typ),
             )?;
-            let mut temp_vec = unsafe { LLVMGetUndef(vector_type) };
+            // Use zeroinitializer instead of undef — same rationale as
+            // the struct case above. The vector lanes that get overwritten
+            // by subsequent insertelement are fine either way, but the
+            // undef in the NOT-yet-overwritten lanes lets LLVM introduce
+            // undefs at phi nodes downstream, corrupting sort kernels.
+            let mut temp_vec = unsafe { LLVMConstNull(vector_type) };
             for (index, src_id) in repack.unpacked.iter().enumerate() {
                 let dst = if index == repack.unpacked.len() - 1 {
                     Some(repack.packed)
@@ -3894,7 +3905,15 @@ fn get_scope_membar(scope: ast::MemScope) -> Result<*const i8, TranslateError> {
 
 fn get_ordering(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
     match semantics {
-        ast::AtomSemantics::Relaxed => LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic,
+        // NVIDIA hardware provides de facto release/acquire for unqualified
+        // (relaxed) device-scope atomics via L2 serialization. AMDGPU's
+        // Monotonic ordering emits NO cache fencing (no s_waitcnt, no
+        // buffer_gl1_inv), breaking inter-block synchronization patterns
+        // that PhysX and other CUDA code rely on. Upgrade to AcqRel so
+        // the AMDGPU backend emits s_waitcnt (drain stores before atomic)
+        // and cache invalidation (fresh reads after atomic).
+        // See: NVIDIA/cccl#3827, LLVM SIMemoryLegalizer, GPUHarbor ISSTA'23.
+        ast::AtomSemantics::Relaxed => LLVMAtomicOrdering::LLVMAtomicOrderingAcquireRelease,
         ast::AtomSemantics::Acquire => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::Release => LLVMAtomicOrdering::LLVMAtomicOrderingRelease,
         ast::AtomSemantics::AcqRel => LLVMAtomicOrdering::LLVMAtomicOrderingAcquireRelease,
@@ -3903,7 +3922,8 @@ fn get_ordering(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
 
 fn get_ordering_failure(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
     match semantics {
-        ast::AtomSemantics::Relaxed => LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic,
+        // CAS failure ordering must be Acquire (not Release/AcqRel per LLVM rules)
+        ast::AtomSemantics::Relaxed => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::Acquire => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::Release => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::AcqRel => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,

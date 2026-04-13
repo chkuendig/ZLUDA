@@ -14,6 +14,7 @@ define amdgpu_kernel void @vote_ballot(ptr addrspace(4) byref(i64) %"46") #1 {
   br label %"44"
 
 "44":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"46", align 8
   store i64 %2, ptr addrspace(5) %"50", align 8
   %"40" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
