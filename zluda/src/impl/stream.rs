@@ -1,4 +1,40 @@
 use hip_runtime_sys::*;
+use std::sync::Mutex;
+
+/// Global lock implementing CUDA's NULL-stream implicit synchronization.
+///
+/// CUDA semantics: the NULL stream (stream 0) serializes with ALL other streams.
+/// An operation on the NULL stream cannot begin until all prior operations on all
+/// streams complete, and no operation on any stream can begin until the NULL-stream
+/// operation completes.
+///
+/// HIP/ROCm 6.2.4 does NOT implement this. We enforce it with:
+/// - Before any NULL-stream operation (kernel launch, memcpy, memset): acquire this
+///   lock + hipDeviceSynchronize (drain all pending work)
+/// - The lock is held until the operation is submitted, preventing another thread
+///   from submitting work between our sync and our operation
+///
+/// This lock is shared between kernel launches (function.rs) and memory operations
+/// (memory.rs) so that ALL NULL-stream operations serialize with each other.
+pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
+
+/// Synchronize for CUDA NULL-stream semantics before performing a GPU operation.
+/// Call this before hipModuleLaunchKernel, hipMemcpyAsync, hipMemsetAsync, etc.
+///
+/// If `stream` is NULL (0x0): acquires the global lock and waits for ALL pending
+/// work on all streams. Returns a guard that must be held until the HIP operation
+/// is submitted — this prevents another thread from submitting work in between.
+///
+/// If `stream` is non-NULL: no-op (non-NULL streams are independent in CUDA).
+pub(crate) fn null_stream_sync(stream: hipStream_t) -> Option<std::sync::MutexGuard<'static, ()>> {
+    if stream.0.is_null() {
+        let guard = NULL_STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = unsafe { hipDeviceSynchronize() };
+        Some(guard)
+    } else {
+        None
+    }
+}
 
 pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
     super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize({:?})", stream));
@@ -88,26 +124,34 @@ pub(crate) fn get_capture_info_v3(
 static QUERY_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub(crate) fn query(stream: hipStream_t) -> hipError_t {
-    let result = unsafe { hipStreamQuery(stream) };
+    let hip_result = unsafe { hipStreamQuery(stream) };
     // PhysX uses cuStreamQuery(NULL) as a push-buffer flush / dispatch heartbeat.
     // On real NVIDIA, this returns NOT_READY when there's pending GPU work.
     // Our dispatch loop runs too fast (no real kernels), causing PhysX to
     // decide "no GPU work needed" and tear down GPU before APEX creates actors.
     // Always return NOT_READY for NULL stream to keep the dispatch loop alive.
-    let result = if stream.0.is_null() {
+    let returned = if stream.0.is_null() {
         Err(hipErrorCode_t::NotReady)
     } else {
-        result
+        hip_result
     };
     let count = QUERY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Log first 100, then only when ZLUDA_LOG_ALL is set
-    if count < 100 || crate::is_log_all_enabled() {
-        super::driver::zluda_log_err(&format!(
-            "cuStreamQuery(stream={:?}) -> {:?} [#{}]",
-            stream, result, count
-        ));
+    // Log first 200, then every 100th, or always when ZLUDA_LOG_ALL is set
+    if count < 200 || count % 100 == 0 || crate::is_log_all_enabled() {
+        // Show both real HIP result and what we return, to detect masking
+        if stream.0.is_null() {
+            super::driver::zluda_log_err(&format!(
+                "cuStreamQuery(NULL) hip={:?} returned=NOT_READY [#{}]",
+                hip_result, count
+            ));
+        } else {
+            super::driver::zluda_log_err(&format!(
+                "cuStreamQuery(stream={:?}) -> {:?} [#{}]",
+                stream, returned, count
+            ));
+        }
     }
-    result
+    returned
 }
 
 pub(crate) fn wait_event(

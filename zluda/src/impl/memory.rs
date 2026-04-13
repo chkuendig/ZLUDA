@@ -250,6 +250,7 @@ pub(crate) fn set_d8_async(
     n: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(stream);
     unsafe { hipMemsetD8Async(dst, value, n, stream) }
 }
 
@@ -267,6 +268,7 @@ pub(crate) fn set_d16_async(
     n: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(stream);
     unsafe { hipMemsetD16Async(dst, value, n, stream) }
 }
 
@@ -280,6 +282,7 @@ pub(crate) fn set_d32_async(
     n: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(stream);
     unsafe { hipMemsetD32Async(dst, value as _, n, stream) }
 }
 
@@ -426,6 +429,7 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
             dst_device.0, num_convex, if bad.is_empty() { "none".to_string() } else { bad.join(",") }
         ));
     }
+    let _guard = super::stream::null_stream_sync(stream);
     let result = hipMemcpyHtoDAsync(dst_device, src_host.cast_mut(), byte_count, stream);
     if result.is_err() {
         // hipMemcpyHtoDAsync failed — try hipMemcpyAsync with Default kind.
@@ -452,6 +456,7 @@ pub(crate) unsafe fn copy_dto_h_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(stream);
     hipMemcpyDtoHAsync(dst_host, src_device, byte_count, stream)
 }
 
@@ -469,6 +474,7 @@ pub(crate) unsafe fn copy_dto_d_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(stream);
     hipMemcpyDtoDAsync(dst_device, src_device, byte_count, stream)
 }
 
@@ -478,6 +484,7 @@ pub(crate) unsafe fn copy_async(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(stream);
     hipMemcpyAsync(
         dst.0,
         src.0,
@@ -591,5 +598,6 @@ pub(crate) unsafe fn set_d_2d32_async(
     height: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(stream);
     hipMemset2DAsync(dst_device.0, dst_pitch, value as _, width, height, stream)
 }

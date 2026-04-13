@@ -2564,7 +2564,7 @@ pub(crate) fn launch_kernel(
     // mode 2 also prevents log lines from interleaving with other threads. The guard
     // is held until it is explicitly dropped or the function returns.
     let mut launch_guard = if lock_mode >= 1 {
-        Some(LAUNCH_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+        Some(super::stream::NULL_STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     } else {
         None
     };
@@ -2761,15 +2761,15 @@ pub(crate) fn launch_kernel(
     // if name == "MemCopyBatchedAsync" {
     //     unsafe { dump_mcb_scratch(kernel_params, extra, grid_dim_y); }
     // }
-    // PRE-LAUNCH SYNC: wait for ALL pending GPU work before dispatching.
-    // PhysX relies on CUDA's cross-stream ordering via NULL-stream barriers:
-    // a memcpy on stream A must complete before a kernel on stream B starts
-    // if either stream is the NULL stream. HIP/ROCm 6.2.4 doesn't enforce
-    // this. hipStreamSynchronize(stream) is insufficient (only syncs the
-    // launch stream, not the memcpy stream). hipDeviceSynchronize waits for
-    // ALL streams — confirmed working in the pre-launch-sync test (13 MS_4
-    // launches, 0 bf000 crashes — first time without rocgdb).
-    unsafe { hip_runtime_sys::hipDeviceSynchronize() };
+    // NULL-stream synchronization: CUDA guarantees that operations on the NULL
+    // stream (stream 0) serialize with ALL other streams. HIP/ROCm 6.2.4 doesn't
+    // enforce this. We call hipDeviceSynchronize only for NULL-stream launches
+    // (which is what CUDA semantics require) instead of the previous blanket sync
+    // that drained all streams before every single launch.
+    //
+    // The guard holds a lock to prevent other threads from submitting work between
+    // our sync and our launch. Dropped after hipModuleLaunchKernel returns.
+    let _null_stream_guard = super::stream::null_stream_sync(stream);
 
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
