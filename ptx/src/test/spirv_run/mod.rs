@@ -585,6 +585,18 @@ test_ptx_warp!(
         48u32, 49u32, 50u32, 51u32, 52u32, 53u32, 54u32, 55u32, 56u32, 57u32, 58u32, 59u32, 60u32,
     ]
 );
+// LDS scatter-gather: smem[tid^1] = input[tid], barrier, output[tid] = smem[tid]
+// Tests scatter-to-different-position + gather, core of CUB BlockExchange
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_scatter_gather_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_scatter_gather.ptx");
+    let input: Vec<u32> = (0..128).collect();
+    // tid^1 swaps adjacent pairs: 0↔1, 2↔3, etc.
+    let expected: Vec<u32> = (0..128u32).map(|i| i ^ 1).collect();
+    test_hip_assert("lds_scatter_gather_test", &ptx, Some(input.as_slice()), &expected, 128)
+}
+
 // LDS exchange test: 128 threads write to smem[tid], barrier, read smem[(tid+1)%128]
 // This is the core operation of CUB's block exchange used in RadixSort Downsweep.
 #[cfg(feature = "has_rocm")]
