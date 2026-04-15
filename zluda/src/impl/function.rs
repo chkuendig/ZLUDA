@@ -2581,6 +2581,43 @@ pub(crate) fn launch_kernel(
             name, grid_dim_x, grid_dim_y, grid_dim_z,
             block_dim_x, block_dim_y, block_dim_z, shared_mem_bytes));
     }
+    // Capture CUB RadixSort kernel args (Downsweep + Upsweep) including GridEvenShare.
+    // Pure CPU reads from the extra buffer — no GPU ops, no ProfilingSignal risk.
+    // Logs once per unique (kernel, begin_bit) pair so we get one line per pass.
+    if (name.contains("RadixSortDownsweepKernel") || name.contains("RadixSortUpsweepKernel"))
+        && !extra.is_null()
+    {
+        static SORT_CAPTURE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SORT_CAPTURE_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+            unsafe {
+                let extra_arr = std::slice::from_raw_parts(extra, 5);
+                if extra_arr[0] == (0x1usize as *mut _) && !extra_arr[1].is_null() {
+                    let buf = extra_arr[1] as *const u8;
+                    // Read all bytes 0-87 of the extra buffer
+                    let raw: Vec<u8> = (0..88).map(|i| *buf.add(i)).collect();
+                    let kernel_type = if name.contains("Downsweep") { "DS" } else { "US" };
+                    let n_items = std::ptr::read_unaligned(buf.add(40) as *const u32);
+                    let begin_bit = std::ptr::read_unaligned(buf.add(44) as *const u32);
+                    let is_first = *buf.add(48);
+                    let is_last = *buf.add(49);
+                    let overwrite = *buf.add(50);
+                    // GridEvenShare at bytes 52-87 (36 bytes)
+                    let ges_raw: Vec<u8> = (52..88).map(|i| *buf.add(i)).collect();
+                    let ges_i32: Vec<i32> = (0..9).map(|i|
+                        std::ptr::read_unaligned(buf.add(52 + i*4) as *const i32)
+                    ).collect();
+                    super::driver::zluda_log_err(&format!(
+                        "SORT_ARGS {} n={} bit={} first={} last={} ow={} GES={:?} grid={} stream={:?}",
+                        kernel_type, n_items, begin_bit, is_first, is_last, overwrite,
+                        ges_i32, grid_dim_x, stream));
+                    // Mark done after capturing all passes (last Downsweep = bit>=16)
+                    if name.contains("Downsweep") && begin_bit >= 16 {
+                        SORT_CAPTURE_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
     // NOTE: pre-launch validation that called hipMemcpyDtoH has been disabled —
     // the D2H copies trigger the ROCm ProfilingSignal pool race condition
     // (see commit 589d0290 "Fix TurbulenceFS GPU page fault" + the comment in
@@ -2707,10 +2744,52 @@ pub(crate) fn launch_kernel(
     // XOR flipback), CreateGrid does wild writes → GPU page fault. The
     // diagnostic that was supposed to catch this had been removed; this
     // re-adds it with the safe D2D pattern (avoids ProfilingSignal pool race).
-    // CreateGrid validator — disabled (does D2D)
-    // if name.contains("CreateGrid") && !name.contains("Turbulence") {
-    //     unsafe { validate_create_grid_safe(kernel_params, extra); }
-    // }
+    // Per-pass sort bisection: read back BOTH buffer A (CreateGrid input, after DtoD copy)
+    // and buffer B (sort output, before DtoD copy) to find where corruption enters.
+    // Gated by ZLUDA_VALIDATE_SORT=1 — the hipMemcpyDtoH calls risk ProfilingSignal.
+    static VALIDATE_SORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *VALIDATE_SORT.get_or_init(|| std::env::var("ZLUDA_VALIDATE_SORT").map_or(false, |v| v == "1"))
+        && name.contains("CreateGrid") && !name.contains("Turbulence")
+    {
+        unsafe {
+            let n: i32 = read_kernel_arg(kernel_params, extra, 0, 0).unwrap_or(0);
+            let sorted_keys: u64 = read_kernel_arg(kernel_params, extra, 8, 1).unwrap_or(0);
+            if n > 0 && sorted_keys != 0 {
+                static CG_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let cg_n = CG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = hip_runtime_sys::hipDeviceSynchronize();
+                let n_u = n as usize;
+                // Buffer A = sortedKeys[0..n] (what CreateGrid will read)
+                let mut buf_a = vec![0i32; n_u];
+                let _ = hip_runtime_sys::hipMemcpyDtoH(
+                    buf_a.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t(sorted_keys as _), n_u * 4);
+                // Buffer B = sortedKeys[n..2n] (CUB sort output, source of DtoD copy)
+                let mut buf_b = vec![0i32; n_u];
+                let _ = hip_runtime_sys::hipMemcpyDtoH(
+                    buf_b.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t((sorted_keys + n_u as u64 * 4) as _), n_u * 4);
+
+                let a_bit31 = buf_a.iter().filter(|&&k| k < 0).count();
+                let b_bit31 = buf_b.iter().filter(|&&k| k < 0).count();
+                let a_viol = buf_a.windows(2).filter(|w| w[1] < w[0]).count();
+                let b_viol = buf_b.windows(2).filter(|w| w[1] < w[0]).count();
+
+                if a_bit31 > 0 || b_bit31 > 0 {
+                    super::driver::zluda_log_err(&format!(
+                        "*** SORT_BISECT #{} n={} bufA(bit31={},viol={}) bufB(bit31={},viol={}) sk=0x{:x}",
+                        cg_n, n, a_bit31, a_viol, b_bit31, b_viol, sorted_keys));
+                    // Dump both to files for offline analysis
+                    let bytes_a: Vec<u8> = buf_a.iter().flat_map(|&v| (v as u32).to_le_bytes()).collect();
+                    let bytes_b: Vec<u8> = buf_b.iter().flat_map(|&v| (v as u32).to_le_bytes()).collect();
+                    let _ = std::fs::write(format!("/tmp/sort_bisect_{}_a.bin", cg_n), &bytes_a);
+                    let _ = std::fs::write(format!("/tmp/sort_bisect_{}_b.bin", cg_n), &bytes_b);
+                } else if cg_n % 10 == 0 {
+                    super::driver::zluda_log_err(&format!(
+                        "SORT_BISECT_OK #{} n={} a_max={} b_max={}",
+                        cg_n, n, buf_a.iter().max().unwrap_or(&0), buf_b.iter().max().unwrap_or(&0)));
+                }
+            }
+        }
+    }
     // MS_2_Batched packet capture + pre-counter snapshot. We snapshot the
     // 88-byte-per-block packet buffer (param_2) AND every tracked counter
     // pointer BEFORE the kernel runs, so the post-capture below can diff
@@ -2826,6 +2905,67 @@ pub(crate) fn launch_kernel(
         }
         other => other,
     };
+    // Spine readback removed — hipMemcpyDtoH triggers ProfilingSignal race.
+    // Instead, read the spine from within the Downsweep readback (same sync point).
+    // Per-pass Downsweep readback: after each Downsweep, sync + read back the
+    // output buffer and check for bit31 corruption. Identifies WHICH pass introduces it.
+    // Gated by ZLUDA_VALIDATE_SORT=1.
+    static VALIDATE_SORT_POST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *VALIDATE_SORT_POST.get_or_init(|| std::env::var("ZLUDA_VALIDATE_SORT").map_or(false, |v| v == "1"))
+        && name.contains("RadixSortDownsweepKernel") && result.is_ok() && !extra.is_null()
+        && stream.0.is_null() // Only FleX sort (NULL stream), not IOFX (non-NULL)
+    {
+        unsafe {
+            let extra_arr = std::slice::from_raw_parts(extra, 5);
+            if extra_arr[0] == (0x1usize as *mut _) && !extra_arr[1].is_null() {
+                let buf = extra_arr[1] as *const u8;
+                let n_items = std::ptr::read_unaligned(buf.add(40) as *const u32) as usize;
+                let begin_bit = std::ptr::read_unaligned(buf.add(44) as *const u32);
+                let keys_out = std::ptr::read_unaligned(buf.add(8) as *const u64);
+                if n_items > 0 && keys_out != 0 {
+                    // Use stream sync (NULL only) instead of device sync (all streams)
+                    // to reduce ProfilingSignal race pressure
+                    let _ = hip_runtime_sys::hipStreamSynchronize(
+                        hip_runtime_sys::hipStream_t(std::ptr::null_mut()));
+                    let mut h_out = vec![0i32; n_items];
+                    let _ = hip_runtime_sys::hipMemcpyDtoH(
+                        h_out.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t(keys_out as _), n_items * 4);
+                    let bit31_out = h_out.iter().filter(|&&k| k < 0).count();
+                    // Also read keys_in to check if corruption is in the INPUT
+                    let keys_in = std::ptr::read_unaligned(buf.add(0) as *const u64);
+                    let mut h_in = vec![0i32; n_items];
+                    let _ = hip_runtime_sys::hipMemcpyDtoH(
+                        h_in.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t(keys_in as _), n_items * 4);
+                    let bit31_in = h_in.iter().filter(|&&k| k < 0).count();
+                    if bit31_out > 0 || bit31_in > 0 {
+                        let viol = h_out.windows(2).filter(|w| w[1] < w[0]).count();
+                        // Also read spine at this sync point (already synced, one extra D2H)
+                        let spine_ptr = std::ptr::read_unaligned(buf.add(32) as *const u64);
+                        let spine_n = (grid_dim_x * 16) as usize; // 16 bins for 4-bit, conservative
+                        let mut h_spine = vec![0u32; spine_n.min(256)];
+                        if spine_ptr != 0 {
+                            let _ = hip_runtime_sys::hipMemcpyDtoH(
+                                h_spine.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t(spine_ptr as _),
+                                h_spine.len() * 4);
+                        }
+                        let spine_max = h_spine.iter().copied().max().unwrap_or(0);
+                        let spine_sum: u64 = h_spine.iter().map(|&v| v as u64).sum();
+                        super::driver::zluda_log_err(&format!(
+                            "*** PASS_CORRUPT bit={} n={} in_bit31={} out_bit31={} viol={} spine_max={} spine_sum={} keys_in=0x{:x} keys_out=0x{:x}",
+                            begin_bit, n_items, bit31_in, bit31_out, viol, spine_max, spine_sum, keys_in, keys_out));
+                    } else {
+                        static PASS_LOG_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let pn = PASS_LOG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if pn < 50 || pn % 100 == 0 {
+                            super::driver::zluda_log_err(&format!(
+                                "PASS_OK bit={} n={} max={}", begin_bit, n_items,
+                                h_out.iter().max().unwrap_or(&0)));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Track last kernel name for SIGABRT handler
     if !name.is_empty() {
         super::driver::set_last_kernel(name.clone());
