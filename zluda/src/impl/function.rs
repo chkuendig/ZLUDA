@@ -1671,6 +1671,76 @@ unsafe fn force_zero_rd5_22176_before_ms1() {
     }
 }
 
+/// Extract the current MS_1 launch's rd5 pointer.
+///
+/// In `CreateParticleShapesIncremental_MultiStage_1`, PTX param_6 is the rd5
+/// base whose `+22176` word feeds the per-frame particle-shape counter.
+fn current_ms1_rd5_ptr(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> Option<u64> {
+    let rd5 = unsafe { read_kernel_arg(kernel_params, extra, 40, 6) }?;
+    (rd5 != 0).then_some(rd5)
+}
+
+/// Targeted Bug A workaround: zero only the current MS_1 launch's rd5+22176.
+///
+/// The original broad workaround zeroed every tracked rd5 before every MS_1,
+/// which corrupted the first actor when Batman issued the second MS_1 launch
+/// in the same frame. This targeted variant only touches the rd5 pointer from
+/// the CURRENT MS_1 launch packet (PTX param_6), so it corrects the stale
+/// carry-over case without overzeroing another actor's freshly written value.
+unsafe fn force_zero_current_ms1_rd5_22176(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) {
+    if !ms4_capture_enabled() {
+        return;
+    }
+    if std::env::var("ZLUDA_PHASE1_DISABLE").ok().as_deref() == Some("1") {
+        return;
+    }
+    let rd5 = match current_ms1_rd5_ptr(kernel_params, extra) {
+        Some(rd5) => rd5,
+        None => return,
+    };
+    track_rd5_ptr(rd5);
+
+    let mut guard = match RD5_TRACKER.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    rd5_tracker_init(&mut guard);
+    let tracker = match guard.as_mut() {
+        Some(t) => t,
+        None => return,
+    };
+
+    let src = (rd5 as usize + F6_OFFSET_IN_RD5) as *mut std::ffi::c_void;
+    let _ = hipMemcpyDtoD(
+        hipDeviceptr_t(tracker.scratch_dev),
+        hipDeviceptr_t(src),
+        F6_BYTES_PER,
+    );
+    let _ = hipDeviceSynchronize();
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+    let cur_val = *(tracker.scratch_host as *const u32);
+    if cur_val == 0 {
+        tracker.last_state.insert(rd5, 0);
+        return;
+    }
+
+    let target = (rd5 as usize + F6_OFFSET_IN_RD5) as *mut std::ffi::c_void;
+    let _ = hipMemsetD32(hipDeviceptr_t(target), 0, 1);
+    tracker.last_state.insert(rd5, 0);
+    super::driver::zluda_log_err(&format!(
+        "*** RD5_22176 FORCE_ZERO current MS_1 rd5=0x{:x} was={} (targeted workaround)",
+        rd5, cur_val,
+    ));
+    let _ = hipDeviceSynchronize();
+}
+
 /// Snapshot `*(rd5+22176)` for every tracked rd5 pointer and diff against
 /// the previous snapshot. Logs `*** RD5_22176 {RESET|DOUBLED|MUTATED} by
 /// '<kernel>' rd5=0x... prev=N new=M`. The RESET tag fires when N→0
@@ -2317,13 +2387,14 @@ impl SortGridEvenShare {
             return None;
         }
         (0..self.block_count()).find_map(|block_idx| {
-            self.block_range(block_idx, item_count).and_then(|(start, end)| {
-                if index >= start && index < end {
-                    Some((block_idx, start, end))
-                } else {
-                    None
-                }
-            })
+            self.block_range(block_idx, item_count)
+                .and_then(|(start, end)| {
+                    if index >= start && index < end {
+                        Some((block_idx, start, end))
+                    } else {
+                        None
+                    }
+                })
         })
     }
 }
@@ -2611,7 +2682,8 @@ fn format_downsweep_rank_line(
     let key = keys_in[source_idx];
     let value = values_in[source_idx];
     let digit = sort_pass_radix_digit(key, begin_bit) as usize;
-    let (block_idx, block_start, block_end) = grid_share.block_for_index(source_idx, keys_in.len())?;
+    let (block_idx, block_start, block_end) =
+        grid_share.block_for_index(source_idx, keys_in.len())?;
     let scan_counts = block_counts
         .iter()
         .map(|counts| counts[digit] as usize)
@@ -2934,9 +3006,9 @@ fn analyze_expected_sort_pass(
     });
     let actual_value_input_window = first_mismatch.and_then(|(_, _, _, _, actual_value)| {
         let actual_value_input_positions = find_value_positions(values_in, actual_value, 4);
-        actual_value_input_positions
-            .first()
-            .and_then(|&idx| format_sort_pair_window(keys_in, values_in, idx, "ACTUAL_VALUE_SRC_IN"))
+        actual_value_input_positions.first().and_then(|&idx| {
+            format_sort_pair_window(keys_in, values_in, idx, "ACTUAL_VALUE_SRC_IN")
+        })
     });
     let actual_value_input_run = first_mismatch.and_then(|(out_idx, _, _, _, actual_value)| {
         let actual_value_input_positions = find_value_positions(values_in, actual_value, 4);
@@ -3787,6 +3859,18 @@ unsafe fn capture_sort_downsweep_safe(
     if n_items == 0 || keys_in == 0 || keys_out == 0 {
         return;
     }
+    // Synchronize the downsweep stream before issuing diagnostic D2D snapshots.
+    // Offline full-pass replay showed the sort kernels themselves can produce a
+    // clean window while host-side copy paths still diverge or wedge, so the
+    // validator must not rely on copy ordering to serialize against the launch.
+    let pre_copy_sync_result = hip_runtime_sys::hipStreamSynchronize(stream);
+    if pre_copy_sync_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_PASS_SAFE: pre-copy stream sync failed {:?} bit={} keys_in=0x{:x} keys_out=0x{:x} n={}",
+            pre_copy_sync_result, begin_bit, keys_in, keys_out, n_items
+        ));
+        return;
+    }
     let read_n = sort_pass_capture_len(n_items, grid_share);
     let logical_n = n_items.min(read_n);
     let mut guard = match SORT_PASS_TRACKER.lock() {
@@ -3876,10 +3960,10 @@ unsafe fn capture_sort_downsweep_safe(
             ));
         }
     }
-    let sync_result = hip_runtime_sys::hipStreamSynchronize(stream);
+    let sync_result = hip_runtime_sys::hipDeviceSynchronize();
     if sync_result.is_err() {
         super::driver::zluda_log_err(&format!(
-            "*** SORT_PASS_SAFE: stream sync failed {:?} bit={} keys_in=0x{:x} keys_out=0x{:x} n={}",
+            "*** SORT_PASS_SAFE: post-copy device sync failed {:?} bit={} keys_in=0x{:x} keys_out=0x{:x} n={}",
             sync_result, begin_bit, keys_in, keys_out, read_n
         ));
         return;
@@ -4681,6 +4765,7 @@ unsafe fn createGrid_validator_init(state: &mut Option<CreateGridValidator>) {
 unsafe fn validate_create_grid_safe(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
+    stream: hipStream_t,
 ) {
     // CreateGrid(int n, const int* sortedKeys, int* gridStarts, int* gridEnds)
     // arg layout (extra flat buffer): n@0, sortedKeys@8, gridStarts@16, gridEnds@24
@@ -4716,6 +4801,19 @@ unsafe fn validate_create_grid_safe(
         Some(v) => v,
         None => return,
     };
+
+    // Synchronize the CreateGrid launch stream before validator snapshots.
+    // The live-only sort corruption still reproduces even when captured pass
+    // inputs replay cleanly offline, so the prelaunch validator must not race
+    // preceding sort/copy work on the same stream.
+    let pre_copy_sync_result = hip_runtime_sys::hipStreamSynchronize(stream);
+    if pre_copy_sync_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** F5_SAFE CreateGrid: pre-copy stream sync failed {:?} ptr=0x{:x} n={} stream={:?}",
+            pre_copy_sync_result, sorted_keys_dev, n, stream
+        ));
+        return;
+    }
 
     let dst_a_dev = hipDeviceptr_t(validator.scratch_dev);
     let dst_b_dev = hipDeviceptr_t((validator.scratch_dev as usize + F5_SCRATCH_BYTES) as _);
@@ -5744,9 +5842,8 @@ unsafe fn snapshot_sort_downsweep_prelaunch_state(
         ));
     }
     if vals_in != 0 {
-        let dst_vals_in_before_dev = hipDeviceptr_t(
-            (tracker.scratch_dev as usize + SORT_PASS_VALS_IN_BEFORE_OFFSET) as _,
-        );
+        let dst_vals_in_before_dev =
+            hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_VALS_IN_BEFORE_OFFSET) as _);
         let copy_vals_in_before_result = hipMemcpyDtoD(
             dst_vals_in_before_dev,
             hipDeviceptr_t(vals_in as *mut std::ffi::c_void),
@@ -5759,9 +5856,8 @@ unsafe fn snapshot_sort_downsweep_prelaunch_state(
             ));
         }
     }
-    let dst_out_before_dev = hipDeviceptr_t(
-        (tracker.scratch_dev as usize + SORT_PASS_KEYS_OUT_BEFORE_OFFSET) as _,
-    );
+    let dst_out_before_dev =
+        hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_KEYS_OUT_BEFORE_OFFSET) as _);
     let copy_out_before_result = hipMemcpyDtoD(
         dst_out_before_dev,
         hipDeviceptr_t(keys_out as *mut std::ffi::c_void),
@@ -5774,9 +5870,8 @@ unsafe fn snapshot_sort_downsweep_prelaunch_state(
         ));
     }
     if vals_out != 0 {
-        let dst_vals_out_before_dev = hipDeviceptr_t(
-            (tracker.scratch_dev as usize + SORT_PASS_VALS_OUT_BEFORE_OFFSET) as _,
-        );
+        let dst_vals_out_before_dev =
+            hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_VALS_OUT_BEFORE_OFFSET) as _);
         let copy_vals_out_before_result = hipMemcpyDtoD(
             dst_vals_out_before_dev,
             hipDeviceptr_t(vals_out as *mut std::ffi::c_void),
@@ -6116,7 +6211,7 @@ pub(crate) fn launch_kernel(
         }
         if creategrid_safe_validator_enabled() {
             unsafe {
-                validate_create_grid_safe(kernel_params, extra);
+                validate_create_grid_safe(kernel_params, extra, stream);
             }
         }
     }
@@ -6155,11 +6250,15 @@ pub(crate) fn launch_kernel(
     // `buffer_gl1_inv; buffer_gl0_inv` on AMDGPU and ensures stores from
     // PhysX MemCopyBatchedAsync's zero-fill path (which doesn't have its
     // own `membar.sys`) are globally visible before the next kernel runs.
-    // The function `force_zero_rd5_22176_before_ms1` is left in place for
-    // the smoke test below; the production call site is gone.
-    // if name == "CreateParticleShapesIncremental_MultiStage_1" {
-    //     unsafe { force_zero_rd5_22176_before_ms1(); }
-    // }
+    // The old broad workaround (`force_zero_rd5_22176_before_ms1`) remains
+    // only for unit tests. Production now uses the targeted variant that
+    // zeros just the current MS_1 launch's rd5 (param_6), avoiding the
+    // two-actors-per-frame overzero bug from runs 18/20/21/22.
+    if name == "CreateParticleShapesIncremental_MultiStage_1" {
+        unsafe {
+            force_zero_current_ms1_rd5_22176(kernel_params, extra);
+        }
+    }
     // Phase 1.5 Item A: dump the MemCopyBatchedAsync Arg2 scratch buffer
     // contents BEFORE the kernel launches. This answers the "PhysX bug or
     // ZLUDA bug?" root-cause question for Phase 1 — by correlating the
@@ -7392,6 +7491,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn current_ms1_rd5_ptr_reads_kernel_params_slot_6() {
+        let mut p0: u64 = 0;
+        let mut p1: u16 = 0;
+        let mut p2: u64 = 0;
+        let mut p3: u64 = 0;
+        let mut p4: u32 = 0;
+        let mut p5: f32 = 0.0;
+        let mut p6: u64 = 0x1234_5678_9abc_def0;
+        let mut p7: u64 = 0;
+        let mut p8: u64 = 0;
+        let mut p9: u64 = 0;
+        let mut p10: u64 = 0;
+        let mut p11: u64 = 0;
+        let mut p12: u8 = 0;
+        let mut params: [*mut ::core::ffi::c_void; 13] = [
+            &mut p0 as *mut _ as *mut _,
+            &mut p1 as *mut _ as *mut _,
+            &mut p2 as *mut _ as *mut _,
+            &mut p3 as *mut _ as *mut _,
+            &mut p4 as *mut _ as *mut _,
+            &mut p5 as *mut _ as *mut _,
+            &mut p6 as *mut _ as *mut _,
+            &mut p7 as *mut _ as *mut _,
+            &mut p8 as *mut _ as *mut _,
+            &mut p9 as *mut _ as *mut _,
+            &mut p10 as *mut _ as *mut _,
+            &mut p11 as *mut _ as *mut _,
+            &mut p12 as *mut _ as *mut _,
+        ];
+
+        let got = current_ms1_rd5_ptr(params.as_mut_ptr(), std::ptr::null_mut());
+        assert_eq!(got, Some(p6));
+    }
+
+    #[test]
+    fn current_ms1_rd5_ptr_reads_extra_buffer_offset_40() {
+        let want: u64 = 0xfedc_ba98_7654_3210;
+        let mut buffer = [0u8; 56];
+        buffer[40..48].copy_from_slice(&want.to_ne_bytes());
+        let mut size = buffer.len();
+        let mut extra = [
+            0x1usize as *mut ::core::ffi::c_void,
+            buffer.as_mut_ptr() as *mut ::core::ffi::c_void,
+            0x2usize as *mut ::core::ffi::c_void,
+            &mut size as *mut _ as *mut ::core::ffi::c_void,
+            std::ptr::null_mut(),
+        ];
+
+        let got = current_ms1_rd5_ptr(std::ptr::null_mut(), extra.as_mut_ptr());
+        assert_eq!(got, Some(want));
+    }
+
     /// `track_rd5_ptr` should add new pointers up to MS3_MAX_TRACKED_COUNTERS,
     /// silently drop duplicates, and silently drop additions beyond the limit.
     /// Bug A tracking depends on this — if a Bug A rd5 isn't in the tracked
@@ -8115,7 +8267,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            capture.capture_text.contains("DEST_BLOCK block=1 range=[2..4)"),
+            capture
+                .capture_text
+                .contains("DEST_BLOCK block=1 range=[2..4)"),
             "capture should include the destination block section: {}",
             capture.capture_text
         );
@@ -8206,12 +8360,30 @@ mod tests {
         assert_eq!(read_u32(44), 1);
         assert_eq!(read_u32(48), 1);
         assert_eq!(read_u32(52), 256);
-        assert_eq!(u64::from_le_bytes(bytes[56..64].try_into().unwrap()), 0x1000);
-        assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 0x2000);
-        assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 0x3000);
-        assert_eq!(u64::from_le_bytes(bytes[80..88].try_into().unwrap()), 0x4000);
-        assert_eq!(u64::from_le_bytes(bytes[88..96].try_into().unwrap()), 0x5000);
-        assert_eq!(u64::from_le_bytes(bytes[96..104].try_into().unwrap()), 0x6000);
+        assert_eq!(
+            u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
+            0x1000
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+            0x2000
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+            0x3000
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+            0x4000
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[88..96].try_into().unwrap()),
+            0x5000
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[96..104].try_into().unwrap()),
+            0x6000
+        );
         assert_eq!(read_i32(104), 5);
         assert_eq!(read_i32(136), 0);
         assert_eq!(read_i32(140), 10);

@@ -18,6 +18,36 @@ use std::sync::Mutex;
 /// (memory.rs) so that ALL NULL-stream operations serialize with each other.
 pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
 
+fn strict_null_stream_barrier_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_NULL_STREAM_STRICT").map_or(false, |v| v == "1"))
+}
+
+fn null_stream_uses_global_lock(stream: hipStream_t, strict: bool) -> bool {
+    strict || stream.0.is_null()
+}
+
+fn null_stream_needs_pre_sync(stream: hipStream_t) -> bool {
+    stream.0.is_null()
+}
+
+fn null_stream_needs_post_sync(stream: hipStream_t, strict: bool) -> bool {
+    strict && stream.0.is_null()
+}
+
+pub(crate) struct NullStreamGuard {
+    guard: Option<std::sync::MutexGuard<'static, ()>>,
+    post_sync: bool,
+}
+
+impl Drop for NullStreamGuard {
+    fn drop(&mut self) {
+        if self.post_sync {
+            let _ = unsafe { hipDeviceSynchronize() };
+        }
+    }
+}
+
 /// Synchronize for CUDA NULL-stream semantics before performing a GPU operation.
 /// Call this before hipModuleLaunchKernel, hipMemcpyAsync, hipMemsetAsync, etc.
 ///
@@ -25,14 +55,26 @@ pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
 /// work on all streams. Returns a guard that must be held until the HIP operation
 /// is submitted — this prevents another thread from submitting work in between.
 ///
-/// If `stream` is non-NULL: no-op (non-NULL streams are independent in CUDA).
-pub(crate) fn null_stream_sync(stream: hipStream_t) -> Option<std::sync::MutexGuard<'static, ()>> {
-    if stream.0.is_null() {
-        let guard = NULL_STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = unsafe { hipDeviceSynchronize() };
-        Some(guard)
+/// If `ZLUDA_NULL_STREAM_STRICT=1` is set, we also enforce the missing postlaunch
+/// half of CUDA's NULL-stream barrier by:
+/// - keeping the lock held until the NULL-stream operation completes, and
+/// - briefly taking the same lock for non-NULL submissions so they cannot race
+///   ahead of an in-flight NULL-stream operation.
+/// This gate is kept opt-in because it fixed Batman's earlier late `n=8827`
+/// CreateGrid corruption but still exposes a different later `n=4688` family.
+pub(crate) fn null_stream_sync(stream: hipStream_t) -> NullStreamGuard {
+    let strict = strict_null_stream_barrier_enabled();
+    let guard = if null_stream_uses_global_lock(stream, strict) {
+        Some(NULL_STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     } else {
         None
+    };
+    if null_stream_needs_pre_sync(stream) {
+        let _ = unsafe { hipDeviceSynchronize() };
+    }
+    NullStreamGuard {
+        guard,
+        post_sync: null_stream_needs_post_sync(stream, strict),
     }
 }
 
@@ -160,4 +202,37 @@ pub(crate) fn wait_event(
     flags: ::core::ffi::c_uint,
 ) -> hipError_t {
     unsafe { hipStreamWaitEvent(stream, event, flags) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_stream_policy_default_mode_only_locks_null_stream() {
+        let null = hipStream_t(std::ptr::null_mut());
+        let other = hipStream_t(1usize as *mut _);
+        let strict = false;
+
+        assert!(null_stream_uses_global_lock(null, strict));
+        assert!(!null_stream_uses_global_lock(other, strict));
+        assert!(null_stream_needs_pre_sync(null));
+        assert!(!null_stream_needs_pre_sync(other));
+        assert!(!null_stream_needs_post_sync(null, strict));
+        assert!(!null_stream_needs_post_sync(other, strict));
+    }
+
+    #[test]
+    fn null_stream_policy_strict_mode_blocks_all_submissions_and_postsyncs_null() {
+        let null = hipStream_t(std::ptr::null_mut());
+        let other = hipStream_t(1usize as *mut _);
+        let strict = true;
+
+        assert!(null_stream_uses_global_lock(null, strict));
+        assert!(null_stream_uses_global_lock(other, strict));
+        assert!(null_stream_needs_pre_sync(null));
+        assert!(!null_stream_needs_pre_sync(other));
+        assert!(null_stream_needs_post_sync(null, strict));
+        assert!(!null_stream_needs_post_sync(other, strict));
+    }
 }

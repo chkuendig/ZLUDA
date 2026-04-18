@@ -11,6 +11,7 @@ Options:
   --no-build           Skip the release build and deploy the existing libnvcuda.so
   --no-launch          Skip the Steam launch after deployment
   --no-benchmark       Launch only; do not wait for the menu or send benchmark keys
+  --no-clean-dumps     Skip clearing Batman crash/GPU dump artifacts before launch
   --compare-captures   Inspect replay captures and run the offline good-vs-bad compare
   --watch-captures     Wait for the next good replay capture and run the offline compare automatically
   --watch-timeout SEC  Max seconds to wait in --watch-captures mode (default: 28800)
@@ -38,6 +39,7 @@ GAME_PROCESS_PATTERN="BatmanAK.exe -nologo"
 DO_BUILD=1
 DO_LAUNCH=1
 DO_BENCHMARK=1
+DO_CLEAN_DUMPS=1
 DO_COMPARE_CAPTURES=0
 DO_WATCH_CAPTURES=0
 GOOD_CAPTURE_PATH=""
@@ -46,13 +48,11 @@ WATCH_TIMEOUT=28800
 WATCH_INTERVAL=10
 
 GAME_TIMEOUT=240
-MENU_TIMEOUT=360
 BENCHMARK_START_TIMEOUT=240
 BENCHMARK_MONITOR_TIMEOUT=900
-INITIAL_MENU_SETTLE=10
-INITIAL_KEYPRESS_EXTRA_DELAY=20
-MENU_VISIBLE_STABLE_SECONDS=10
-MENU_IDLE_CALL_THRESHOLD=50
+INITIAL_MENU_SETTLE=30
+TITLE_PROMPT_ADVANCE_DELAY=2
+SAVE_SLOT_ADVANCE_DELAY=10
 FOCUS_SETTLE_DELAY=0.2
 BENCHMARK_RETRY_AFTER_SECONDS=20
 
@@ -69,6 +69,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-benchmark)
             DO_BENCHMARK=0
+            ;;
+        --no-clean-dumps)
+            DO_CLEAN_DUMPS=0
             ;;
         --compare-captures)
             DO_COMPARE_CAPTURES=1
@@ -133,6 +136,8 @@ PROTONFIX_SRC="$REPO_DIR/protonfixes/gamefixes-steam/208650.py"
 PROTONFIX_DST="$COMPAT_TOOL_DIR/protonfixes/gamefixes-steam/208650.py"
 PROTONFIX_PKG_DST="$COMPAT_TOOL_DIR/protonfixes/protonfixes/gamefixes-steam/208650.py"
 COMPUTE_CACHE_DB="${HOME}/.cache/zluda/ComputeCache/zluda.db"
+ZLUDA_CARGO_SCRIPT="$REPO_DIR/scripts/zluda-cargo.sh"
+BATMAN_DUMP_CLEANUP_SCRIPT="$REPO_DIR/scripts/cleanup-batman-dumps.sh"
 
 status() {
     echo "[batman] $*" >&2
@@ -285,10 +290,7 @@ send_key() {
 
 build_release() {
     status "building ZLUDA release"
-    (
-        cd "$ZLUDA_DIR"
-        LIBRARY_PATH=/tmp/stub_libs:ext/rocm/lib cargo build --release -p zluda
-    )
+    bash "$ZLUDA_CARGO_SCRIPT" build --release -p zluda
 }
 
 deploy_binaries() {
@@ -311,7 +313,13 @@ clear_caches() {
     rm -f "$COMPUTE_CACHE_DB"
 }
 
+clean_batman_dumps() {
+    status "clearing Batman crash/GPU dump artifacts"
+    bash "$BATMAN_DUMP_CLEANUP_SCRIPT"
+}
+
 launch_game() {
+    discover_x_session
     status "launching app ${APP_ID} via Steam CLI"
     "$STEAM_CLI" -applaunch "$APP_ID" >/tmp/batman_steam_launch.log 2>&1 &
     local steam_pid=$!
@@ -339,53 +347,7 @@ wait_for_game_process() {
     return 1
 }
 
-wait_for_menu_ready() {
-    local log_start="$1"
-    local attempts=$((MENU_TIMEOUT / 2))
-    local window_seen_at=""
-    status "waiting for menu-ready state"
-    for ((i = 1; i <= attempts; i++)); do
-        local crash_line=""
-        crash_line="$(latest_new_log_match "$log_start" '\\*\\*\\* SIGABRT|GPU fault likely|\\*\\*\\* SIGSEGV' || true)"
-        if [[ -n "$crash_line" ]]; then
-            echo "Error: crash detected before menu-ready state: $crash_line" >&2
-            return 1
-        fi
-        if ! game_running; then
-            echo "Error: BatmanAK.exe exited before menu-ready state" >&2
-            return 1
-        fi
-        local kernels=""
-        local idle_calls=""
-        local wid=""
-        local visible_for=0
-        kernels="$(count_new_log_matches "$log_start" 'cuLaunchKernel')"
-        idle_calls="$(count_new_log_matches "$log_start" 'cuEventRecord|cuEventSynchronize|cuCtxGetCurrent')"
-        wid="$(find_game_window)"
-        if [[ -n "$wid" ]]; then
-            if [[ -z "$window_seen_at" ]]; then
-                window_seen_at="$SECONDS"
-            fi
-            visible_for=$((SECONDS - window_seen_at))
-        else
-            window_seen_at=""
-        fi
-        if [[ "$kernels" -eq 0 && "$idle_calls" -ge "$MENU_IDLE_CALL_THRESHOLD" && -n "$wid" && "$visible_for" -ge "$MENU_VISIBLE_STABLE_SECONDS" ]]; then
-            status "menu ready (idle_calls=${idle_calls}, kernels=${kernels}, window=${wid}, visible_for=${visible_for}s)"
-            return 0
-        fi
-        if (( i % 10 == 0 )); then
-            status "menu wait: idle_calls=${idle_calls} kernels=${kernels} window=${wid:-none} visible_for=${visible_for}s"
-        fi
-        sleep 2
-    done
-    echo "Error: timed out waiting for Batman menu-ready state" >&2
-    return 1
-}
-
-run_benchmark_sequence() {
-    send_key Return 2
-    send_key Return 10
+run_benchmark_menu_sequence() {
     send_key Up 2
     send_key Up 2
     send_key Return 2
@@ -395,15 +357,18 @@ run_benchmark_sequence() {
 
 start_benchmark() {
     status "starting benchmark sequence"
-    status "waiting ${INITIAL_MENU_SETTLE}s initial settle + ${INITIAL_KEYPRESS_EXTRA_DELAY}s extra pre-key delay"
+    status "waiting ${INITIAL_MENU_SETTLE}s before first input"
     sleep "$INITIAL_MENU_SETTLE"
-    sleep "$INITIAL_KEYPRESS_EXTRA_DELAY"
-    run_benchmark_sequence
+    status "advancing past title prompt"
+    send_key Return "$TITLE_PROMPT_ADVANCE_DELAY"
+    status "selecting default save slot"
+    send_key Return "$SAVE_SLOT_ADVANCE_DELAY"
+    run_benchmark_menu_sequence
 }
 
 retry_benchmark_sequence() {
     status "benchmark still idle; retrying benchmark sequence once"
-    run_benchmark_sequence
+    run_benchmark_menu_sequence
 }
 
 wait_for_benchmark_start() {
@@ -538,14 +503,9 @@ compare_replay_captures() {
         return 0
     fi
     status "running offline replay capture diff"
-    (
-        cd "$ZLUDA_DIR"
-        ZLUDA_SORT_REPLAY_GOOD_CAPTURE="$RESOLVED_GOOD_CAPTURE" \
-        ZLUDA_SORT_REPLAY_BAD_CAPTURE="$RESOLVED_BAD_CAPTURE" \
-        LD_LIBRARY_PATH="$(pwd)/ext/rocm/lib" \
-        LIBRARY_PATH=/tmp/stub_libs:ext/rocm/lib \
-        cargo test -p ptx sort_replay_compare_good_and_bad_captures_live -- --ignored --nocapture
-    )
+    ZLUDA_SORT_REPLAY_GOOD_CAPTURE="$RESOLVED_GOOD_CAPTURE" \
+    ZLUDA_SORT_REPLAY_BAD_CAPTURE="$RESOLVED_BAD_CAPTURE" \
+    bash "$ZLUDA_CARGO_SCRIPT" test -p ptx --features has_rocm sort_replay_compare_good_and_bad_captures_live -- --ignored --nocapture
 }
 
 watch_replay_captures() {
@@ -586,10 +546,9 @@ run_benchmark() {
     discover_x_session
     local log_start="$1"
     wait_for_game_process "$log_start"
-    wait_for_menu_ready "$log_start"
     local benchmark_log_start=""
     benchmark_log_start="$(log_cursor)"
-    start_benchmark
+    start_benchmark "$benchmark_log_start"
     wait_for_benchmark_start "$benchmark_log_start"
     monitor_benchmark_outcome "$benchmark_log_start" || return $?
 }
@@ -598,6 +557,8 @@ require_dir "$REPO_DIR"
 require_dir "$ZLUDA_DIR"
 require_dir "$COMPAT_TOOL_DIR"
 require_file "$PROTONFIX_SRC"
+require_file "$ZLUDA_CARGO_SCRIPT"
+require_file "$BATMAN_DUMP_CLEANUP_SCRIPT"
 
 COMPARE_ONLY=0
 if [[ "$DO_COMPARE_CAPTURES" -eq 1 && "$DO_BUILD" -eq 0 && "$DO_LAUNCH" -eq 0 ]]; then
@@ -619,6 +580,9 @@ fi
 
 if [[ "$DO_LAUNCH" -eq 1 ]]; then
     require_cmd "$STEAM_CLI"
+    if [[ "$DO_CLEAN_DUMPS" -eq 1 ]]; then
+        clean_batman_dumps
+    fi
     LOG_START="$(log_cursor)"
     launch_game
     if [[ "$DO_BENCHMARK" -eq 1 ]]; then

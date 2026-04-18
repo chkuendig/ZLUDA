@@ -2414,6 +2414,25 @@ fn latest_sort_replay_capture_path() -> Result<Option<String>, Box<dyn error::Er
     Ok(newest.map(|(_, path)| path))
 }
 
+fn sort_pass_digit(key: i32, begin_bit: u32) -> u32 {
+    ((key as u32) >> begin_bit) & 0xf
+}
+
+fn first_sort_replay_capture_mismatch_index(capture: &SortReplayCapture) -> Option<usize> {
+    let mut expected_order: Vec<usize> = (0..capture.keys_in.len()).collect();
+    expected_order.sort_by_key(|&idx| sort_pass_digit(capture.keys_in[idx], capture.begin_bit));
+    let vals_in = capture.vals_in.as_ref();
+    let vals_out = capture.vals_out.as_ref();
+    expected_order.into_iter().enumerate().find_map(|(out_idx, in_idx)| {
+        let keys_match = capture.keys_out.get(out_idx) == capture.keys_in.get(in_idx);
+        let vals_match = match (vals_in, vals_out) {
+            (Some(vals_in), Some(vals_out)) => vals_out.get(out_idx) == vals_in.get(in_idx),
+            _ => true,
+        };
+        (!keys_match || !vals_match).then_some(out_idx)
+    })
+}
+
 #[test]
 fn parse_sort_replay_capture_reads_expected_layout() -> Result<(), Box<dyn error::Error>> {
     let mut bytes = Vec::new();
@@ -2493,6 +2512,47 @@ fn parse_sort_replay_capture_reads_expected_layout() -> Result<(), Box<dyn error
     );
     Ok(())
 }
+
+#[test]
+fn first_sort_replay_capture_mismatch_index_finds_first_bad_pair() {
+    let capture = SortReplayCapture {
+        pass_n: 1,
+        begin_bit: 4,
+        n_items: 4,
+        capture_items: 4,
+        grid_dim_x: 1,
+        block_dim_x: 128,
+        block_dim_y: 1,
+        block_dim_z: 1,
+        shared_mem_bytes: 0,
+        first: 0,
+        last: 0,
+        overwrite: 0,
+        keys_in_ptr: 0,
+        keys_out_ptr: 0,
+        vals_in_ptr: 0,
+        vals_out_ptr: 0,
+        spine_ptr: 0,
+        stream_ptr: 0,
+        spine_words: vec![],
+        grid_share: None,
+        keys_in: vec![0x10, 0x20, 0x01, 0x11],
+        vals_in: Some(vec![10, 20, 1, 11]),
+        keys_in_before: vec![],
+        vals_in_before: None,
+        keys_out_before: vec![],
+        vals_out_before: None,
+        keys_out: vec![0x01, 0x10, 0x20, 0x11],
+        vals_out: Some(vec![1, 10, 20, 11]),
+    };
+    assert_eq!(first_sort_replay_capture_mismatch_index(&capture), Some(2));
+}
+
+
+
+
+
+
 
 
 
@@ -5804,7 +5864,7 @@ fn ms4_scatter_known_good_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
 /// Replay MS_4 with real input buffers captured from a crashing game run.
 ///
-/// Consumes `/tmp/ms4_captures.bin` (a ring of 8 slots written by the
+/// Consumes `/tmp/ms4_captures.bin` (a capture ring written by the
 /// `ZLUDA_MS4_CAPTURE=1` path in `launch_kernel`) and, for each slot that has
 /// a valid magic header, uploads the captured buffers to the GPU and launches
 /// MS_4. Verifies that the kernel completes without a GPU fault.
@@ -5841,7 +5901,6 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
     );
 
     // Must mirror the layout in zluda/src/impl/function.rs::Ms4CaptureSlot.
-    const MS4_CAPTURE_SLOTS: usize = 8;
     const MS4_CAPTURE_MAX_PARTICLES: usize = 32 * 1024;
     const MS4_CAPTURE_MAX_SHAPES: usize = 256;
     const MS4_PARTICLE_REGION_BYTES: usize = MS4_CAPTURE_MAX_PARTICLES * 4;
@@ -5853,11 +5912,8 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
     const SLOT_BYTES: usize = HEADER_BYTES + DATA_BYTES;
     const MAGIC: u64 = 0x4d53344341505455;
 
-    assert_eq!(
-        capture.len(),
-        SLOT_BYTES * MS4_CAPTURE_SLOTS,
-        "unexpected capture file size"
-    );
+    assert_eq!(capture.len() % SLOT_BYTES, 0, "unexpected capture file size");
+    let capture_slots = capture.len() / SLOT_BYTES;
 
     let elf_path = "/tmp/zluda_ir_dump/module_3_elf";
     let elf = match fs::read(elf_path) {
@@ -5877,7 +5933,7 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // by the capture path). For each valid slot, upload + launch.
     let mut replayed = 0usize;
     let mut faulted = 0usize;
-    for slot_idx in 0..MS4_CAPTURE_SLOTS {
+    for slot_idx in 0..capture_slots {
         let slot_off = slot_idx * SLOT_BYTES;
         let header = &capture[slot_off..slot_off + HEADER_BYTES];
         let magic = u64::from_ne_bytes(header[0..8].try_into().unwrap());
@@ -6064,7 +6120,7 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
     eprintln!(
         "ms4_replay: replayed {}/{} slots, {} faulted",
-        replayed, MS4_CAPTURE_SLOTS, faulted
+        replayed, capture_slots, faulted
     );
     if replayed == 0 {
         eprintln!("ms4_replay: no valid slots in capture — likely game hasn't reached MS_4 yet");
@@ -6076,7 +6132,7 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
 /// (the one with the highest `launch_n` in the ring — by definition the one
 /// that was in flight when SIGABRT fired). This is the minimal-HIP-operation
 /// variant of `ms4_replay_captured_inputs_amdgpu`: where the full-chain test
-/// does 8 slots × ~11 HIP operations and trips the ROCm ProfilingSignal pool
+/// does one pass over the whole capture ring and trips the ROCm ProfilingSignal pool
 /// race after a handful of copies, this test does just ~11 ops total.
 ///
 /// Purpose: isolate whether the EXACT bytes the game fed MS_4 on the crashing
@@ -6094,7 +6150,6 @@ fn ms4_replay_crashing_slot_amdgpu() -> Result<(), Box<dyn error::Error>> {
     }
 
     // Layout mirror of `zluda/src/impl/function.rs::Ms4CaptureSlot`.
-    const MS4_CAPTURE_SLOTS: usize = 8;
     const MS4_CAPTURE_MAX_PARTICLES: usize = 32 * 1024;
     const MS4_CAPTURE_MAX_SHAPES: usize = 256;
     const MS4_PARTICLE_REGION_BYTES: usize = MS4_CAPTURE_MAX_PARTICLES * 4;
@@ -6117,12 +6172,13 @@ fn ms4_replay_crashing_slot_amdgpu() -> Result<(), Box<dyn error::Error>> {
             return Ok(());
         }
     };
-    assert_eq!(capture.len(), SLOT_BYTES * MS4_CAPTURE_SLOTS);
+    assert_eq!(capture.len() % SLOT_BYTES, 0, "unexpected capture file size");
+    let capture_slots = capture.len() / SLOT_BYTES;
 
     // Find the slot with the highest launch_n (that's the most recent — the
     // crashing one).
     let mut best: Option<(usize, u64)> = None;
-    for slot_idx in 0..MS4_CAPTURE_SLOTS {
+    for slot_idx in 0..capture_slots {
         let off = slot_idx * SLOT_BYTES;
         let magic = u64::from_ne_bytes(capture[off..off + 8].try_into().unwrap());
         if magic != MAGIC {
