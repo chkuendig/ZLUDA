@@ -78,6 +78,48 @@ extern "C"
 {
     extern "C" __attribute__((constant)) CONSTANT_SPACE uint32_t __oclc_ISA_version __device__;
 
+    __device__ static __forceinline__ uint32_t workitem_id(uint8_t member)
+    {
+        switch (member)
+        {
+        case 0:
+            return __builtin_amdgcn_workitem_id_x();
+        case 1:
+            return __builtin_amdgcn_workitem_id_y();
+        case 2:
+            return __builtin_amdgcn_workitem_id_z();
+        default:
+            return 0;
+        }
+    }
+
+    __device__ static __forceinline__ uint32_t workgroup_size(uint8_t member)
+    {
+        switch (member)
+        {
+        case 0:
+            return uint32_t(__builtin_amdgcn_workgroup_size_x());
+        case 1:
+            return uint32_t(__builtin_amdgcn_workgroup_size_y());
+        case 2:
+            return uint32_t(__builtin_amdgcn_workgroup_size_z());
+        default:
+            return 0;
+        }
+    }
+
+    // __lane_id() and some OCKL local-id helpers can lower to active-lane rank under
+    // divergence, but PTX %laneid is the physical lane within the flattened CTA.
+    __device__ static __forceinline__ uint32_t physical_laneid()
+    {
+        uint32_t tid_x = workitem_id(0);
+        uint32_t tid_y = workitem_id(1);
+        uint32_t tid_z = workitem_id(2);
+        uint32_t ntid_x = workgroup_size(0);
+        uint32_t ntid_y = workgroup_size(1);
+        return ((tid_z * ntid_y + tid_y) * ntid_x + tid_x) & 31U;
+    }
+
     uint32_t FUNC(activemask)()
     {
         return __builtin_amdgcn_read_exec_lo();
@@ -86,13 +128,13 @@ extern "C"
     size_t __ockl_get_local_id(uint32_t) __device__;
     uint32_t FUNC(sreg_tid)(uint8_t member)
     {
-        return (uint32_t)__ockl_get_local_id(member);
+        return workitem_id(member);
     }
 
     size_t __ockl_get_local_size(uint32_t) __device__;
     uint32_t FUNC(sreg_ntid)(uint8_t member)
     {
-        return (uint32_t)__ockl_get_local_size(member);
+        return workgroup_size(member);
     }
 
     size_t __ockl_get_group_id(uint32_t) __device__;
@@ -109,7 +151,7 @@ extern "C"
 
     uint32_t FUNC(sreg_laneid)()
     {
-        return __lane_id();
+        return physical_laneid();
     }
 
     uint32_t FUNC(sreg_lanemask_le)()
@@ -272,7 +314,7 @@ extern "C"
     {                                                                                                                                           \
         int32_t section_mask = (opts >> 8) & 0b11111;                                                                                           \
         int32_t warp_end = opts & 0b11111;                                                                                                      \
-        int32_t self = (int32_t)__lane_id();                                                                                                    \
+        int32_t self = (int32_t)FUNC_CALL(sreg_laneid)();                                                                                       \
         int32_t subsection = section_mask & self;                                                                                               \
         int32_t subsection_end = subsection | (~section_mask & warp_end);                                                                       \
         int32_t idx = calculate_index;                                                                                                          \
@@ -1311,7 +1353,7 @@ __device__ static void mma_load_rowcol(T upper_row[8], T lower_row[8], T left_co
                                        uint32_t a0a1, uint32_t a2a3,
                                        uint32_t b0b1)
 {
-    uint8_t laneid = uint8_t(__lane_id());
+    uint8_t laneid = uint8_t(FUNC_CALL(sreg_laneid)());
     uint8_t quad_source = (laneid + quad_index) % 4;
     upper_row[index] = std::bit_cast<T>(__builtin_amdgcn_mov_dpp(std::bit_cast<int32_t>(a0a1), DPP_MASK, 0xf, 0xf, 1));
     lower_row[index] = std::bit_cast<T>(__builtin_amdgcn_mov_dpp(std::bit_cast<int32_t>(a2a3), DPP_MASK, 0xf, 0xf, 1));
@@ -1325,7 +1367,7 @@ __device__ static void mma_load_col(T upper_row[16], T lower_row[16], T left_col
                                     uint32_t a0a1, uint32_t a2a3,
                                     uint32_t b0b1)
 {
-    uint8_t laneid = uint8_t(__lane_id());
+    uint8_t laneid = uint8_t(FUNC_CALL(sreg_laneid)());
     uint8_t quad_source = laneid % 4;
     upper_row[index] = std::bit_cast<T>(a0a1);
     lower_row[index] = std::bit_cast<T>(a2a3);

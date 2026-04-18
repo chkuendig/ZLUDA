@@ -6,7 +6,8 @@ Cargo.lock
 
 ptx/lib/zluda_ptx_impl.ll
 
-# Downloaded ROCm packages (reproducible via script)
+# Downloaded ROCm packages / local runtime symlink (reproducible via script)
+ext/rocm
 ext/rocm/
 
 # Debug artifacts
@@ -19,3 +20,5 @@ test_ptx_parse.sh
 *.core
 gpucore.*
 ext/dbgapi-src/
+ext/physx-debug-symbols/*.dll
+ext/physx-debug-symbols/fatbin*

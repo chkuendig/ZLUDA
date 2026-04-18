@@ -1,0 +1,50 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+.visible .entry shfl_scan_idx_lower_half_active_w16(
+    .param .u64 output
+)
+{
+    .reg .u64       out_addr;
+    .reg .u64       out_index;
+    .reg .u32       tid;
+    .reg .u32       lane_id;
+    .reg .u32       value;
+    .reg .u32       total;
+    .reg .u32       result;
+    .reg .pred      active;
+    .reg .pred      in_range;
+
+    ld.param.u64    out_addr, [output];
+    mov.u32         tid, %tid.x;
+    mov.u32         lane_id, %laneid;
+    add.u32         value, tid, 1;
+    mov.u32         result, tid;
+
+    // Exercise the old CUB-style shfl.up prefix scan plus shfl.idx broadcast,
+    // but keep it legal under divergence by running only the lower half of each
+    // warp as a width-16 subwarp.
+    setp.lt.u32     active, lane_id, 16;
+    @!active add.u32 result, result, 2000;
+    @!active bra STORE;
+
+    shfl.up.b32     total|in_range, value, 1, 4096;
+    @in_range add.u32 value, total, value;
+    shfl.up.b32     total|in_range, value, 2, 4096;
+    @in_range add.u32 value, total, value;
+    shfl.up.b32     total|in_range, value, 4, 4096;
+    @in_range add.u32 value, total, value;
+    shfl.up.b32     total|in_range, value, 8, 4096;
+    @in_range add.u32 value, total, value;
+
+    shfl.idx.b32    total, value, 15, 4127;
+    add.u32         result, value, total;
+
+STORE:
+    cvt.u64.u32     out_index, tid;
+    mul.lo.u64      out_index, out_index, 4;
+    add.u64         out_addr, out_addr, out_index;
+    st.u32          [out_addr], result;
+    ret;
+}

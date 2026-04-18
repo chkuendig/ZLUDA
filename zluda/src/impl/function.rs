@@ -1,7 +1,9 @@
 use cuda_types::cuda::{CUfunction, CUfunction_attribute, CUkernel};
 use hip_runtime_sys::*;
-use std::mem;
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::io::Write as IoWrite;
+use std::mem;
 use std::sync::Mutex;
 
 static FUNC_NAMES: std::sync::LazyLock<Mutex<HashMap<usize, String>>> =
@@ -47,23 +49,23 @@ const MS4_COUNTER_REGION_BYTES: usize = MS4_CAPTURE_MAX_SHAPES * 4;
 #[repr(C)]
 struct Ms4CaptureSlot {
     // Header (128 bytes — aligned so the data regions start cleanly)
-    magic: u64,                  // 0: 0x4d533443_4150_5455 = "MS4CAPTU"
-    launch_n: u64,               // 8
-    timestamp_ms: u64,           // 16
-    num_particles: u32,          // 24
-    grid_x: u32,                 // 28
-    block_x: u32,                // 32
-    _pad0: u32,                  // 36
-    flags_ptr: u64,              // 40
-    struct_ptr: u64,             // 48
-    scatter_ptr: u64,            // 56
-    shape_idx_ptr: u64,          // 64
-    counter_ptr: u64,            // 72
-    flags_bytes: u32,            // 80 — actual bytes captured for this slot
-    shape_idx_bytes: u32,        // 84
-    struct_bytes: u32,           // 88
-    counter_bytes: u32,          // 92
-    _pad1: [u8; 32],             // 96..=127
+    magic: u64,           // 0: 0x4d533443_4150_5455 = "MS4CAPTU"
+    launch_n: u64,        // 8
+    timestamp_ms: u64,    // 16
+    num_particles: u32,   // 24
+    grid_x: u32,          // 28
+    block_x: u32,         // 32
+    _pad0: u32,           // 36
+    flags_ptr: u64,       // 40
+    struct_ptr: u64,      // 48
+    scatter_ptr: u64,     // 56
+    shape_idx_ptr: u64,   // 64
+    counter_ptr: u64,     // 72
+    flags_bytes: u32,     // 80 — actual bytes captured for this slot
+    shape_idx_bytes: u32, // 84
+    struct_bytes: u32,    // 88
+    counter_bytes: u32,   // 92
+    _pad1: [u8; 32],      // 96..=127
     // Data regions (aligned at 128)
     flags_data: [u8; MS4_PARTICLE_REGION_BYTES],
     shape_idx_data: [u8; MS4_PARTICLE_REGION_BYTES],
@@ -100,9 +102,7 @@ static MS4_CAPTURE: Mutex<Option<Ms4CaptureState>> = Mutex::new(None);
 /// memory and adds 4 extra hipMemcpyDtoD calls per MS_4 launch.
 fn ms4_capture_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ZLUDA_MS4_CAPTURE").map_or(false, |v| v == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_MS4_CAPTURE").map_or(false, |v| v == "1"))
 }
 
 /// F.6 mutation tracker — separately gated because it does
@@ -120,9 +120,7 @@ fn ms4_capture_enabled() -> bool {
 /// the benchmark, before any group teardown).
 fn f6_tracker_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ZLUDA_F6_TRACK").map_or(false, |v| v == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_F6_TRACK").map_or(false, |v| v == "1"))
 }
 
 /// Initialize the capture state on first use. Called from inside the mutex.
@@ -132,25 +130,30 @@ unsafe fn ms4_capture_init(state: &mut Option<Ms4CaptureState>) {
     }
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     // hipHostMallocMapped = 2 (the flag value is in hip_runtime_sys).
-    let alloc_result = unsafe {
-        hipHostMalloc(&mut host_ptr, MS4_CAPTURE_TOTAL_SIZE, hipHostMallocMapped)
-    };
+    let alloc_result =
+        unsafe { hipHostMalloc(&mut host_ptr, MS4_CAPTURE_TOTAL_SIZE, hipHostMallocMapped) };
     if alloc_result.is_err() || host_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] MS4 capture: hipHostMalloc({}) failed: {:?}",
-            MS4_CAPTURE_TOTAL_SIZE, alloc_result));
+            MS4_CAPTURE_TOTAL_SIZE, alloc_result
+        ));
         return;
     }
     // Zero the buffer so uninitialized slots are obviously empty.
-    unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, MS4_CAPTURE_TOTAL_SIZE); }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, MS4_CAPTURE_TOTAL_SIZE);
+    }
 
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
     if map_result.is_err() || dev_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] MS4 capture: hipHostGetDevicePointer failed: {:?}",
-            map_result));
-        unsafe { let _ = hipHostFree(host_ptr); }
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
         return;
     }
 
@@ -200,8 +203,12 @@ unsafe fn capture_ms4_inputs(
     let shape_idx_ptr: u64 = read_kernel_arg(kernel_params, extra, 48, 6).unwrap_or(0);
     let counter_ptr: u64 = read_kernel_arg(kernel_params, extra, 56, 7).unwrap_or(0);
 
-    if num_particles == 0 || num_particles as usize > MS4_CAPTURE_MAX_PARTICLES
-       || flags_ptr == 0 || struct_ptr == 0 || shape_idx_ptr == 0 || counter_ptr == 0
+    if num_particles == 0
+        || num_particles as usize > MS4_CAPTURE_MAX_PARTICLES
+        || flags_ptr == 0
+        || struct_ptr == 0
+        || shape_idx_ptr == 0
+        || counter_ptr == 0
     {
         return;
     }
@@ -226,7 +233,9 @@ unsafe fn capture_ms4_inputs(
     let shape_idx_bytes = (num_particles as usize) * 4;
     let struct_bytes = MS4_STRUCT_REGION_BYTES;
     let counter_bytes = MS4_COUNTER_REGION_BYTES;
-    if flags_bytes > MS4_PARTICLE_REGION_BYTES { return; }
+    if flags_bytes > MS4_PARTICLE_REGION_BYTES {
+        return;
+    }
 
     // Compute offsets into the slot. The slot struct is repr(C), so we can
     // compute them from std::mem::offset_of style or from the field order.
@@ -255,9 +264,9 @@ unsafe fn capture_ms4_inputs(
     // slot. Use std::mem::offset_of when stable, else hand-compute using
     // the known header size of 128 bytes.
     let data_base = 128usize;
-    let flags_off   = data_base;
-    let shape_off   = flags_off + MS4_PARTICLE_REGION_BYTES;
-    let struct_off  = shape_off + MS4_PARTICLE_REGION_BYTES;
+    let flags_off = data_base;
+    let shape_off = flags_off + MS4_PARTICLE_REGION_BYTES;
+    let struct_off = shape_off + MS4_PARTICLE_REGION_BYTES;
     let counter_off = struct_off + MS4_STRUCT_REGION_BYTES;
 
     // EXPANDED capture path (Phase 1.5 Item B) — copy counter AND shape_idx.
@@ -284,6 +293,14 @@ unsafe fn capture_ms4_inputs(
         hipDeviceptr_t(counter_ptr as _),
         counter_bytes,
     );
+    let flag_cap = flags_bytes.min(MS4_PARTICLE_REGION_BYTES);
+    if flag_cap > 0 && flags_ptr != 0 {
+        let _ = hipMemcpyDtoD(
+            hipDeviceptr_t(slot_dev_base.add(flags_off) as _),
+            hipDeviceptr_t(flags_ptr as _),
+            flag_cap,
+        );
+    }
     // NEW: capture the shape_idx buffer (num_particles u32 entries).
     // Cap at MS4_PARTICLE_REGION_BYTES to stay within the slot's reserved space.
     let shape_cap = shape_idx_bytes.min(MS4_PARTICLE_REGION_BYTES);
@@ -294,7 +311,7 @@ unsafe fn capture_ms4_inputs(
             shape_cap,
         );
     }
-    let _ = (flags_off, flags_bytes, struct_off, struct_bytes); // silence warnings
+    let _ = (struct_off, struct_bytes); // struct capture remains disabled here
 
     // Track this counter pointer so the MS_3 capture can snapshot it too.
     track_counter_ptr(counter_ptr);
@@ -325,9 +342,11 @@ unsafe fn capture_ms4_inputs(
     // Either pattern should stop the investigation immediately and tell us
     // which frame produced the bad state.
     if num_particles > 100 {
-        let counter_host_ptr = state
-            .host_ptr
-            .add(slot_index * MS4_SLOT_SIZE + counter_off) as *const u32;
+        let launch_n = state.launch_counter - 1;
+        let flags_host_ptr = state.host_ptr.add(slot_index * MS4_SLOT_SIZE + flags_off);
+        let shape_host_ptr = state.host_ptr.add(slot_index * MS4_SLOT_SIZE + shape_off);
+        let counter_host_ptr =
+            state.host_ptr.add(slot_index * MS4_SLOT_SIZE + counter_off) as *const u32;
         let scan_count = 64usize.min(counter_bytes / 4);
         let mut zero_count = 0usize;
         let mut negative_count = 0usize;
@@ -347,7 +366,7 @@ unsafe fn capture_ms4_inputs(
         if negative_count > 0 {
             super::driver::zluda_log_err(&format!(
                 "*** MS_4 BUG SIGNATURE (stale -1 → -2) launch_n={} n={} negative_counters={}/{} first=(shape={}, counter=0x{:x}={}) — kernel will scatter to wild address",
-                state.launch_counter - 1,
+                launch_n,
                 num_particles,
                 negative_count,
                 scan_count,
@@ -358,10 +377,47 @@ unsafe fn capture_ms4_inputs(
         } else if zero_count == scan_count {
             super::driver::zluda_log_err(&format!(
                 "*** MS_4 BUG SIGNATURE (all-zero) launch_n={} n={} counter[0..{}] all zero — kernel will underflow",
-                state.launch_counter - 1,
+                launch_n,
                 num_particles,
                 scan_count,
             ));
+        }
+        if let Some(summary) = summarize_ms4_capture(
+            std::slice::from_raw_parts(flags_host_ptr, flag_cap),
+            std::slice::from_raw_parts(shape_host_ptr, shape_cap),
+            std::slice::from_raw_parts(counter_host_ptr as *const u8, counter_bytes),
+            num_particles as usize,
+        ) {
+            let has_issues = summary.out_of_range_particles > 0
+                || summary.zero_used_shapes > 0
+                || summary.negative_used_shapes > 0
+                || summary.underflow_count > 0;
+            if launch_n < 5 || launch_n % 10 == 0 || has_issues {
+                super::driver::zluda_log_err(&format!(
+                    "MS4_SAFE #{} n={} active={} shapes={} max_shape={} out_of_range={} zero_used={} neg_used={} underflows={}",
+                    launch_n,
+                    num_particles,
+                    summary.active_count,
+                    summary.unique_shapes,
+                    summary.max_shape_idx,
+                    summary.out_of_range_particles,
+                    summary.zero_used_shapes,
+                    summary.negative_used_shapes,
+                    summary.underflow_count,
+                ));
+            }
+            if let Some((particle_idx, shape, flag)) = summary.first_out_of_range_particle {
+                super::driver::zluda_log_err(&format!(
+                    "*** MS4_SHAPE_IDX_OOR launch_n={} particle={} flag=0x{:04x} shape=0x{:08x}",
+                    launch_n, particle_idx, flag, shape
+                ));
+            }
+            if let Some(issue) = summary.first_underflow {
+                super::driver::zluda_log_err(&format!(
+                    "*** MS4_COUNTER_UNDERFLOW launch_n={} shape={} counter={} uses={}",
+                    launch_n, issue.shape, issue.counter, issue.uses
+                ));
+            }
         }
     }
 }
@@ -388,25 +444,25 @@ unsafe fn capture_ms4_inputs(
 
 const MS2B_CAPTURE_SLOTS: usize = 32;
 const MS2B_CAPTURE_MAX_PACKET_BYTES: usize = 4096; // 46 entries × 88 bytes
-// MS_2_Batched pre/post counter capture (F.2/F.3): the F.2 capture revealed
-// that MS_2_Batched silently no-ops in the crash frame — pre and post of the
-// rd7 counter buffer are both all-zero despite entry[0].count=1497.
-//
-// Reading the PTX (CreateParticleShapesIncremental_MultiStage_2_Batched in
-// zluda_ptx_086.ptx line 2564) shows the kernel skips ALL writes to rd7 when
-// `*(rd5 + 22176)` (the source for the shared `particleShapesCounter`) is 0,
-// branching to BB11_23 which only writes 4 bytes to rd5+22180 and returns.
-//
-// F.3 extends the capture to also snapshot rd5+22160..+22224 (64 bytes,
-// containing the +22176 field at offset 16 of the captured window) per
-// entry, both BEFORE and AFTER the kernel runs. This lets us prove which
-// kernel zeroed `*(rd5+22176)` and confirm the no-op hypothesis.
-//
-// We deliberately reuse MS3_MAX_TRACKED_COUNTERS / MS3_COUNTER_BYTES_PER
-// — the same TRACKED_COUNTER_PTRS pool feeds both rings, and the per-buffer
-// size (256 shapes × 4 bytes) is intrinsic to the PhysX layout, not the
-// stage. Keeping the consts in lockstep guarantees the parser can use one
-// set of dimensions for both rings.
+                                                   // MS_2_Batched pre/post counter capture (F.2/F.3): the F.2 capture revealed
+                                                   // that MS_2_Batched silently no-ops in the crash frame — pre and post of the
+                                                   // rd7 counter buffer are both all-zero despite entry[0].count=1497.
+                                                   //
+                                                   // Reading the PTX (CreateParticleShapesIncremental_MultiStage_2_Batched in
+                                                   // zluda_ptx_086.ptx line 2564) shows the kernel skips ALL writes to rd7 when
+                                                   // `*(rd5 + 22176)` (the source for the shared `particleShapesCounter`) is 0,
+                                                   // branching to BB11_23 which only writes 4 bytes to rd5+22180 and returns.
+                                                   //
+                                                   // F.3 extends the capture to also snapshot rd5+22160..+22224 (64 bytes,
+                                                   // containing the +22176 field at offset 16 of the captured window) per
+                                                   // entry, both BEFORE and AFTER the kernel runs. This lets us prove which
+                                                   // kernel zeroed `*(rd5+22176)` and confirm the no-op hypothesis.
+                                                   //
+                                                   // We deliberately reuse MS3_MAX_TRACKED_COUNTERS / MS3_COUNTER_BYTES_PER
+                                                   // — the same TRACKED_COUNTER_PTRS pool feeds both rings, and the per-buffer
+                                                   // size (256 shapes × 4 bytes) is intrinsic to the PhysX layout, not the
+                                                   // stage. Keeping the consts in lockstep guarantees the parser can use one
+                                                   // set of dimensions for both rings.
 const MS2B_MAX_TRACKED_COUNTERS: usize = MS3_MAX_TRACKED_COUNTERS;
 const MS2B_COUNTER_BYTES_PER: usize = MS3_COUNTER_BYTES_PER;
 // rd5 metadata window: 64 bytes per entry, 16 entries max (we typically see
@@ -424,18 +480,18 @@ const MS2B_RD5_META_OFFSET_IN_RD5: usize = 22160;
 #[repr(C)]
 struct Ms2bCaptureSlot {
     // Header — 192 bytes
-    magic: u64,                                            // 0:  "MS2BCAPT"
-    launch_n: u64,                                         // 8:  MS_2_Batched invocation count (monotonic)
-    timestamp_ms: u64,                                     // 16
-    grid_x: u32,                                           // 24
-    block_x: u32,                                          // 28
-    packet_ptr: u64,                                       // 32: the kernarg param_2 value the game passed
-    packet_bytes: u32,                                     // 40: how many bytes we actually copied
-    num_tracked: u32,                                      // 44: how many entries in counter_ptrs are valid
-    counter_ptrs: [u64; MS2B_MAX_TRACKED_COUNTERS],        // 48..112
-    _pad: [u8; 80],                                        // 112..192
+    magic: u64,                                     // 0:  "MS2BCAPT"
+    launch_n: u64,                                  // 8:  MS_2_Batched invocation count (monotonic)
+    timestamp_ms: u64,                              // 16
+    grid_x: u32,                                    // 24
+    block_x: u32,                                   // 28
+    packet_ptr: u64,                                // 32: the kernarg param_2 value the game passed
+    packet_bytes: u32,                              // 40: how many bytes we actually copied
+    num_tracked: u32, // 44: how many entries in counter_ptrs are valid
+    counter_ptrs: [u64; MS2B_MAX_TRACKED_COUNTERS], // 48..112
+    _pad: [u8; 80],   // 112..192
     // Data — 4096 bytes of raw packet memory
-    packet_data: [u8; MS2B_CAPTURE_MAX_PACKET_BYTES],      // 192..4288
+    packet_data: [u8; MS2B_CAPTURE_MAX_PACKET_BYTES], // 192..4288
     // Pre/post counter snapshots — 8 KB each (8 ptrs × 1024 B)
     counter_pre: [u8; MS2B_MAX_TRACKED_COUNTERS * MS2B_COUNTER_BYTES_PER],
     counter_post: [u8; MS2B_MAX_TRACKED_COUNTERS * MS2B_COUNTER_BYTES_PER],
@@ -474,31 +530,39 @@ unsafe fn ms2b_capture_init(state: &mut Option<Ms2bCaptureState>) {
         return;
     }
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let alloc_result = unsafe {
-        hipHostMalloc(&mut host_ptr, MS2B_CAPTURE_TOTAL_SIZE, hipHostMallocMapped)
-    };
+    let alloc_result =
+        unsafe { hipHostMalloc(&mut host_ptr, MS2B_CAPTURE_TOTAL_SIZE, hipHostMallocMapped) };
     if alloc_result.is_err() || host_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] MS2B capture: hipHostMalloc({}) failed: {:?}",
-            MS2B_CAPTURE_TOTAL_SIZE, alloc_result));
+            MS2B_CAPTURE_TOTAL_SIZE, alloc_result
+        ));
         return;
     }
-    unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, MS2B_CAPTURE_TOTAL_SIZE); }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, MS2B_CAPTURE_TOTAL_SIZE);
+    }
 
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
     if map_result.is_err() || dev_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
-            "[ZLUDA] MS2B capture: hipHostGetDevicePointer failed: {:?}", map_result));
-        unsafe { let _ = hipHostFree(host_ptr); }
+            "[ZLUDA] MS2B capture: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
         return;
     }
 
     super::driver::zluda_log_err(&format!(
         "[ZLUDA] MS2B capture: {} slots × {} B = {} KB pinned; host=0x{:x} dev=0x{:x}",
-        MS2B_CAPTURE_SLOTS, MS2B_SLOT_SIZE,
+        MS2B_CAPTURE_SLOTS,
+        MS2B_SLOT_SIZE,
         MS2B_CAPTURE_TOTAL_SIZE / 1024,
-        host_ptr as usize, dev_ptr as usize,
+        host_ptr as usize,
+        dev_ptr as usize,
     ));
     MS2B_CAPTURE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::SeqCst);
     MS2B_CAPTURE_TOTAL_BYTES.store(MS2B_CAPTURE_TOTAL_SIZE, std::sync::atomic::Ordering::SeqCst);
@@ -591,15 +655,23 @@ unsafe fn capture_ms2b_inputs(
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     let num_entries = packet_bytes / 88;
     for e in 0..num_entries {
-        let base = state.host_ptr.add(slot_index * MS2B_SLOT_SIZE + MS2B_PACKET_OFF + e * 88);
+        let base = state
+            .host_ptr
+            .add(slot_index * MS2B_SLOT_SIZE + MS2B_PACKET_OFF + e * 88);
         let count = *(base as *const u32);
-        if count == 0 { continue; }
+        if count == 0 {
+            continue;
+        }
         let rd7 = *(base.add(80) as *const u64);
-        if rd7 != 0 { track_counter_ptr(rd7); }
+        if rd7 != 0 {
+            track_counter_ptr(rd7);
+        }
         // F.6: also track the rd5 base so the per-launch *(rd5+22176) tracker
         // can spot resets and the doubling bug.
         let rd5 = *(base.add(32) as *const u64);
-        if rd5 != 0 { track_rd5_ptr(rd5); }
+        if rd5 != 0 {
+            track_rd5_ptr(rd5);
+        }
     }
 
     // Pre-snapshot: copy the tracked counters list (under TRACKED_COUNTER_PTRS
@@ -631,11 +703,17 @@ unsafe fn capture_ms2b_inputs(
     // particleShapesCounter source value AT KERNEL LAUNCH TIME.
     let n_rd5_entries = num_entries.min(MS2B_RD5_META_MAX_ENTRIES);
     for e in 0..n_rd5_entries {
-        let entry_base = state.host_ptr.add(slot_index * MS2B_SLOT_SIZE + MS2B_PACKET_OFF + e * 88);
+        let entry_base = state
+            .host_ptr
+            .add(slot_index * MS2B_SLOT_SIZE + MS2B_PACKET_OFF + e * 88);
         let count = *(entry_base as *const u32);
-        if count == 0 { continue; }
+        if count == 0 {
+            continue;
+        }
         let rd5 = *(entry_base.add(32) as *const u64);
-        if rd5 == 0 { continue; }
+        if rd5 == 0 {
+            continue;
+        }
         let dst = slot_dev_base.add(MS2B_RD5_PRE_OFF + e * MS2B_RD5_META_BYTES_PER_ENTRY);
         let src = (rd5 as usize + MS2B_RD5_META_OFFSET_IN_RD5) as *mut std::ffi::c_void;
         let _ = hipMemcpyDtoD(
@@ -652,12 +730,19 @@ unsafe fn capture_ms2b_inputs(
     // kernel will take the BB11_23 path and skip rd7 writes entirely.
     // Offset in our 64-byte window: 22176 - 22160 = 16, i.e. word index 4.
     for e in 0..n_rd5_entries {
-        let entry_base = state.host_ptr.add(slot_index * MS2B_SLOT_SIZE + MS2B_PACKET_OFF + e * 88);
+        let entry_base = state
+            .host_ptr
+            .add(slot_index * MS2B_SLOT_SIZE + MS2B_PACKET_OFF + e * 88);
         let count = *(entry_base as *const u32);
-        if count == 0 { continue; }
+        if count == 0 {
+            continue;
+        }
         let rd5 = *(entry_base.add(32) as *const u64);
         let rd7 = *(entry_base.add(80) as *const u64);
-        let meta_host = state.host_ptr.add(slot_index * MS2B_SLOT_SIZE + MS2B_RD5_PRE_OFF + e * MS2B_RD5_META_BYTES_PER_ENTRY) as *const u32;
+        let meta_host = state
+            .host_ptr
+            .add(slot_index * MS2B_SLOT_SIZE + MS2B_RD5_PRE_OFF + e * MS2B_RD5_META_BYTES_PER_ENTRY)
+            as *const u32;
         let shapes_counter_src = *meta_host.add(4); // word index 4 = byte 16 = rd5+22176
         if shapes_counter_src == 0 {
             super::driver::zluda_log_err(&format!(
@@ -675,7 +760,9 @@ unsafe fn capture_ms2b_inputs(
 /// matching counter_post region. The kernel must have finished — the caller
 /// is responsible for issuing hipDeviceSynchronize first (mirrors MS_3).
 unsafe fn capture_ms2b_post(slot_index: usize) {
-    if !ms4_capture_enabled() { return; }
+    if !ms4_capture_enabled() {
+        return;
+    }
 
     let guard = match MS2B_CAPTURE.lock() {
         Ok(g) => g,
@@ -694,7 +781,9 @@ unsafe fn capture_ms2b_post(slot_index: usize) {
 
     for i in 0..num_tracked {
         let ptr = (*slot_host).counter_ptrs[i];
-        if ptr == 0 { continue; }
+        if ptr == 0 {
+            continue;
+        }
         let dst = slot_dev_base.add(MS2B_POST_OFF + i * MS2B_COUNTER_BYTES_PER);
         let _ = hipMemcpyDtoD(
             hipDeviceptr_t(dst as _),
@@ -707,11 +796,17 @@ unsafe fn capture_ms2b_post(slot_index: usize) {
     // against the pre-snapshot. Reads from the slot's own packet copy
     // (already on the host side) for rd5 / count, then D2D from the live rd5.
     for e in 0..num_entries {
-        let entry_base = state.host_ptr.add(slot_index * MS2B_SLOT_SIZE + MS2B_PACKET_OFF + e * 88);
+        let entry_base = state
+            .host_ptr
+            .add(slot_index * MS2B_SLOT_SIZE + MS2B_PACKET_OFF + e * 88);
         let count = *(entry_base as *const u32);
-        if count == 0 { continue; }
+        if count == 0 {
+            continue;
+        }
         let rd5 = *(entry_base.add(32) as *const u64);
-        if rd5 == 0 { continue; }
+        if rd5 == 0 {
+            continue;
+        }
         let dst = slot_dev_base.add(MS2B_RD5_POST_OFF + e * MS2B_RD5_META_BYTES_PER_ENTRY);
         let src = (rd5 as usize + MS2B_RD5_META_OFFSET_IN_RD5) as *mut std::ffi::c_void;
         let _ = hipMemcpyDtoD(
@@ -730,11 +825,17 @@ unsafe fn capture_ms2b_post(slot_index: usize) {
     let launch_n = (*slot_host).launch_n;
     for i in 0..num_tracked {
         let ptr = (*slot_host).counter_ptrs[i];
-        if ptr == 0 { continue; }
-        let pre_host = state.host_ptr
-            .add(slot_index * MS2B_SLOT_SIZE + MS2B_PRE_OFF + i * MS2B_COUNTER_BYTES_PER) as *const i32;
-        let post_host = state.host_ptr
-            .add(slot_index * MS2B_SLOT_SIZE + MS2B_POST_OFF + i * MS2B_COUNTER_BYTES_PER) as *const i32;
+        if ptr == 0 {
+            continue;
+        }
+        let pre_host = state
+            .host_ptr
+            .add(slot_index * MS2B_SLOT_SIZE + MS2B_PRE_OFF + i * MS2B_COUNTER_BYTES_PER)
+            as *const i32;
+        let post_host = state
+            .host_ptr
+            .add(slot_index * MS2B_SLOT_SIZE + MS2B_POST_OFF + i * MS2B_COUNTER_BYTES_PER)
+            as *const i32;
         // Quick scan: any new negative-and-small value in [0..18) of post that
         // wasn't already negative in pre? If so, this is the smoking gun.
         let mut bug = false;
@@ -753,7 +854,10 @@ unsafe fn capture_ms2b_post(slot_index: usize) {
             pre_str.push('[');
             post_str.push('[');
             for j in 0..18 {
-                if j > 0 { pre_str.push(','); post_str.push(','); }
+                if j > 0 {
+                    pre_str.push(',');
+                    post_str.push(',');
+                }
                 pre_str.push_str(&(*pre_host.add(j)).to_string());
                 post_str.push_str(&(*post_host.add(j)).to_string());
             }
@@ -792,15 +896,15 @@ const MS3_COUNTER_BYTES_PER: usize = 1024; // 256 shapes × 4 bytes
 #[repr(C)]
 struct Ms3CaptureSlot {
     // Header — 128 bytes
-    magic: u64,                                       // 0
-    launch_n: u64,                                    // 8
-    timestamp_ms: u64,                                // 16
-    grid_x: u32,                                      // 24
-    block_x: u32,                                     // 28
-    num_tracked: u32,                                 // 32
-    _pad0: u32,                                       // 36
-    counter_ptrs: [u64; MS3_MAX_TRACKED_COUNTERS],    // 40..104
-    _pad1: [u8; 24],                                  // 104..128
+    magic: u64,                                    // 0
+    launch_n: u64,                                 // 8
+    timestamp_ms: u64,                             // 16
+    grid_x: u32,                                   // 24
+    block_x: u32,                                  // 28
+    num_tracked: u32,                              // 32
+    _pad0: u32,                                    // 36
+    counter_ptrs: [u64; MS3_MAX_TRACKED_COUNTERS], // 40..104
+    _pad1: [u8; 24],                               // 104..128
     // Data — 8 counter buffers before + 8 after = 16 × 1024 = 16384 bytes
     counter_pre: [u8; MS3_MAX_TRACKED_COUNTERS * MS3_COUNTER_BYTES_PER],
     counter_post: [u8; MS3_MAX_TRACKED_COUNTERS * MS3_COUNTER_BYTES_PER],
@@ -830,7 +934,9 @@ pub(crate) static MS3_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
 static TRACKED_COUNTER_PTRS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 fn track_counter_ptr(ptr: u64) {
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        return;
+    }
     let mut guard = match TRACKED_COUNTER_PTRS.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -839,7 +945,8 @@ fn track_counter_ptr(ptr: u64) {
         guard.push(ptr);
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] MS3 capture: tracking counter_ptr[{}]=0x{:x}",
-            guard.len() - 1, ptr
+            guard.len() - 1,
+            ptr
         ));
     }
 }
@@ -851,7 +958,9 @@ fn track_counter_ptr(ptr: u64) {
 static TRACKED_RD5_PTRS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 fn track_rd5_ptr(ptr: u64) {
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        return;
+    }
     let mut guard = match TRACKED_RD5_PTRS.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -860,39 +969,50 @@ fn track_rd5_ptr(ptr: u64) {
         guard.push(ptr);
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] F6 rd5 tracker: tracking rd5[{}]=0x{:x} (watching +22176)",
-            guard.len() - 1, ptr
+            guard.len() - 1,
+            ptr
         ));
     }
 }
 
 unsafe fn ms3_capture_init(state: &mut Option<Ms3CaptureState>) {
-    if state.is_some() { return; }
+    if state.is_some() {
+        return;
+    }
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let alloc_result = unsafe {
-        hipHostMalloc(&mut host_ptr, MS3_CAPTURE_TOTAL_SIZE, hipHostMallocMapped)
-    };
+    let alloc_result =
+        unsafe { hipHostMalloc(&mut host_ptr, MS3_CAPTURE_TOTAL_SIZE, hipHostMallocMapped) };
     if alloc_result.is_err() || host_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] MS3 capture: hipHostMalloc({}) failed: {:?}",
-            MS3_CAPTURE_TOTAL_SIZE, alloc_result));
+            MS3_CAPTURE_TOTAL_SIZE, alloc_result
+        ));
         return;
     }
-    unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, MS3_CAPTURE_TOTAL_SIZE); }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, MS3_CAPTURE_TOTAL_SIZE);
+    }
 
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
     if map_result.is_err() || dev_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
-            "[ZLUDA] MS3 capture: hipHostGetDevicePointer failed: {:?}", map_result));
-        unsafe { let _ = hipHostFree(host_ptr); }
+            "[ZLUDA] MS3 capture: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
         return;
     }
 
     super::driver::zluda_log_err(&format!(
         "[ZLUDA] MS3 capture: {} slots × {} KB = {} KB pinned; host=0x{:x} dev=0x{:x}",
-        MS3_CAPTURE_SLOTS, MS3_SLOT_SIZE / 1024,
+        MS3_CAPTURE_SLOTS,
+        MS3_SLOT_SIZE / 1024,
         MS3_CAPTURE_TOTAL_SIZE / 1024,
-        host_ptr as usize, dev_ptr as usize,
+        host_ptr as usize,
+        dev_ptr as usize,
     ));
     MS3_CAPTURE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::SeqCst);
     MS3_CAPTURE_TOTAL_BYTES.store(MS3_CAPTURE_TOTAL_SIZE, std::sync::atomic::Ordering::SeqCst);
@@ -909,7 +1029,9 @@ unsafe fn ms3_capture_init(state: &mut Option<Ms3CaptureState>) {
 /// counter_pre region. Returns the slot_index so the post-capture can
 /// write to the matching counter_post region.
 unsafe fn capture_ms3_pre(grid_x: u32, block_x: u32) -> Option<usize> {
-    if !ms4_capture_enabled() { return None; }
+    if !ms4_capture_enabled() {
+        return None;
+    }
 
     let tracked: Vec<u64> = {
         let guard = match TRACKED_COUNTER_PTRS.lock() {
@@ -918,7 +1040,9 @@ unsafe fn capture_ms3_pre(grid_x: u32, block_x: u32) -> Option<usize> {
         };
         guard.clone()
     };
-    if tracked.is_empty() { return None; }
+    if tracked.is_empty() {
+        return None;
+    }
 
     let mut guard = match MS3_CAPTURE.lock() {
         Ok(g) => g,
@@ -967,7 +1091,9 @@ unsafe fn capture_ms3_pre(grid_x: u32, block_x: u32) -> Option<usize> {
 /// counter_post region. The kernel is expected to have completed (caller
 /// ensures this by running after hipDeviceSynchronize or under mode 2).
 unsafe fn capture_ms3_post(slot_index: usize) {
-    if !ms4_capture_enabled() { return; }
+    if !ms4_capture_enabled() {
+        return;
+    }
 
     let guard = match MS3_CAPTURE.lock() {
         Ok(g) => g,
@@ -986,7 +1112,9 @@ unsafe fn capture_ms3_post(slot_index: usize) {
     let post_base = 128usize + MS3_MAX_TRACKED_COUNTERS * MS3_COUNTER_BYTES_PER;
     for i in 0..num_tracked {
         let ptr = (*slot_host).counter_ptrs[i];
-        if ptr == 0 { continue; }
+        if ptr == 0 {
+            continue;
+        }
         let dst = slot_dev_base.add(post_base + i * MS3_COUNTER_BYTES_PER);
         let _ = hipMemcpyDtoD(
             hipDeviceptr_t(dst as _),
@@ -1003,17 +1131,27 @@ unsafe fn capture_ms3_post(slot_index: usize) {
     let launch_n = (*slot_host).launch_n;
     for i in 0..num_tracked {
         let ptr = (*slot_host).counter_ptrs[i];
-        if ptr == 0 { continue; }
-        let pre_host = state.host_ptr
-            .add(slot_index * MS3_SLOT_SIZE + 128 + i * MS3_COUNTER_BYTES_PER) as *const i32;
-        let post_host = state.host_ptr
-            .add(slot_index * MS3_SLOT_SIZE + post_base + i * MS3_COUNTER_BYTES_PER) as *const i32;
+        if ptr == 0 {
+            continue;
+        }
+        let pre_host = state
+            .host_ptr
+            .add(slot_index * MS3_SLOT_SIZE + 128 + i * MS3_COUNTER_BYTES_PER)
+            as *const i32;
+        let post_host = state
+            .host_ptr
+            .add(slot_index * MS3_SLOT_SIZE + post_base + i * MS3_COUNTER_BYTES_PER)
+            as *const i32;
         let pre0 = *pre_host;
         let post0 = *post_host;
         if pre0 != post0 || (post0 < 0 && post0 > -1_000_000) {
             super::driver::zluda_log_err(&format!(
                 "[MS_3 DIFF] launch_n={} counter[0x{:x}]: pre={} post={} delta={}",
-                launch_n, ptr, pre0, post0, post0.wrapping_sub(pre0),
+                launch_n,
+                ptr,
+                pre0,
+                post0,
+                post0.wrapping_sub(pre0),
             ));
         }
     }
@@ -1053,25 +1191,32 @@ unsafe impl Sync for CounterTracker {}
 static COUNTER_TRACKER: Mutex<Option<CounterTracker>> = Mutex::new(None);
 
 unsafe fn counter_tracker_init(state: &mut Option<CounterTracker>) {
-    if state.is_some() { return; }
+    if state.is_some() {
+        return;
+    }
     let total = F4_MAX_COUNTERS * F4_BYTES_PER;
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let alloc_result = unsafe {
-        hipHostMalloc(&mut host_ptr, total, hipHostMallocMapped)
-    };
+    let alloc_result = unsafe { hipHostMalloc(&mut host_ptr, total, hipHostMallocMapped) };
     if alloc_result.is_err() || host_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] F4 counter tracker: hipHostMalloc({}) failed: {:?}",
-            total, alloc_result));
+            total, alloc_result
+        ));
         return;
     }
-    unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, total); }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, total);
+    }
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
     if map_result.is_err() || dev_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
-            "[ZLUDA] F4 counter tracker: hipHostGetDevicePointer failed: {:?}", map_result));
-        unsafe { let _ = hipHostFree(host_ptr); }
+            "[ZLUDA] F4 counter tracker: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
         return;
     }
     super::driver::zluda_log_err(&format!(
@@ -1091,10 +1236,14 @@ unsafe fn counter_tracker_init(state: &mut Option<CounterTracker>) {
 /// zeroed AND prev had non-zero values there) gets a stronger
 /// `*** COUNTER SHIFT_ZERO` tag for easy grepping.
 unsafe fn check_counter_mutation(current_kernel: &str) {
-    if !ms4_capture_enabled() { return; }
+    if !ms4_capture_enabled() {
+        return;
+    }
     // F.6 tracker is gated separately because it has a stale-pointer
     // hazard — see f6_tracker_enabled() comment.
-    if !f6_tracker_enabled() { return; }
+    if !f6_tracker_enabled() {
+        return;
+    }
     let tracked: Vec<u64> = {
         let g = match TRACKED_COUNTER_PTRS.lock() {
             Ok(g) => g,
@@ -1102,7 +1251,9 @@ unsafe fn check_counter_mutation(current_kernel: &str) {
         };
         g.clone()
     };
-    if tracked.is_empty() { return; }
+    if tracked.is_empty() {
+        return;
+    }
 
     let mut guard = match COUNTER_TRACKER.lock() {
         Ok(g) => g,
@@ -1119,32 +1270,21 @@ unsafe fn check_counter_mutation(current_kernel: &str) {
     let n = tracked.len().min(F4_MAX_COUNTERS);
     for (i, &ptr) in tracked.iter().take(n).enumerate() {
         let dst = (tracker.scratch_dev as usize + i * F4_BYTES_PER) as *mut std::ffi::c_void;
-        let _ = hipMemcpyDtoD(
-            hipDeviceptr_t(dst),
-            hipDeviceptr_t(ptr as _),
-            F4_BYTES_PER,
-        );
+        let _ = hipMemcpyDtoD(hipDeviceptr_t(dst), hipDeviceptr_t(ptr as _), F4_BYTES_PER);
     }
     let _ = hipDeviceSynchronize();
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
     // Compare scratch_host vs last_state per pointer.
     for (i, &ptr) in tracked.iter().take(n).enumerate() {
-        let new_slice: &[u8] = std::slice::from_raw_parts(
-            tracker.scratch_host.add(i * F4_BYTES_PER),
-            F4_BYTES_PER,
-        );
+        let new_slice: &[u8] =
+            std::slice::from_raw_parts(tracker.scratch_host.add(i * F4_BYTES_PER), F4_BYTES_PER);
         // Read first 18 i32 entries for the human-readable log.
-        let new_i32: &[i32] = std::slice::from_raw_parts(
-            new_slice.as_ptr() as *const i32,
-            18,
-        );
+        let new_i32: &[i32] = std::slice::from_raw_parts(new_slice.as_ptr() as *const i32, 18);
         if let Some(prev_arr) = tracker.last_state.get(&ptr) {
             if &prev_arr[..] != new_slice {
-                let prev_i32: &[i32] = std::slice::from_raw_parts(
-                    prev_arr.as_ptr() as *const i32,
-                    18,
-                );
+                let prev_i32: &[i32] =
+                    std::slice::from_raw_parts(prev_arr.as_ptr() as *const i32, 18);
                 // Detect the shift-and-zero pattern: count how many leading
                 // zeros are in `new` and how many of those positions had
                 // non-zero values in `prev`. If both are >= 3, this is the
@@ -1152,13 +1292,17 @@ unsafe fn check_counter_mutation(current_kernel: &str) {
                 let mut new_leading_zeros = 0usize;
                 while new_leading_zeros < 32 {
                     let v = *(new_slice.as_ptr() as *const i32).add(new_leading_zeros);
-                    if v != 0 { break; }
+                    if v != 0 {
+                        break;
+                    }
                     new_leading_zeros += 1;
                 }
                 let mut prev_was_nonzero_in_zone = 0usize;
                 for j in 0..new_leading_zeros.min(32) {
                     let pv = *(prev_arr.as_ptr() as *const i32).add(j);
-                    if pv != 0 { prev_was_nonzero_in_zone += 1; }
+                    if pv != 0 {
+                        prev_was_nonzero_in_zone += 1;
+                    }
                 }
                 let tag = if new_leading_zeros >= 3 && prev_was_nonzero_in_zone >= 3 {
                     "SHIFT_ZERO"
@@ -1170,7 +1314,10 @@ unsafe fn check_counter_mutation(current_kernel: &str) {
                 prev_str.push('[');
                 new_str.push('[');
                 for j in 0..18 {
-                    if j > 0 { prev_str.push(','); new_str.push(','); }
+                    if j > 0 {
+                        prev_str.push(',');
+                        new_str.push(',');
+                    }
                     prev_str.push_str(&prev_i32[j].to_string());
                     new_str.push_str(&new_i32[j].to_string());
                 }
@@ -1223,24 +1370,32 @@ unsafe impl Sync for Rd5Tracker {}
 static RD5_TRACKER: Mutex<Option<Rd5Tracker>> = Mutex::new(None);
 
 unsafe fn rd5_tracker_init(state: &mut Option<Rd5Tracker>) {
-    if state.is_some() { return; }
+    if state.is_some() {
+        return;
+    }
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let alloc_result = unsafe {
-        hipHostMalloc(&mut host_ptr, F6_SCRATCH_BYTES, hipHostMallocMapped)
-    };
+    let alloc_result =
+        unsafe { hipHostMalloc(&mut host_ptr, F6_SCRATCH_BYTES, hipHostMallocMapped) };
     if alloc_result.is_err() || host_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] F6 rd5 tracker: hipHostMalloc({}) failed: {:?}",
-            F6_SCRATCH_BYTES, alloc_result));
+            F6_SCRATCH_BYTES, alloc_result
+        ));
         return;
     }
-    unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, F6_SCRATCH_BYTES); }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, F6_SCRATCH_BYTES);
+    }
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
     if map_result.is_err() || dev_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
-            "[ZLUDA] F6 rd5 tracker: hipHostGetDevicePointer failed: {:?}", map_result));
-        unsafe { let _ = hipHostFree(host_ptr); }
+            "[ZLUDA] F6 rd5 tracker: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
         return;
     }
     super::driver::zluda_log_err(&format!(
@@ -1303,29 +1458,37 @@ unsafe impl Sync for McbScratchBuffer {}
 static MCB_SCRATCH: Mutex<Option<McbScratchBuffer>> = Mutex::new(None);
 
 unsafe fn mcb_scratch_init(state: &mut Option<McbScratchBuffer>) {
-    if state.is_some() { return; }
+    if state.is_some() {
+        return;
+    }
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let alloc_result = unsafe {
-        hipHostMalloc(&mut host_ptr, MCB_DUMP_BYTES, hipHostMallocMapped)
-    };
+    let alloc_result = unsafe { hipHostMalloc(&mut host_ptr, MCB_DUMP_BYTES, hipHostMallocMapped) };
     if alloc_result.is_err() || host_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] MCB scratch: hipHostMalloc({}) failed: {:?}",
-            MCB_DUMP_BYTES, alloc_result));
+            MCB_DUMP_BYTES, alloc_result
+        ));
         return;
     }
-    unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, MCB_DUMP_BYTES); }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, MCB_DUMP_BYTES);
+    }
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
     if map_result.is_err() || dev_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
-            "[ZLUDA] MCB scratch: hipHostGetDevicePointer failed: {:?}", map_result));
-        unsafe { let _ = hipHostFree(host_ptr); }
+            "[ZLUDA] MCB scratch: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
         return;
     }
     super::driver::zluda_log_err(&format!(
         "[ZLUDA] MCB scratch: pinned {} B host=0x{:x} dev=0x{:x}",
-        MCB_DUMP_BYTES, host_ptr as usize, dev_ptr as usize));
+        MCB_DUMP_BYTES, host_ptr as usize, dev_ptr as usize
+    ));
     *state = Some(McbScratchBuffer {
         host_ptr: host_ptr as *mut u8,
         dev_ptr,
@@ -1340,16 +1503,20 @@ unsafe fn mcb_scratch_init(state: &mut Option<McbScratchBuffer>) {
 unsafe fn dump_mcb_scratch(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
-    grid_y: u32,  // the "N" in grid=[1,N,1] — correlates to # rd5s in batch
+    grid_y: u32, // the "N" in grid=[1,N,1] — correlates to # rd5s in batch
 ) {
-    if !ms4_capture_enabled() { return; }
+    if !ms4_capture_enabled() {
+        return;
+    }
 
     // MemCopyBatchedAsync param layout (same as MS_2_Batched, per the PTX):
     //   param_0: u64 @ 0
     //   param_1: u16 @ 8
     //   param_2: u64 @ 16  ← scratch buffer device pointer
     let scratch_ptr: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
-    if scratch_ptr == 0 { return; }
+    if scratch_ptr == 0 {
+        return;
+    }
 
     let mut guard = match MCB_SCRATCH.lock() {
         Ok(g) => g,
@@ -1374,7 +1541,8 @@ unsafe fn dump_mcb_scratch(
     if copy_result.is_err() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] MCB scratch dump: hipMemcpyDtoD(0x{:x}, {}) failed: {:?}",
-            scratch_ptr, MCB_DUMP_BYTES, copy_result));
+            scratch_ptr, MCB_DUMP_BYTES, copy_result
+        ));
         return;
     }
     // Drain the D2D so CPU-side reads of host_ptr see the fresh bytes.
@@ -1393,7 +1561,9 @@ unsafe fn dump_mcb_scratch(
     }
     super::driver::zluda_log_err(&format!(
         "*** MCB SCRATCH arg2=0x{:x} grid_y={} u64s=[{}]",
-        scratch_ptr, grid_y, hex_parts.join(", "),
+        scratch_ptr,
+        grid_y,
+        hex_parts.join(", "),
     ));
 }
 
@@ -1472,11 +1642,7 @@ unsafe fn force_zero_rd5_22176_before_ms1() {
     for (i, &rd5) in tracked.iter().take(n).enumerate() {
         let dst = (tracker.scratch_dev as usize + i * F6_BYTES_PER) as *mut std::ffi::c_void;
         let src = (rd5 as usize + F6_OFFSET_IN_RD5) as *mut std::ffi::c_void;
-        let _ = hipMemcpyDtoD(
-            hipDeviceptr_t(dst),
-            hipDeviceptr_t(src),
-            F6_BYTES_PER,
-        );
+        let _ = hipMemcpyDtoD(hipDeviceptr_t(dst), hipDeviceptr_t(src), F6_BYTES_PER);
     }
     let _ = hipDeviceSynchronize();
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -1511,10 +1677,14 @@ unsafe fn force_zero_rd5_22176_before_ms1() {
 /// (normal between-frame reset), DOUBLED fires when N→2N (the bug),
 /// MUTATED otherwise.
 unsafe fn check_rd5_22176_mutation(current_kernel: &str) {
-    if !ms4_capture_enabled() { return; }
+    if !ms4_capture_enabled() {
+        return;
+    }
     // F.6 tracker is gated separately because it has a stale-pointer
     // hazard — see f6_tracker_enabled() comment.
-    if !f6_tracker_enabled() { return; }
+    if !f6_tracker_enabled() {
+        return;
+    }
     let tracked: Vec<u64> = {
         let g = match TRACKED_RD5_PTRS.lock() {
             Ok(g) => g,
@@ -1522,7 +1692,9 @@ unsafe fn check_rd5_22176_mutation(current_kernel: &str) {
         };
         g.clone()
     };
-    if tracked.is_empty() { return; }
+    if tracked.is_empty() {
+        return;
+    }
 
     let mut guard = match RD5_TRACKER.lock() {
         Ok(g) => g,
@@ -1539,11 +1711,7 @@ unsafe fn check_rd5_22176_mutation(current_kernel: &str) {
     for (i, &rd5) in tracked.iter().take(n).enumerate() {
         let dst = (tracker.scratch_dev as usize + i * F6_BYTES_PER) as *mut std::ffi::c_void;
         let src = (rd5 as usize + F6_OFFSET_IN_RD5) as *mut std::ffi::c_void;
-        let _ = hipMemcpyDtoD(
-            hipDeviceptr_t(dst),
-            hipDeviceptr_t(src),
-            F6_BYTES_PER,
-        );
+        let _ = hipMemcpyDtoD(hipDeviceptr_t(dst), hipDeviceptr_t(src), F6_BYTES_PER);
     }
     let _ = hipDeviceSynchronize();
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -1583,6 +1751,14 @@ unsafe fn check_rd5_22176_mutation(current_kernel: &str) {
 /// is confirmed as the root cause.
 static LAUNCH_LOCK: Mutex<()> = Mutex::new(());
 
+fn launch_mutex(lock_mode: u8) -> Option<&'static Mutex<()>> {
+    if lock_mode >= 1 {
+        Some(&LAUNCH_LOCK)
+    } else {
+        None
+    }
+}
+
 // ============================================================================
 // F.5: Safe CreateGrid sortedKeys validator
 // ============================================================================
@@ -1603,6 +1779,2848 @@ static LAUNCH_LOCK: Mutex<()> = Mutex::new(());
 
 const F5_MAX_KEYS: usize = 16384;
 const F5_SCRATCH_BYTES: usize = F5_MAX_KEYS * 4;
+const F5_TOTAL_SCRATCH_BYTES: usize = F5_SCRATCH_BYTES * 2;
+const SORT_PASS_SPINE_MAX_WORDS: usize = 256;
+const SORT_PASS_SPINE_BYTES: usize = SORT_PASS_SPINE_MAX_WORDS * 4;
+const SORT_PASS_KEYS_IN_OFFSET: usize = 0;
+const SORT_PASS_KEYS_OUT_OFFSET: usize = SORT_PASS_KEYS_IN_OFFSET + F5_SCRATCH_BYTES;
+const SORT_PASS_VALS_IN_OFFSET: usize = SORT_PASS_KEYS_OUT_OFFSET + F5_SCRATCH_BYTES;
+const SORT_PASS_VALS_OUT_OFFSET: usize = SORT_PASS_VALS_IN_OFFSET + F5_SCRATCH_BYTES;
+const SORT_PASS_KEYS_IN_BEFORE_OFFSET: usize = SORT_PASS_VALS_OUT_OFFSET + F5_SCRATCH_BYTES;
+const SORT_PASS_VALS_IN_BEFORE_OFFSET: usize = SORT_PASS_KEYS_IN_BEFORE_OFFSET + F5_SCRATCH_BYTES;
+const SORT_PASS_KEYS_OUT_BEFORE_OFFSET: usize = SORT_PASS_VALS_IN_BEFORE_OFFSET + F5_SCRATCH_BYTES;
+const SORT_PASS_VALS_OUT_BEFORE_OFFSET: usize = SORT_PASS_KEYS_OUT_BEFORE_OFFSET + F5_SCRATCH_BYTES;
+const SORT_PASS_SPINE_OFFSET: usize = SORT_PASS_VALS_OUT_BEFORE_OFFSET + F5_SCRATCH_BYTES;
+const SORT_PASS_TOTAL_SCRATCH_BYTES: usize = SORT_PASS_SPINE_OFFSET + SORT_PASS_SPINE_BYTES;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SortedKeySummary {
+    min_key: i32,
+    max_key: i32,
+    violations: u32,
+    negative_count: u32,
+    huge_count: u32,
+    first_violation: Option<usize>,
+    first_bad_value: Option<(usize, i32)>,
+}
+
+fn summarize_sorted_keys(keys: &[i32]) -> Option<SortedKeySummary> {
+    let (&first, rest) = keys.split_first()?;
+    let mut summary = SortedKeySummary {
+        min_key: first,
+        max_key: first,
+        violations: 0,
+        negative_count: u32::from(first < 0),
+        huge_count: u32::from(first > 16_000_000),
+        first_violation: None,
+        first_bad_value: if first < 0 || first > 16_000_000 {
+            Some((0, first))
+        } else {
+            None
+        },
+    };
+    let mut prev = first;
+    for (idx, &key) in rest.iter().enumerate() {
+        let i = idx + 1;
+        if key < prev {
+            summary.violations += 1;
+            if summary.first_violation.is_none() {
+                summary.first_violation = Some(i);
+            }
+        }
+        if key < summary.min_key {
+            summary.min_key = key;
+        }
+        if key > summary.max_key {
+            summary.max_key = key;
+        }
+        if key < 0 {
+            summary.negative_count += 1;
+        }
+        if key > 16_000_000 {
+            summary.huge_count += 1;
+        }
+        if summary.first_bad_value.is_none() && (key < 0 || key > 16_000_000) {
+            summary.first_bad_value = Some((i, key));
+        }
+        prev = key;
+    }
+    Some(summary)
+}
+
+fn restore_signed_radix_residue(keys: &[i32]) -> Vec<i32> {
+    keys.iter()
+        .map(|&key| {
+            if key < 0 {
+                ((key as u32) ^ 0x8000_0000) as i32
+            } else {
+                key
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SortValueSummary {
+    negative_count: u32,
+    extra_count: u32,
+    missing_count: u32,
+    first_negative: Option<(usize, i32)>,
+    first_extra: Option<(usize, i32, u32, u32)>,
+    first_missing: Option<(usize, i32, u32, u32)>,
+}
+
+fn summarize_sort_values(values_in: &[i32], values_out: &[i32]) -> Option<SortValueSummary> {
+    if values_in.is_empty() || values_out.is_empty() || values_in.len() != values_out.len() {
+        return None;
+    }
+    let mut input_counts = HashMap::<i32, u32>::new();
+    for &value in values_in {
+        *input_counts.entry(value).or_insert(0) += 1;
+    }
+    let mut output_counts = HashMap::<i32, u32>::new();
+    let mut summary = SortValueSummary {
+        negative_count: 0,
+        extra_count: 0,
+        missing_count: 0,
+        first_negative: None,
+        first_extra: None,
+        first_missing: None,
+    };
+    for (i, &value) in values_out.iter().enumerate() {
+        if value < 0 {
+            summary.negative_count += 1;
+            if summary.first_negative.is_none() {
+                summary.first_negative = Some((i, value));
+            }
+        }
+        let seen = output_counts.entry(value).or_insert(0);
+        *seen += 1;
+        let input_seen = input_counts.get(&value).copied().unwrap_or(0);
+        if *seen > input_seen {
+            summary.extra_count += 1;
+            if summary.first_extra.is_none() {
+                summary.first_extra = Some((i, value, input_seen, *seen));
+            }
+        }
+    }
+    for (&value, &expected) in input_counts.iter() {
+        let actual = output_counts.get(&value).copied().unwrap_or(0);
+        if expected > actual {
+            summary.missing_count += expected - actual;
+        }
+    }
+    for (idx, &value) in values_in.iter().enumerate() {
+        let expected = input_counts.get(&value).copied().unwrap_or(0);
+        let actual = output_counts.get(&value).copied().unwrap_or(0);
+        if expected > actual {
+            if summary.first_missing.is_none() {
+                summary.first_missing = Some((idx, value, expected, actual));
+            }
+            break;
+        }
+    }
+    Some(summary)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GoodSortReplayCaptureKind {
+    TargetBit0N8109,
+    FallbackBit0LargeClean,
+}
+
+fn classify_good_sort_replay_capture(
+    begin_bit: u32,
+    n_items: usize,
+    first: u8,
+    overwrite: u8,
+    summary_out: SortedKeySummary,
+    vals_summary: Option<SortValueSummary>,
+) -> Option<GoodSortReplayCaptureKind> {
+    if begin_bit != 0
+        || first != 0
+        || overwrite != 0
+        || summary_out.negative_count != 0
+        || !vals_summary
+            .map(|summary| {
+                summary.negative_count == 0
+                    && summary.extra_count == 0
+                    && summary.missing_count == 0
+            })
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    if n_items == 8109 {
+        Some(GoodSortReplayCaptureKind::TargetBit0N8109)
+    } else if n_items >= 1024 {
+        Some(GoodSortReplayCaptureKind::FallbackBit0LargeClean)
+    } else {
+        None
+    }
+}
+
+fn good_sort_replay_capture_path(
+    kind: GoodSortReplayCaptureKind,
+    begin_bit: u32,
+    n_items: usize,
+    pass_n: u32,
+) -> String {
+    match kind {
+        GoodSortReplayCaptureKind::TargetBit0N8109 => {
+            format!(
+                "/tmp/zluda_sort_replay_capture_good_bit{}_pass{}.bin",
+                begin_bit, pass_n
+            )
+        }
+        GoodSortReplayCaptureKind::FallbackBit0LargeClean => {
+            format!(
+                "/tmp/zluda_sort_replay_capture_good_bit{}_n{}_pass{}.bin",
+                begin_bit, n_items, pass_n
+            )
+        }
+    }
+}
+
+fn format_sort_pair_window(
+    keys: &[i32],
+    values: &[i32],
+    center: usize,
+    label: &str,
+) -> Option<String> {
+    if keys.len() != values.len() || center >= keys.len() || keys.is_empty() {
+        return None;
+    }
+    let start = center.saturating_sub(4);
+    let end = std::cmp::min(keys.len(), center + 5);
+    let mut parts = Vec::new();
+    for idx in start..end {
+        parts.push(format!(
+            "[{}]=k:{}(0x{:08x}) v:{}",
+            idx, keys[idx], keys[idx] as u32, values[idx]
+        ));
+    }
+    Some(format!(
+        "{}[{}..{}): {}",
+        label,
+        start,
+        end,
+        parts.join(" ")
+    ))
+}
+
+fn summarize_sort_pair_window_diff(
+    expected_keys: &[i32],
+    expected_values: &[i32],
+    actual_keys: &[i32],
+    actual_values: &[i32],
+    center: usize,
+    label: &str,
+) -> Option<String> {
+    if expected_keys.len() != expected_values.len()
+        || actual_keys.len() != actual_values.len()
+        || expected_keys.len() != actual_keys.len()
+        || center >= expected_keys.len()
+        || expected_keys.is_empty()
+    {
+        return None;
+    }
+    let start = center.saturating_sub(4);
+    let end = std::cmp::min(expected_keys.len(), center + 5);
+    let mismatches = (start..end)
+        .filter(|&idx| {
+            expected_keys[idx] != actual_keys[idx] || expected_values[idx] != actual_values[idx]
+        })
+        .collect::<Vec<_>>();
+    let mismatch_runs = mismatches
+        .split_first()
+        .map(|(&first, rest)| {
+            let mut runs = Vec::new();
+            let mut run_start = first;
+            let mut run_end = first + 1;
+            for &idx in rest {
+                if idx == run_end {
+                    run_end += 1;
+                } else {
+                    runs.push(format!("{}..{}", run_start, run_end));
+                    run_start = idx;
+                    run_end = idx + 1;
+                }
+            }
+            runs.push(format!("{}..{}", run_start, run_end));
+            format!("[{}]", runs.join(", "))
+        })
+        .unwrap_or_else(|| "[]".to_string());
+    Some(format!(
+        "{}[{}..{}): mismatch_count={} mismatches={:?} runs={}",
+        label,
+        start,
+        end,
+        mismatches.len(),
+        mismatches,
+        mismatch_runs
+    ))
+}
+
+fn find_value_positions(values: &[i32], target: i32, limit: usize) -> Vec<usize> {
+    values
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &value)| if value == target { Some(idx) } else { None })
+        .take(limit)
+        .collect()
+}
+
+fn find_key_positions(keys: &[i32], target: i32, limit: usize) -> Vec<usize> {
+    keys.iter()
+        .enumerate()
+        .filter_map(|(idx, &key)| if key == target { Some(idx) } else { None })
+        .take(limit)
+        .collect()
+}
+
+fn find_pair_positions(
+    keys: &[i32],
+    values: &[i32],
+    target_key: i32,
+    target_value: i32,
+    limit: usize,
+) -> Vec<usize> {
+    keys.iter()
+        .zip(values.iter())
+        .enumerate()
+        .filter_map(|(idx, (&key, &value))| {
+            if key == target_key && value == target_value {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .take(limit)
+        .collect()
+}
+
+fn matching_pair_run(
+    keys: &[i32],
+    values: &[i32],
+    left: usize,
+    right: usize,
+) -> Option<(usize, usize, usize)> {
+    if keys.len() != values.len() || left >= keys.len() || right >= keys.len() || left == right {
+        return None;
+    }
+    let mut left_start = left;
+    let mut right_start = right;
+    while left_start > 0
+        && right_start > 0
+        && keys[left_start - 1] == keys[right_start - 1]
+        && values[left_start - 1] == values[right_start - 1]
+    {
+        left_start -= 1;
+        right_start -= 1;
+    }
+    let mut len = 0;
+    while left_start + len < keys.len()
+        && right_start + len < keys.len()
+        && keys[left_start + len] == keys[right_start + len]
+        && values[left_start + len] == values[right_start + len]
+    {
+        len += 1;
+    }
+    Some((left_start, right_start, len))
+}
+
+fn matching_value_run(
+    left_values: &[i32],
+    right_values: &[i32],
+    left: usize,
+    right: usize,
+) -> Option<(usize, usize, usize)> {
+    if left >= left_values.len() || right >= right_values.len() {
+        return None;
+    }
+    let mut left_start = left;
+    let mut right_start = right;
+    while left_start > 0
+        && right_start > 0
+        && left_values[left_start - 1] == right_values[right_start - 1]
+    {
+        left_start -= 1;
+        right_start -= 1;
+    }
+    let mut len = 0;
+    while left_start + len < left_values.len()
+        && right_start + len < right_values.len()
+        && left_values[left_start + len] == right_values[right_start + len]
+    {
+        len += 1;
+    }
+    Some((left_start, right_start, len))
+}
+
+fn sort_pass_radix_digit(key: i32, begin_bit: u32) -> u32 {
+    ((key as u32) >> begin_bit) & 0xf
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedSortPass {
+    keys_out: Vec<i32>,
+    values_out: Vec<i32>,
+    output_to_input: Vec<usize>,
+}
+
+fn reconstruct_expected_sort_pass(
+    keys_in: &[i32],
+    values_in: &[i32],
+    begin_bit: u32,
+) -> Option<ExpectedSortPass> {
+    if keys_in.is_empty() || keys_in.len() != values_in.len() {
+        return None;
+    }
+    let mut counts = [0usize; 16];
+    for &key in keys_in {
+        counts[sort_pass_radix_digit(key, begin_bit) as usize] += 1;
+    }
+    let mut offsets = [0usize; 16];
+    let mut running = 0usize;
+    for (digit, count) in counts.into_iter().enumerate() {
+        offsets[digit] = running;
+        running += count;
+    }
+    let mut keys_out = vec![0i32; keys_in.len()];
+    let mut values_out = vec![0i32; values_in.len()];
+    let mut output_to_input = vec![0usize; keys_in.len()];
+    for (input_idx, (&key, &value)) in keys_in.iter().zip(values_in.iter()).enumerate() {
+        let digit = sort_pass_radix_digit(key, begin_bit) as usize;
+        let out_idx = offsets[digit];
+        keys_out[out_idx] = key;
+        values_out[out_idx] = value;
+        output_to_input[out_idx] = input_idx;
+        offsets[digit] += 1;
+    }
+    Some(ExpectedSortPass {
+        keys_out,
+        values_out,
+        output_to_input,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedSortPassDiagnostics {
+    mismatch_line: Option<String>,
+    expected_window: Option<String>,
+    extra_positions: Option<String>,
+    missing_positions: Option<String>,
+    actual_pair_route: Option<String>,
+    actual_pair_source_window: Option<String>,
+    actual_pair_clone_window: Option<String>,
+    actual_value_route: Option<String>,
+    actual_value_input_window: Option<String>,
+    actual_value_input_run: Option<String>,
+    actual_value_expected_window: Option<String>,
+    actual_value_expected_run: Option<String>,
+    actual_value_source_window: Option<String>,
+    actual_value_clone_window: Option<String>,
+    actual_value_source_diff: Option<String>,
+    actual_value_clone_diff: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SortGridEvenShare {
+    total_grains: i32,
+    big_blocks: i32,
+    big_share: i32,
+    normal_share: i32,
+    normal_base_offset: i32,
+    num_items: i32,
+    grid_size: i32,
+    block_offset: i32,
+    block_end: i32,
+}
+
+impl SortGridEvenShare {
+    fn from_words(words: [i32; 9]) -> Self {
+        Self {
+            total_grains: words[0],
+            big_blocks: words[1],
+            big_share: words[2],
+            normal_share: words[3],
+            normal_base_offset: words[4],
+            num_items: words[5],
+            grid_size: words[6],
+            block_offset: words[7],
+            block_end: words[8],
+        }
+    }
+
+    fn block_count(&self) -> usize {
+        self.grid_size.max(self.total_grains).max(0) as usize
+    }
+
+    fn item_count(&self, limit: usize) -> usize {
+        let num_items = usize::try_from(self.num_items.max(0)).unwrap_or(0);
+        if num_items == 0 {
+            limit
+        } else {
+            std::cmp::min(limit, num_items)
+        }
+    }
+
+    fn covered_item_count(&self) -> Option<usize> {
+        let block_count = self.block_count();
+        if block_count == 0 {
+            return Some(0);
+        }
+        let big_blocks = self.big_blocks.max(0) as usize;
+        let big_share = usize::try_from(self.big_share.max(0)).ok()?;
+        let normal_share = usize::try_from(self.normal_share.max(0)).ok()?;
+        let normal_base_offset = usize::try_from(self.normal_base_offset.max(0)).ok()?;
+        let big_end = big_blocks.checked_mul(big_share)?;
+        let normal_blocks = block_count.saturating_sub(big_blocks);
+        let normal_end =
+            normal_base_offset.checked_add(normal_blocks.checked_mul(normal_share)?)?;
+        Some(big_end.max(normal_end))
+    }
+
+    fn block_range(&self, block_idx: usize, limit: usize) -> Option<(usize, usize)> {
+        let item_count = self.item_count(limit);
+        if item_count == 0 || block_idx >= self.block_count() {
+            return None;
+        }
+        let big_blocks = self.big_blocks.max(0) as usize;
+        let (start_i32, share_i32) = if block_idx < big_blocks {
+            (
+                i32::try_from(block_idx).ok()?.checked_mul(self.big_share)?,
+                self.big_share,
+            )
+        } else {
+            let normal_idx = i32::try_from(block_idx - big_blocks).ok()?;
+            (
+                self.normal_base_offset
+                    .checked_add(normal_idx.checked_mul(self.normal_share)?)?,
+                self.normal_share,
+            )
+        };
+        let start = usize::try_from(start_i32).ok()?;
+        let share = usize::try_from(share_i32).ok()?;
+        let end = start.saturating_add(share).min(item_count);
+        if start >= end {
+            None
+        } else {
+            Some((start, end))
+        }
+    }
+
+    fn block_for_index(&self, index: usize, limit: usize) -> Option<(usize, usize, usize)> {
+        let item_count = self.item_count(limit);
+        if index >= item_count {
+            return None;
+        }
+        (0..self.block_count()).find_map(|block_idx| {
+            self.block_range(block_idx, item_count).and_then(|(start, end)| {
+                if index >= start && index < end {
+                    Some((block_idx, start, end))
+                } else {
+                    None
+                }
+            })
+        })
+    }
+}
+
+fn sort_pass_capture_len(n_items: usize, grid_share: Option<SortGridEvenShare>) -> usize {
+    let capture_len = grid_share
+        .and_then(|share| share.covered_item_count())
+        .map(|covered| covered.max(n_items))
+        .unwrap_or(n_items);
+    capture_len.min(F5_MAX_KEYS)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DownsweepRankDiagnostics {
+    expected_line: Option<String>,
+    actual_line: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DownsweepBlockCapture {
+    block_idx: usize,
+    start: usize,
+    end: usize,
+    expected_source_block: usize,
+    actual_source_block: Option<usize>,
+    capture_text: String,
+}
+
+const SORT_PASS_REPLAY_CAPTURE_MAGIC: u32 = 0x5350_5243; // "SPRC"
+const SORT_PASS_REPLAY_CAPTURE_VERSION: u32 = 6;
+const SORT_PASS_REPLAY_CAPTURE_FLAG_HAS_VALS: u32 = 1 << 0;
+const SORT_PASS_REPLAY_CAPTURE_FLAG_HAS_GRID_SHARE: u32 = 1 << 1;
+
+fn push_le_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_le_i32(bytes: &mut Vec<u8>, value: i32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_le_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn pack_sort_replay_launch_flags(first: u8, last: u8, overwrite: u8) -> u32 {
+    u32::from(first) | (u32::from(last) << 8) | (u32::from(overwrite) << 16)
+}
+
+fn serialize_sort_pass_replay_capture(
+    pass_n: u32,
+    begin_bit: u32,
+    n_items: usize,
+    grid_dim_x: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+    first: u8,
+    last: u8,
+    overwrite: u8,
+    keys_in_ptr: u64,
+    keys_out_ptr: u64,
+    vals_in_ptr: u64,
+    vals_out_ptr: u64,
+    spine_ptr: u64,
+    stream_ptr: u64,
+    keys_in: &[i32],
+    vals_in: Option<&[i32]>,
+    keys_in_before: &[i32],
+    vals_in_before: Option<&[i32]>,
+    keys_out_before: &[i32],
+    vals_out_before: Option<&[i32]>,
+    keys_out: &[i32],
+    vals_out: Option<&[i32]>,
+    spine_words: &[u32],
+    grid_share: Option<SortGridEvenShare>,
+) -> Option<Vec<u8>> {
+    if keys_in.len() != keys_out.len()
+        || keys_in.len() != keys_in_before.len()
+        || keys_in.len() != keys_out_before.len()
+    {
+        return None;
+    }
+    if vals_in.is_some() != vals_out.is_some()
+        || vals_in.is_some() != vals_in_before.is_some()
+        || vals_in.is_some() != vals_out_before.is_some()
+    {
+        return None;
+    }
+    if let Some(vals_in) = vals_in {
+        if vals_in.len() != keys_in.len()
+            || vals_in_before?.len() != keys_in_before.len()
+            || vals_out?.len() != keys_out.len()
+            || vals_out_before?.len() != keys_out_before.len()
+        {
+            return None;
+        }
+    }
+    if n_items > keys_in.len() {
+        return None;
+    }
+    let n_items = u32::try_from(n_items).ok()?;
+    let capture_items = u32::try_from(keys_in.len()).ok()?;
+    let spine_words_len = u32::try_from(spine_words.len()).ok()?;
+    let grid_share_words = grid_share.map(|share| {
+        [
+            share.total_grains,
+            share.big_blocks,
+            share.big_share,
+            share.normal_share,
+            share.normal_base_offset,
+            share.num_items,
+            share.grid_size,
+            share.block_offset,
+            share.block_end,
+        ]
+    });
+    let mut flags = 0u32;
+    if vals_in.is_some() {
+        flags |= SORT_PASS_REPLAY_CAPTURE_FLAG_HAS_VALS;
+    }
+    if grid_share_words.is_some() {
+        flags |= SORT_PASS_REPLAY_CAPTURE_FLAG_HAS_GRID_SHARE;
+    }
+    let payload_words = keys_in.len()
+        + keys_in_before.len()
+        + keys_out_before.len()
+        + keys_out.len()
+        + vals_in.map(|v| v.len()).unwrap_or(0)
+        + vals_in_before.map(|v| v.len()).unwrap_or(0)
+        + vals_out_before.map(|v| v.len()).unwrap_or(0)
+        + vals_out.map(|v| v.len()).unwrap_or(0)
+        + spine_words.len();
+    let mut bytes = Vec::with_capacity((35 + payload_words) * 4);
+
+    push_le_u32(&mut bytes, SORT_PASS_REPLAY_CAPTURE_MAGIC);
+    push_le_u32(&mut bytes, SORT_PASS_REPLAY_CAPTURE_VERSION);
+    push_le_u32(&mut bytes, pass_n);
+    push_le_u32(&mut bytes, begin_bit);
+    push_le_u32(&mut bytes, n_items);
+    push_le_u32(&mut bytes, capture_items);
+    push_le_u32(&mut bytes, grid_dim_x);
+    push_le_u32(&mut bytes, spine_words_len);
+    push_le_u32(&mut bytes, flags);
+    push_le_u32(
+        &mut bytes,
+        pack_sort_replay_launch_flags(first, last, overwrite),
+    );
+    push_le_u32(&mut bytes, block_dim_x);
+    push_le_u32(&mut bytes, block_dim_y);
+    push_le_u32(&mut bytes, block_dim_z);
+    push_le_u32(&mut bytes, shared_mem_bytes);
+    push_le_u64(&mut bytes, keys_in_ptr);
+    push_le_u64(&mut bytes, keys_out_ptr);
+    push_le_u64(&mut bytes, vals_in_ptr);
+    push_le_u64(&mut bytes, vals_out_ptr);
+    push_le_u64(&mut bytes, spine_ptr);
+    push_le_u64(&mut bytes, stream_ptr);
+    for word in grid_share_words.unwrap_or([0; 9]) {
+        push_le_i32(&mut bytes, word);
+    }
+    for &value in keys_in {
+        push_le_i32(&mut bytes, value);
+    }
+    if let Some(vals_in) = vals_in {
+        for &value in vals_in {
+            push_le_i32(&mut bytes, value);
+        }
+    }
+    for &value in keys_in_before {
+        push_le_i32(&mut bytes, value);
+    }
+    if let Some(vals_in_before) = vals_in_before {
+        for &value in vals_in_before {
+            push_le_i32(&mut bytes, value);
+        }
+    }
+    for &value in keys_out_before {
+        push_le_i32(&mut bytes, value);
+    }
+    if let Some(vals_out_before) = vals_out_before {
+        for &value in vals_out_before {
+            push_le_i32(&mut bytes, value);
+        }
+    }
+    for &value in keys_out {
+        push_le_i32(&mut bytes, value);
+    }
+    if let Some(vals_out) = vals_out {
+        for &value in vals_out {
+            push_le_i32(&mut bytes, value);
+        }
+    }
+    for &value in spine_words {
+        push_le_u32(&mut bytes, value);
+    }
+    Some(bytes)
+}
+
+fn write_good_sort_replay_capture_once(
+    captured: &std::sync::atomic::AtomicBool,
+    path: &str,
+    capture: Option<&[u8]>,
+    begin_bit: u32,
+    n_items: usize,
+    grid_dim_x: u32,
+    spine_words: usize,
+) -> Option<String> {
+    if captured
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return None;
+    }
+    let line = match capture {
+        Some(bytes) => match std::fs::write(path, bytes) {
+            Ok(()) => format!(
+                "SORT_REPLAY_CAPTURE_GOOD bit={} n={} grid={} spine_words={} path={}",
+                begin_bit, n_items, grid_dim_x, spine_words, path
+            ),
+            Err(err) => {
+                captured.store(false, std::sync::atomic::Ordering::Relaxed);
+                format!(
+                    "SORT_REPLAY_CAPTURE_GOOD bit={} n={} grid={} spine_words={} path={} write_err={}",
+                    begin_bit, n_items, grid_dim_x, spine_words, path, err
+                )
+            }
+        },
+        None => {
+            captured.store(false, std::sync::atomic::Ordering::Relaxed);
+            format!(
+                "SORT_REPLAY_CAPTURE_GOOD bit={} n={} grid={} spine_words={} path={} capture_missing",
+                begin_bit, n_items, grid_dim_x, spine_words, path
+            )
+        }
+    };
+    Some(line)
+}
+
+fn compute_sort_digit_block_counts(
+    keys_in: &[i32],
+    begin_bit: u32,
+    grid_share: &SortGridEvenShare,
+) -> Option<Vec<[u32; 16]>> {
+    let item_count = grid_share.item_count(keys_in.len());
+    let block_count = grid_share.block_count();
+    if item_count == 0 || block_count == 0 {
+        return None;
+    }
+    let mut counts = vec![[0u32; 16]; block_count];
+    let mut saw_block = false;
+    for block_idx in 0..block_count {
+        let Some((start, end)) = grid_share.block_range(block_idx, item_count) else {
+            continue;
+        };
+        saw_block = true;
+        for &key in &keys_in[start..end] {
+            counts[block_idx][sort_pass_radix_digit(key, begin_bit) as usize] += 1;
+        }
+    }
+    saw_block.then_some(counts)
+}
+
+fn format_downsweep_rank_line(
+    label: &str,
+    keys_in: &[i32],
+    values_in: &[i32],
+    begin_bit: u32,
+    grid_share: &SortGridEvenShare,
+    block_counts: &[[u32; 16]],
+    source_idx: usize,
+    out_idx: usize,
+    output_key: Option<i32>,
+    actual_dst: Option<usize>,
+) -> Option<String> {
+    if keys_in.len() != values_in.len() || source_idx >= keys_in.len() {
+        return None;
+    }
+    let key = keys_in[source_idx];
+    let value = values_in[source_idx];
+    let digit = sort_pass_radix_digit(key, begin_bit) as usize;
+    let (block_idx, block_start, block_end) = grid_share.block_for_index(source_idx, keys_in.len())?;
+    let scan_counts = block_counts
+        .iter()
+        .map(|counts| counts[digit] as usize)
+        .collect::<Vec<_>>();
+    let mut running = 0usize;
+    let scan_prefix = scan_counts
+        .iter()
+        .map(|&count| {
+            let prefix = running;
+            running += count;
+            prefix
+        })
+        .collect::<Vec<_>>();
+    let local_rank = keys_in[block_start..source_idx]
+        .iter()
+        .filter(|&&candidate| sort_pass_radix_digit(candidate, begin_bit) as usize == digit)
+        .count();
+    let global_rank = scan_prefix.get(block_idx).copied()? + local_rank;
+    let digit_base = (0..digit)
+        .map(|digit_idx| {
+            block_counts
+                .iter()
+                .map(|counts| counts[digit_idx] as usize)
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+    let scatter_dst = digit_base + global_rank;
+    let output_key_note = output_key
+        .filter(|&candidate| candidate != key)
+        .map(|candidate| format!(" output_k:{}(0x{:08x})", candidate, candidate as u32))
+        .unwrap_or_default();
+    let actual_dst_note = actual_dst
+        .map(|dst| format!(" actual_dst={}", dst))
+        .unwrap_or_default();
+    Some(format!(
+        "{} out[{}] source=in[{}] k:{}(0x{:08x}) v:{} digit={} block={} range=[{}..{}) scan_counts={:?} scan_prefix={:?} digit_base={} local_rank={} global_rank={} scatter_dst={}{}{}",
+        label,
+        out_idx,
+        source_idx,
+        key,
+        key as u32,
+        value,
+        digit,
+        block_idx,
+        block_start,
+        block_end,
+        scan_counts,
+        scan_prefix,
+        digit_base,
+        local_rank,
+        global_rank,
+        scatter_dst,
+        output_key_note,
+        actual_dst_note,
+    ))
+}
+
+fn append_downsweep_block_capture_rows(
+    capture_text: &mut String,
+    section: &str,
+    block_idx: usize,
+    start: usize,
+    end: usize,
+    mismatch_out: usize,
+    keys_in: &[i32],
+    values_in: &[i32],
+    expected: &ExpectedSortPass,
+    keys_out: &[i32],
+    values_out: &[i32],
+    begin_bit: u32,
+) {
+    let _ = writeln!(
+        capture_text,
+        "{} block={} range=[{}..{})",
+        section, block_idx, start, end
+    );
+    for idx in start..end {
+        let in_key = keys_in[idx];
+        let in_value = values_in[idx];
+        let expected_key = expected.keys_out[idx];
+        let expected_value = expected.values_out[idx];
+        let expected_src = expected.output_to_input[idx];
+        let actual_key_at_idx = keys_out[idx];
+        let actual_value_at_idx = values_out[idx];
+        let actual_xor_note = if actual_key_at_idx < 0 {
+            let restored = ((actual_key_at_idx as u32) ^ 0x8000_0000) as i32;
+            format!(" xor_k:{}(0x{:08x})", restored, restored as u32)
+        } else {
+            String::new()
+        };
+        let marker = if idx == mismatch_out { "!" } else { " " };
+        let _ = writeln!(
+            capture_text,
+            "{}[{}] in=k:{}(0x{:08x}) v:{} d:{} | expect<-in[{}] k:{}(0x{:08x}) v:{} d:{} | actual k:{}(0x{:08x}) v:{} d:{}{}",
+            marker,
+            idx,
+            in_key,
+            in_key as u32,
+            in_value,
+            sort_pass_radix_digit(in_key, begin_bit),
+            expected_src,
+            expected_key,
+            expected_key as u32,
+            expected_value,
+            sort_pass_radix_digit(expected_key, begin_bit),
+            actual_key_at_idx,
+            actual_key_at_idx as u32,
+            actual_value_at_idx,
+            sort_pass_radix_digit(actual_key_at_idx, begin_bit),
+            actual_xor_note,
+        );
+    }
+}
+
+fn analyze_expected_sort_pass(
+    keys_in: &[i32],
+    values_in: &[i32],
+    keys_out: &[i32],
+    values_out: &[i32],
+    begin_bit: u32,
+    vals_summary: Option<SortValueSummary>,
+) -> Option<ExpectedSortPassDiagnostics> {
+    if keys_in.len() != values_in.len()
+        || keys_out.len() != values_out.len()
+        || keys_in.len() != keys_out.len()
+        || keys_in.is_empty()
+    {
+        return None;
+    }
+    let expected = reconstruct_expected_sort_pass(keys_in, values_in, begin_bit)?;
+    let first_mismatch = expected
+        .keys_out
+        .iter()
+        .zip(expected.values_out.iter())
+        .zip(keys_out.iter().zip(values_out.iter()))
+        .enumerate()
+        .find_map(
+            |(idx, ((&expected_key, &expected_value), (&actual_key, &actual_value)))| {
+                if expected_key != actual_key || expected_value != actual_value {
+                    Some((idx, expected_key, expected_value, actual_key, actual_value))
+                } else {
+                    None
+                }
+            },
+        );
+    let mismatch_line = first_mismatch.map(
+        |(out_idx, expected_key, expected_value, actual_key, actual_value)| {
+            let input_idx = expected.output_to_input[out_idx];
+            let digit = sort_pass_radix_digit(expected_key, begin_bit);
+            let actual_input_positions =
+                find_pair_positions(keys_in, values_in, actual_key, actual_value, 4);
+            let actual_expected_out_positions = find_pair_positions(
+                &expected.keys_out,
+                &expected.values_out,
+                actual_key,
+                actual_value,
+                4,
+            );
+            let actual_value_input_positions = find_value_positions(values_in, actual_value, 4);
+            let actual_value_expected_out_positions =
+                find_value_positions(&expected.values_out, actual_value, 4);
+            let actual_value_route_note = actual_value_input_positions
+                .first()
+                .map(|&input_pos| {
+                    let source_key = keys_in[input_pos];
+                    let source_digit = sort_pass_radix_digit(source_key, begin_bit);
+                    let expected_out_note = actual_value_expected_out_positions
+                        .first()
+                        .map(|&expected_out_pos| {
+                            let expected_key_for_value = expected.keys_out[expected_out_pos];
+                            format!(
+                                " expected_out[{}]=k:{}(0x{:08x}) digit={}",
+                                expected_out_pos,
+                                expected_key_for_value,
+                                expected_key_for_value as u32,
+                                sort_pass_radix_digit(expected_key_for_value, begin_bit),
+                            )
+                        })
+                        .unwrap_or_else(|| " expected_out=[]".to_string());
+                    format!(
+                        " actual_value_src=in[{}]=k:{}(0x{:08x}) digit={}{}",
+                        input_pos,
+                        source_key,
+                        source_key as u32,
+                        source_digit,
+                        expected_out_note,
+                    )
+                })
+                .unwrap_or_default();
+            let actual_xor_note = if actual_key < 0 {
+                let restored_key = ((actual_key as u32) ^ 0x8000_0000) as i32;
+                let restored_input_positions =
+                    find_pair_positions(keys_in, values_in, restored_key, actual_value, 4);
+                let restored_expected_out_positions = find_pair_positions(
+                    &expected.keys_out,
+                    &expected.values_out,
+                    restored_key,
+                    actual_value,
+                    4,
+                );
+                let restored_key_input_positions = find_key_positions(keys_in, restored_key, 4);
+                let restored_key_expected_out_positions =
+                    find_key_positions(&expected.keys_out, restored_key, 4);
+                format!(
+                    " actual_xor=k:{}(0x{:08x}) in={:?} expected_out={:?} key_in={:?} key_expected_out={:?}",
+                    restored_key,
+                    restored_key as u32,
+                    restored_input_positions,
+                    restored_expected_out_positions,
+                    restored_key_input_positions,
+                    restored_key_expected_out_positions,
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "EXPECT_MISMATCH out[{}] bit={} digit={} expected=in[{}] k:{}(0x{:08x}) v:{} actual=k:{}(0x{:08x}) v:{} actual_in={:?} actual_expected_out={:?} actual_value_in={:?} actual_value_expected_out={:?}",
+                out_idx,
+                begin_bit,
+                digit,
+                input_idx,
+                expected_key,
+                expected_key as u32,
+                expected_value,
+                actual_key,
+                actual_key as u32,
+                actual_value,
+                actual_input_positions,
+                actual_expected_out_positions,
+                actual_value_input_positions,
+                actual_value_expected_out_positions,
+            ) + &actual_value_route_note
+                + &actual_xor_note
+        },
+    );
+    let actual_pair_route = first_mismatch.and_then(|(out_idx, _, _, actual_key, actual_value)| {
+        let actual_input_positions =
+            find_pair_positions(keys_in, values_in, actual_key, actual_value, 4);
+        let actual_expected_out_positions = find_pair_positions(
+            &expected.keys_out,
+            &expected.values_out,
+            actual_key,
+            actual_value,
+            4,
+        );
+        actual_expected_out_positions
+            .first()
+            .map(|&expected_out_idx| {
+                let input_note = actual_input_positions
+                    .first()
+                    .map(|&input_idx| format!("in[{}] -> ", input_idx))
+                    .unwrap_or_default();
+                format!(
+                    "ACTUAL_PAIR_ROUTE {}expected_out[{}] -> out[{}] k:{}(0x{:08x}) v:{}",
+                    input_note,
+                    expected_out_idx,
+                    out_idx,
+                    actual_key,
+                    actual_key as u32,
+                    actual_value,
+                )
+            })
+    });
+    let expected_window = first_mismatch.and_then(|(idx, _, _, _, _)| {
+        format_sort_pair_window(&expected.keys_out, &expected.values_out, idx, "EXPECT")
+    });
+    let actual_pair_source_window =
+        first_mismatch.and_then(|(_, _, _, actual_key, actual_value)| {
+            let actual_expected_out_positions = find_pair_positions(
+                &expected.keys_out,
+                &expected.values_out,
+                actual_key,
+                actual_value,
+                4,
+            );
+            actual_expected_out_positions.first().and_then(|&idx| {
+                format_sort_pair_window(keys_out, values_out, idx, "ACTUAL_PAIR_SRC_OUT")
+            })
+        });
+    let actual_pair_clone_window =
+        first_mismatch.and_then(|(out_idx, _, _, actual_key, actual_value)| {
+            let actual_expected_out_positions = find_pair_positions(
+                &expected.keys_out,
+                &expected.values_out,
+                actual_key,
+                actual_value,
+                4,
+            );
+            actual_expected_out_positions
+                .first()
+                .and_then(|&source_idx| {
+                    if source_idx != out_idx {
+                        format_sort_pair_window(
+                            keys_out,
+                            values_out,
+                            out_idx,
+                            "ACTUAL_PAIR_DST_OUT",
+                        )
+                    } else {
+                        None
+                    }
+                })
+        });
+    let actual_value_route = first_mismatch.and_then(|(out_idx, _, _, _, actual_value)| {
+        let actual_value_input_positions = find_value_positions(values_in, actual_value, 4);
+        let actual_value_expected_out_positions =
+            find_value_positions(&expected.values_out, actual_value, 4);
+        actual_value_expected_out_positions
+            .first()
+            .map(|&expected_out_idx| {
+                let input_note = actual_value_input_positions
+                    .first()
+                    .map(|&input_idx| format!("in[{}] -> ", input_idx))
+                    .unwrap_or_default();
+                format!(
+                    "ACTUAL_VALUE_ROUTE {}expected_out[{}] -> out[{}] v:{}",
+                    input_note, expected_out_idx, out_idx, actual_value
+                )
+            })
+    });
+    let actual_value_input_window = first_mismatch.and_then(|(_, _, _, _, actual_value)| {
+        let actual_value_input_positions = find_value_positions(values_in, actual_value, 4);
+        actual_value_input_positions
+            .first()
+            .and_then(|&idx| format_sort_pair_window(keys_in, values_in, idx, "ACTUAL_VALUE_SRC_IN"))
+    });
+    let actual_value_input_run = first_mismatch.and_then(|(out_idx, _, _, _, actual_value)| {
+        let actual_value_input_positions = find_value_positions(values_in, actual_value, 4);
+        actual_value_input_positions.first().and_then(|&input_idx| {
+            matching_value_run(values_in, values_out, input_idx, out_idx).map(
+                |(input_start, out_start, len)| {
+                    format!(
+                        "ACTUAL_VALUE_INPUT_RUN in[{}] -> out[{}] start_in={} start_out={} len={}",
+                        input_idx, out_idx, input_start, out_start, len
+                    )
+                },
+            )
+        })
+    });
+    let actual_value_expected_window = first_mismatch.and_then(|(_, _, _, _, actual_value)| {
+        let actual_value_expected_out_positions =
+            find_value_positions(&expected.values_out, actual_value, 4);
+        actual_value_expected_out_positions
+            .first()
+            .and_then(|&idx| {
+                format_sort_pair_window(
+                    &expected.keys_out,
+                    &expected.values_out,
+                    idx,
+                    "EXPECT_VALUE_SRC",
+                )
+            })
+    });
+    let actual_value_expected_run = first_mismatch.and_then(|(out_idx, _, _, _, actual_value)| {
+        let actual_value_expected_out_positions =
+            find_value_positions(&expected.values_out, actual_value, 4);
+        actual_value_expected_out_positions
+            .first()
+            .and_then(|&expected_idx| {
+                matching_value_run(&expected.values_out, values_out, expected_idx, out_idx).map(
+                    |(expected_start, out_start, len)| {
+                        format!(
+                            "ACTUAL_VALUE_EXPECTED_RUN expected_out[{}] -> out[{}] start_expected={} start_out={} len={}",
+                            expected_idx, out_idx, expected_start, out_start, len
+                        )
+                    },
+                )
+            })
+    });
+    let actual_value_source_window = first_mismatch.and_then(|(_, _, _, _, actual_value)| {
+        let actual_value_expected_out_positions =
+            find_value_positions(&expected.values_out, actual_value, 4);
+        actual_value_expected_out_positions
+            .first()
+            .and_then(|&idx| {
+                format_sort_pair_window(keys_out, values_out, idx, "ACTUAL_VALUE_SRC_OUT")
+            })
+    });
+    let actual_value_source_diff = first_mismatch.and_then(|(_, _, _, _, actual_value)| {
+        let actual_value_expected_out_positions =
+            find_value_positions(&expected.values_out, actual_value, 4);
+        actual_value_expected_out_positions
+            .first()
+            .and_then(|&idx| {
+                summarize_sort_pair_window_diff(
+                    &expected.keys_out,
+                    &expected.values_out,
+                    keys_out,
+                    values_out,
+                    idx,
+                    "ACTUAL_VALUE_SRC_DIFF",
+                )
+            })
+    });
+    let actual_value_clone_window = first_mismatch.and_then(|(out_idx, _, _, _, actual_value)| {
+        let actual_value_expected_out_positions =
+            find_value_positions(&expected.values_out, actual_value, 4);
+        actual_value_expected_out_positions
+            .first()
+            .and_then(|&source_idx| {
+                if source_idx != out_idx {
+                    format_sort_pair_window(keys_out, values_out, out_idx, "ACTUAL_VALUE_DST_OUT")
+                } else {
+                    None
+                }
+            })
+    });
+    let actual_value_clone_diff = first_mismatch.and_then(|(out_idx, _, _, _, _)| {
+        summarize_sort_pair_window_diff(
+            &expected.keys_out,
+            &expected.values_out,
+            keys_out,
+            values_out,
+            out_idx,
+            "ACTUAL_VALUE_DST_DIFF",
+        )
+    });
+    let extra_positions =
+        vals_summary
+            .and_then(|summary| summary.first_extra)
+            .map(|(_, value, _, _)| {
+                let expected_positions = find_value_positions(&expected.values_out, value, 4);
+                let actual_positions = find_value_positions(values_out, value, 4);
+                format!(
+                    "EXPECT_POS extra={} expected_out={:?} actual_out={:?}",
+                    value, expected_positions, actual_positions
+                )
+            });
+    let missing_positions =
+        vals_summary
+            .and_then(|summary| summary.first_missing)
+            .map(|(_, value, _, _)| {
+                let expected_positions = find_value_positions(&expected.values_out, value, 4);
+                let actual_positions = find_value_positions(values_out, value, 4);
+                format!(
+                    "EXPECT_POS missing={} expected_out={:?} actual_out={:?}",
+                    value, expected_positions, actual_positions
+                )
+            });
+    Some(ExpectedSortPassDiagnostics {
+        mismatch_line,
+        expected_window,
+        extra_positions,
+        missing_positions,
+        actual_pair_route,
+        actual_pair_source_window,
+        actual_pair_clone_window,
+        actual_value_route,
+        actual_value_input_window,
+        actual_value_input_run,
+        actual_value_expected_window,
+        actual_value_expected_run,
+        actual_value_source_window,
+        actual_value_clone_window,
+        actual_value_source_diff,
+        actual_value_clone_diff,
+    })
+}
+
+fn analyze_downsweep_rank_diagnostics(
+    keys_in: &[i32],
+    values_in: &[i32],
+    keys_out: &[i32],
+    values_out: &[i32],
+    begin_bit: u32,
+    grid_share: Option<SortGridEvenShare>,
+) -> Option<DownsweepRankDiagnostics> {
+    if begin_bit != 0
+        || keys_in.len() != values_in.len()
+        || keys_out.len() != values_out.len()
+        || keys_in.len() != keys_out.len()
+        || keys_in.is_empty()
+    {
+        return None;
+    }
+    let grid_share = grid_share?;
+    let expected = reconstruct_expected_sort_pass(keys_in, values_in, begin_bit)?;
+    let first_mismatch = expected
+        .keys_out
+        .iter()
+        .zip(expected.values_out.iter())
+        .zip(keys_out.iter().zip(values_out.iter()))
+        .enumerate()
+        .find_map(
+            |(idx, ((&expected_key, &expected_value), (&actual_key, &actual_value)))| {
+                if expected_key != actual_key || expected_value != actual_value {
+                    Some((idx, actual_key, actual_value))
+                } else {
+                    None
+                }
+            },
+        )?;
+    let block_counts = compute_sort_digit_block_counts(keys_in, begin_bit, &grid_share)?;
+    let expected_source_idx = expected.output_to_input[first_mismatch.0];
+    let expected_line = format_downsweep_rank_line(
+        "RANK_EXPECTED",
+        keys_in,
+        values_in,
+        begin_bit,
+        &grid_share,
+        &block_counts,
+        expected_source_idx,
+        first_mismatch.0,
+        None,
+        None,
+    );
+    let actual_line = find_value_positions(values_in, first_mismatch.2, 1)
+        .into_iter()
+        .next()
+        .and_then(|source_idx| {
+            format_downsweep_rank_line(
+                "RANK_ACTUAL",
+                keys_in,
+                values_in,
+                begin_bit,
+                &grid_share,
+                &block_counts,
+                source_idx,
+                first_mismatch.0,
+                Some(first_mismatch.1),
+                Some(first_mismatch.0),
+            )
+        });
+    Some(DownsweepRankDiagnostics {
+        expected_line,
+        actual_line,
+    })
+}
+
+fn analyze_downsweep_block_capture(
+    keys_in: &[i32],
+    values_in: &[i32],
+    keys_out: &[i32],
+    values_out: &[i32],
+    begin_bit: u32,
+    grid_share: Option<SortGridEvenShare>,
+) -> Option<DownsweepBlockCapture> {
+    if keys_in.len() != values_in.len()
+        || keys_out.len() != values_out.len()
+        || keys_in.len() != keys_out.len()
+        || keys_in.is_empty()
+    {
+        return None;
+    }
+    let grid_share = grid_share?;
+    let expected = reconstruct_expected_sort_pass(keys_in, values_in, begin_bit)?;
+    let (out_idx, _, _, _, actual_value) = expected
+        .keys_out
+        .iter()
+        .zip(expected.values_out.iter())
+        .zip(keys_out.iter().zip(values_out.iter()))
+        .enumerate()
+        .find_map(
+            |(idx, ((&expected_key, &expected_value), (&actual_key, &actual_value)))| {
+                if expected_key != actual_key || expected_value != actual_value {
+                    Some((idx, expected_key, expected_value, actual_key, actual_value))
+                } else {
+                    None
+                }
+            },
+        )?;
+    let expected_source_idx = expected.output_to_input[out_idx];
+    let actual_source_idx = find_value_positions(values_in, actual_value, 1)
+        .into_iter()
+        .next();
+    let (block_idx, start, end) = grid_share.block_for_index(out_idx, keys_in.len())?;
+    let expected_source_block = grid_share
+        .block_for_index(expected_source_idx, keys_in.len())
+        .map(|(block, _, _)| block)?;
+    let actual_source_block = actual_source_idx.and_then(|idx| {
+        grid_share
+            .block_for_index(idx, keys_in.len())
+            .map(|(block, _, _)| block)
+    });
+    let mut capture_text = String::new();
+    let _ = writeln!(
+        &mut capture_text,
+        "SORT_CTA_CAPTURE bit={} block={} range=[{}..{}) mismatch_out={} expected_src=in[{}] actual_value_src={:?} expected_src_block={} actual_src_block={:?}",
+        begin_bit,
+        block_idx,
+        start,
+        end,
+        out_idx,
+        expected_source_idx,
+        actual_source_idx,
+        expected_source_block,
+        actual_source_block,
+    );
+    append_downsweep_block_capture_rows(
+        &mut capture_text,
+        "DEST_BLOCK",
+        block_idx,
+        start,
+        end,
+        out_idx,
+        keys_in,
+        values_in,
+        &expected,
+        keys_out,
+        values_out,
+        begin_bit,
+    );
+    if expected_source_block != block_idx {
+        if let Some((expected_start, expected_end)) =
+            grid_share.block_range(expected_source_block, keys_in.len())
+        {
+            append_downsweep_block_capture_rows(
+                &mut capture_text,
+                "EXPECTED_SOURCE_BLOCK",
+                expected_source_block,
+                expected_start,
+                expected_end,
+                out_idx,
+                keys_in,
+                values_in,
+                &expected,
+                keys_out,
+                values_out,
+                begin_bit,
+            );
+        }
+    }
+    if let Some(actual_source_block) = actual_source_block {
+        if actual_source_block != block_idx && actual_source_block != expected_source_block {
+            if let Some((actual_start, actual_end)) =
+                grid_share.block_range(actual_source_block, keys_in.len())
+            {
+                append_downsweep_block_capture_rows(
+                    &mut capture_text,
+                    "ACTUAL_SOURCE_BLOCK",
+                    actual_source_block,
+                    actual_start,
+                    actual_end,
+                    out_idx,
+                    keys_in,
+                    values_in,
+                    &expected,
+                    keys_out,
+                    values_out,
+                    begin_bit,
+                );
+            }
+        }
+    }
+    Some(DownsweepBlockCapture {
+        block_idx,
+        start,
+        end,
+        expected_source_block,
+        actual_source_block,
+        capture_text,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SortSpineSummary {
+    words_read: usize,
+    nonzero_count: u32,
+    max_value: u32,
+    sum: u64,
+}
+
+fn summarize_sort_spine(words: &[u32]) -> Option<SortSpineSummary> {
+    if words.is_empty() {
+        return None;
+    }
+    Some(SortSpineSummary {
+        words_read: words.len(),
+        nonzero_count: words.iter().filter(|&&v| v != 0).count() as u32,
+        max_value: words.iter().copied().max().unwrap_or(0),
+        sum: words.iter().map(|&v| v as u64).sum(),
+    })
+}
+
+fn format_sorted_key_window(
+    keys: &[i32],
+    summary: &SortedKeySummary,
+    label: &str,
+) -> Option<String> {
+    let center = summary
+        .first_bad_value
+        .map(|(idx, _)| idx)
+        .or(summary.first_violation)?;
+    let start = center.saturating_sub(5);
+    let end = (center + 5).min(keys.len());
+    let around: Vec<String> = (start..end)
+        .map(|i| format!("{}[{}]={}", label, i, keys[i]))
+        .collect();
+    Some(around.join(", "))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Ms4ShapeUseSummary {
+    shape: u32,
+    counter: u32,
+    uses: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Ms4CaptureSummary {
+    active_count: u32,
+    unique_shapes: usize,
+    max_shape_idx: u32,
+    out_of_range_particles: u32,
+    zero_used_shapes: u32,
+    negative_used_shapes: u32,
+    underflow_count: u32,
+    first_out_of_range_particle: Option<(usize, u32, u16)>,
+    first_underflow: Option<Ms4ShapeUseSummary>,
+}
+
+fn summarize_ms4_capture(
+    flags_data: &[u8],
+    shape_idx_data: &[u8],
+    counter_data: &[u8],
+    num_particles: usize,
+) -> Option<Ms4CaptureSummary> {
+    let particle_count = num_particles
+        .min(flags_data.len() / 4)
+        .min(shape_idx_data.len() / 4);
+    if particle_count == 0 {
+        return None;
+    }
+    let counter_words: Vec<u32> = counter_data
+        .chunks_exact(4)
+        .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    let mut summary = Ms4CaptureSummary {
+        active_count: 0,
+        unique_shapes: 0,
+        max_shape_idx: 0,
+        out_of_range_particles: 0,
+        zero_used_shapes: 0,
+        negative_used_shapes: 0,
+        underflow_count: 0,
+        first_out_of_range_particle: None,
+        first_underflow: None,
+    };
+    let mut use_count = HashMap::<u32, u32>::new();
+    for i in 0..particle_count {
+        let flag = u16::from_ne_bytes([flags_data[i * 4], flags_data[i * 4 + 1]]);
+        if (flag & 0x11) != 1 {
+            continue;
+        }
+        summary.active_count += 1;
+        let shape = u32::from_ne_bytes([
+            shape_idx_data[i * 4],
+            shape_idx_data[i * 4 + 1],
+            shape_idx_data[i * 4 + 2],
+            shape_idx_data[i * 4 + 3],
+        ]);
+        if shape > summary.max_shape_idx {
+            summary.max_shape_idx = shape;
+        }
+        if (shape & 0x8000_0000) != 0 || shape as usize >= counter_words.len() {
+            summary.out_of_range_particles += 1;
+            if summary.first_out_of_range_particle.is_none() {
+                summary.first_out_of_range_particle = Some((i, shape, flag));
+            }
+            continue;
+        }
+        *use_count.entry(shape).or_insert(0) += 1;
+    }
+    summary.unique_shapes = use_count.len();
+    for (shape, uses) in use_count {
+        let counter = counter_words[shape as usize];
+        if counter == 0 {
+            summary.zero_used_shapes += 1;
+        }
+        if (counter as i32) < 0 {
+            summary.negative_used_shapes += 1;
+        }
+        if counter < uses {
+            summary.underflow_count += 1;
+            if summary.first_underflow.is_none() {
+                summary.first_underflow = Some(Ms4ShapeUseSummary {
+                    shape,
+                    counter,
+                    uses,
+                });
+            }
+        }
+    }
+    Some(summary)
+}
+
+fn creategrid_safe_validator_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_VALIDATE_SORT_SAFE").map_or(false, |v| v == "1"))
+}
+
+fn zero_sort_input_slack_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_SORT_ZERO_INPUT_SLACK").map_or(false, |v| v == "1"))
+}
+
+fn append_sort_input_slack_probe(message: &str) {
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/zluda_sort_zero_input_slack.log")
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{}", message);
+}
+
+fn trace_sort_copy_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_TRACE_SORT_COPY").map_or(false, |v| v == "1"))
+}
+
+static LAST_CREATEGRID_SORTED_KEYS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static LAST_CREATEGRID_KEY_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+fn note_creategrid_sorted_keys(sorted_keys: u64, n: usize) {
+    if sorted_keys == 0 || n == 0 || n > u32::MAX as usize {
+        return;
+    }
+    LAST_CREATEGRID_SORTED_KEYS.store(sorted_keys, std::sync::atomic::Ordering::Relaxed);
+    LAST_CREATEGRID_KEY_COUNT.store(n as u32, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn is_creategrid_sorted_keys_copy(
+    sorted_keys: u64,
+    n: usize,
+    dst: u64,
+    src: u64,
+    byte_count: usize,
+) -> bool {
+    sorted_keys != 0
+        && n > 0
+        && byte_count == n * 4
+        && dst == sorted_keys
+        && src == sorted_keys + (n * 4) as u64
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreateGridSortBufferRole {
+    CreateGridInput,
+    CopySource,
+}
+
+fn classify_creategrid_sort_buffer(
+    sorted_keys: u64,
+    n: usize,
+    buffer: u64,
+) -> Option<CreateGridSortBufferRole> {
+    if sorted_keys == 0 || n == 0 || buffer == 0 {
+        return None;
+    }
+    if buffer == sorted_keys {
+        return Some(CreateGridSortBufferRole::CreateGridInput);
+    }
+    let copy_src = sorted_keys.checked_add((n.checked_mul(4)?) as u64)?;
+    if buffer == copy_src {
+        return Some(CreateGridSortBufferRole::CopySource);
+    }
+    None
+}
+
+fn creategrid_sort_buffer_role_name(role: CreateGridSortBufferRole) -> &'static str {
+    match role {
+        CreateGridSortBufferRole::CreateGridInput => "creategrid_input",
+        CreateGridSortBufferRole::CopySource => "copy_src",
+    }
+}
+
+const CREATEGRID_SORT_TOUCH_MAX_EXTRA_BYTES: usize = 160;
+const CREATEGRID_SORT_TOUCH_MAX_RECENT: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CreateGridSortTouchArg {
+    extra_offset: usize,
+    buffer: u64,
+    role: CreateGridSortBufferRole,
+}
+
+#[derive(Clone, Debug)]
+struct CreateGridSortTouchRecord {
+    launch_n: u32,
+    sorted_keys: u64,
+    n_items: usize,
+    name: String,
+    stream: String,
+    grid_dim: [u32; 3],
+    block_dim: [u32; 3],
+    shared_mem_bytes: u32,
+    refs: Vec<CreateGridSortTouchArg>,
+}
+
+static CREATEGRID_SORT_TOUCHES: Mutex<Vec<CreateGridSortTouchRecord>> = Mutex::new(Vec::new());
+
+fn scan_launch_extra_for_creategrid_sort_refs(
+    sorted_keys: u64,
+    n: usize,
+    buffer: &[u8],
+) -> Vec<CreateGridSortTouchArg> {
+    if sorted_keys == 0 || n == 0 || buffer.len() < 8 {
+        return Vec::new();
+    }
+    let scan_len = buffer.len().min(CREATEGRID_SORT_TOUCH_MAX_EXTRA_BYTES);
+    let mut refs = Vec::new();
+    for extra_offset in (0..=(scan_len - 8)).step_by(8) {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&buffer[extra_offset..extra_offset + 8]);
+        let candidate = u64::from_le_bytes(raw);
+        let Some(role) = classify_creategrid_sort_buffer(sorted_keys, n, candidate) else {
+            continue;
+        };
+        refs.push(CreateGridSortTouchArg {
+            extra_offset,
+            buffer: candidate,
+            role,
+        });
+    }
+    refs
+}
+
+unsafe fn maybe_capture_creategrid_sort_buffer_touch(
+    name: &str,
+    extra: *mut *mut ::core::ffi::c_void,
+    shared_mem_bytes: u32,
+    stream: hipStream_t,
+    grid_dim_x: u32,
+    grid_dim_y: u32,
+    grid_dim_z: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+) {
+    if name.contains("CreateGrid") && !name.contains("Turbulence") {
+        return;
+    }
+    let sorted_keys = LAST_CREATEGRID_SORTED_KEYS.load(std::sync::atomic::Ordering::Relaxed);
+    let n = LAST_CREATEGRID_KEY_COUNT.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if sorted_keys == 0 || n == 0 || extra.is_null() {
+        return;
+    }
+    let extra_arr = std::slice::from_raw_parts(extra, 5);
+    if extra_arr[0] != (0x1usize as *mut _) || extra_arr[1].is_null() {
+        return;
+    }
+    let buffer_size = if extra_arr[2] == (0x2usize as *mut _) && !extra_arr[3].is_null() {
+        std::ptr::read_unaligned(extra_arr[3] as *const usize)
+    } else {
+        CREATEGRID_SORT_TOUCH_MAX_EXTRA_BYTES
+    };
+    if buffer_size < 8 {
+        return;
+    }
+    let refs = scan_launch_extra_for_creategrid_sort_refs(
+        sorted_keys,
+        n,
+        std::slice::from_raw_parts(extra_arr[1] as *const u8, buffer_size),
+    );
+    if refs.is_empty() {
+        return;
+    }
+    static LAUNCH_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let launch_n = LAUNCH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut guard = match CREATEGRID_SORT_TOUCHES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    guard.push(CreateGridSortTouchRecord {
+        launch_n,
+        sorted_keys,
+        n_items: n,
+        name: name.to_string(),
+        stream: format!("{:?}", stream),
+        grid_dim: [grid_dim_x, grid_dim_y, grid_dim_z],
+        block_dim: [block_dim_x, block_dim_y, block_dim_z],
+        shared_mem_bytes,
+        refs,
+    });
+    if guard.len() > CREATEGRID_SORT_TOUCH_MAX_RECENT {
+        let drop_n = guard.len() - CREATEGRID_SORT_TOUCH_MAX_RECENT;
+        guard.drain(0..drop_n);
+    }
+}
+
+fn dump_recent_creategrid_sort_buffer_touches(call_n: u32, n: usize, sorted_keys: u64) {
+    let guard = match CREATEGRID_SORT_TOUCHES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let mut matched = 0usize;
+    for record in guard
+        .iter()
+        .rev()
+        .filter(|record| record.n_items == n && record.sorted_keys == sorted_keys)
+        .take(12)
+    {
+        matched += 1;
+        let refs = record
+            .refs
+            .iter()
+            .map(|arg| {
+                format!(
+                    "extra+{}=0x{:x}({})",
+                    arg.extra_offset,
+                    arg.buffer,
+                    creategrid_sort_buffer_role_name(arg.role)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        super::driver::zluda_log_err(&format!(
+            "    SORT_TOUCH_MATCH creategrid#{} launch#{} '{}' grid=[{},{},{}] block=[{},{},{}] shared={} stream={} refs=[{}]",
+            call_n,
+            record.launch_n,
+            record.name,
+            record.grid_dim[0],
+            record.grid_dim[1],
+            record.grid_dim[2],
+            record.block_dim[0],
+            record.block_dim[1],
+            record.block_dim[2],
+            record.shared_mem_bytes,
+            record.stream,
+            refs
+        ));
+    }
+    if matched == 0 {
+        super::driver::zluda_log_err(&format!(
+            "    SORT_TOUCH_MATCH creategrid#{}: no recent launch extra matched sk=0x{:x} n={}",
+            call_n, sorted_keys, n
+        ));
+    }
+}
+
+pub(crate) fn maybe_log_creategrid_sorted_keys_copy(
+    dst: u64,
+    src: u64,
+    byte_count: usize,
+    stream: hipStream_t,
+) {
+    if !trace_sort_copy_enabled() {
+        return;
+    }
+    let sorted_keys = LAST_CREATEGRID_SORTED_KEYS.load(std::sync::atomic::Ordering::Relaxed);
+    let n = LAST_CREATEGRID_KEY_COUNT.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if !is_creategrid_sorted_keys_copy(sorted_keys, n, dst, src, byte_count) {
+        return;
+    }
+    static COPY_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let copy_n = COPY_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    super::driver::zluda_log_err(&format!(
+        "SORT_COPY #{} dst=0x{:x} src=0x{:x} bytes={} n={} stream={:?}",
+        copy_n, dst, src, byte_count, n, stream
+    ));
+}
+
+#[derive(Clone, Debug)]
+struct SortPassSummaryRecord {
+    pass_n: u32,
+    begin_bit: u32,
+    n_items: usize,
+    keys_in: u64,
+    keys_out: u64,
+    spine_ptr: u64,
+    summary_in: SortedKeySummary,
+    summary_out: SortedKeySummary,
+    vals_summary: Option<SortValueSummary>,
+    spine_summary: Option<SortSpineSummary>,
+    window_in: Option<String>,
+    window_out: Option<String>,
+    vals_in_window: Option<String>,
+    vals_out_window: Option<String>,
+    vals_extra_in_window: Option<String>,
+    vals_extra_first_out_window: Option<String>,
+    vals_extra_positions: Option<String>,
+    vals_extra_run: Option<String>,
+    vals_missing_positions: Option<String>,
+    expected_mismatch_line: Option<String>,
+    expected_window: Option<String>,
+    expected_extra_positions: Option<String>,
+    expected_missing_positions: Option<String>,
+    expected_actual_pair_route: Option<String>,
+    expected_actual_pair_source_window: Option<String>,
+    expected_actual_pair_clone_window: Option<String>,
+    expected_actual_value_route: Option<String>,
+    expected_actual_value_input_window: Option<String>,
+    expected_actual_value_input_run: Option<String>,
+    expected_actual_value_expected_window: Option<String>,
+    expected_actual_value_expected_run: Option<String>,
+    expected_actual_value_source_window: Option<String>,
+    expected_actual_value_clone_window: Option<String>,
+    expected_actual_value_source_diff: Option<String>,
+    expected_actual_value_clone_diff: Option<String>,
+    rank_expected_line: Option<String>,
+    rank_actual_line: Option<String>,
+    cta_capture_line: Option<String>,
+    replay_capture_line: Option<String>,
+    restored_out_summary: Option<SortedKeySummary>,
+    restored_out_window: Option<String>,
+}
+
+struct SortPassTracker {
+    scratch_host: *mut u8,
+    scratch_dev: *mut std::ffi::c_void,
+    recent: Vec<SortPassSummaryRecord>,
+}
+unsafe impl Send for SortPassTracker {}
+unsafe impl Sync for SortPassTracker {}
+
+static SORT_PASS_TRACKER: Mutex<Option<SortPassTracker>> = Mutex::new(None);
+
+unsafe fn sort_pass_tracker_init(state: &mut Option<SortPassTracker>) {
+    if state.is_some() {
+        return;
+    }
+    let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let alloc_result = unsafe {
+        hipHostMalloc(
+            &mut host_ptr,
+            SORT_PASS_TOTAL_SCRATCH_BYTES,
+            hipHostMallocMapped,
+        )
+    };
+    if alloc_result.is_err() || host_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] SORT pass tracker: hipHostMalloc({}) failed: {:?}",
+            SORT_PASS_TOTAL_SCRATCH_BYTES, alloc_result
+        ));
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, SORT_PASS_TOTAL_SCRATCH_BYTES);
+    }
+    let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
+    if map_result.is_err() || dev_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] SORT pass tracker: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
+        return;
+    }
+    *state = Some(SortPassTracker {
+        scratch_host: host_ptr as *mut u8,
+        scratch_dev: dev_ptr,
+        recent: Vec::new(),
+    });
+}
+
+unsafe fn capture_sort_downsweep_safe(
+    begin_bit: u32,
+    n_items: usize,
+    keys_in: u64,
+    keys_out: u64,
+    vals_in: u64,
+    vals_out: u64,
+    spine_ptr: u64,
+    grid_share: Option<SortGridEvenShare>,
+    grid_dim_x: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+    first: u8,
+    last: u8,
+    overwrite: u8,
+    stream: hipStream_t,
+) {
+    if n_items == 0 || keys_in == 0 || keys_out == 0 {
+        return;
+    }
+    let read_n = sort_pass_capture_len(n_items, grid_share);
+    let logical_n = n_items.min(read_n);
+    let mut guard = match SORT_PASS_TRACKER.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    sort_pass_tracker_init(&mut guard);
+    let tracker = match guard.as_mut() {
+        Some(v) => v,
+        None => return,
+    };
+    let dst_in_dev = hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_KEYS_IN_OFFSET) as _);
+    let dst_out_dev =
+        hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_KEYS_OUT_OFFSET) as _);
+    let dst_vals_in_dev =
+        hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_VALS_IN_OFFSET) as _);
+    let dst_vals_out_dev =
+        hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_VALS_OUT_OFFSET) as _);
+    let dst_spine_dev =
+        hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_SPINE_OFFSET) as _);
+    let copy_in_result = hipMemcpyDtoD(
+        dst_in_dev,
+        hipDeviceptr_t(keys_in as *mut std::ffi::c_void),
+        read_n * 4,
+    );
+    let copy_out_result = hipMemcpyDtoD(
+        dst_out_dev,
+        hipDeviceptr_t(keys_out as *mut std::ffi::c_void),
+        read_n * 4,
+    );
+    let copy_vals_in_result = if vals_in != 0 {
+        Some(hipMemcpyDtoD(
+            dst_vals_in_dev,
+            hipDeviceptr_t(vals_in as *mut std::ffi::c_void),
+            read_n * 4,
+        ))
+    } else {
+        None
+    };
+    let copy_vals_out_result = if vals_out != 0 {
+        Some(hipMemcpyDtoD(
+            dst_vals_out_dev,
+            hipDeviceptr_t(vals_out as *mut std::ffi::c_void),
+            read_n * 4,
+        ))
+    } else {
+        None
+    };
+    let spine_words = ((grid_dim_x as usize) * 16).min(SORT_PASS_SPINE_MAX_WORDS);
+    let spine_copy_result = if spine_ptr != 0 && spine_words > 0 {
+        Some(hipMemcpyDtoD(
+            dst_spine_dev,
+            hipDeviceptr_t(spine_ptr as *mut std::ffi::c_void),
+            spine_words * 4,
+        ))
+    } else {
+        None
+    };
+    if copy_in_result.is_err() || copy_out_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_PASS_SAFE: D2D failed bit={} in={:?} out={:?} keys_in=0x{:x} keys_out=0x{:x} n={}",
+            begin_bit, copy_in_result, copy_out_result, keys_in, keys_out, read_n
+        ));
+        return;
+    }
+    if let Some(copy_result) = copy_vals_in_result {
+        if copy_result.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "*** SORT_PASS_SAFE: vals_in D2D failed bit={} vals_in=0x{:x} n={} -> {:?}",
+                begin_bit, vals_in, read_n, copy_result
+            ));
+        }
+    }
+    if let Some(copy_result) = copy_vals_out_result {
+        if copy_result.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "*** SORT_PASS_SAFE: vals_out D2D failed bit={} vals_out=0x{:x} n={} -> {:?}",
+                begin_bit, vals_out, read_n, copy_result
+            ));
+        }
+    }
+    if let Some(copy_result) = spine_copy_result {
+        if copy_result.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "*** SORT_PASS_SAFE: spine D2D failed bit={} spine=0x{:x} words={} -> {:?}",
+                begin_bit, spine_ptr, spine_words, copy_result
+            ));
+        }
+    }
+    let sync_result = hip_runtime_sys::hipStreamSynchronize(stream);
+    if sync_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_PASS_SAFE: stream sync failed {:?} bit={} keys_in=0x{:x} keys_out=0x{:x} n={}",
+            sync_result, begin_bit, keys_in, keys_out, read_n
+        ));
+        return;
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+    let keys_in_full: &[i32] = std::slice::from_raw_parts(
+        tracker.scratch_host.add(SORT_PASS_KEYS_IN_OFFSET) as *const i32,
+        read_n,
+    );
+    let keys_in_before_full: &[i32] = std::slice::from_raw_parts(
+        tracker.scratch_host.add(SORT_PASS_KEYS_IN_BEFORE_OFFSET) as *const i32,
+        read_n,
+    );
+    let keys_out_before_full: &[i32] = std::slice::from_raw_parts(
+        tracker.scratch_host.add(SORT_PASS_KEYS_OUT_BEFORE_OFFSET) as *const i32,
+        read_n,
+    );
+    let keys_out_full: &[i32] = std::slice::from_raw_parts(
+        tracker.scratch_host.add(SORT_PASS_KEYS_OUT_OFFSET) as *const i32,
+        read_n,
+    );
+    let vals_in_full: &[i32] = std::slice::from_raw_parts(
+        tracker.scratch_host.add(SORT_PASS_VALS_IN_OFFSET) as *const i32,
+        read_n,
+    );
+    let vals_in_before_full: &[i32] = std::slice::from_raw_parts(
+        tracker.scratch_host.add(SORT_PASS_VALS_IN_BEFORE_OFFSET) as *const i32,
+        read_n,
+    );
+    let vals_out_before_full: &[i32] = std::slice::from_raw_parts(
+        tracker.scratch_host.add(SORT_PASS_VALS_OUT_BEFORE_OFFSET) as *const i32,
+        read_n,
+    );
+    let vals_out_full: &[i32] = std::slice::from_raw_parts(
+        tracker.scratch_host.add(SORT_PASS_VALS_OUT_OFFSET) as *const i32,
+        read_n,
+    );
+    let keys_in_host = &keys_in_full[..logical_n];
+    let keys_out_host = &keys_out_full[..logical_n];
+    let vals_in_host = &vals_in_full[..logical_n];
+    let vals_out_host = &vals_out_full[..logical_n];
+    let summary_in = match summarize_sorted_keys(keys_in_host) {
+        Some(summary) => summary,
+        None => return,
+    };
+    let summary_out = match summarize_sorted_keys(keys_out_host) {
+        Some(summary) => summary,
+        None => return,
+    };
+    let vals_summary = if vals_in != 0 && vals_out != 0 {
+        summarize_sort_values(vals_in_host, vals_out_host)
+    } else {
+        None
+    };
+    let restored_out_summary = if summary_out.negative_count > 0 {
+        let restored = restore_signed_radix_residue(keys_out_host);
+        summarize_sorted_keys(&restored)
+    } else {
+        None
+    };
+    let spine_summary = if spine_ptr != 0 && spine_words > 0 {
+        let spine_words_host: &[u32] = std::slice::from_raw_parts(
+            tracker.scratch_host.add(SORT_PASS_SPINE_OFFSET) as *const u32,
+            spine_words,
+        );
+        summarize_sort_spine(spine_words_host)
+    } else {
+        None
+    };
+    let window_in = format_sorted_key_window(keys_in_host, &summary_in, "IN");
+    let window_out = format_sorted_key_window(keys_out_host, &summary_out, "OUT");
+    let vals_in_window = vals_summary
+        .and_then(|summary| summary.first_missing)
+        .and_then(|(idx, _, _, _)| {
+            format_sort_pair_window(keys_in_host, vals_in_host, idx, "VAL_IN")
+        });
+    let vals_out_window = vals_summary
+        .and_then(|summary| summary.first_extra)
+        .and_then(|(idx, _, _, _)| {
+            format_sort_pair_window(keys_out_host, vals_out_host, idx, "VAL_OUT")
+        });
+    let vals_extra_in_window = vals_summary
+        .and_then(|summary| summary.first_extra)
+        .and_then(|(_, value, _, _)| {
+            find_value_positions(vals_in_host, value, 1)
+                .into_iter()
+                .next()
+                .and_then(|idx| {
+                    format_sort_pair_window(keys_in_host, vals_in_host, idx, "VAL_EXTRA_IN")
+                })
+        });
+    let vals_extra_first_out_window = vals_summary
+        .and_then(|summary| summary.first_extra)
+        .and_then(|(_, value, _, _)| {
+            find_value_positions(vals_out_host, value, 1)
+                .into_iter()
+                .next()
+                .and_then(|idx| {
+                    format_sort_pair_window(keys_out_host, vals_out_host, idx, "VAL_EXTRA_OUT0")
+                })
+        });
+    let vals_extra_positions =
+        vals_summary
+            .and_then(|summary| summary.first_extra)
+            .map(|(_, value, _, _)| {
+                let input_positions = find_value_positions(vals_in_host, value, 4);
+                let output_positions = find_value_positions(vals_out_host, value, 4);
+                format!(
+                    "VAL_POS extra={} in={:?} out={:?}",
+                    value, input_positions, output_positions
+                )
+            });
+    let vals_extra_run = vals_summary
+        .and_then(|summary| summary.first_extra)
+        .and_then(|(dup_idx, value, _, _)| {
+            let output_positions = find_value_positions(vals_out_host, value, 2);
+            if output_positions.len() < 2 {
+                return None;
+            }
+            let first_idx = output_positions[0];
+            let second_idx = if output_positions[1] == dup_idx {
+                output_positions[1]
+            } else {
+                dup_idx
+            };
+            matching_pair_run(keys_out_host, vals_out_host, first_idx, second_idx).map(
+                |(first_start, second_start, len)| {
+                    format!(
+                        "VAL_DUP_RUN value={} out0={} out1={} start0={} start1={} len={}",
+                        value, first_idx, second_idx, first_start, second_start, len
+                    )
+                },
+            )
+        });
+    let vals_missing_positions =
+        vals_summary
+            .and_then(|summary| summary.first_missing)
+            .map(|(_, value, _, _)| {
+                let input_positions = find_value_positions(vals_in_host, value, 4);
+                let output_positions = find_value_positions(vals_out_host, value, 4);
+                format!(
+                    "VAL_POS missing={} in={:?} out={:?}",
+                    value, input_positions, output_positions
+                )
+            });
+    let restored_out_window = if let Some(summary) = restored_out_summary.as_ref() {
+        let restored = restore_signed_radix_residue(keys_out_host);
+        format_sorted_key_window(&restored, summary, "OUT_XOR")
+    } else {
+        None
+    };
+    static PASS_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let pass_n = PASS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let has_issues = summary_in.violations > 0
+        || summary_in.negative_count > 0
+        || summary_in.huge_count > 0
+        || summary_out.violations > 0
+        || summary_out.negative_count > 0
+        || summary_out.huge_count > 0
+        || vals_summary
+            .map(|summary| {
+                summary.negative_count > 0 || summary.extra_count > 0 || summary.missing_count > 0
+            })
+            .unwrap_or(false);
+    let expected_diagnostics = if has_issues && vals_summary.is_some() {
+        analyze_expected_sort_pass(
+            keys_in_host,
+            vals_in_host,
+            keys_out_host,
+            vals_out_host,
+            begin_bit,
+            vals_summary,
+        )
+    } else {
+        None
+    };
+    let rank_diagnostics = if has_issues {
+        analyze_downsweep_rank_diagnostics(
+            keys_in_host,
+            vals_in_host,
+            keys_out_host,
+            vals_out_host,
+            begin_bit,
+            grid_share,
+        )
+    } else {
+        None
+    };
+    let cta_capture = if has_issues {
+        analyze_downsweep_block_capture(
+            keys_in_host,
+            vals_in_host,
+            keys_out_host,
+            vals_out_host,
+            begin_bit,
+            grid_share,
+        )
+    } else {
+        None
+    };
+    let spine_words_host = if spine_ptr != 0 && spine_words > 0 {
+        Some(std::slice::from_raw_parts(
+            tracker.scratch_host.add(SORT_PASS_SPINE_OFFSET) as *const u32,
+            spine_words,
+        ))
+    } else {
+        None
+    };
+    let good_capture_kind = classify_good_sort_replay_capture(
+        begin_bit,
+        n_items,
+        first,
+        overwrite,
+        summary_out,
+        vals_summary,
+    );
+    let replay_capture = if has_issues || good_capture_kind.is_some() {
+        serialize_sort_pass_replay_capture(
+            pass_n,
+            begin_bit,
+            n_items,
+            grid_dim_x,
+            block_dim_x,
+            block_dim_y,
+            block_dim_z,
+            shared_mem_bytes,
+            first,
+            last,
+            overwrite,
+            keys_in,
+            keys_out,
+            vals_in,
+            vals_out,
+            spine_ptr,
+            stream.0 as u64,
+            keys_in_full,
+            (vals_in != 0 && vals_out != 0).then_some(vals_in_full),
+            keys_in_before_full,
+            (vals_in != 0 && vals_out != 0).then_some(vals_in_before_full),
+            keys_out_before_full,
+            (vals_in != 0 && vals_out != 0).then_some(vals_out_before_full),
+            keys_out_full,
+            (vals_in != 0 && vals_out != 0).then_some(vals_out_full),
+            spine_words_host.unwrap_or(&[]),
+            grid_share,
+        )
+    } else {
+        None
+    };
+    static GOOD_TARGET_CAPTURED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static GOOD_FALLBACK_CAPTURED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if let Some(kind) = good_capture_kind {
+        let path = good_sort_replay_capture_path(kind, begin_bit, n_items, pass_n);
+        let captured = match kind {
+            GoodSortReplayCaptureKind::TargetBit0N8109 => &GOOD_TARGET_CAPTURED,
+            GoodSortReplayCaptureKind::FallbackBit0LargeClean => &GOOD_FALLBACK_CAPTURED,
+        };
+        if let Some(capture_line) = write_good_sort_replay_capture_once(
+            captured,
+            &path,
+            replay_capture.as_deref(),
+            begin_bit,
+            n_items,
+            grid_dim_x,
+            spine_words,
+        ) {
+            super::driver::zluda_log_err(&format!("    {}", capture_line));
+        }
+    }
+    let spine_max = spine_summary.map(|s| s.max_value).unwrap_or(0);
+    let spine_sum = spine_summary.map(|s| s.sum).unwrap_or(0);
+    if pass_n < 8 || pass_n % 100 == 0 || has_issues {
+        let mut line = format!(
+            "SORT_PASS_SAFE #{} bit={} n={} IN[viol={},neg={},huge={}] OUT[viol={},neg={},huge={}]",
+            pass_n,
+            begin_bit,
+            n_items,
+            summary_in.violations,
+            summary_in.negative_count,
+            summary_in.huge_count,
+            summary_out.violations,
+            summary_out.negative_count,
+            summary_out.huge_count,
+        );
+        if let Some(restored) = restored_out_summary {
+            line.push_str(&format!(
+                " OUT_XOR[viol={},neg={},huge={}]",
+                restored.violations, restored.negative_count, restored.huge_count,
+            ));
+        }
+        if let Some(vals_summary) = vals_summary {
+            line.push_str(&format!(
+                " VAL_FLOW[neg={},extra={},miss={}]",
+                vals_summary.negative_count, vals_summary.extra_count, vals_summary.missing_count
+            ));
+        }
+        line.push_str(&format!(
+            " spine=0x{:x}[max={},sum={}] keys_in=0x{:x} keys_out=0x{:x}",
+            spine_ptr, spine_max, spine_sum, keys_in, keys_out
+        ));
+        super::driver::zluda_log_err(&line);
+        if let Some(summary) = vals_summary {
+            if summary.negative_count > 0 || summary.extra_count > 0 || summary.missing_count > 0 {
+                if let Some(window) = vals_out_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("    {}", window));
+                }
+                if let Some(window) = vals_in_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("    {}", window));
+                }
+                if let Some(window) = vals_extra_in_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("    {}", window));
+                }
+                if let Some(window) = vals_extra_first_out_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("    {}", window));
+                }
+                if let Some(line) = vals_extra_positions.as_ref() {
+                    super::driver::zluda_log_err(&format!("    {}", line));
+                }
+                if let Some(line) = vals_extra_run.as_ref() {
+                    super::driver::zluda_log_err(&format!("    {}", line));
+                }
+                if let Some(line) = vals_missing_positions.as_ref() {
+                    super::driver::zluda_log_err(&format!("    {}", line));
+                }
+                if let Some(diag) = expected_diagnostics.as_ref() {
+                    if let Some(line) = diag.mismatch_line.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                    if let Some(window) = diag.expected_window.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", window));
+                    }
+                    if let Some(line) = diag.actual_pair_route.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                    if let Some(window) = diag.actual_pair_source_window.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", window));
+                    }
+                    if let Some(window) = diag.actual_pair_clone_window.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", window));
+                    }
+                    if let Some(line) = diag.actual_value_route.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                    if let Some(window) = diag.actual_value_input_window.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", window));
+                    }
+                    if let Some(line) = diag.actual_value_input_run.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                    if let Some(window) = diag.actual_value_expected_window.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", window));
+                    }
+                    if let Some(line) = diag.actual_value_expected_run.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                    if let Some(window) = diag.actual_value_source_window.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", window));
+                    }
+                    if let Some(window) = diag.actual_value_clone_window.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", window));
+                    }
+                    if let Some(line) = diag.actual_value_source_diff.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                    if let Some(line) = diag.actual_value_clone_diff.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                    if let Some(line) = diag.extra_positions.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                    if let Some(line) = diag.missing_positions.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                }
+                if let Some(diag) = rank_diagnostics.as_ref() {
+                    if let Some(line) = diag.expected_line.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                    if let Some(line) = diag.actual_line.as_ref() {
+                        super::driver::zluda_log_err(&format!("    {}", line));
+                    }
+                }
+                if let Some(capture) = cta_capture.as_ref() {
+                    let path = format!(
+                        "/tmp/zluda_sort_cta_capture_bit{}_pass{}.txt",
+                        begin_bit, pass_n
+                    );
+                    let capture_line = match std::fs::write(&path, &capture.capture_text) {
+                        Ok(()) => format!(
+                            "SORT_CTA_CAPTURE bit={} block={} range=[{}..{}) expected_src_block={} actual_src_block={:?} path={}",
+                            begin_bit,
+                            capture.block_idx,
+                            capture.start,
+                            capture.end,
+                            capture.expected_source_block,
+                            capture.actual_source_block,
+                            path
+                        ),
+                        Err(err) => format!(
+                            "SORT_CTA_CAPTURE bit={} block={} range=[{}..{}) expected_src_block={} actual_src_block={:?} path={} write_err={}",
+                            begin_bit,
+                            capture.block_idx,
+                            capture.start,
+                            capture.end,
+                            capture.expected_source_block,
+                            capture.actual_source_block,
+                            path,
+                            err
+                        ),
+                    };
+                    super::driver::zluda_log_err(&format!("    {}", capture_line));
+                }
+                if let Some(capture) = replay_capture.as_ref() {
+                    let path = format!(
+                        "/tmp/zluda_sort_replay_capture_bit{}_pass{}.bin",
+                        begin_bit, pass_n
+                    );
+                    let capture_line = match std::fs::write(&path, capture) {
+                        Ok(()) => format!(
+                            "SORT_REPLAY_CAPTURE bit={} n={} grid={} spine_words={} path={}",
+                            begin_bit, n_items, grid_dim_x, spine_words, path
+                        ),
+                        Err(err) => format!(
+                            "SORT_REPLAY_CAPTURE bit={} n={} grid={} spine_words={} path={} write_err={}",
+                            begin_bit, n_items, grid_dim_x, spine_words, path, err
+                        ),
+                    };
+                    super::driver::zluda_log_err(&format!("    {}", capture_line));
+                }
+            }
+        }
+    }
+    tracker.recent.push(SortPassSummaryRecord {
+        pass_n,
+        begin_bit,
+        n_items,
+        keys_in,
+        keys_out,
+        spine_ptr,
+        summary_in,
+        summary_out,
+        vals_summary,
+        spine_summary,
+        window_in,
+        window_out,
+        vals_in_window,
+        vals_out_window,
+        vals_extra_in_window,
+        vals_extra_first_out_window,
+        vals_extra_positions,
+        vals_extra_run,
+        vals_missing_positions,
+        expected_mismatch_line: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.mismatch_line.clone()),
+        expected_window: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.expected_window.clone()),
+        expected_extra_positions: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.extra_positions.clone()),
+        expected_missing_positions: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.missing_positions.clone()),
+        expected_actual_pair_route: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_pair_route.clone()),
+        expected_actual_pair_source_window: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_pair_source_window.clone()),
+        expected_actual_pair_clone_window: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_pair_clone_window.clone()),
+        expected_actual_value_route: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_value_route.clone()),
+        expected_actual_value_input_window: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_value_input_window.clone()),
+        expected_actual_value_input_run: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_value_input_run.clone()),
+        expected_actual_value_expected_window: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_value_expected_window.clone()),
+        expected_actual_value_expected_run: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_value_expected_run.clone()),
+        expected_actual_value_source_window: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_value_source_window.clone()),
+        expected_actual_value_clone_window: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_value_clone_window.clone()),
+        expected_actual_value_source_diff: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_value_source_diff.clone()),
+        expected_actual_value_clone_diff: expected_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_value_clone_diff.clone()),
+        rank_expected_line: rank_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.expected_line.clone()),
+        rank_actual_line: rank_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.actual_line.clone()),
+        cta_capture_line: cta_capture.as_ref().map(|capture| {
+            format!(
+                "SORT_CTA_CAPTURE bit={} block={} range=[{}..{}) expected_src_block={} actual_src_block={:?} path=/tmp/zluda_sort_cta_capture_bit{}_pass{}.txt",
+                begin_bit,
+                capture.block_idx,
+                capture.start,
+                capture.end,
+                capture.expected_source_block,
+                capture.actual_source_block,
+                begin_bit,
+                pass_n
+            )
+        }),
+        replay_capture_line: replay_capture.as_ref().map(|_| {
+            format!(
+                "SORT_REPLAY_CAPTURE bit={} n={} grid={} spine_words={} path=/tmp/zluda_sort_replay_capture_bit{}_pass{}.bin",
+                begin_bit, n_items, grid_dim_x, spine_words, begin_bit, pass_n
+            )
+        }),
+        restored_out_summary,
+        restored_out_window,
+    });
+    const SORT_PASS_RECENT_LIMIT: usize = 24;
+    if tracker.recent.len() > SORT_PASS_RECENT_LIMIT {
+        let overflow = tracker.recent.len() - SORT_PASS_RECENT_LIMIT;
+        tracker.recent.drain(0..overflow);
+    }
+}
+
+fn dump_recent_sort_passes_for_creategrid(call_n: u32, n: usize, sorted_keys: u64) {
+    let guard = match SORT_PASS_TRACKER.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let tracker = match guard.as_ref() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut matched = 0usize;
+    for record in tracker.recent.iter().rev() {
+        if record.n_items != n {
+            continue;
+        }
+        let in_role = classify_creategrid_sort_buffer(sorted_keys, n, record.keys_in);
+        let out_role = classify_creategrid_sort_buffer(sorted_keys, n, record.keys_out);
+        if in_role.is_none() && out_role.is_none() {
+            continue;
+        }
+        matched += 1;
+        let in_role_str = in_role.map(creategrid_sort_buffer_role_name).unwrap_or("-");
+        let out_role_str = out_role
+            .map(creategrid_sort_buffer_role_name)
+            .unwrap_or("-");
+        let spine_words = record.spine_summary.map(|s| s.words_read).unwrap_or(0);
+        let spine_max = record.spine_summary.map(|s| s.max_value).unwrap_or(0);
+        let spine_sum = record.spine_summary.map(|s| s.sum).unwrap_or(0);
+        let mut line = format!(
+            "    SORT_PASS_MATCH creategrid#{} pass#{} bit={} keys_in=0x{:x}({}) keys_out=0x{:x}({}) spine=0x{:x}[words={},max={},sum={}] IN[viol={},neg={},huge={}] OUT[viol={},neg={},huge={}]",
+            call_n,
+            record.pass_n,
+            record.begin_bit,
+            record.keys_in,
+            in_role_str,
+            record.keys_out,
+            out_role_str,
+            record.spine_ptr,
+            spine_words,
+            spine_max,
+            spine_sum,
+            record.summary_in.violations,
+            record.summary_in.negative_count,
+            record.summary_in.huge_count,
+            record.summary_out.violations,
+            record.summary_out.negative_count,
+            record.summary_out.huge_count,
+        );
+        if let Some(vals_summary) = record.vals_summary {
+            line.push_str(&format!(
+                " VAL_FLOW[neg={},extra={},miss={}]",
+                vals_summary.negative_count, vals_summary.extra_count, vals_summary.missing_count
+            ));
+        }
+        super::driver::zluda_log_err(&line);
+        let value_issues = record
+            .vals_summary
+            .map(|summary| {
+                summary.negative_count > 0 || summary.extra_count > 0 || summary.missing_count > 0
+            })
+            .unwrap_or(false);
+        if record.summary_out.negative_count > 0
+            || record.summary_out.huge_count > 0
+            || value_issues
+        {
+            if let Some(window) = record.window_out.as_ref() {
+                super::driver::zluda_log_err(&format!("        OUT window: {}", window));
+            }
+            if let Some((idx, value)) = record.summary_out.first_bad_value {
+                super::driver::zluda_log_err(&format!(
+                    "        OUT bad value: [{}]={} (0x{:x})",
+                    idx, value, value as u32
+                ));
+            }
+            if let Some(restored) = record.restored_out_summary {
+                super::driver::zluda_log_err(&format!(
+                    "        OUT xor-restore: viol={} neg={} huge={}",
+                    restored.violations, restored.negative_count, restored.huge_count
+                ));
+            }
+            if let Some(window) = record.restored_out_window.as_ref() {
+                super::driver::zluda_log_err(&format!("        OUT xor window: {}", window));
+            }
+            if let Some(vals_summary) = record.vals_summary {
+                super::driver::zluda_log_err(&format!(
+                    "        OUT values: neg={} extra={} miss={}",
+                    vals_summary.negative_count,
+                    vals_summary.extra_count,
+                    vals_summary.missing_count
+                ));
+                if let Some((idx, value, expected, seen)) = vals_summary.first_extra {
+                    super::driver::zluda_log_err(&format!(
+                        "        OUT values first extra: [{}]={} (in={}, out_seen={})",
+                        idx, value, expected, seen
+                    ));
+                }
+                if let Some((idx, value, expected, actual)) = vals_summary.first_missing {
+                    super::driver::zluda_log_err(&format!(
+                        "        OUT values first missing: in[{}]={} (in={}, out={})",
+                        idx, value, expected, actual
+                    ));
+                }
+                if let Some(window) = record.vals_out_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(window) = record.vals_in_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(window) = record.vals_extra_in_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(window) = record.vals_extra_first_out_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(line) = record.vals_extra_positions.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.vals_extra_run.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.vals_missing_positions.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.expected_mismatch_line.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(window) = record.expected_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(line) = record.expected_actual_pair_route.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(window) = record.expected_actual_pair_source_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(window) = record.expected_actual_pair_clone_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(line) = record.expected_actual_value_route.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(window) = record.expected_actual_value_input_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(line) = record.expected_actual_value_input_run.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(window) = record.expected_actual_value_expected_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(line) = record.expected_actual_value_expected_run.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(window) = record.expected_actual_value_source_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(window) = record.expected_actual_value_clone_window.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", window));
+                }
+                if let Some(line) = record.expected_actual_value_source_diff.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.expected_actual_value_clone_diff.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.expected_extra_positions.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.expected_missing_positions.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.rank_expected_line.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.rank_actual_line.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.cta_capture_line.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+                if let Some(line) = record.replay_capture_line.as_ref() {
+                    super::driver::zluda_log_err(&format!("        {}", line));
+                }
+            }
+        }
+        if record.summary_in.negative_count > 0 || record.summary_in.huge_count > 0 {
+            if let Some(window) = record.window_in.as_ref() {
+                super::driver::zluda_log_err(&format!("        IN window: {}", window));
+            }
+            if let Some((idx, value)) = record.summary_in.first_bad_value {
+                super::driver::zluda_log_err(&format!(
+                    "        IN bad value: [{}]={} (0x{:x})",
+                    idx, value, value as u32
+                ));
+            }
+        }
+    }
+    if matched == 0 {
+        super::driver::zluda_log_err(&format!(
+            "    SORT_PASS_MATCH creategrid#{}: no recent downsweep record matched sk=0x{:x} n={}",
+            call_n, sorted_keys, n
+        ));
+    }
+}
 
 struct CreateGridValidator {
     scratch_host: *mut u8,
@@ -1614,29 +4632,37 @@ unsafe impl Sync for CreateGridValidator {}
 static CREATEGRID_VALIDATOR: Mutex<Option<CreateGridValidator>> = Mutex::new(None);
 
 unsafe fn createGrid_validator_init(state: &mut Option<CreateGridValidator>) {
-    if state.is_some() { return; }
+    if state.is_some() {
+        return;
+    }
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let alloc_result = unsafe {
-        hipHostMalloc(&mut host_ptr, F5_SCRATCH_BYTES, hipHostMallocMapped)
-    };
+    let alloc_result =
+        unsafe { hipHostMalloc(&mut host_ptr, F5_TOTAL_SCRATCH_BYTES, hipHostMallocMapped) };
     if alloc_result.is_err() || host_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] F5 CreateGrid validator: hipHostMalloc({}) failed: {:?}",
-            F5_SCRATCH_BYTES, alloc_result));
+            F5_TOTAL_SCRATCH_BYTES, alloc_result
+        ));
         return;
     }
-    unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, F5_SCRATCH_BYTES); }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, F5_TOTAL_SCRATCH_BYTES);
+    }
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
     if map_result.is_err() || dev_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
-            "[ZLUDA] F5 CreateGrid validator: hipHostGetDevicePointer failed: {:?}", map_result));
-        unsafe { let _ = hipHostFree(host_ptr); }
+            "[ZLUDA] F5 CreateGrid validator: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
         return;
     }
     super::driver::zluda_log_err(&format!(
         "[ZLUDA] F5 CreateGrid validator: scratch={} B pinned; host=0x{:x} dev=0x{:x}",
-        F5_SCRATCH_BYTES, host_ptr as usize, dev_ptr as usize,
+        F5_TOTAL_SCRATCH_BYTES, host_ptr as usize, dev_ptr as usize,
     ));
     *state = Some(CreateGridValidator {
         scratch_host: host_ptr as *mut u8,
@@ -1656,8 +4682,6 @@ unsafe fn validate_create_grid_safe(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) {
-    if !ms4_capture_enabled() { return; }
-
     // CreateGrid(int n, const int* sortedKeys, int* gridStarts, int* gridEnds)
     // arg layout (extra flat buffer): n@0, sortedKeys@8, gridStarts@16, gridEnds@24
     let num_particles: i32 = match read_kernel_arg(kernel_params, extra, 0, 0) {
@@ -1670,13 +4694,18 @@ unsafe fn validate_create_grid_safe(
     };
     if num_particles <= 0 || num_particles > 1_000_000 {
         super::driver::zluda_log_err(&format!(
-            "*** F5 CreateGrid: numParticles={} (suspicious)", num_particles));
+            "*** F5 CreateGrid: numParticles={} (suspicious)",
+            num_particles
+        ));
         return;
     }
-    if sorted_keys_dev == 0 { return; }
+    if sorted_keys_dev == 0 {
+        return;
+    }
 
     let n = num_particles as usize;
     let read_n = n.min(F5_MAX_KEYS);
+    note_creategrid_sorted_keys(sorted_keys_dev, n);
 
     let mut guard = match CREATEGRID_VALIDATOR.lock() {
         Ok(g) => g,
@@ -1688,82 +4717,130 @@ unsafe fn validate_create_grid_safe(
         None => return,
     };
 
-    // D2D into pinned scratch — safe vs ProfilingSignal pool race.
-    let copy_result = hipMemcpyDtoD(
-        hipDeviceptr_t(validator.scratch_dev),
+    let dst_a_dev = hipDeviceptr_t(validator.scratch_dev);
+    let dst_b_dev = hipDeviceptr_t((validator.scratch_dev as usize + F5_SCRATCH_BYTES) as _);
+    let copy_a_result = hipMemcpyDtoD(
+        dst_a_dev,
         hipDeviceptr_t(sorted_keys_dev as *mut std::ffi::c_void),
         read_n * 4,
     );
-    if copy_result.is_err() {
+    let copy_b_result = hipMemcpyDtoD(
+        dst_b_dev,
+        hipDeviceptr_t((sorted_keys_dev + (n * 4) as u64) as *mut std::ffi::c_void),
+        read_n * 4,
+    );
+    if copy_a_result.is_err() || copy_b_result.is_err() {
         super::driver::zluda_log_err(&format!(
-            "*** F5 CreateGrid: D2D failed {:?} ptr=0x{:x} n={}",
-            copy_result, sorted_keys_dev, read_n));
+            "*** F5_SAFE CreateGrid: D2D failed a={:?} b={:?} ptr=0x{:x} n={} read={}",
+            copy_a_result, copy_b_result, sorted_keys_dev, n, read_n
+        ));
         return;
     }
-    let _ = hipDeviceSynchronize();
+    let sync_result = hipDeviceSynchronize();
+    if sync_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** F5_SAFE CreateGrid: hipDeviceSynchronize failed {:?} ptr=0x{:x} n={}",
+            sync_result, sorted_keys_dev, n
+        ));
+        return;
+    }
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
-    // Walk on host via the host-mapped pointer.
-    let keys: &[i32] = std::slice::from_raw_parts(
-        validator.scratch_host as *const i32,
+    let keys_a: &[i32] = std::slice::from_raw_parts(validator.scratch_host as *const i32, read_n);
+    let keys_b: &[i32] = std::slice::from_raw_parts(
+        validator.scratch_host.add(F5_SCRATCH_BYTES) as *const i32,
         read_n,
     );
-
-    let mut violations = 0u32;
-    let mut first_violation: Option<usize> = None;
-    let mut min_key = keys[0];
-    let mut max_key = keys[0];
-    let mut negative_count = 0u32;
-    let mut huge_count = 0u32;
-    if keys[0] < 0 { negative_count += 1; }
-    if keys[0] > 16_000_000 { huge_count += 1; }
-    for i in 1..read_n {
-        let k = keys[i];
-        if k < keys[i - 1] {
-            violations += 1;
-            if first_violation.is_none() {
-                first_violation = Some(i);
-            }
-        }
-        if k < min_key { min_key = k; }
-        if k > max_key { max_key = k; }
-        if k < 0 { negative_count += 1; }
-        if k > 16_000_000 { huge_count += 1; }
-    }
-
+    let summary_a = match summarize_sorted_keys(keys_a) {
+        Some(summary) => summary,
+        None => return,
+    };
+    let summary_b = match summarize_sorted_keys(keys_b) {
+        Some(summary) => summary,
+        None => return,
+    };
     static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let has_issues = violations > 0 || negative_count > 0 || huge_count > 0;
+    let has_issues = summary_a.violations > 0
+        || summary_a.negative_count > 0
+        || summary_a.huge_count > 0
+        || summary_b.violations > 0
+        || summary_b.negative_count > 0
+        || summary_b.huge_count > 0;
 
-    if call_n < 5 || call_n % 100 == 0 || has_issues {
+    if call_n < 5 || call_n % 50 == 0 || has_issues {
         super::driver::zluda_log_err(&format!(
-            "F5 CreateGrid #{}: n={} read={} min={} max={} viol={} neg={} huge={}",
-            call_n, n, read_n, min_key, max_key, violations, negative_count, huge_count,
+            "F5_SAFE CreateGrid #{}: n={} read={} A[min={},max={},viol={},neg={},huge={}] B[min={},max={},viol={},neg={},huge={}] sk=0x{:x}",
+            call_n,
+            n,
+            read_n,
+            summary_a.min_key,
+            summary_a.max_key,
+            summary_a.violations,
+            summary_a.negative_count,
+            summary_a.huge_count,
+            summary_b.min_key,
+            summary_b.max_key,
+            summary_b.violations,
+            summary_b.negative_count,
+            summary_b.huge_count,
+            sorted_keys_dev,
         ));
     }
-    if violations > 0 {
-        let vi = first_violation.unwrap();
+
+    if has_issues {
         super::driver::zluda_log_err(&format!(
-            "*** SORT CORRUPTED #{}: keys[{}]={} > keys[{}]={} (n={} read={})",
-            call_n, vi - 1, keys[vi - 1], vi, keys[vi], n, read_n,
+            "*** SORT_BISECT_SAFE #{} n={} A(viol={},neg={},huge={}) B(viol={},neg={},huge={}) sk=0x{:x}",
+            call_n,
+            n,
+            summary_a.violations,
+            summary_a.negative_count,
+            summary_a.huge_count,
+            summary_b.violations,
+            summary_b.negative_count,
+            summary_b.huge_count,
+            sorted_keys_dev,
         ));
-        let start = vi.saturating_sub(5);
-        let end = (vi + 5).min(read_n);
-        let around: Vec<String> = (start..end)
-            .map(|j| format!("[{}]={}", j, keys[j]))
-            .collect();
-        super::driver::zluda_log_err(&format!("    keys around violation: {}", around.join(", ")));
-    }
-    if negative_count > 0 || huge_count > 0 {
-        // Find a representative bad key for the log.
-        let bad = keys.iter().copied().enumerate()
-            .find(|(_, k)| *k < 0 || *k > 16_000_000);
-        if let Some((idx, k)) = bad {
+        dump_recent_sort_passes_for_creategrid(call_n, n, sorted_keys_dev);
+        dump_recent_creategrid_sort_buffer_touches(call_n, n, sorted_keys_dev);
+        if let Some(vi) = summary_a.first_violation {
+            let start = vi.saturating_sub(5);
+            let end = (vi + 5).min(read_n);
+            let around: Vec<String> = (start..end)
+                .map(|j| format!("A[{}]={}", j, keys_a[j]))
+                .collect();
+            super::driver::zluda_log_err(&format!("    A around violation: {}", around.join(", ")));
+        }
+        if let Some((idx, key)) = summary_a.first_bad_value {
             super::driver::zluda_log_err(&format!(
-                "*** SORT BAD VALUE #{}: keys[{}]={} (0x{:x}) — bit31={}",
-                call_n, idx, k, k as u32, (k as u32) >> 31,
+                "    A bad value: [{}]={} (0x{:x})",
+                idx, key, key as u32
             ));
         }
+        if let Some(vi) = summary_b.first_violation {
+            let start = vi.saturating_sub(5);
+            let end = (vi + 5).min(read_n);
+            let around: Vec<String> = (start..end)
+                .map(|j| format!("B[{}]={}", j, keys_b[j]))
+                .collect();
+            super::driver::zluda_log_err(&format!("    B around violation: {}", around.join(", ")));
+        }
+        if let Some((idx, key)) = summary_b.first_bad_value {
+            super::driver::zluda_log_err(&format!(
+                "    B bad value: [{}]={} (0x{:x})",
+                idx, key, key as u32
+            ));
+        }
+        let bytes_a: Vec<u8> = keys_a
+            .iter()
+            .flat_map(|&v| (v as u32).to_le_bytes())
+            .collect();
+        let bytes_b: Vec<u8> = keys_b
+            .iter()
+            .flat_map(|&v| (v as u32).to_le_bytes())
+            .collect();
+        let _ = std::fs::write(format!("/tmp/sort_bisect_safe_{}_a.bin", call_n), &bytes_a);
+        let _ = std::fs::write(format!("/tmp/sort_bisect_safe_{}_b.bin", call_n), &bytes_b);
     }
 }
 
@@ -1798,16 +4875,13 @@ const COUNTER_SNAPSHOT_BYTES: usize = 256; // first 64 u32 entries
 
 fn counter_snapshot_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ZLUDA_COUNTER_SNAPSHOT").map_or(false, |v| v == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_COUNTER_SNAPSHOT").map_or(false, |v| v == "1"))
 }
 
 /// Most recently observed MS_4 counter pointer (kp[7]). Updated by
 /// `latch_counter_ptr_from_ms4` immediately before each MS_4 launch, read
 /// by `snapshot_counter_after_launch` after every other launch. 0 = unset.
-static LATCHED_COUNTER_PTR: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static LATCHED_COUNTER_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct CounterSnapshotState {
     scratch_host: *mut u8,
@@ -1822,24 +4896,32 @@ unsafe impl Sync for CounterSnapshotState {}
 static COUNTER_SNAPSHOT: Mutex<Option<CounterSnapshotState>> = Mutex::new(None);
 
 unsafe fn counter_snapshot_init(state: &mut Option<CounterSnapshotState>) {
-    if state.is_some() { return; }
+    if state.is_some() {
+        return;
+    }
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let alloc_result = unsafe {
-        hipHostMalloc(&mut host_ptr, COUNTER_SNAPSHOT_BYTES, hipHostMallocMapped)
-    };
+    let alloc_result =
+        unsafe { hipHostMalloc(&mut host_ptr, COUNTER_SNAPSHOT_BYTES, hipHostMallocMapped) };
     if alloc_result.is_err() || host_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] counter snapshot: hipHostMalloc({}) failed: {:?}",
-            COUNTER_SNAPSHOT_BYTES, alloc_result));
+            COUNTER_SNAPSHOT_BYTES, alloc_result
+        ));
         return;
     }
-    unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, COUNTER_SNAPSHOT_BYTES); }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, COUNTER_SNAPSHOT_BYTES);
+    }
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
     if map_result.is_err() || dev_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
-            "[ZLUDA] counter snapshot: hipHostGetDevicePointer failed: {:?}", map_result));
-        unsafe { let _ = hipHostFree(host_ptr); }
+            "[ZLUDA] counter snapshot: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
         return;
     }
     super::driver::zluda_log_err(&format!(
@@ -1862,9 +4944,13 @@ unsafe fn latch_counter_ptr_from_ms4(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) {
-    if !counter_snapshot_enabled() { return; }
+    if !counter_snapshot_enabled() {
+        return;
+    }
     let counter_ptr: u64 = read_kernel_arg(kernel_params, extra, 56, 7).unwrap_or(0);
-    if counter_ptr == 0 { return; }
+    if counter_ptr == 0 {
+        return;
+    }
     let prev = LATCHED_COUNTER_PTR.swap(counter_ptr, std::sync::atomic::Ordering::SeqCst);
     if prev != counter_ptr {
         super::driver::zluda_log_err(&format!(
@@ -1880,9 +4966,13 @@ unsafe fn latch_counter_ptr_from_ms4(
 /// Special-cases the non-zero → all-zero transition (the bug signature
 /// we're hunting) with a `[COUNTER ZEROED]` tag.
 unsafe fn snapshot_counter_after_launch(kernel_name: &str) {
-    if !counter_snapshot_enabled() { return; }
+    if !counter_snapshot_enabled() {
+        return;
+    }
     let ptr = LATCHED_COUNTER_PTR.load(std::sync::atomic::Ordering::SeqCst);
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        return;
+    }
 
     let mut guard = match COUNTER_SNAPSHOT.lock() {
         Ok(g) => g,
@@ -1912,22 +5002,22 @@ unsafe fn snapshot_counter_after_launch(kernel_name: &str) {
         // Bad / unmapped pointer. Unlatch so we don't keep retrying.
         super::driver::zluda_log_err(&format!(
             "[COUNTER] snapshot D2D failed for ptr=0x{:x} after '{}': {:?} — unlatching",
-            ptr, kernel_name, copy_result));
+            ptr, kernel_name, copy_result
+        ));
         LATCHED_COUNTER_PTR.store(0, std::sync::atomic::Ordering::SeqCst);
         return;
     }
     let _ = hipDeviceSynchronize();
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
-    let cur_slice: &[u8] = std::slice::from_raw_parts(
-        state.scratch_host, COUNTER_SNAPSHOT_BYTES);
-    if cur_slice == state.last_bytes { return; }
+    let cur_slice: &[u8] = std::slice::from_raw_parts(state.scratch_host, COUNTER_SNAPSHOT_BYTES);
+    if cur_slice == state.last_bytes {
+        return;
+    }
 
     // Mutated. Build the human log line and detect the all-zero bug signature.
-    let cur_i32: &[i32] = std::slice::from_raw_parts(
-        state.scratch_host as *const i32,
-        COUNTER_SNAPSHOT_BYTES / 4,
-    );
+    let cur_i32: &[i32] =
+        std::slice::from_raw_parts(state.scratch_host as *const i32, COUNTER_SNAPSHOT_BYTES / 4);
     let prev_i32: &[i32] = std::slice::from_raw_parts(
         state.last_bytes.as_ptr() as *const i32,
         COUNTER_SNAPSHOT_BYTES / 4,
@@ -1946,7 +5036,10 @@ unsafe fn snapshot_counter_after_launch(kernel_name: &str) {
     prev_str.push('[');
     new_str.push('[');
     for j in 0..8 {
-        if j > 0 { prev_str.push(','); new_str.push(','); }
+        if j > 0 {
+            prev_str.push(',');
+            new_str.push(',');
+        }
         prev_str.push_str(&prev_i32[j].to_string());
         new_str.push_str(&cur_i32[j].to_string());
     }
@@ -1995,11 +5088,15 @@ unsafe impl Sync for Ms4CounterFixup {}
 static MS4_COUNTER_FIXUP: Mutex<Option<Ms4CounterFixup>> = Mutex::new(None);
 
 unsafe fn ms4_counter_fixup_init(state: &mut Option<Ms4CounterFixup>) {
-    if state.is_some() { return; }
+    if state.is_some() {
+        return;
+    }
     let alloc_size = MS4_MAX_SHAPES * 4;
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let r = hipHostMalloc(&mut host_ptr, alloc_size, hipHostMallocMapped);
-    if r.is_err() || host_ptr.is_null() { return; }
+    if r.is_err() || host_ptr.is_null() {
+        return;
+    }
     std::ptr::write_bytes(host_ptr as *mut u8, 0, alloc_size);
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let r2 = hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0);
@@ -2016,10 +5113,12 @@ unsafe fn ms4_counter_fixup_init(state: &mut Option<Ms4CounterFixup>) {
 /// Pre-launch fixup for MS_4: patch any zero counters to 1.
 /// Returns the number of zeros found and patched.
 unsafe fn fixup_ms4_counters(
-    counter_ptr: u64,     // param_7 device pointer
-    n_particles: u32,     // param_3 (N) — upper bound on shape count
+    counter_ptr: u64, // param_7 device pointer
+    n_particles: u32, // param_3 (N) — upper bound on shape count
 ) -> u32 {
-    if counter_ptr == 0 { return 0; }
+    if counter_ptr == 0 {
+        return 0;
+    }
     // The counter array has one u32 per shape. We don't know the exact shape
     // count, but MS_4's grid_x * block_x threads can reference at most
     // grid_x * block_x different shapes. A safe upper bound on the shape
@@ -2044,17 +5143,20 @@ unsafe fn fixup_ms4_counters(
         hipDeviceptr_t(counter_ptr as *mut std::ffi::c_void),
         copy_bytes,
     );
-    if r.is_err() { return 0; }
+    if r.is_err() {
+        return 0;
+    }
     let _ = hipDeviceSynchronize();
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
     // Log first 32 values BEFORE patching for diagnosis
-    let counters = std::slice::from_raw_parts_mut(
-        buf.host_ptr as *mut u32, n_shapes);
+    let counters = std::slice::from_raw_parts_mut(buf.host_ptr as *mut u32, n_shapes);
     let dump_n = n_shapes.min(32);
     let mut vals = String::with_capacity(dump_n * 8);
     for i in 0..dump_n {
-        if i > 0 { vals.push(','); }
+        if i > 0 {
+            vals.push(',');
+        }
         vals.push_str(&format!("{}", counters[i]));
     }
     super::driver::zluda_log_err(&format!(
@@ -2065,7 +5167,9 @@ unsafe fn fixup_ms4_counters(
     // Diagnostic only — no patching. Count zeros in counter range.
     let mut n_zeros = 0u32;
     for i in 0..n_shapes {
-        if counters[i] == 0 { n_zeros += 1; }
+        if counters[i] == 0 {
+            n_zeros += 1;
+        }
     }
     n_zeros
 }
@@ -2080,7 +5184,9 @@ unsafe fn scan_ms4_shape_idx(
     counter_ptr: u64,
     n_particles: u32,
 ) {
-    if flags_ptr == 0 || shape_idx_ptr == 0 || counter_ptr == 0 || n_particles == 0 { return; }
+    if flags_ptr == 0 || shape_idx_ptr == 0 || counter_ptr == 0 || n_particles == 0 {
+        return;
+    }
     let n = (n_particles as usize).min(2048);
 
     let mut guard = match MS4_COUNTER_FIXUP.lock() {
@@ -2101,13 +5207,19 @@ unsafe fn scan_ms4_shape_idx(
         hipDeviceptr_t(counter_ptr as *mut std::ffi::c_void),
         n_ctr * 4,
     );
-    if r.is_err() { return; }
+    if r.is_err() {
+        return;
+    }
     let _ = hipDeviceSynchronize();
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     let ctr = std::slice::from_raw_parts(buf.host_ptr as *const u32, n_ctr);
     let mut counter_vals = [0u32; 64];
     counter_vals.copy_from_slice(ctr);
-    let n_shapes = counter_vals.iter().rposition(|&v| v != 0).map(|i| i + 1).unwrap_or(0);
+    let n_shapes = counter_vals
+        .iter()
+        .rposition(|&v| v != 0)
+        .map(|i| i + 1)
+        .unwrap_or(0);
 
     // 2. Read flags + shape_idx, count active per shape
     let mut active_per_shape = [0u32; 64];
@@ -2120,14 +5232,16 @@ unsafe fn scan_ms4_shape_idx(
             hipDeviceptr_t((flags_ptr + (offset * 4) as u64) as *mut std::ffi::c_void),
             this_chunk * 4,
         );
-        if r2.is_err() { break; }
+        if r2.is_err() {
+            break;
+        }
         let _ = hipDeviceSynchronize();
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let flags_raw = std::slice::from_raw_parts(buf.host_ptr as *const u8, this_chunk * 4);
         // Save flags locally
         let mut flags_local = vec![0u16; this_chunk];
         for i in 0..this_chunk {
-            flags_local[i] = u16::from_le_bytes([flags_raw[i*4], flags_raw[i*4+1]]);
+            flags_local[i] = u16::from_le_bytes([flags_raw[i * 4], flags_raw[i * 4 + 1]]);
         }
 
         // Read shape_idx chunk
@@ -2136,7 +5250,9 @@ unsafe fn scan_ms4_shape_idx(
             hipDeviceptr_t((shape_idx_ptr + (offset * 4) as u64) as *mut std::ffi::c_void),
             this_chunk * 4,
         );
-        if r3.is_err() { break; }
+        if r3.is_err() {
+            break;
+        }
         let _ = hipDeviceSynchronize();
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let sids = std::slice::from_raw_parts(buf.host_ptr as *const u32, this_chunk);
@@ -2165,7 +5281,8 @@ unsafe fn scan_ms4_shape_idx(
     if !mismatches.is_empty() {
         super::driver::zluda_log_err(&format!(
             "[MS4_MISMATCH] n_shapes={} mismatches: {}",
-            n_shapes, mismatches.join(" "),
+            n_shapes,
+            mismatches.join(" "),
         ));
     } else {
         super::driver::zluda_log_err(&format!(
@@ -2207,41 +5324,41 @@ unsafe fn scan_ms4_shape_idx(
 const TFS_CAPTURE_SLOTS: usize = 64;
 const TFS_DESC_BYTES: usize = 456;
 const TFS_KERNEL_NAME_BYTES: usize = 64;
-const TFS_RAW_ARGS_BYTES: usize = 512;  // covers struct + scalar args + extras
+const TFS_RAW_ARGS_BYTES: usize = 512; // covers struct + scalar args + extras
 const TFS_SLOT_SIZE: usize = std::mem::size_of::<TfsCaptureSlot>();
 const TFS_CAPTURE_TOTAL_SIZE: usize = TFS_SLOT_SIZE * TFS_CAPTURE_SLOTS;
 const TFS_CAPTURE_MAGIC: u64 = 0x5446_5343_4150_5455; // "TFSCAPTU"
 
 #[repr(C)]
 struct TfsCaptureSlot {
-    magic: u64,                              // 0
-    launch_n: u64,                           // 8
-    timestamp_ms: u64,                       // 16
-    kernel_id: u32,                          // 24 — see TFS_KERNEL_ID_*
-    grid_x: u32,                             // 28
-    grid_y: u32,                             // 32
-    grid_z: u32,                             // 36
-    block_x: u32,                            // 40
-    block_y: u32,                            // 44
-    block_z: u32,                            // 48
-    raw_args_len: u32,                       // 52 — actual bytes captured
+    magic: u64,                               // 0
+    launch_n: u64,                            // 8
+    timestamp_ms: u64,                        // 16
+    kernel_id: u32,                           // 24 — see TFS_KERNEL_ID_*
+    grid_x: u32,                              // 28
+    grid_y: u32,                              // 32
+    grid_z: u32,                              // 36
+    block_x: u32,                             // 40
+    block_y: u32,                             // 44
+    block_z: u32,                             // 48
+    raw_args_len: u32,                        // 52 — actual bytes captured
     kernel_name: [u8; TFS_KERNEL_NAME_BYTES], // 56 — null-padded ASCII
-    raw_args: [u8; TFS_RAW_ARGS_BYTES],      // 120 — kernel arg flat buffer dump
-    _pad: [u8; 8],                           // 632 — round to 640
+    raw_args: [u8; TFS_RAW_ARGS_BYTES],       // 120 — kernel arg flat buffer dump
+    _pad: [u8; 8],                            // 632 — round to 640
 }
 
 // Kernel IDs (compact identifier for which TurbulenceFS kernel — used by
 // the post-mortem analyzer to find the right replay slot configuration).
-const TFS_KERNEL_ID_OTHER: u32                       = 0;  // any TFS_* not specifically known
-const TFS_KERNEL_ID_CLEAR: u32                       = 1;
-const TFS_KERNEL_ID_ADVECT: u32                      = 2;
-const TFS_KERNEL_ID_SMOOTH_VELOCITY: u32             = 3;
-const TFS_KERNEL_ID_PRESSURE_DIVERGENCE: u32         = 4;
+const TFS_KERNEL_ID_OTHER: u32 = 0; // any TFS_* not specifically known
+const TFS_KERNEL_ID_CLEAR: u32 = 1;
+const TFS_KERNEL_ID_ADVECT: u32 = 2;
+const TFS_KERNEL_ID_SMOOTH_VELOCITY: u32 = 3;
+const TFS_KERNEL_ID_PRESSURE_DIVERGENCE: u32 = 4;
 const TFS_KERNEL_ID_PARTICLE_DENSITY_TO_PARTICLES: u32 = 5;
-const TFS_KERNEL_ID_MIGRATE: u32                     = 6;
-const TFS_KERNEL_ID_COUPLE_FROM_PARTICLES: u32       = 7;
+const TFS_KERNEL_ID_MIGRATE: u32 = 6;
+const TFS_KERNEL_ID_COUPLE_FROM_PARTICLES: u32 = 7;
 const TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX: u32 = 8;
-const TFS_KERNEL_ID_PARTICLE_DENSITY_SMOOTH: u32     = 9;
+const TFS_KERNEL_ID_PARTICLE_DENSITY_SMOOTH: u32 = 9;
 
 fn classify_tfs_kernel(name: &str) -> Option<u32> {
     if !name.starts_with("TurbulenceFS_") {
@@ -2288,37 +5405,45 @@ pub(crate) static TFS_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
 
 fn tfs_capture_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ZLUDA_TFS_CAPTURE").map_or(false, |v| v == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_TFS_CAPTURE").map_or(false, |v| v == "1"))
 }
 
 unsafe fn tfs_capture_init(state: &mut Option<TfsCaptureState>) {
-    if state.is_some() { return; }
+    if state.is_some() {
+        return;
+    }
     let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let alloc_result = unsafe {
-        hipHostMalloc(&mut host_ptr, TFS_CAPTURE_TOTAL_SIZE, hipHostMallocMapped)
-    };
+    let alloc_result =
+        unsafe { hipHostMalloc(&mut host_ptr, TFS_CAPTURE_TOTAL_SIZE, hipHostMallocMapped) };
     if alloc_result.is_err() || host_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] TFS capture: hipHostMalloc({}) failed: {:?}",
-            TFS_CAPTURE_TOTAL_SIZE, alloc_result));
+            TFS_CAPTURE_TOTAL_SIZE, alloc_result
+        ));
         return;
     }
-    unsafe { std::ptr::write_bytes(host_ptr as *mut u8, 0, TFS_CAPTURE_TOTAL_SIZE); }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, TFS_CAPTURE_TOTAL_SIZE);
+    }
     let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
     if map_result.is_err() || dev_ptr.is_null() {
         super::driver::zluda_log_err(&format!(
-            "[ZLUDA] TFS capture: hipHostGetDevicePointer failed: {:?}", map_result));
-        unsafe { let _ = hipHostFree(host_ptr); }
+            "[ZLUDA] TFS capture: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
         return;
     }
     super::driver::zluda_log_err(&format!(
         "[ZLUDA] TFS capture: {} slots × {} B = {} KB pinned; host=0x{:x} dev=0x{:x}",
-        TFS_CAPTURE_SLOTS, TFS_SLOT_SIZE,
+        TFS_CAPTURE_SLOTS,
+        TFS_SLOT_SIZE,
         TFS_CAPTURE_TOTAL_SIZE / 1024,
-        host_ptr as usize, dev_ptr as usize,
+        host_ptr as usize,
+        dev_ptr as usize,
     ));
     TFS_CAPTURE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::SeqCst);
     TFS_CAPTURE_TOTAL_BYTES.store(TFS_CAPTURE_TOTAL_SIZE, std::sync::atomic::Ordering::SeqCst);
@@ -2376,9 +5501,13 @@ unsafe fn dump_kernel_args_raw(
         // we should rarely hit this branch.
         let mut written = 0usize;
         for i in 0..16 {
-            if written + 8 > max_len { break; }
+            if written + 8 > max_len {
+                break;
+            }
             let p = *kernel_params.add(i);
-            if p.is_null() { break; }
+            if p.is_null() {
+                break;
+            }
             std::ptr::copy_nonoverlapping(p as *const u8, dst.add(written), 8);
             written += 8;
         }
@@ -2396,10 +5525,16 @@ unsafe fn capture_tfs_launch(
     kernel_id: u32,
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
-    grid_x: u32, grid_y: u32, grid_z: u32,
-    block_x: u32, block_y: u32, block_z: u32,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
 ) {
-    if !tfs_capture_enabled() { return; }
+    if !tfs_capture_enabled() {
+        return;
+    }
 
     let mut guard = match TFS_CAPTURE.lock() {
         Ok(g) => g,
@@ -2530,6 +5665,204 @@ pub(crate) fn get_attribute(
     result
 }
 
+#[derive(Clone, Copy)]
+struct SortDownsweepLaunchArgs {
+    begin_bit: u32,
+    n_items: usize,
+    keys_in: u64,
+    keys_out: u64,
+    vals_in: u64,
+    vals_out: u64,
+    spine_ptr: u64,
+    first: u8,
+    last: u8,
+    overwrite: u8,
+    grid_share: SortGridEvenShare,
+}
+
+unsafe fn read_sort_downsweep_launch_args(
+    extra: *mut *mut ::core::ffi::c_void,
+) -> Option<SortDownsweepLaunchArgs> {
+    if extra.is_null() {
+        return None;
+    }
+    let extra_arr = std::slice::from_raw_parts(extra, 5);
+    if extra_arr[0] != (0x1usize as *mut _) || extra_arr[1].is_null() {
+        return None;
+    }
+    let buf = extra_arr[1] as *const u8;
+    Some(SortDownsweepLaunchArgs {
+        n_items: std::ptr::read_unaligned(buf.add(40) as *const u32) as usize,
+        begin_bit: std::ptr::read_unaligned(buf.add(44) as *const u32),
+        keys_in: std::ptr::read_unaligned(buf.add(0) as *const u64),
+        keys_out: std::ptr::read_unaligned(buf.add(8) as *const u64),
+        vals_in: std::ptr::read_unaligned(buf.add(16) as *const u64),
+        vals_out: std::ptr::read_unaligned(buf.add(24) as *const u64),
+        spine_ptr: std::ptr::read_unaligned(buf.add(32) as *const u64),
+        first: *buf.add(48),
+        last: *buf.add(49),
+        overwrite: *buf.add(50),
+        grid_share: SortGridEvenShare::from_words(std::array::from_fn(|idx| {
+            std::ptr::read_unaligned(buf.add(52 + idx * 4) as *const i32)
+        })),
+    })
+}
+
+unsafe fn snapshot_sort_downsweep_prelaunch_state(
+    begin_bit: u32,
+    n_items: usize,
+    grid_share: SortGridEvenShare,
+    keys_in: u64,
+    vals_in: u64,
+    keys_out: u64,
+    vals_out: u64,
+) {
+    if n_items == 0 || keys_in == 0 || keys_out == 0 {
+        return;
+    }
+    let read_n = sort_pass_capture_len(n_items, Some(grid_share));
+    let mut guard = match SORT_PASS_TRACKER.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    sort_pass_tracker_init(&mut guard);
+    let tracker = match guard.as_mut() {
+        Some(v) => v,
+        None => return,
+    };
+    let dst_in_before_dev =
+        hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_KEYS_IN_BEFORE_OFFSET) as _);
+    let copy_in_before_result = hipMemcpyDtoD(
+        dst_in_before_dev,
+        hipDeviceptr_t(keys_in as *mut std::ffi::c_void),
+        read_n * 4,
+    );
+    if copy_in_before_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_PASS_SAFE: prelaunch keys_in D2D failed bit={} keys_in=0x{:x} n={} -> {:?}",
+            begin_bit, keys_in, read_n, copy_in_before_result
+        ));
+    }
+    if vals_in != 0 {
+        let dst_vals_in_before_dev = hipDeviceptr_t(
+            (tracker.scratch_dev as usize + SORT_PASS_VALS_IN_BEFORE_OFFSET) as _,
+        );
+        let copy_vals_in_before_result = hipMemcpyDtoD(
+            dst_vals_in_before_dev,
+            hipDeviceptr_t(vals_in as *mut std::ffi::c_void),
+            read_n * 4,
+        );
+        if copy_vals_in_before_result.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "*** SORT_PASS_SAFE: prelaunch vals_in D2D failed bit={} vals_in=0x{:x} n={} -> {:?}",
+                begin_bit, vals_in, read_n, copy_vals_in_before_result
+            ));
+        }
+    }
+    let dst_out_before_dev = hipDeviceptr_t(
+        (tracker.scratch_dev as usize + SORT_PASS_KEYS_OUT_BEFORE_OFFSET) as _,
+    );
+    let copy_out_before_result = hipMemcpyDtoD(
+        dst_out_before_dev,
+        hipDeviceptr_t(keys_out as *mut std::ffi::c_void),
+        read_n * 4,
+    );
+    if copy_out_before_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_PASS_SAFE: prelaunch keys_out D2D failed bit={} keys_out=0x{:x} n={} -> {:?}",
+            begin_bit, keys_out, read_n, copy_out_before_result
+        ));
+    }
+    if vals_out != 0 {
+        let dst_vals_out_before_dev = hipDeviceptr_t(
+            (tracker.scratch_dev as usize + SORT_PASS_VALS_OUT_BEFORE_OFFSET) as _,
+        );
+        let copy_vals_out_before_result = hipMemcpyDtoD(
+            dst_vals_out_before_dev,
+            hipDeviceptr_t(vals_out as *mut std::ffi::c_void),
+            read_n * 4,
+        );
+        if copy_vals_out_before_result.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "*** SORT_PASS_SAFE: prelaunch vals_out D2D failed bit={} vals_out=0x{:x} n={} -> {:?}",
+                begin_bit, vals_out, read_n, copy_vals_out_before_result
+            ));
+        }
+    }
+}
+
+unsafe fn zero_sort_downsweep_input_slack(
+    n_items: usize,
+    grid_share: SortGridEvenShare,
+    keys_in: u64,
+    vals_in: u64,
+) {
+    if !zero_sort_input_slack_enabled() {
+        return;
+    }
+    let Some(covered_items) = grid_share.covered_item_count() else {
+        append_sort_input_slack_probe(&format!(
+            "skip covered-none n={} share={:?}",
+            n_items, grid_share
+        ));
+        return;
+    };
+    if covered_items <= n_items {
+        append_sort_input_slack_probe(&format!(
+            "skip no-slack n={} covered={}",
+            n_items, covered_items
+        ));
+        return;
+    }
+    let slack_items = covered_items - n_items;
+    let slack_bytes = slack_items.saturating_mul(std::mem::size_of::<i32>());
+    if slack_bytes == 0 {
+        append_sort_input_slack_probe(&format!(
+            "skip zero-bytes n={} covered={} slack={}",
+            n_items, covered_items, slack_items
+        ));
+        return;
+    }
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let keys_tail = keys_in.saturating_add((n_items * std::mem::size_of::<i32>()) as u64);
+    let keys_result = hipMemsetD32(
+        hipDeviceptr_t(keys_tail as *mut std::ffi::c_void),
+        0,
+        slack_items,
+    );
+    let vals_result = if vals_in != 0 {
+        let vals_tail = vals_in.saturating_add((n_items * std::mem::size_of::<i32>()) as u64);
+        Some(hipMemsetD32(
+            hipDeviceptr_t(vals_tail as *mut std::ffi::c_void),
+            0,
+            slack_items,
+        ))
+    } else {
+        None
+    };
+    if let Err(code) = keys_result {
+        append_sort_input_slack_probe(&format!(
+            "keys-error n={} covered={} slack={} err={:?}",
+            n_items, covered_items, slack_items, code
+        ));
+    }
+    if let Some(Err(code)) = vals_result {
+        append_sort_input_slack_probe(&format!(
+            "vals-error n={} covered={} slack={} err={:?}",
+            n_items, covered_items, slack_items, code
+        ));
+    }
+    if keys_result.is_ok()
+        && vals_result.as_ref().map_or(true, Result::is_ok)
+        && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        append_sort_input_slack_probe(&format!(
+            "active n={} covered={} slack={} keys_in=0x{:x} vals_in=0x{:x}",
+            n_items, covered_items, slack_items, keys_in, vals_in
+        ));
+    }
+}
+
 pub(crate) fn launch_kernel(
     f: &Function,
     grid_dim_x: ::core::ffi::c_uint,
@@ -2563,23 +5896,26 @@ pub(crate) fn launch_kernel(
     // Acquire the global launch lock before ANY diagnostic logging or HIP calls, so
     // mode 2 also prevents log lines from interleaving with other threads. The guard
     // is held until it is explicitly dropped or the function returns.
-    let mut launch_guard = if lock_mode >= 1 {
-        Some(super::stream::NULL_STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
-    } else {
-        None
-    };
+    let mut launch_guard =
+        launch_mutex(lock_mode).map(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()));
 
     // Log kernel name — gated by ZLUDA_LOG_LAUNCHES=1 to avoid overhead
     static LOG_LAUNCHES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let log_launches = *LOG_LAUNCHES.get_or_init(|| {
-        std::env::var("ZLUDA_LOG_LAUNCHES").map_or(false, |v| v == "1")
-    });
+    let log_launches = *LOG_LAUNCHES
+        .get_or_init(|| std::env::var("ZLUDA_LOG_LAUNCHES").map_or(false, |v| v == "1"));
     let name = lookup_name(f.base);
     if log_launches {
         super::driver::zluda_log_err(&format!(
             "cuLaunchKernel '{}' grid=[{},{},{}] block=[{},{},{}] shared={}",
-            name, grid_dim_x, grid_dim_y, grid_dim_z,
-            block_dim_x, block_dim_y, block_dim_z, shared_mem_bytes));
+            name,
+            grid_dim_x,
+            grid_dim_y,
+            grid_dim_z,
+            block_dim_x,
+            block_dim_y,
+            block_dim_z,
+            shared_mem_bytes
+        ));
     }
     // Capture CUB RadixSort kernel args (Downsweep + Upsweep) including GridEvenShare.
     // Pure CPU reads from the extra buffer — no GPU ops, no ProfilingSignal risk.
@@ -2587,7 +5923,8 @@ pub(crate) fn launch_kernel(
     if (name.contains("RadixSortDownsweepKernel") || name.contains("RadixSortUpsweepKernel"))
         && !extra.is_null()
     {
-        static SORT_CAPTURE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static SORT_CAPTURE_DONE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         if !SORT_CAPTURE_DONE.load(std::sync::atomic::Ordering::Relaxed) {
             unsafe {
                 let extra_arr = std::slice::from_raw_parts(extra, 5);
@@ -2595,7 +5932,11 @@ pub(crate) fn launch_kernel(
                     let buf = extra_arr[1] as *const u8;
                     // Read all bytes 0-87 of the extra buffer
                     let raw: Vec<u8> = (0..88).map(|i| *buf.add(i)).collect();
-                    let kernel_type = if name.contains("Downsweep") { "DS" } else { "US" };
+                    let kernel_type = if name.contains("Downsweep") {
+                        "DS"
+                    } else {
+                        "US"
+                    };
                     let n_items = std::ptr::read_unaligned(buf.add(40) as *const u32);
                     let begin_bit = std::ptr::read_unaligned(buf.add(44) as *const u32);
                     let is_first = *buf.add(48);
@@ -2603,9 +5944,9 @@ pub(crate) fn launch_kernel(
                     let overwrite = *buf.add(50);
                     // GridEvenShare at bytes 52-87 (36 bytes)
                     let ges_raw: Vec<u8> = (52..88).map(|i| *buf.add(i)).collect();
-                    let ges_i32: Vec<i32> = (0..9).map(|i|
-                        std::ptr::read_unaligned(buf.add(52 + i*4) as *const i32)
-                    ).collect();
+                    let ges_i32: Vec<i32> = (0..9)
+                        .map(|i| std::ptr::read_unaligned(buf.add(52 + i * 4) as *const i32))
+                        .collect();
                     super::driver::zluda_log_err(&format!(
                         "SORT_ARGS {} n={} bit={} first={} last={} ow={} GES={:?} grid={} stream={:?}",
                         kernel_type, n_items, begin_bit, is_first, is_last, overwrite,
@@ -2658,7 +5999,9 @@ pub(crate) fn launch_kernel(
                     let mut dump = String::new();
                     for i in 0..words {
                         let w = std::ptr::read_volatile((host as *const u32).add(i));
-                        if i > 0 { dump.push(' '); }
+                        if i > 0 {
+                            dump.push(' ');
+                        }
                         dump.push_str(&format!("{:08x}", w));
                     }
                     super::driver::zluda_log_err(&format!(
@@ -2672,7 +6015,9 @@ pub(crate) fn launch_kernel(
                 // u32s starting at the arg offset.
                 let args = [(4u8, p4), (5, p5), (6, p6), (7, p7)];
                 for &(arg_idx, arg_ptr) in args.iter() {
-                    if arg_ptr == 0 { continue; }
+                    if arg_ptr == 0 {
+                        continue;
+                    }
                     for &(host, dev, size) in table.iter() {
                         let dev_end = dev.wrapping_add(size);
                         if (arg_ptr as usize) >= dev && (arg_ptr as usize) < dev_end {
@@ -2683,7 +6028,9 @@ pub(crate) fn launch_kernel(
                             let base = (host + offset) as *const u32;
                             for i in 0..words {
                                 let w = std::ptr::read_volatile(base.add(i));
-                                if i > 0 { dump.push(' '); }
+                                if i > 0 {
+                                    dump.push(' ');
+                                }
                                 dump.push_str(&format!("{:08x}", w));
                             }
                             super::driver::zluda_log_err(&format!(
@@ -2732,61 +6079,44 @@ pub(crate) fn launch_kernel(
     if let Some(tfs_kernel_id) = classify_tfs_kernel(&name) {
         unsafe {
             capture_tfs_launch(
-                &name, tfs_kernel_id, kernel_params, extra,
-                grid_dim_x, grid_dim_y, grid_dim_z,
-                block_dim_x, block_dim_y, block_dim_z,
+                &name,
+                tfs_kernel_id,
+                kernel_params,
+                extra,
+                grid_dim_x,
+                grid_dim_y,
+                grid_dim_z,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z,
             );
         }
     }
-    // F.5: validate CreateGrid sortedKeys input. The kernel reads
-    // `sortedKeys[i]` and uses it as a SIGNED index into gridStarts/gridEnds.
-    // If CUB Downsweep produced corrupt keys (bit-31 stuck from lost
-    // XOR flipback), CreateGrid does wild writes → GPU page fault. The
-    // diagnostic that was supposed to catch this had been removed; this
-    // re-adds it with the safe D2D pattern (avoids ProfilingSignal pool race).
-    // Per-pass sort bisection: read back BOTH buffer A (CreateGrid input, after DtoD copy)
-    // and buffer B (sort output, before DtoD copy) to find where corruption enters.
-    // Gated by ZLUDA_VALIDATE_SORT=1 — the hipMemcpyDtoH calls risk ProfilingSignal.
-    static VALIDATE_SORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *VALIDATE_SORT.get_or_init(|| std::env::var("ZLUDA_VALIDATE_SORT").map_or(false, |v| v == "1"))
-        && name.contains("CreateGrid") && !name.contains("Turbulence")
-    {
+    if creategrid_safe_validator_enabled() {
         unsafe {
-            let n: i32 = read_kernel_arg(kernel_params, extra, 0, 0).unwrap_or(0);
-            let sorted_keys: u64 = read_kernel_arg(kernel_params, extra, 8, 1).unwrap_or(0);
-            if n > 0 && sorted_keys != 0 {
-                static CG_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                let cg_n = CG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let _ = hip_runtime_sys::hipDeviceSynchronize();
-                let n_u = n as usize;
-                // Buffer A = sortedKeys[0..n] (what CreateGrid will read)
-                let mut buf_a = vec![0i32; n_u];
-                let _ = hip_runtime_sys::hipMemcpyDtoH(
-                    buf_a.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t(sorted_keys as _), n_u * 4);
-                // Buffer B = sortedKeys[n..2n] (CUB sort output, source of DtoD copy)
-                let mut buf_b = vec![0i32; n_u];
-                let _ = hip_runtime_sys::hipMemcpyDtoH(
-                    buf_b.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t((sorted_keys + n_u as u64 * 4) as _), n_u * 4);
-
-                let a_bit31 = buf_a.iter().filter(|&&k| k < 0).count();
-                let b_bit31 = buf_b.iter().filter(|&&k| k < 0).count();
-                let a_viol = buf_a.windows(2).filter(|w| w[1] < w[0]).count();
-                let b_viol = buf_b.windows(2).filter(|w| w[1] < w[0]).count();
-
-                if a_bit31 > 0 || b_bit31 > 0 {
-                    super::driver::zluda_log_err(&format!(
-                        "*** SORT_BISECT #{} n={} bufA(bit31={},viol={}) bufB(bit31={},viol={}) sk=0x{:x}",
-                        cg_n, n, a_bit31, a_viol, b_bit31, b_viol, sorted_keys));
-                    // Dump both to files for offline analysis
-                    let bytes_a: Vec<u8> = buf_a.iter().flat_map(|&v| (v as u32).to_le_bytes()).collect();
-                    let bytes_b: Vec<u8> = buf_b.iter().flat_map(|&v| (v as u32).to_le_bytes()).collect();
-                    let _ = std::fs::write(format!("/tmp/sort_bisect_{}_a.bin", cg_n), &bytes_a);
-                    let _ = std::fs::write(format!("/tmp/sort_bisect_{}_b.bin", cg_n), &bytes_b);
-                } else if cg_n % 10 == 0 {
-                    super::driver::zluda_log_err(&format!(
-                        "SORT_BISECT_OK #{} n={} a_max={} b_max={}",
-                        cg_n, n, buf_a.iter().max().unwrap_or(&0), buf_b.iter().max().unwrap_or(&0)));
-                }
+            maybe_capture_creategrid_sort_buffer_touch(
+                &name,
+                extra,
+                shared_mem_bytes,
+                stream,
+                grid_dim_x,
+                grid_dim_y,
+                grid_dim_z,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z,
+            );
+        }
+    }
+    if name.contains("CreateGrid") && !name.contains("Turbulence") {
+        let n: i32 = unsafe { read_kernel_arg(kernel_params, extra, 0, 0).unwrap_or(0) };
+        let sorted_keys: u64 = unsafe { read_kernel_arg(kernel_params, extra, 8, 1).unwrap_or(0) };
+        if n > 0 && sorted_keys != 0 {
+            note_creategrid_sorted_keys(sorted_keys, n as usize);
+        }
+        if creategrid_safe_validator_enabled() {
+            unsafe {
+                validate_create_grid_safe(kernel_params, extra);
             }
         }
     }
@@ -2849,6 +6179,34 @@ pub(crate) fn launch_kernel(
     // The guard holds a lock to prevent other threads from submitting work between
     // our sync and our launch. Dropped after hipModuleLaunchKernel returns.
     let _null_stream_guard = super::stream::null_stream_sync(stream);
+    let sort_downsweep_args = if creategrid_safe_validator_enabled()
+        && name.contains("RadixSortDownsweepKernel")
+        && !extra.is_null()
+        && stream.0.is_null()
+    {
+        unsafe { read_sort_downsweep_launch_args(extra) }
+    } else {
+        None
+    };
+    if let Some(args) = sort_downsweep_args {
+        unsafe {
+            zero_sort_downsweep_input_slack(
+                args.n_items,
+                args.grid_share,
+                args.keys_in,
+                args.vals_in,
+            );
+            snapshot_sort_downsweep_prelaunch_state(
+                args.begin_bit,
+                args.n_items,
+                args.grid_share,
+                args.keys_in,
+                args.vals_in,
+                args.keys_out,
+                args.vals_out,
+            );
+        }
+    }
 
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
@@ -2870,9 +6228,15 @@ pub(crate) fn launch_kernel(
             ];
             unsafe {
                 hipModuleLaunchKernel(
-                    f.base, grid_dim_x, grid_dim_y, grid_dim_z,
-                    block_dim_x, block_dim_y, block_dim_z,
-                    shared_mem_bytes, stream,
+                    f.base,
+                    grid_dim_x,
+                    grid_dim_y,
+                    grid_dim_z,
+                    block_dim_x,
+                    block_dim_y,
+                    block_dim_z,
+                    shared_mem_bytes,
+                    stream,
                     std::ptr::null_mut(),
                     patched.as_mut_ptr(),
                 )
@@ -2880,18 +6244,34 @@ pub(crate) fn launch_kernel(
         } else {
             unsafe {
                 hipModuleLaunchKernel(
-                    f.base, grid_dim_x, grid_dim_y, grid_dim_z,
-                    block_dim_x, block_dim_y, block_dim_z,
-                    shared_mem_bytes, stream, kernel_params, extra,
+                    f.base,
+                    grid_dim_x,
+                    grid_dim_y,
+                    grid_dim_z,
+                    block_dim_x,
+                    block_dim_y,
+                    block_dim_z,
+                    shared_mem_bytes,
+                    stream,
+                    kernel_params,
+                    extra,
                 )
             }
         }
     } else {
         unsafe {
             hipModuleLaunchKernel(
-                f.base, grid_dim_x, grid_dim_y, grid_dim_z,
-                block_dim_x, block_dim_y, block_dim_z,
-                shared_mem_bytes, stream, kernel_params, extra,
+                f.base,
+                grid_dim_x,
+                grid_dim_y,
+                grid_dim_z,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z,
+                shared_mem_bytes,
+                stream,
+                kernel_params,
+                extra,
             )
         }
     };
@@ -2900,20 +6280,45 @@ pub(crate) fn launch_kernel(
     // which CUDA apps handle by reducing block size and retrying. HIP returns 719 (LAUNCH_FAILURE)
     // which many apps treat as fatal. This translation makes ZLUDA match NVIDIA behavior.
     let result = match result {
-        Err(code) if code == hipErrorCode_t::LaunchFailure => {
-            hipError_t::ErrorLaunchOutOfResources
-        }
+        Err(code) if code == hipErrorCode_t::LaunchFailure => hipError_t::ErrorLaunchOutOfResources,
         other => other,
     };
+    if let Some(args) = sort_downsweep_args.filter(|_| result.is_ok()) {
+        unsafe {
+            capture_sort_downsweep_safe(
+                args.begin_bit,
+                args.n_items,
+                args.keys_in,
+                args.keys_out,
+                args.vals_in,
+                args.vals_out,
+                args.spine_ptr,
+                Some(args.grid_share),
+                grid_dim_x,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z,
+                shared_mem_bytes,
+                args.first,
+                args.last,
+                args.overwrite,
+                stream,
+            );
+        }
+    }
     // Spine readback removed — hipMemcpyDtoH triggers ProfilingSignal race.
     // Instead, read the spine from within the Downsweep readback (same sync point).
     // Per-pass Downsweep readback: after each Downsweep, sync + read back the
     // output buffer and check for bit31 corruption. Identifies WHICH pass introduces it.
     // Gated by ZLUDA_VALIDATE_SORT=1.
     static VALIDATE_SORT_POST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *VALIDATE_SORT_POST.get_or_init(|| std::env::var("ZLUDA_VALIDATE_SORT").map_or(false, |v| v == "1"))
-        && name.contains("RadixSortDownsweepKernel") && result.is_ok() && !extra.is_null()
-        && stream.0.is_null() // Only FleX sort (NULL stream), not IOFX (non-NULL)
+    if *VALIDATE_SORT_POST
+        .get_or_init(|| std::env::var("ZLUDA_VALIDATE_SORT").map_or(false, |v| v == "1"))
+        && name.contains("RadixSortDownsweepKernel")
+        && result.is_ok()
+        && !extra.is_null()
+        && stream.0.is_null()
+    // Only FleX sort (NULL stream), not IOFX (non-NULL)
     {
         unsafe {
             let extra_arr = std::slice::from_raw_parts(extra, 5);
@@ -2925,17 +6330,24 @@ pub(crate) fn launch_kernel(
                 if n_items > 0 && keys_out != 0 {
                     // Use stream sync (NULL only) instead of device sync (all streams)
                     // to reduce ProfilingSignal race pressure
-                    let _ = hip_runtime_sys::hipStreamSynchronize(
-                        hip_runtime_sys::hipStream_t(std::ptr::null_mut()));
+                    let _ = hip_runtime_sys::hipStreamSynchronize(hip_runtime_sys::hipStream_t(
+                        std::ptr::null_mut(),
+                    ));
                     let mut h_out = vec![0i32; n_items];
                     let _ = hip_runtime_sys::hipMemcpyDtoH(
-                        h_out.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t(keys_out as _), n_items * 4);
+                        h_out.as_mut_ptr() as _,
+                        hip_runtime_sys::hipDeviceptr_t(keys_out as _),
+                        n_items * 4,
+                    );
                     let bit31_out = h_out.iter().filter(|&&k| k < 0).count();
                     // Also read keys_in to check if corruption is in the INPUT
                     let keys_in = std::ptr::read_unaligned(buf.add(0) as *const u64);
                     let mut h_in = vec![0i32; n_items];
                     let _ = hip_runtime_sys::hipMemcpyDtoH(
-                        h_in.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t(keys_in as _), n_items * 4);
+                        h_in.as_mut_ptr() as _,
+                        hip_runtime_sys::hipDeviceptr_t(keys_in as _),
+                        n_items * 4,
+                    );
                     let bit31_in = h_in.iter().filter(|&&k| k < 0).count();
                     if bit31_out > 0 || bit31_in > 0 {
                         let viol = h_out.windows(2).filter(|w| w[1] < w[0]).count();
@@ -2945,8 +6357,10 @@ pub(crate) fn launch_kernel(
                         let mut h_spine = vec![0u32; spine_n.min(256)];
                         if spine_ptr != 0 {
                             let _ = hip_runtime_sys::hipMemcpyDtoH(
-                                h_spine.as_mut_ptr() as _, hip_runtime_sys::hipDeviceptr_t(spine_ptr as _),
-                                h_spine.len() * 4);
+                                h_spine.as_mut_ptr() as _,
+                                hip_runtime_sys::hipDeviceptr_t(spine_ptr as _),
+                                h_spine.len() * 4,
+                            );
                         }
                         let spine_max = h_spine.iter().copied().max().unwrap_or(0);
                         let spine_sum: u64 = h_spine.iter().map(|&v| v as u64).sum();
@@ -2954,12 +6368,16 @@ pub(crate) fn launch_kernel(
                             "*** PASS_CORRUPT bit={} n={} in_bit31={} out_bit31={} viol={} spine_max={} spine_sum={} keys_in=0x{:x} keys_out=0x{:x}",
                             begin_bit, n_items, bit31_in, bit31_out, viol, spine_max, spine_sum, keys_in, keys_out));
                     } else {
-                        static PASS_LOG_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        static PASS_LOG_N: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
                         let pn = PASS_LOG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if pn < 50 || pn % 100 == 0 {
                             super::driver::zluda_log_err(&format!(
-                                "PASS_OK bit={} n={} max={}", begin_bit, n_items,
-                                h_out.iter().max().unwrap_or(&0)));
+                                "PASS_OK bit={} n={} max={}",
+                                begin_bit,
+                                n_items,
+                                h_out.iter().max().unwrap_or(&0)
+                            ));
                         }
                     }
                 }
@@ -2989,9 +6407,8 @@ pub(crate) fn launch_kernel(
     // completed on the GPU.
     if result.is_ok() {
         static SYNC_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let sync_all = *SYNC_ALL.get_or_init(|| {
-            std::env::var("ZLUDA_SYNC_LAUNCHES").map_or(false, |v| v == "1")
-        });
+        let sync_all = *SYNC_ALL
+            .get_or_init(|| std::env::var("ZLUDA_SYNC_LAUNCHES").map_or(false, |v| v == "1"));
         if sync_all || lock_mode == 2 {
             static LAUNCH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = LAUNCH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3013,14 +6430,21 @@ pub(crate) fn launch_kernel(
                 // kernel scenario.
                 super::driver::zluda_log_err(&format!(
                     "*** PEEK_FAULT #{} '{}' grid=[{},{},{}] block=[{},{},{}] peek={:?}",
-                    n, name, grid_dim_x, grid_dim_y, grid_dim_z,
-                    block_dim_x, block_dim_y, block_dim_z, peek_result));
+                    n,
+                    name,
+                    grid_dim_x,
+                    grid_dim_y,
+                    grid_dim_z,
+                    block_dim_x,
+                    block_dim_y,
+                    block_dim_z,
+                    peek_result
+                ));
             } else if n < 20 || n % 1000 == 0 {
                 // Positive confirmation that sync ran and returned OK. Sampled so we
                 // don't flood the log; the first 20 cover PhysX init, later samples
                 // cover gameplay.
-                super::driver::zluda_log_err(&format!(
-                    "SYNC_OK #{} '{}'", n, name));
+                super::driver::zluda_log_err(&format!("SYNC_OK #{} '{}'", n, name));
             }
         }
     }
@@ -3087,9 +6511,17 @@ pub(crate) fn launch_kernel_ptsz(
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
     launch_kernel(
-        f, grid_dim_x, grid_dim_y, grid_dim_z,
-        block_dim_x, block_dim_y, block_dim_z,
-        shared_mem_bytes, stream, kernel_params, extra,
+        f,
+        grid_dim_x,
+        grid_dim_y,
+        grid_dim_z,
+        block_dim_x,
+        block_dim_y,
+        block_dim_z,
+        shared_mem_bytes,
+        stream,
+        kernel_params,
+        extra,
     )
 }
 
@@ -3183,7 +6615,8 @@ unsafe fn validate_surface_kernel_inputs(
     if copy_result.is_err() {
         super::driver::zluda_log_err(&format!(
             "VALIDATE_SURF {} #{}: handle=0x{:016x} desc_ptr=0x{:016x} shift={} READ FAILED {:?}",
-            name, call_n, surf_handle, desc_ptr, shift, copy_result));
+            name, call_n, surf_handle, desc_ptr, shift, copy_result
+        ));
         return;
     }
 
@@ -3280,9 +6713,13 @@ unsafe fn validate_multistage4_args(
         h_flags.as_mut_ptr() as _,
         hip_runtime_sys::hipDeviceptr_t(flags_ptr as *mut std::ffi::c_void),
         flags_byte_size,
-    ).is_err() {
+    )
+    .is_err()
+    {
         super::driver::zluda_log_err(&format!(
-            "VALIDATE {} #{}: flags read FAILED ptr=0x{:x}", name, call_n, flags_ptr));
+            "VALIDATE {} #{}: flags read FAILED ptr=0x{:x}",
+            name, call_n, flags_ptr
+        ));
         return;
     }
 
@@ -3292,9 +6729,13 @@ unsafe fn validate_multistage4_args(
         h_shape_idx.as_mut_ptr() as _,
         hip_runtime_sys::hipDeviceptr_t(shape_idx_ptr as *mut std::ffi::c_void),
         n * 4,
-    ).is_err() {
+    )
+    .is_err()
+    {
         super::driver::zluda_log_err(&format!(
-            "VALIDATE {} #{}: shape_idx read FAILED ptr=0x{:x}", name, call_n, shape_idx_ptr));
+            "VALIDATE {} #{}: shape_idx read FAILED ptr=0x{:x}",
+            name, call_n, shape_idx_ptr
+        ));
         return;
     }
 
@@ -3307,7 +6748,9 @@ unsafe fn validate_multistage4_args(
         if (flag & 0x11) == 1 {
             active_count += 1;
             let sh = h_shape_idx[i];
-            if sh > max_shape_idx { max_shape_idx = sh; }
+            if sh > max_shape_idx {
+                max_shape_idx = sh;
+            }
             *use_count.entry(sh).or_insert(0) += 1;
         }
     }
@@ -3322,10 +6765,16 @@ unsafe fn validate_multistage4_args(
         h_counters.as_mut_ptr() as _,
         hip_runtime_sys::hipDeviceptr_t(counter_ptr as *mut std::ffi::c_void),
         shape_count * 4,
-    ).is_err() {
+    )
+    .is_err()
+    {
         super::driver::zluda_log_err(&format!(
             "VALIDATE {} #{}: counter read FAILED ptr=0x{:x} size={}",
-            name, call_n, counter_ptr, shape_count * 4));
+            name,
+            call_n,
+            counter_ptr,
+            shape_count * 4
+        ));
         return;
     }
 
@@ -3335,7 +6784,8 @@ unsafe fn validate_multistage4_args(
         h_struct_bytes.as_mut_ptr() as _,
         hip_runtime_sys::hipDeviceptr_t(struct_ptr as *mut std::ffi::c_void),
         shape_count * 12,
-    ).is_ok();
+    )
+    .is_ok();
 
     // Check: for every unique shape index used, is the counter >= usage count?
     // If counter < uses, an atomic dec will underflow through zero.
@@ -3350,7 +6800,9 @@ unsafe fn validate_multistage4_args(
                 h_struct_bytes[off + 2],
                 h_struct_bytes[off + 3],
             ])
-        } else { 0 };
+        } else {
+            0
+        };
         if counter < uses {
             underflows.push((shape, counter, uses, base));
         }
@@ -3375,7 +6827,10 @@ unsafe fn validate_multistage4_args(
             .map(|i| format!("{}", h_counters[i]))
             .collect();
         super::driver::zluda_log_err(&format!(
-            "  counter[0..{}] = [{}]", dump_len, counters_str.join(",")));
+            "  counter[0..{}] = [{}]",
+            dump_len,
+            counters_str.join(",")
+        ));
         if struct_read_ok {
             let bases_str: Vec<String> = (0..dump_len)
                 .map(|i| {
@@ -3390,7 +6845,10 @@ unsafe fn validate_multistage4_args(
                 })
                 .collect();
             super::driver::zluda_log_err(&format!(
-                "  base[0..{}] = [{}]", dump_len, bases_str.join(",")));
+                "  base[0..{}] = [{}]",
+                dump_len,
+                bases_str.join(",")
+            ));
         }
     }
 
@@ -3424,7 +6882,9 @@ unsafe fn validate_multistage4_inputs(
 
     if num_particles == 0 || num_particles > 100_000 {
         super::driver::zluda_log_err(&format!(
-            "VALIDATE {}: numParticles={} (suspicious)", name, num_particles));
+            "VALIDATE {}: numParticles={} (suspicious)",
+            name, num_particles
+        ));
         return;
     }
 
@@ -3442,7 +6902,8 @@ unsafe fn validate_multistage4_inputs(
     if flags_result.is_err() {
         super::driver::zluda_log_err(&format!(
             "VALIDATE {}: flags read FAILED {:?} ptr={:?} size={}",
-            name, flags_result, flags_ptr, flags_byte_size));
+            name, flags_result, flags_ptr, flags_byte_size
+        ));
         return;
     }
 
@@ -3456,7 +6917,11 @@ unsafe fn validate_multistage4_inputs(
     if idx_result.is_err() {
         super::driver::zluda_log_err(&format!(
             "VALIDATE {}: index read FAILED {:?} ptr={:?} size={}",
-            name, idx_result, index_ptr, n * 4));
+            name,
+            idx_result,
+            index_ptr,
+            n * 4
+        ));
         return;
     }
 
@@ -3490,7 +6955,13 @@ unsafe fn validate_multistage4_inputs(
     if call_n < 10 || call_n % 10 == 0 || !bad_indices.is_empty() {
         super::driver::zluda_log_err(&format!(
             "VALIDATE {} #{}: n={} active={} max_idx={} bad={}",
-            name, call_n, n, active_count, max_index, bad_indices.len()));
+            name,
+            call_n,
+            n,
+            active_count,
+            max_index,
+            bad_indices.len()
+        ));
     }
 
     if !bad_indices.is_empty() {
@@ -3498,11 +6969,14 @@ unsafe fn validate_multistage4_inputs(
         for &(i, idx, flag) in &bad_indices[..show] {
             super::driver::zluda_log_err(&format!(
                 "  BAD [{}]: flag=0x{:04x} index=0x{:08x} ({})",
-                i, flag, idx, idx as i32));
+                i, flag, idx, idx as i32
+            ));
         }
         if bad_indices.len() > 10 {
             super::driver::zluda_log_err(&format!(
-                "  ... and {} more bad indices", bad_indices.len() - 10));
+                "  ... and {} more bad indices",
+                bad_indices.len() - 10
+            ));
         }
     }
 }
@@ -3522,7 +6996,9 @@ unsafe fn validate_create_grid_inputs(
 
     if num_particles <= 0 || num_particles > 200_000 {
         super::driver::zluda_log_err(&format!(
-            "VALIDATE CreateGrid: numParticles={} (suspicious)", num_particles));
+            "VALIDATE CreateGrid: numParticles={} (suspicious)",
+            num_particles
+        ));
         return;
     }
 
@@ -3536,7 +7012,8 @@ unsafe fn validate_create_grid_inputs(
     if result.is_err() {
         super::driver::zluda_log_err(&format!(
             "VALIDATE CreateGrid: sorted keys read FAILED {:?} ptr=0x{:x} n={}",
-            result, sorted_keys_dev, n));
+            result, sorted_keys_dev, n
+        ));
         return;
     }
 
@@ -3552,16 +7029,24 @@ unsafe fn validate_create_grid_inputs(
                 first_violation = Some(i);
             }
         }
-        if h_keys[i] < min_key { min_key = h_keys[i]; }
-        if h_keys[i] > max_key { max_key = h_keys[i]; }
+        if h_keys[i] < min_key {
+            min_key = h_keys[i];
+        }
+        if h_keys[i] > max_key {
+            max_key = h_keys[i];
+        }
     }
 
     // Check for unreasonable values (negative or extremely large)
     let mut negative_count = 0u32;
     let mut huge_count = 0u32;
     for &k in &h_keys {
-        if k < 0 { negative_count += 1; }
-        if k > 16_000_000 { huge_count += 1; }  // 16M cells seems extremely large
+        if k < 0 {
+            negative_count += 1;
+        }
+        if k > 16_000_000 {
+            huge_count += 1;
+        } // 16M cells seems extremely large
     }
 
     static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3573,14 +7058,21 @@ unsafe fn validate_create_grid_inputs(
     if call_n < 5 || call_n % 20 == 0 || has_issues {
         super::driver::zluda_log_err(&format!(
             "VALIDATE CreateGrid #{}: n={} min={} max={} violations={} neg={} huge={}",
-            call_n, n, min_key, max_key, violations, negative_count, huge_count));
+            call_n, n, min_key, max_key, violations, negative_count, huge_count
+        ));
     }
 
     if violations > 0 {
         let vi = first_violation.unwrap();
         super::driver::zluda_log_err(&format!(
             "*** SORT CORRUPTED #{}: first violation at [{}]: keys[{}]={} > keys[{}]={}",
-            call_n, vi, vi - 1, h_keys[vi - 1], vi, h_keys[vi]));
+            call_n,
+            vi,
+            vi - 1,
+            h_keys[vi - 1],
+            vi,
+            h_keys[vi]
+        ));
         // Dump keys around the first violation
         let start = vi.saturating_sub(5);
         let end = (vi + 5).min(n);
@@ -3598,18 +7090,24 @@ unsafe fn read_kernel_arg<T: Copy>(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
     arg_offset: usize, // byte offset in the flat buffer (for extra)
-    arg_index: usize,   // index in kernel_params array
+    arg_index: usize,  // index in kernel_params array
 ) -> Option<T> {
     if !kernel_params.is_null() {
         let param_ptr = *kernel_params.add(arg_index);
-        if param_ptr.is_null() { return None; }
+        if param_ptr.is_null() {
+            return None;
+        }
         Some(*(param_ptr as *const T))
     } else if !extra.is_null() {
         // extra format: [CU_LAUNCH_PARAM_BUFFER_POINTER(1), buffer_ptr, CU_LAUNCH_PARAM_BUFFER_SIZE(2), size_ptr, END]
         let extra_arr = std::slice::from_raw_parts(extra, 5);
-        if extra_arr[0] != (0x1usize as *mut ::core::ffi::c_void) { return None; }
+        if extra_arr[0] != (0x1usize as *mut ::core::ffi::c_void) {
+            return None;
+        }
         let buffer = extra_arr[1] as *const u8;
-        if buffer.is_null() { return None; }
+        if buffer.is_null() {
+            return None;
+        }
         Some(std::ptr::read_unaligned(buffer.add(arg_offset) as *const T))
     } else {
         None
@@ -3690,7 +7188,7 @@ unsafe fn validate_collide_particles_args(
     // 10: u64 contacts          @64
     let ptr_args: &[(usize, usize, &str)] = &[
         // (flat_offset, kernel_params_index, name)
-        (8,  2, "gridCellStart"),
+        (8, 2, "gridCellStart"),
         (16, 3, "gridCellEnd"),
         (24, 4, "sortedIndices"),
         (32, 5, "positions"),
@@ -3718,15 +7216,25 @@ unsafe fn validate_collide_particles_args(
     if !nulls.is_empty() || call_n < 3 {
         super::driver::zluda_log_err(&format!(
             "VALIDATE {} #{}: n={} nCells={} NULL=[{}] ptrs=[{}]",
-            name, call_n, n, n_cells,
-            if nulls.is_empty() { "none".to_string() } else { nulls.join(",") },
-            ptrs.join(", ")));
+            name,
+            call_n,
+            n,
+            n_cells,
+            if nulls.is_empty() {
+                "none".to_string()
+            } else {
+                nulls.join(",")
+            },
+            ptrs.join(", ")
+        ));
     }
 
     if !nulls.is_empty() {
         super::driver::zluda_log_err(&format!(
             "*** NULL POINTER in CollideParticles #{}: {} args are NULL!",
-            call_n, nulls.join(", ")));
+            call_n,
+            nulls.join(", ")
+        ));
     }
 }
 
@@ -3751,7 +7259,9 @@ unsafe fn validate_create_grid_from_args(
 
     if num_particles <= 0 || num_particles > 200_000 {
         super::driver::zluda_log_err(&format!(
-            "VALIDATE CreateGrid: numParticles={} (suspicious)", num_particles));
+            "VALIDATE CreateGrid: numParticles={} (suspicious)",
+            num_particles
+        ));
         return;
     }
 
@@ -3769,7 +7279,8 @@ unsafe fn validate_create_grid_from_args(
     if result.is_err() {
         super::driver::zluda_log_err(&format!(
             "VALIDATE CreateGrid: sorted keys read FAILED {:?} ptr=0x{:x} n={}",
-            result, sorted_keys_dev, n));
+            result, sorted_keys_dev, n
+        ));
         return;
     }
 
@@ -3786,9 +7297,15 @@ unsafe fn validate_create_grid_from_args(
                 first_violation = Some(i);
             }
         }
-        if h_keys[i] < min_key { min_key = h_keys[i]; }
-        if h_keys[i] > max_key { max_key = h_keys[i]; }
-        if h_keys[i] < 0 { negative_count += 1; }
+        if h_keys[i] < min_key {
+            min_key = h_keys[i];
+        }
+        if h_keys[i] > max_key {
+            max_key = h_keys[i];
+        }
+        if h_keys[i] < 0 {
+            negative_count += 1;
+        }
     }
 
     static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3799,14 +7316,20 @@ unsafe fn validate_create_grid_from_args(
     if call_n < 3 || call_n % 50 == 0 || has_issues {
         super::driver::zluda_log_err(&format!(
             "VALIDATE CreateGrid #{}: n={} read={} min={} max={} violations={} neg={}",
-            call_n, n, read_n, min_key, max_key, violations, negative_count));
+            call_n, n, read_n, min_key, max_key, violations, negative_count
+        ));
     }
 
     if violations > 0 {
         let vi = first_violation.unwrap();
         super::driver::zluda_log_err(&format!(
             "*** SORT CORRUPTED #{}: [{}]={} > [{}]={}",
-            call_n, vi - 1, h_keys[vi - 1], vi, h_keys[vi]));
+            call_n,
+            vi - 1,
+            h_keys[vi - 1],
+            vi,
+            h_keys[vi]
+        ));
         let start = vi.saturating_sub(3);
         let end = (vi + 4).min(read_n);
         let around: Vec<String> = (start..end)
@@ -3856,7 +7379,9 @@ mod tests {
         }
         // Should return immediately — no panic, no HIP calls (because the
         // ms4_capture_enabled gate is also off in tests by default).
-        unsafe { force_zero_rd5_22176_before_ms1(); }
+        unsafe {
+            force_zero_rd5_22176_before_ms1();
+        }
         // Restore in case other tests need it.
         {
             let mut g = match TRACKED_RD5_PTRS.lock() {
@@ -3892,7 +7417,8 @@ mod tests {
         // Adding 0 must be a no-op (we use 0 as a sentinel for "no rd5").
         track_rd5_ptr(0);
         assert_eq!(
-            TRACKED_RD5_PTRS.lock().unwrap().len(), 0,
+            TRACKED_RD5_PTRS.lock().unwrap().len(),
+            0,
             "track_rd5_ptr(0) must not add anything"
         );
 
@@ -3902,7 +7428,8 @@ mod tests {
             track_rd5_ptr(fake_ptr);
         }
         assert_eq!(
-            TRACKED_RD5_PTRS.lock().unwrap().len(), MS3_MAX_TRACKED_COUNTERS,
+            TRACKED_RD5_PTRS.lock().unwrap().len(),
+            MS3_MAX_TRACKED_COUNTERS,
             "should track up to MS3_MAX_TRACKED_COUNTERS distinct ptrs"
         );
 
@@ -3912,14 +7439,16 @@ mod tests {
             track_rd5_ptr(fake_ptr);
         }
         assert_eq!(
-            TRACKED_RD5_PTRS.lock().unwrap().len(), MS3_MAX_TRACKED_COUNTERS,
+            TRACKED_RD5_PTRS.lock().unwrap().len(),
+            MS3_MAX_TRACKED_COUNTERS,
             "duplicate adds must not grow the tracked list"
         );
 
         // Adding a NEW pointer beyond the limit silently drops.
         track_rd5_ptr(0xdead_0000_0000_00ffu64);
         assert_eq!(
-            TRACKED_RD5_PTRS.lock().unwrap().len(), MS3_MAX_TRACKED_COUNTERS,
+            TRACKED_RD5_PTRS.lock().unwrap().len(),
+            MS3_MAX_TRACKED_COUNTERS,
             "additions beyond MS3_MAX_TRACKED_COUNTERS must be silently dropped"
         );
 
@@ -3931,5 +7460,928 @@ mod tests {
             };
             *g = snapshot;
         }
+    }
+
+    #[test]
+    fn launch_mutex_uses_dedicated_lock() {
+        let lock = launch_mutex(1).expect("mode 1 should enable the launch mutex");
+        assert!(
+            std::ptr::eq(lock, &LAUNCH_LOCK),
+            "launch mutex mode should use the dedicated launch lock"
+        );
+        assert!(
+            !std::ptr::eq(lock, &crate::r#impl::stream::NULL_STREAM_LOCK),
+            "launch mutex mode must not reuse NULL_STREAM_LOCK or NULL-stream launches can deadlock"
+        );
+    }
+
+    #[test]
+    fn launch_mutex_mode_zero_is_disabled() {
+        assert!(
+            launch_mutex(0).is_none(),
+            "mode 0 should leave launch serialization disabled"
+        );
+    }
+
+    #[test]
+    fn summarize_sorted_keys_detects_bad_values_and_ordering() {
+        let summary = summarize_sorted_keys(&[1, 2, 7, -1, 6, 20_000_001]).unwrap();
+        assert_eq!(summary.min_key, -1);
+        assert_eq!(summary.max_key, 20_000_001);
+        assert_eq!(summary.violations, 1);
+        assert_eq!(summary.first_violation, Some(3));
+        assert_eq!(summary.negative_count, 1);
+        assert_eq!(summary.huge_count, 1);
+        assert_eq!(summary.first_bad_value, Some((3, -1)));
+    }
+
+    #[test]
+    fn restore_signed_radix_residue_clears_xor_stuck_negatives() {
+        let corrupted = [10, 11, 0x8000_000cu32 as i32, 13];
+        let restored = restore_signed_radix_residue(&corrupted);
+        assert_eq!(restored, vec![10, 11, 12, 13]);
+        let summary = summarize_sorted_keys(&restored).unwrap();
+        assert_eq!(summary.violations, 0);
+        assert_eq!(summary.negative_count, 0);
+        assert_eq!(summary.first_bad_value, None);
+    }
+
+    #[test]
+    fn summarize_sort_values_accepts_reordered_multiset() {
+        let summary = summarize_sort_values(&[10, 20, 10, 30], &[10, 30, 10, 20]).unwrap();
+        assert_eq!(summary.negative_count, 0);
+        assert_eq!(summary.extra_count, 0);
+        assert_eq!(summary.missing_count, 0);
+        assert_eq!(summary.first_extra, None);
+        assert_eq!(summary.first_missing, None);
+    }
+
+    #[test]
+    fn summarize_sort_values_detects_extra_and_missing_entries() {
+        let summary = summarize_sort_values(&[10, 20, 10, 30], &[10, 20, 20, 30]).unwrap();
+        assert_eq!(summary.negative_count, 0);
+        assert_eq!(summary.extra_count, 1);
+        assert_eq!(summary.missing_count, 1);
+        assert_eq!(summary.first_extra, Some((2, 20, 1, 2)));
+        assert_eq!(summary.first_missing, Some((0, 10, 2, 1)));
+    }
+
+    #[test]
+    fn good_sort_replay_baseline_capture_matches_clean_bit0_game_shape() {
+        let summary_out = SortedKeySummary {
+            min_key: 5,
+            max_key: 1_605_599,
+            violations: 3741,
+            negative_count: 0,
+            huge_count: 0,
+            first_violation: Some(1),
+            first_bad_value: None,
+        };
+        let vals_summary = SortValueSummary {
+            negative_count: 0,
+            extra_count: 0,
+            missing_count: 0,
+            first_negative: None,
+            first_extra: None,
+            first_missing: None,
+        };
+        assert_eq!(
+            classify_good_sort_replay_capture(0, 8109, 0, 0, summary_out, Some(vals_summary)),
+            Some(GoodSortReplayCaptureKind::TargetBit0N8109)
+        );
+    }
+
+    #[test]
+    fn good_sort_replay_baseline_capture_accepts_large_clean_fallback_family() {
+        let summary_out = SortedKeySummary {
+            min_key: 114,
+            max_key: 1_602_345,
+            violations: 917,
+            negative_count: 0,
+            huge_count: 0,
+            first_violation: Some(2),
+            first_bad_value: None,
+        };
+        let vals_summary = SortValueSummary {
+            negative_count: 0,
+            extra_count: 0,
+            missing_count: 0,
+            first_negative: None,
+            first_extra: None,
+            first_missing: None,
+        };
+        assert_eq!(
+            classify_good_sort_replay_capture(0, 1985, 0, 0, summary_out, Some(vals_summary)),
+            Some(GoodSortReplayCaptureKind::FallbackBit0LargeClean)
+        );
+    }
+
+    #[test]
+    fn good_sort_replay_baseline_capture_rejects_zero_fill_and_wrong_flags() {
+        let clean_out = SortedKeySummary {
+            min_key: 0,
+            max_key: 0,
+            violations: 0,
+            negative_count: 0,
+            huge_count: 0,
+            first_violation: None,
+            first_bad_value: None,
+        };
+        let zero_fill_vals = SortValueSummary {
+            negative_count: 0,
+            extra_count: 8109,
+            missing_count: 8109,
+            first_negative: None,
+            first_extra: Some((0, 0, 0, 1)),
+            first_missing: Some((0, 1, 1, 0)),
+        };
+        assert_eq!(
+            classify_good_sort_replay_capture(0, 8109, 0, 0, clean_out, Some(zero_fill_vals)),
+            None
+        );
+        let clean_vals = SortValueSummary {
+            negative_count: 0,
+            extra_count: 0,
+            missing_count: 0,
+            first_negative: None,
+            first_extra: None,
+            first_missing: None,
+        };
+        assert_eq!(
+            classify_good_sort_replay_capture(0, 8109, 1, 0, clean_out, Some(clean_vals)),
+            None
+        );
+        assert_eq!(
+            classify_good_sort_replay_capture(4, 8109, 0, 0, clean_out, Some(clean_vals)),
+            None
+        );
+        assert_eq!(
+            classify_good_sort_replay_capture(0, 877, 0, 0, clean_out, Some(clean_vals)),
+            None
+        );
+    }
+
+    #[test]
+    fn good_sort_replay_capture_write_retries_after_failure_and_latches_on_success() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let captured = AtomicBool::new(false);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing_dir = std::env::temp_dir().join(format!(
+            "zluda-missing-good-capture-{}-{}",
+            std::process::id(),
+            nonce
+        ));
+        let missing_path = missing_dir.join("capture.bin");
+        let failed_line = write_good_sort_replay_capture_once(
+            &captured,
+            missing_path.to_str().unwrap(),
+            Some(&[1, 2, 3, 4]),
+            0,
+            8109,
+            5,
+            80,
+        )
+        .unwrap();
+        assert!(
+            failed_line.contains("write_err="),
+            "failed write should be reported explicitly: {}",
+            failed_line
+        );
+        assert!(
+            !captured.load(Ordering::Relaxed),
+            "failed writes should release the good-capture latch for a later retry"
+        );
+
+        let success_path = std::env::temp_dir().join(format!(
+            "zluda-good-capture-{}-{}.bin",
+            std::process::id(),
+            nonce
+        ));
+        let success_line = write_good_sort_replay_capture_once(
+            &captured,
+            success_path.to_str().unwrap(),
+            Some(&[9, 8, 7, 6]),
+            0,
+            8109,
+            5,
+            80,
+        )
+        .unwrap();
+        assert!(
+            success_line.contains("SORT_REPLAY_CAPTURE_GOOD"),
+            "successful writes should log the emitted artifact: {}",
+            success_line
+        );
+        assert_eq!(std::fs::read(&success_path).unwrap(), vec![9, 8, 7, 6]);
+        assert!(
+            captured.load(Ordering::Relaxed),
+            "successful writes should keep the good-capture latch set"
+        );
+
+        let second_path = std::env::temp_dir().join(format!(
+            "zluda-good-capture-{}-{}-second.bin",
+            std::process::id(),
+            nonce
+        ));
+        assert!(
+            write_good_sort_replay_capture_once(
+                &captured,
+                second_path.to_str().unwrap(),
+                Some(&[5, 4, 3, 2]),
+                0,
+                8109,
+                5,
+                80,
+            )
+            .is_none(),
+            "once the good capture is written, later candidates should stay suppressed"
+        );
+        assert!(
+            !second_path.exists(),
+            "suppressed follow-up writes should not emit another artifact"
+        );
+
+        let _ = std::fs::remove_file(success_path);
+    }
+
+    #[test]
+    fn reconstruct_expected_sort_pass_preserves_stable_radix_order() {
+        let expected = reconstruct_expected_sort_pass(
+            &[0x23, 0x10, 0x31, 0x12, 0x01],
+            &[23, 10, 31, 12, 1],
+            0,
+        )
+        .unwrap();
+        assert_eq!(expected.keys_out, vec![0x10, 0x31, 0x01, 0x12, 0x23]);
+        assert_eq!(expected.values_out, vec![10, 31, 1, 12, 23]);
+        assert_eq!(expected.output_to_input, vec![1, 2, 4, 3, 0]);
+    }
+
+    #[test]
+    fn analyze_expected_sort_pass_reports_expected_destinations() {
+        let keys_in = [0x10, 0x21, 0x01, 0x12];
+        let values_in = [10, 20, 30, 40];
+        let keys_out = [0x10, 0x21, 0x21, 0x12];
+        let values_out = [10, 20, 20, 40];
+        let vals_summary = summarize_sort_values(&values_in, &values_out);
+        let diag = analyze_expected_sort_pass(
+            &keys_in,
+            &values_in,
+            &keys_out,
+            &values_out,
+            0,
+            vals_summary,
+        )
+        .unwrap();
+        let mismatch = diag.mismatch_line.unwrap();
+        assert!(
+            mismatch.contains("out[2] bit=0 digit=1 expected=in[2]"),
+            "unexpected mismatch summary: {}",
+            mismatch
+        );
+        assert!(
+            mismatch.contains("actual_expected_out=[1]"),
+            "mismatch summary should point back to the duplicated pair's rightful destination: {}",
+            mismatch
+        );
+        assert_eq!(
+            diag.extra_positions,
+            Some("EXPECT_POS extra=20 expected_out=[1] actual_out=[1, 2]".to_string())
+        );
+        assert_eq!(
+            diag.missing_positions,
+            Some("EXPECT_POS missing=30 expected_out=[2] actual_out=[]".to_string())
+        );
+        assert!(
+            diag.expected_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("EXPECT"),
+            "expected window should be populated around the first mismatch"
+        );
+        assert_eq!(
+            diag.actual_pair_route,
+            Some(
+                "ACTUAL_PAIR_ROUTE in[1] -> expected_out[1] -> out[2] k:33(0x00000021) v:20"
+                    .to_string()
+            )
+        );
+        assert!(
+            diag.actual_pair_source_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACTUAL_PAIR_SRC_OUT"),
+            "source window should be populated when the bad pair exists elsewhere in output"
+        );
+        assert!(
+            diag.actual_pair_clone_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACTUAL_PAIR_DST_OUT"),
+            "clone window should be populated when the bad pair is replayed into another slot"
+        );
+        assert_eq!(
+            diag.actual_value_route,
+            Some("ACTUAL_VALUE_ROUTE in[1] -> expected_out[1] -> out[2] v:20".to_string())
+        );
+        assert!(
+            diag.actual_value_input_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACTUAL_VALUE_SRC_IN"),
+            "input window should be populated for the foreign value's source slot"
+        );
+        assert_eq!(
+            diag.actual_value_input_run,
+            Some("ACTUAL_VALUE_INPUT_RUN in[1] -> out[2] start_in=1 start_out=2 len=1".to_string())
+        );
+        assert!(
+            diag.actual_value_expected_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("EXPECT_VALUE_SRC"),
+            "expected value-source window should be populated when the value belongs elsewhere in output"
+        );
+        assert_eq!(
+            diag.actual_value_expected_run,
+            Some(
+                "ACTUAL_VALUE_EXPECTED_RUN expected_out[1] -> out[2] start_expected=1 start_out=2 len=1"
+                    .to_string()
+            )
+        );
+        assert!(
+            diag.actual_value_source_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACTUAL_VALUE_SRC_OUT"),
+            "value source window should be populated when the value belongs elsewhere in output"
+        );
+        assert!(
+            diag.actual_value_clone_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACTUAL_VALUE_DST_OUT"),
+            "value clone window should be populated when the value is replayed into another slot"
+        );
+        assert_eq!(
+            diag.actual_value_source_diff,
+            Some(
+                "ACTUAL_VALUE_SRC_DIFF[0..4): mismatch_count=1 mismatches=[2] runs=[2..3]"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            diag.actual_value_clone_diff,
+            Some(
+                "ACTUAL_VALUE_DST_DIFF[0..4): mismatch_count=1 mismatches=[2] runs=[2..3]"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn analyze_expected_sort_pass_tracks_xor_restored_actual_pairs() {
+        let keys_in = [0x05, 0x17];
+        let values_in = [50, 70];
+        let keys_out = [0x05, 0x8000_0017u32 as i32];
+        let values_out = [50, 70];
+        let vals_summary = summarize_sort_values(&values_in, &values_out);
+        let diag = analyze_expected_sort_pass(
+            &keys_in,
+            &values_in,
+            &keys_out,
+            &values_out,
+            0,
+            vals_summary,
+        )
+        .unwrap();
+        let mismatch = diag.mismatch_line.unwrap();
+        assert!(
+            mismatch.contains("actual_xor=k:23(0x00000017)"),
+            "mismatch summary should include the xor-restored pair: {}",
+            mismatch
+        );
+        assert!(
+            mismatch.contains("expected_out=[1]"),
+            "xor-restored pair should point back to its rightful destination: {}",
+            mismatch
+        );
+        assert!(
+            mismatch.contains("actual_value_src=in[1]=k:23(0x00000017) digit=7 expected_out[1]=k:23(0x00000017) digit=7"),
+            "mismatch summary should show where the value legitimately belongs: {}",
+            mismatch
+        );
+        assert_eq!(
+            diag.actual_value_route,
+            Some("ACTUAL_VALUE_ROUTE in[1] -> expected_out[1] -> out[1] v:70".to_string())
+        );
+        assert!(
+            diag.actual_value_input_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACTUAL_VALUE_SRC_IN"),
+            "input window should be populated even when the value stayed at its rightful slot"
+        );
+        assert_eq!(
+            diag.actual_value_input_run,
+            Some("ACTUAL_VALUE_INPUT_RUN in[1] -> out[1] start_in=0 start_out=0 len=2".to_string())
+        );
+        assert!(
+            diag.actual_value_expected_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("EXPECT_VALUE_SRC"),
+            "expected value-source window should be populated even when the value stayed at its rightful slot"
+        );
+        assert_eq!(
+            diag.actual_value_expected_run,
+            Some(
+                "ACTUAL_VALUE_EXPECTED_RUN expected_out[1] -> out[1] start_expected=0 start_out=0 len=2"
+                    .to_string()
+            )
+        );
+        assert!(
+            diag.actual_value_source_window
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACTUAL_VALUE_SRC_OUT"),
+            "value source window should be populated even when the value stayed at its rightful slot"
+        );
+        assert!(
+            diag.actual_value_clone_window.is_none(),
+            "value clone window should stay empty when the value did not move"
+        );
+        assert_eq!(
+            diag.actual_value_source_diff,
+            Some(
+                "ACTUAL_VALUE_SRC_DIFF[0..2): mismatch_count=1 mismatches=[1] runs=[1..2]"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            diag.actual_value_clone_diff,
+            Some(
+                "ACTUAL_VALUE_DST_DIFF[0..2): mismatch_count=1 mismatches=[1] runs=[1..2]"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn analyze_downsweep_rank_diagnostics_reports_scan_counts_and_destinations() {
+        let grid_share = SortGridEvenShare {
+            total_grains: 2,
+            big_blocks: 0,
+            big_share: 4,
+            normal_share: 2,
+            normal_base_offset: 0,
+            num_items: 4,
+            grid_size: 2,
+            block_offset: 0,
+            block_end: 0,
+        };
+        let keys_in = [0x02, 0x0c, 0x01, 0x0d];
+        let values_in = [100, 200, 300, 400];
+        let keys_out = [0x01, 0x8000_000cu32 as i32, 0x02, 0x0d];
+        let values_out = [300, 200, 100, 400];
+        let diag = analyze_downsweep_rank_diagnostics(
+            &keys_in,
+            &values_in,
+            &keys_out,
+            &values_out,
+            0,
+            Some(grid_share),
+        )
+        .unwrap();
+        let expected_line = diag.expected_line.unwrap();
+        assert!(
+            expected_line.contains("RANK_EXPECTED out[1] source=in[0]"),
+            "expected rank trace should identify the rightful source: {}",
+            expected_line
+        );
+        assert!(
+            expected_line.contains("scan_counts=[1, 0]"),
+            "expected rank trace should include the per-block digit counts: {}",
+            expected_line
+        );
+        assert!(
+            expected_line.contains("digit_base=1 local_rank=0 global_rank=0 scatter_dst=1"),
+            "expected rank trace should include the computed destination: {}",
+            expected_line
+        );
+        let actual_line = diag.actual_line.unwrap();
+        assert!(
+            actual_line.contains("RANK_ACTUAL out[1] source=in[1]"),
+            "actual rank trace should identify the foreign value source: {}",
+            actual_line
+        );
+        assert!(
+            actual_line.contains("output_k:-2147483636(0x8000000c)"),
+            "actual rank trace should include the mismatching output key: {}",
+            actual_line
+        );
+        assert!(
+            actual_line.contains("digit_base=2 local_rank=0 global_rank=0 scatter_dst=2"),
+            "actual rank trace should compare the computed destination against where the value landed: {}",
+            actual_line
+        );
+        assert!(
+            actual_line.contains("actual_dst=1"),
+            "actual rank trace should record the mismatching destination slot: {}",
+            actual_line
+        );
+    }
+
+    #[test]
+    fn analyze_downsweep_block_capture_formats_full_block_artifact() {
+        let grid_share = SortGridEvenShare {
+            total_grains: 2,
+            big_blocks: 0,
+            big_share: 4,
+            normal_share: 2,
+            normal_base_offset: 0,
+            num_items: 4,
+            grid_size: 2,
+            block_offset: 0,
+            block_end: 0,
+        };
+        let keys_in = [0x02, 0x0c, 0x01, 0x0d];
+        let values_in = [100, 200, 300, 400];
+        let keys_out = [0x01, 0x8000_000cu32 as i32, 0x02, 0x0d];
+        let values_out = [300, 200, 100, 400];
+        let capture = analyze_downsweep_block_capture(
+            &keys_in,
+            &values_in,
+            &keys_out,
+            &values_out,
+            0,
+            Some(grid_share),
+        )
+        .unwrap();
+        assert_eq!(capture.block_idx, 0);
+        assert_eq!((capture.start, capture.end), (0, 2));
+        assert_eq!(capture.expected_source_block, 0);
+        assert_eq!(capture.actual_source_block, Some(0));
+        assert!(
+            capture
+                .capture_text
+                .contains("SORT_CTA_CAPTURE bit=0 block=0 range=[0..2) mismatch_out=1 expected_src=in[0] actual_value_src=Some(1)"),
+            "capture header should identify the mismatch and source slots: {}",
+            capture.capture_text
+        );
+        assert!(
+            capture.capture_text.contains("![1]"),
+            "capture should mark the mismatching output slot: {}",
+            capture.capture_text
+        );
+        assert!(
+            capture
+                .capture_text
+                .contains("actual k:-2147483636(0x8000000c) v:200 d:12 xor_k:12(0x0000000c)"),
+            "capture should include the synthetic output key and xor-restored note: {}",
+            capture.capture_text
+        );
+    }
+
+    #[test]
+    fn analyze_downsweep_block_capture_handles_nonzero_bit_passes() {
+        let grid_share = SortGridEvenShare {
+            total_grains: 2,
+            big_blocks: 0,
+            big_share: 4,
+            normal_share: 2,
+            normal_base_offset: 0,
+            num_items: 4,
+            grid_size: 2,
+            block_offset: 0,
+            block_end: 0,
+        };
+        let keys_in = [0x02, 0x0c, 0x01, 0x0d];
+        let values_in = [100, 200, 300, 400];
+        let keys_out = [0x01, 0x8000_000cu32 as i32, 0x02, 0x0d];
+        let values_out = [300, 200, 100, 400];
+        let capture = analyze_downsweep_block_capture(
+            &keys_in,
+            &values_in,
+            &keys_out,
+            &values_out,
+            4,
+            Some(grid_share),
+        )
+        .unwrap();
+        assert!(
+            capture.capture_text.contains("SORT_CTA_CAPTURE bit=4"),
+            "capture header should preserve the pass bit for nonzero-bit passes: {}",
+            capture.capture_text
+        );
+        assert!(
+            capture
+                .capture_text
+                .contains("actual k:-2147483636(0x8000000c) v:200 d:0 xor_k:12(0x0000000c)"),
+            "capture should recompute digits using the current pass bit: {}",
+            capture.capture_text
+        );
+    }
+
+    #[test]
+    fn analyze_downsweep_block_capture_includes_cross_block_source_section() {
+        let grid_share = SortGridEvenShare {
+            total_grains: 2,
+            big_blocks: 0,
+            big_share: 4,
+            normal_share: 2,
+            normal_base_offset: 0,
+            num_items: 4,
+            grid_size: 2,
+            block_offset: 0,
+            block_end: 0,
+        };
+        let keys_in = [0x11, 0x12, 0x21, 0x22];
+        let values_in = [100, 101, 200, 201];
+        let keys_out = [0x11, 0x12, 0x11, 0x12];
+        let values_out = [100, 101, 100, 101];
+        let capture = analyze_downsweep_block_capture(
+            &keys_in,
+            &values_in,
+            &keys_out,
+            &values_out,
+            4,
+            Some(grid_share),
+        )
+        .unwrap();
+        assert!(
+            capture.capture_text.contains("DEST_BLOCK block=1 range=[2..4)"),
+            "capture should include the destination block section: {}",
+            capture.capture_text
+        );
+        assert!(
+            capture
+                .capture_text
+                .contains("ACTUAL_SOURCE_BLOCK block=0 range=[0..2)"),
+            "capture should include the foreign source block when the replay crosses blocks: {}",
+            capture.capture_text
+        );
+    }
+
+    #[test]
+    fn sort_pass_capture_len_uses_grid_share_coverage() {
+        let grid_share = SortGridEvenShare {
+            total_grains: 5,
+            big_blocks: 0,
+            big_share: 3328,
+            normal_share: 1664,
+            normal_base_offset: 0,
+            num_items: 8109,
+            grid_size: 5,
+            block_offset: 0,
+            block_end: 0,
+        };
+        assert_eq!(sort_pass_capture_len(8109, Some(grid_share)), 8320);
+        assert_eq!(sort_pass_capture_len(8109, None), 8109);
+    }
+
+    #[test]
+    fn serialize_sort_pass_replay_capture_writes_expected_header_and_payload() {
+        let bytes = serialize_sort_pass_replay_capture(
+            615,
+            12,
+            2,
+            5,
+            128,
+            1,
+            1,
+            256,
+            0,
+            1,
+            1,
+            0x1000,
+            0x2000,
+            0x3000,
+            0x4000,
+            0x5000,
+            0x6000,
+            &[10, 20],
+            Some(&[100, 200]),
+            &[11, 12],
+            Some(&[110, 120]),
+            &[21, 22],
+            Some(&[210, 220]),
+            &[30, 40],
+            Some(&[300, 400]),
+            &[7, 8, 9],
+            Some(SortGridEvenShare {
+                total_grains: 5,
+                big_blocks: 0,
+                big_share: 3328,
+                normal_share: 1664,
+                normal_base_offset: 0,
+                num_items: 2,
+                grid_size: 5,
+                block_offset: 0,
+                block_end: 0,
+            }),
+        )
+        .unwrap();
+        let read_u32 = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let read_i32 = |offset| i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(read_u32(0), SORT_PASS_REPLAY_CAPTURE_MAGIC);
+        assert_eq!(read_u32(4), SORT_PASS_REPLAY_CAPTURE_VERSION);
+        assert_eq!(read_u32(8), 615);
+        assert_eq!(read_u32(12), 12);
+        assert_eq!(read_u32(16), 2);
+        assert_eq!(read_u32(20), 2);
+        assert_eq!(read_u32(24), 5);
+        assert_eq!(
+            read_u32(32),
+            SORT_PASS_REPLAY_CAPTURE_FLAG_HAS_VALS | SORT_PASS_REPLAY_CAPTURE_FLAG_HAS_GRID_SHARE
+        );
+        assert_eq!(read_u32(28), 3);
+        assert_eq!(read_u32(36), pack_sort_replay_launch_flags(0, 1, 1));
+        assert_eq!(read_u32(40), 128);
+        assert_eq!(read_u32(44), 1);
+        assert_eq!(read_u32(48), 1);
+        assert_eq!(read_u32(52), 256);
+        assert_eq!(u64::from_le_bytes(bytes[56..64].try_into().unwrap()), 0x1000);
+        assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 0x2000);
+        assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 0x3000);
+        assert_eq!(u64::from_le_bytes(bytes[80..88].try_into().unwrap()), 0x4000);
+        assert_eq!(u64::from_le_bytes(bytes[88..96].try_into().unwrap()), 0x5000);
+        assert_eq!(u64::from_le_bytes(bytes[96..104].try_into().unwrap()), 0x6000);
+        assert_eq!(read_i32(104), 5);
+        assert_eq!(read_i32(136), 0);
+        assert_eq!(read_i32(140), 10);
+        assert_eq!(read_i32(144), 20);
+        assert_eq!(read_i32(148), 100);
+        assert_eq!(read_i32(152), 200);
+        assert_eq!(read_i32(156), 11);
+        assert_eq!(read_i32(160), 12);
+        assert_eq!(read_i32(164), 110);
+        assert_eq!(read_i32(168), 120);
+        assert_eq!(read_i32(172), 21);
+        assert_eq!(read_i32(176), 22);
+        assert_eq!(read_i32(180), 210);
+        assert_eq!(read_i32(184), 220);
+        assert_eq!(read_i32(188), 30);
+        assert_eq!(read_i32(192), 40);
+        assert_eq!(read_i32(196), 300);
+        assert_eq!(read_i32(200), 400);
+        assert_eq!(read_u32(204), 7);
+        assert_eq!(read_u32(212), 9);
+        assert_eq!(bytes.len(), 216);
+    }
+
+    #[test]
+    fn creategrid_sorted_keys_copy_match_requires_expected_layout() {
+        let sorted_keys = 0x1000_u64;
+        let n = 64usize;
+        assert!(is_creategrid_sorted_keys_copy(
+            sorted_keys,
+            n,
+            sorted_keys,
+            sorted_keys + (n * 4) as u64,
+            n * 4,
+        ));
+        assert!(
+            !is_creategrid_sorted_keys_copy(sorted_keys, n, sorted_keys, sorted_keys + 4, n * 4,),
+            "unexpected source offset must not match the CreateGrid overwrite pattern"
+        );
+    }
+
+    #[test]
+    fn classify_creategrid_sort_buffer_distinguishes_input_and_copy_source() {
+        let sorted_keys = 0x2000_u64;
+        let n = 128usize;
+        assert_eq!(
+            classify_creategrid_sort_buffer(sorted_keys, n, sorted_keys),
+            Some(CreateGridSortBufferRole::CreateGridInput)
+        );
+        assert_eq!(
+            classify_creategrid_sort_buffer(sorted_keys, n, sorted_keys + (n * 4) as u64),
+            Some(CreateGridSortBufferRole::CopySource)
+        );
+        assert_eq!(
+            classify_creategrid_sort_buffer(sorted_keys, n, sorted_keys + 8),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_launch_extra_for_creategrid_sort_refs_finds_both_roles() {
+        let sorted_keys = 0x4000_u64;
+        let n = 64usize;
+        let copy_src = sorted_keys + (n * 4) as u64;
+        let mut extra = vec![0u8; 48];
+        extra[8..16].copy_from_slice(&sorted_keys.to_le_bytes());
+        extra[24..32].copy_from_slice(&copy_src.to_le_bytes());
+        let refs = scan_launch_extra_for_creategrid_sort_refs(sorted_keys, n, &extra);
+        assert_eq!(
+            refs,
+            vec![
+                CreateGridSortTouchArg {
+                    extra_offset: 8,
+                    buffer: sorted_keys,
+                    role: CreateGridSortBufferRole::CreateGridInput,
+                },
+                CreateGridSortTouchArg {
+                    extra_offset: 24,
+                    buffer: copy_src,
+                    role: CreateGridSortBufferRole::CopySource,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_launch_extra_for_creategrid_sort_refs_ignores_nonmatching_values() {
+        let sorted_keys = 0x5000_u64;
+        let n = 32usize;
+        let mut extra = vec![0u8; 32];
+        extra[0..8].copy_from_slice(&(sorted_keys + 4).to_le_bytes());
+        extra[8..16].copy_from_slice(&(sorted_keys + 8).to_le_bytes());
+        assert!(scan_launch_extra_for_creategrid_sort_refs(sorted_keys, n, &extra).is_empty());
+    }
+
+    fn pack_u16_stride4(values: &[u16]) -> Vec<u8> {
+        let mut bytes = vec![0u8; values.len() * 4];
+        for (i, value) in values.iter().copied().enumerate() {
+            let offset = i * 4;
+            bytes[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes
+    }
+
+    fn pack_u32(values: &[u32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn summarize_ms4_capture_detects_underflow_and_out_of_range() {
+        let flags = pack_u16_stride4(&[1, 1, 1, 1]);
+        let shape_idx = pack_u32(&[0, 1, 1, 99]);
+        let counters = pack_u32(&[1, 1]);
+        let summary = summarize_ms4_capture(&flags, &shape_idx, &counters, 4).unwrap();
+        assert_eq!(summary.active_count, 4);
+        assert_eq!(summary.unique_shapes, 2);
+        assert_eq!(summary.max_shape_idx, 99);
+        assert_eq!(summary.out_of_range_particles, 1);
+        assert_eq!(summary.first_out_of_range_particle, Some((3, 99, 1)));
+        assert_eq!(summary.underflow_count, 1);
+        assert_eq!(
+            summary.first_underflow,
+            Some(Ms4ShapeUseSummary {
+                shape: 1,
+                counter: 1,
+                uses: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn summarize_ms4_capture_counts_negative_used_counters() {
+        let flags = pack_u16_stride4(&[1, 1]);
+        let shape_idx = pack_u32(&[0, 1]);
+        let counters = pack_u32(&[0xffff_fffe, 0]);
+        let summary = summarize_ms4_capture(&flags, &shape_idx, &counters, 2).unwrap();
+        assert_eq!(summary.active_count, 2);
+        assert_eq!(summary.negative_used_shapes, 1);
+        assert_eq!(summary.zero_used_shapes, 1);
+        assert_eq!(summary.underflow_count, 1);
+        assert_eq!(
+            summary.first_underflow,
+            Some(Ms4ShapeUseSummary {
+                shape: 1,
+                counter: 0,
+                uses: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn summarize_sort_spine_reports_basic_stats() {
+        let summary = summarize_sort_spine(&[0, 3, 7, 0, 2]).unwrap();
+        assert_eq!(
+            summary,
+            SortSpineSummary {
+                words_read: 5,
+                nonzero_count: 3,
+                max_value: 7,
+                sum: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn format_sorted_key_window_centers_on_first_bad_value() {
+        let summary = summarize_sorted_keys(&[10, 11, 12, -1, 14, 15]).unwrap();
+        let window = format_sorted_key_window(&[10, 11, 12, -1, 14, 15], &summary, "OUT").unwrap();
+        assert!(window.contains("OUT[3]=-1"));
     }
 }

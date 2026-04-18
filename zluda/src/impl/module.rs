@@ -24,7 +24,9 @@ static SYNTHETIC_TEXREFS: std::sync::LazyLock<Mutex<HashMap<usize, hipDeviceptr_
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Check if a texture reference is synthetic and get its device global address
-pub(crate) fn get_synthetic_texref_global(tex_ref: *const textureReference) -> Option<hipDeviceptr_t> {
+pub(crate) fn get_synthetic_texref_global(
+    tex_ref: *const textureReference,
+) -> Option<hipDeviceptr_t> {
     SYNTHETIC_TEXREFS
         .lock()
         .ok()
@@ -106,18 +108,30 @@ fn get_best_ptx_and_compile(
             module_count += 1;
             match module {
                 Ok(CodeModuleRef::Text(ptx)) => {
-                    super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: Text PTX ({} bytes)", module_count, ptx.len()));
+                    super::driver::zluda_log(&format!(
+                        "[ZLUDA]   module[{}]: Text PTX ({} bytes)",
+                        module_count,
+                        ptx.len()
+                    ));
                     ptx_modules.push(Cow::Borrowed(ptx));
                 }
                 Ok(CodeModuleRef::File(file)) => {
-                    let kind = if file.header.kind == FatbinFileHeader::HEADER_KIND_PTX { "PTX" } else { "non-PTX" };
+                    let kind = if file.header.kind == FatbinFileHeader::HEADER_KIND_PTX {
+                        "PTX"
+                    } else {
+                        "non-PTX"
+                    };
                     super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: File kind={} sm={} payload_size={} compressed_size={} uncompressed_payload={} flags={:?}", module_count, kind, file.header.sm_version, file.header.payload_size, file.header.compressed_size, file.header.uncompressed_payload, file.header.flags));
                     if file.header.kind != FatbinFileHeader::HEADER_KIND_PTX {
                         return;
                     }
                     match file.get_or_decompress_content() {
                         Ok(text) => {
-                            super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: decompressed OK, {} bytes", module_count, text.len()));
+                            super::driver::zluda_log(&format!(
+                                "[ZLUDA]   module[{}]: decompressed OK, {} bytes",
+                                module_count,
+                                text.len()
+                            ));
                             match cow_bytes_to_str(text) {
                                 Some(text) => {
                                     super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: PTX text extracted ({} bytes), first 100 chars: {}", module_count, text.len(), &text[..text.len().min(100)]));
@@ -125,9 +139,14 @@ fn get_best_ptx_and_compile(
                                     {
                                         use std::io::Write;
                                         let _ = std::fs::create_dir_all("/tmp/zluda_ptx_dump");
-                                        static DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                                        let n = DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if let Ok(mut f) = std::fs::File::create(format!("/tmp/zluda_ptx_dump/module_{}.ptx", n)) {
+                                        static DUMP_COUNT: std::sync::atomic::AtomicU32 =
+                                            std::sync::atomic::AtomicU32::new(0);
+                                        let n = DUMP_COUNT
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if let Ok(mut f) = std::fs::File::create(format!(
+                                            "/tmp/zluda_ptx_dump/module_{}.ptx",
+                                            n
+                                        )) {
                                             let _ = f.write_all(text.as_bytes());
                                         }
                                     }
@@ -139,17 +158,27 @@ fn get_best_ptx_and_compile(
                             }
                         }
                         Err(_) => {
-                            super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: get_or_decompress_content FAILED", module_count));
+                            super::driver::zluda_log(&format!(
+                                "[ZLUDA]   module[{}]: get_or_decompress_content FAILED",
+                                module_count
+                            ));
                         }
                     }
                 }
                 _ => {
-                    super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: other format (ELF/Archive/Error)", module_count));
+                    super::driver::zluda_log(&format!(
+                        "[ZLUDA]   module[{}]: other format (ELF/Archive/Error)",
+                        module_count
+                    ));
                 }
             }
         })
     };
-    super::driver::zluda_log(&format!("[ZLUDA]   found {} total modules, {} PTX candidates", module_count, ptx_modules.len()));
+    super::driver::zluda_log(&format!(
+        "[ZLUDA]   found {} total modules, {} PTX candidates",
+        module_count,
+        ptx_modules.len()
+    ));
     if ptx_modules.is_empty() {
         super::driver::zluda_log("[ZLUDA]   NO PTX modules found!");
     }
@@ -170,7 +199,11 @@ fn get_best_ptx_and_compile(
                         ControlFlow::Continue(acc)
                     }
                     Ok(ast) => {
-                        super::driver::zluda_log(&format!("[ZLUDA]   PTX parsed OK, invalid_directives={}, directives={}", ast.invalid_directives, ast.directives.len()));
+                        super::driver::zluda_log(&format!(
+                            "[ZLUDA]   PTX parsed OK, invalid_directives={}, directives={}",
+                            ast.invalid_directives,
+                            ast.directives.len()
+                        ));
                         if ast.invalid_directives == 0 {
                             return ControlFlow::Break((src, ast));
                         } else {
@@ -193,7 +226,8 @@ fn get_best_ptx_and_compile(
         ControlFlow::Break((ast, module)) | ControlFlow::Continue(Some((ast, module))) => {
             super::driver::zluda_log("[ZLUDA]   selected PTX module for compilation");
             // Dump each PTX module with a unique counter for offline debugging
-            static PTX_DUMP_CTR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            static PTX_DUMP_CTR: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
             let n = PTX_DUMP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dump_path = format!("/tmp/zluda_ptx_{:03}.ptx", n);
             let _ = std::fs::write(&dump_path, ast.as_bytes());
@@ -235,13 +269,15 @@ fn get_best_ptx_and_compile(
     };
     let cached_binary = load_cached_binary(&mut cache_with_key);
     let from_cache = cached_binary.is_some();
-    let (elf_module, sm_version) = cached_binary
-        .ok_or(CUerror::UNKNOWN)
-        .or_else(|_| {
-            super::driver::zluda_log("[ZLUDA]   no cache hit, compiling PTX -> AMDGPU");
-            compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key)
-        })?;
-    super::driver::zluda_log(&format!("[ZLUDA]   ELF module ready ({} bytes, from_cache={})", elf_module.len(), from_cache));
+    let (elf_module, sm_version) = cached_binary.ok_or(CUerror::UNKNOWN).or_else(|_| {
+        super::driver::zluda_log("[ZLUDA]   no cache hit, compiling PTX -> AMDGPU");
+        compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key)
+    })?;
+    super::driver::zluda_log(&format!(
+        "[ZLUDA]   ELF module ready ({} bytes, from_cache={})",
+        elf_module.len(),
+        from_cache
+    ));
     let mut hip_module = unsafe { mem::zeroed() };
     super::driver::zluda_log("[ZLUDA]   calling hipModuleLoadData");
     unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) }?;
@@ -331,7 +367,10 @@ fn compile_and_cache(
         super::driver::zluda_log(&format!("[ZLUDA]   ptx::to_llvm_module FAILED: {}", e));
         CUerror::UNKNOWN
     })?;
-    super::driver::zluda_log(&format!("[ZLUDA]   ptx::to_llvm_module OK in {:?}, starting llvm_zluda::compile", compile_start.elapsed()));
+    super::driver::zluda_log(&format!(
+        "[ZLUDA]   ptx::to_llvm_module OK in {:?}, starting llvm_zluda::compile",
+        compile_start.elapsed()
+    ));
     let ptx_impl = llvm_module.linked_bitcode();
     let sm_version = llvm_module.metadata.sm_version;
     // Dump LLVM IR and assembly for debugging PTX compilation issues
@@ -340,28 +379,35 @@ fn compile_and_cache(
     // Direct test: write a marker file to confirm this code path runs
     {
         let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
-        let _ = std::fs::write(format!("/tmp/zluda_ir_dump/MARKER_{}", n), format!("compile #{}", n));
+        let _ = std::fs::write(
+            format!("/tmp/zluda_ir_dump/MARKER_{}", n),
+            format!("compile #{}", n),
+        );
     }
     let hook = move |data: &Vec<u8>, name: String| {
         let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
         let path = format!("/tmp/zluda_ir_dump/module_{}_{}", n, name);
-        super::driver::zluda_log_err(&format!("IR DUMP: {} ({} bytes) -> {}", name, data.len(), path));
+        super::driver::zluda_log_err(&format!(
+            "IR DUMP: {} ({} bytes) -> {}",
+            name,
+            data.len(),
+            path
+        ));
         let _ = std::fs::write(&path, data);
     };
-    let elf_module = llvm_zluda::compile(
-        &llvm_module.context,
-        gcn_arch,
-        llvm_module.llvm_ir,
-        ptx_impl,
-        llvm_module.attributes_ir,
-        llvm_module.metadata,
-        Some(&hook),
-    )
-    .map_err(|e| {
-        super::driver::zluda_log(&format!("[ZLUDA]   llvm_zluda::compile FAILED: {}", e));
-        CUerror::UNKNOWN
+    // Compile in a forked subprocess to survive LLVM abort() crashes.
+    // The AMDGPU backend can crash in loadRegFromStackSlot for very large
+    // kernels (e.g. BasicIOS_simulateKernel_templ). A subprocess isolates
+    // the crash so the game can continue without the affected module.
+    let elf_module = compile_in_subprocess(gcn_arch, llvm_module).map_err(|e| {
+        super::driver::zluda_log(&format!("[ZLUDA]   compile_in_subprocess FAILED: {:?}", e));
+        e
     })?;
-    super::driver::zluda_log(&format!("[ZLUDA]   llvm_zluda::compile OK in {:?}, {} bytes ELF", compile_start.elapsed(), elf_module.len()));
+    super::driver::zluda_log(&format!(
+        "[ZLUDA]   llvm_zluda::compile OK in {:?}, {} bytes ELF",
+        compile_start.elapsed(),
+        elf_module.len()
+    ));
     if let Some((cache, key)) = cache_with_key {
         key.last_access = zluda_cache::ModuleCache::time_now();
         cache.insert_module(key, &elf_module);
@@ -370,10 +416,7 @@ fn compile_and_cache(
 }
 
 #[allow(dead_code)]
-fn compile_in_subprocess(
-    gcn_arch: &str,
-    llvm_module: ptx::Module,
-) -> Result<Vec<u8>, CUerror> {
+fn compile_in_subprocess(gcn_arch: &str, llvm_module: ptx::Module) -> Result<Vec<u8>, CUerror> {
     use std::io::Write;
     // Create a temp file for the output
     let output_path = format!("/tmp/zluda_compile_{}.elf", std::process::id());
@@ -410,7 +453,10 @@ fn compile_in_subprocess(
         }
     }
     // Parent process — wait for child
-    super::driver::zluda_log(&format!("[ZLUDA]   waiting for compile subprocess pid={}", pid));
+    super::driver::zluda_log(&format!(
+        "[ZLUDA]   waiting for compile subprocess pid={}",
+        pid
+    ));
     let mut status: i32 = 0;
     let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
     if wait_result < 0 {
@@ -419,9 +465,20 @@ fn compile_in_subprocess(
         return Err(CUerror::UNKNOWN);
     }
     if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
-        let signal = if libc::WIFSIGNALED(status) { libc::WTERMSIG(status) } else { 0 };
-        super::driver::zluda_log(&format!("[ZLUDA]   compile subprocess failed: exit={}, signal={}", exit_code, signal));
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+        let signal = if libc::WIFSIGNALED(status) {
+            libc::WTERMSIG(status)
+        } else {
+            0
+        };
+        super::driver::zluda_log(&format!(
+            "[ZLUDA]   compile subprocess failed: exit={}, signal={}",
+            exit_code, signal
+        ));
         // Try to read error message
         if let Ok(msg) = std::fs::read_to_string(&output_path) {
             super::driver::zluda_log(&format!("[ZLUDA]   compile error: {}", msg));
@@ -436,7 +493,10 @@ fn compile_in_subprocess(
     })?;
     let _ = std::fs::remove_file(&output_path);
     if elf_module.starts_with(b"ERROR:") {
-        super::driver::zluda_log(&format!("[ZLUDA]   compile error: {}", String::from_utf8_lossy(&elf_module)));
+        super::driver::zluda_log(&format!(
+            "[ZLUDA]   compile error: {}",
+            String::from_utf8_lossy(&elf_module)
+        ));
         return Err(CUerror::UNKNOWN);
     }
     Ok(elf_module)
@@ -456,11 +516,13 @@ pub(crate) fn load(module: &mut CUmodule, fname: &CStr) -> CUresult {
 
 pub(crate) fn load_data(module: &mut CUmodule, image: &std::ffi::c_void) -> CUresult {
     super::driver::zluda_log("[ZLUDA] cuModuleLoadData: entering");
-    let library =
-        unsafe { CodeLibraryRef::try_load(image) }.map_err(|e| {
-            super::driver::zluda_log(&format!("[ZLUDA] cuModuleLoadData -> NO_BINARY_FOR_GPU (try_load failed: {:?})", e));
-            CUerror::NO_BINARY_FOR_GPU
-        })?;
+    let library = unsafe { CodeLibraryRef::try_load(image) }.map_err(|e| {
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] cuModuleLoadData -> NO_BINARY_FOR_GPU (try_load failed: {:?})",
+            e
+        ));
+        CUerror::NO_BINARY_FOR_GPU
+    })?;
     let format = match library {
         CodeLibraryRef::FatbincWrapper(_) => "FatbincWrapper",
         CodeLibraryRef::FatbinHeader(_) => "FatbinHeader",
@@ -468,7 +530,10 @@ pub(crate) fn load_data(module: &mut CUmodule, image: &std::ffi::c_void) -> CUre
         CodeLibraryRef::Elf(_) => "Elf",
         CodeLibraryRef::Archive(_) => "Archive",
     };
-    super::driver::zluda_log(&format!("[ZLUDA] cuModuleLoadData: try_load OK, format={}", format));
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuModuleLoadData: try_load OK, format={}",
+        format
+    ));
     let (hip_module, sm_version) = load_hip_module(library)?;
     *module = Module::new(hip_module, sm_version).wrap();
     super::driver::zluda_log("[ZLUDA] cuModuleLoadData -> SUCCESS");
@@ -499,7 +564,9 @@ pub(crate) fn get_function(
     let func = module.get_function(name)?;
     super::function::register_name(func.base, &name_str);
     super::driver::zluda_log_err(&format!(
-        "cuModuleGetFunction('{}') -> func={:p}", name_str, func.base.0));
+        "cuModuleGetFunction('{}') -> func={:p}",
+        name_str, func.base.0
+    ));
     *hfunc = func;
     Ok(())
 }
@@ -511,17 +578,29 @@ pub(crate) fn get_global_v2(
     name: *const ::core::ffi::c_char,
 ) -> hipError_t {
     let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
-    let result = unsafe { hipModuleGetGlobal(dptr, bytes, hmod.base, name) };
+    // lsh hipfix item 7: hipModuleGetGlobal called with bytes==NULL leaves the
+    // global "unusable" — subsequent operations against it return
+    // CUDA_ERROR_INVALID_VALUE or silently corrupt. Always pass a real local
+    // out-pointer and copy back only if the caller asked for it.
+    let mut local_bytes: usize = 0;
+    let result = unsafe { hipModuleGetGlobal(dptr, &mut local_bytes, hmod.base, name) };
+    if !bytes.is_null() {
+        unsafe { *bytes = local_bytes };
+    }
     let dptr_val = unsafe { (*dptr).0 };
-    let bytes_val = if bytes.is_null() { 0 } else { unsafe { *bytes } };
-    let addr_space = if (dptr_val as u64) < 0x7f0000000000 { "HOST" } else { "DEV" };
+    let addr_space = if (dptr_val as u64) < 0x7f0000000000 {
+        "HOST"
+    } else {
+        "DEV"
+    };
     // Track module global address in alloc range
     if result.is_ok() {
-        super::memory::update_alloc_range(dptr_val as u64, bytes_val.max(256) as u64);
+        super::memory::update_alloc_range(dptr_val as u64, local_bytes.max(256) as u64);
     }
     super::driver::zluda_log(&format!(
         "[ZLUDA] cuModuleGetGlobal('{}') -> {:?} dptr={:p} bytes={} [{}]",
-        name_str, result, dptr_val, bytes_val, addr_space));
+        name_str, result, dptr_val, local_bytes, addr_space
+    ));
     result
 }
 
@@ -535,7 +614,10 @@ pub(crate) fn get_tex_ref(
     let result = unsafe { hipModuleGetTexRef(&mut tex_ref, hmod.base, name) };
     match result {
         Ok(()) => {
-            super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetTexRef('{}') -> {:p}", name_str, tex_ref));
+            super::driver::zluda_log(&format!(
+                "[ZLUDA] cuModuleGetTexRef('{}') -> {:p}",
+                name_str, tex_ref
+            ));
             *p_tex_ref = tex_ref as CUtexref;
             Ok(())
         }
@@ -544,7 +626,8 @@ pub(crate) fn get_tex_ref(
             // Try to find it as a global variable and create a synthetic texture reference.
             let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
             let mut bytes = 0usize;
-            let global_result = unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hmod.base, name) };
+            let global_result =
+                unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hmod.base, name) };
             if global_result.is_ok() {
                 super::driver::zluda_log(&format!(
                     "[ZLUDA] cuModuleGetTexRef('{}') -> found as global variable at {:p} ({} bytes), creating synthetic texref",
@@ -558,7 +641,8 @@ pub(crate) fn get_tex_ref(
                     tex_ref: unsafe { mem::zeroed::<textureReference>() },
                     device_global: dptr,
                 });
-                let tex_ref_ptr = &synth_ref.tex_ref as *const textureReference as *mut textureReference;
+                let tex_ref_ptr =
+                    &synth_ref.tex_ref as *const textureReference as *mut textureReference;
                 // Register in global map so tex.rs can find the device global
                 if let Ok(mut map) = SYNTHETIC_TEXREFS.lock() {
                     map.insert(tex_ref_ptr as usize, dptr);
@@ -597,7 +681,10 @@ pub(crate) fn get_surf_ref(
     let result = unsafe { hipModuleGetTexRef(&mut tex_ref, hmod.base, name) };
     match result {
         Ok(()) => {
-            super::driver::zluda_log(&format!("[ZLUDA] cuModuleGetSurfRef('{}') -> {:p}", name_str, tex_ref));
+            super::driver::zluda_log(&format!(
+                "[ZLUDA] cuModuleGetSurfRef('{}') -> {:p}",
+                name_str, tex_ref
+            ));
             *p_surf_ref = tex_ref as cuda_types::cuda::CUsurfref;
             Ok(())
         }
@@ -605,7 +692,8 @@ pub(crate) fn get_surf_ref(
             // .surfref compiled as .global .u64 — same approach as .texref
             let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
             let mut bytes = 0usize;
-            let global_result = unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hmod.base, name) };
+            let global_result =
+                unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hmod.base, name) };
             if global_result.is_ok() {
                 super::driver::zluda_log(&format!(
                     "[ZLUDA] cuModuleGetSurfRef('{}') -> found as global at {:p}, creating synthetic surfref",
@@ -615,7 +703,8 @@ pub(crate) fn get_surf_ref(
                     tex_ref: unsafe { mem::zeroed::<textureReference>() },
                     device_global: dptr,
                 });
-                let tex_ref_ptr = &synth_ref.tex_ref as *const textureReference as *mut textureReference;
+                let tex_ref_ptr =
+                    &synth_ref.tex_ref as *const textureReference as *mut textureReference;
                 if let Ok(mut map) = SYNTHETIC_TEXREFS.lock() {
                     map.insert(tex_ref_ptr as usize, dptr);
                 }
@@ -640,4 +729,129 @@ pub(crate) fn get_loading_mode(mode: &mut cuda_types::cuda::CUmoduleLoadingMode)
 
 pub(crate) fn load_fat_binary(module: &mut CUmodule, image: &std::ffi::c_void) -> CUresult {
     load_data(module, image)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for `cuModuleGetGlobal_v2`.
+    //!
+    //! lsh hipfix item 7: hipModuleGetGlobal called with `bytes == NULL`
+    //! leaves the global "unusable" — subsequent operations against the
+    //! returned device pointer return CUDA_ERROR_INVALID_VALUE or silently
+    //! corrupt. Our wrapper always passes a real local out-pointer to HIP
+    //! and copies back only if the caller asked for it.
+    //!
+    //! These tests go through the full Zluda extern "C" entry points (via
+    //! `crate::cuXxx`) so they exercise the same code path the game hits.
+    //! Skipped cleanly when no AMD GPU is available.
+    use cuda_types::cuda::*;
+    use std::ffi::CStr;
+    use std::mem;
+    use std::ptr;
+
+    /// Tiny PTX with a single 4-byte global. We initialize it to a known
+    /// non-zero value so a follow-up DtoH copy can verify the global is
+    /// actually usable after the NULL-bytes get_global call.
+    const PTX_WITH_GLOBAL: &CStr = c"
+.version 7.0
+.target sm_60
+.address_size 64
+
+.visible .global .align 4 .u32 my_global = 305419896;
+";
+
+    /// Helper: minimal "init + ctx + module load" boilerplate. Returns the
+    /// loaded module handle, or `None` if the GPU/runtime is unavailable
+    /// (test should skip cleanly in that case).
+    unsafe fn try_load_test_module() -> Option<CUmodule> {
+        if crate::cuInit(0).is_err() {
+            return None;
+        }
+        let mut ctx: CUcontext = mem::zeroed();
+        if crate::cuCtxCreate_v2(&mut ctx, 0, 0 as CUdevice).is_err() {
+            return None;
+        }
+        let mut module: CUmodule = mem::zeroed();
+        if crate::cuModuleLoadData(&mut module, PTX_WITH_GLOBAL.as_ptr().cast()).is_err() {
+            return None;
+        }
+        Some(module)
+    }
+
+    /// REGRESSION: calling cuModuleGetGlobal_v2 with bytes=NULL must leave
+    /// the global usable for subsequent device-memory operations. Without
+    /// the lsh hipfix item 7 workaround in `get_global_v2`, hipModuleGetGlobal
+    /// internally marks the global as broken and the follow-up DtoH copy
+    /// fails or returns garbage.
+    #[test]
+    fn get_global_with_null_bytes_keeps_global_usable() {
+        unsafe {
+            let module = match try_load_test_module() {
+                Some(m) => m,
+                None => return, // No GPU / runtime — skip
+            };
+
+            // Call cuModuleGetGlobal_v2 with bytes = NULL — the bug case.
+            let mut dptr: CUdeviceptr = mem::zeroed();
+            let result = crate::cuModuleGetGlobal_v2(
+                &mut dptr,
+                ptr::null_mut(),
+                module,
+                c"my_global".as_ptr(),
+            );
+            assert!(
+                result.is_ok(),
+                "cuModuleGetGlobal_v2 with bytes=NULL must succeed, got {:?}",
+                result
+            );
+            assert!(
+                !dptr.0.is_null(),
+                "returned device pointer must not be null"
+            );
+
+            // The actual regression check: read the global back via DtoH and
+            // verify the value matches what the PTX initialized it to. If
+            // hipModuleGetGlobal corrupted the global (the lsh-documented bug),
+            // this readback returns 0 or fails outright.
+            let mut value: u32 = 0;
+            let copy_result =
+                crate::cuMemcpyDtoH_v2(&mut value as *mut u32 as *mut std::ffi::c_void, dptr, 4);
+            assert!(
+                copy_result.is_ok(),
+                "cuMemcpyDtoH_v2 from a NULL-bytes-fetched global failed: {:?} \
+                 (lsh hipfix item 7 regression)",
+                copy_result
+            );
+            assert_eq!(
+                value, 305419896,
+                "global value mismatch after NULL-bytes fetch \
+                 (lsh hipfix item 7 regression — global was silently corrupted)"
+            );
+        }
+    }
+
+    /// Sanity: when the caller DOES pass a real `bytes` out-pointer, the
+    /// wrapper must still write the size into it. This guards against the
+    /// obvious mistake of dropping the write-back when adding the local
+    /// out-pointer plumbing.
+    #[test]
+    fn get_global_with_real_bytes_pointer_writes_size() {
+        unsafe {
+            let module = match try_load_test_module() {
+                Some(m) => m,
+                None => return,
+            };
+
+            let mut dptr: CUdeviceptr = mem::zeroed();
+            let mut bytes: usize = 0;
+            let result =
+                crate::cuModuleGetGlobal_v2(&mut dptr, &mut bytes, module, c"my_global".as_ptr());
+            assert!(result.is_ok(), "cuModuleGetGlobal_v2 failed: {:?}", result);
+            assert!(!dptr.0.is_null());
+            assert_eq!(
+                bytes, 4,
+                "bytes out-pointer must be written with the global's size (4 for u32)"
+            );
+        }
+    }
 }

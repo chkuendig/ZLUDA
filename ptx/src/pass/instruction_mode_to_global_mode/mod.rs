@@ -1056,9 +1056,8 @@ fn apply_global_mode_controls(
                     {
                         // For indirect calls (function pointers), the target may not
                         // be in functions_exit_modes. Use default mode in that case.
-                        if let Some(node_exit_mode) = global_modes
-                            .functions_exit_modes
-                            .get(&call_target)
+                        if let Some(node_exit_mode) =
+                            global_modes.functions_exit_modes.get(&call_target)
                         {
                             redirect_jump_impl(
                                 &bb_state.global_modes,

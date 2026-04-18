@@ -42,17 +42,15 @@ pub(crate) unsafe fn object_create(
     };
     super::driver::zluda_log_err(&format!(
         "cuSurfObjectCreate: hip_obj=0x{:x} fmt={:?} ch={} pixel_size={} shift={} array={:?}",
-        surf_obj as u64, array_desc.Format, array_desc.NumChannels, pixel_size, shift_bits, array));
+        surf_obj as u64, array_desc.Format, array_desc.NumChannels, pixel_size, shift_bits, array
+    ));
     let shift_amount = shift_bits << (usize::BITS - IMAGE_RESERVED_TOP_BITS);
     surf_obj = (surf_obj as usize | shift_amount) as _;
     *p_surf_object = surf_obj as CUsurfObject;
     Ok(())
 }
 
-
-pub(crate) unsafe fn object_destroy(
-    surf_object: CUsurfObject,
-) -> CUresult {
+pub(crate) unsafe fn object_destroy(surf_object: CUsurfObject) -> CUresult {
     let surf_obj = surf_object as hipSurfaceObject_t;
     hipDestroySurfaceObject(
         (((surf_obj as usize) << IMAGE_RESERVED_TOP_BITS) >> IMAGE_RESERVED_TOP_BITS) as _,
@@ -82,9 +80,17 @@ pub(crate) unsafe fn ref_set_array(
     // The PTX sust helper functions extract shift from top bits to compute
     // x-coordinate byte offsets. Without this, shift=0 → wrong offsets → GPU fault.
     let fmt_size = format_size(desc.Format).unwrap_or(4);
-    let num_ch = if desc.NumChannels == 0 { 1 } else { desc.NumChannels as usize };
+    let num_ch = if desc.NumChannels == 0 {
+        1
+    } else {
+        desc.NumChannels as usize
+    };
     let pixel_size = fmt_size * num_ch;
-    let shift_bits = if pixel_size == 0 { 0usize } else { pixel_size.trailing_zeros() as usize };
+    let shift_bits = if pixel_size == 0 {
+        0usize
+    } else {
+        pixel_size.trailing_zeros() as usize
+    };
     let tex_obj = (*surf_ref).textureObject;
     if !tex_obj.is_null() {
         let encoded = (tex_obj as usize) | (shift_bits << (usize::BITS - IMAGE_RESERVED_TOP_BITS));
@@ -189,9 +195,11 @@ mod tests {
         // 2D descriptor query on a 3D array — check if NumChannels is correct
         let mut desc2d: CUDA_ARRAY_DESCRIPTOR = mem::zeroed();
         api.cuArrayGetDescriptor_v2(&mut desc2d, array);
-        assert_ne!(desc2d.NumChannels, 0,
+        assert_ne!(
+            desc2d.NumChannels, 0,
             "hipArrayGetDescriptor returns NumChannels=0 for 3D arrays — \
-             this causes pixel_size=0 → shift overflow → corrupt surface handles");
+             this causes pixel_size=0 → shift overflow → corrupt surface handles"
+        );
 
         api.cuArrayDestroy(array);
     }
@@ -230,10 +238,12 @@ mod tests {
         // For FLOAT (4 bytes), 1 channel: pixel_size=4, trailing_zeros(4)=2
         // shift_amount = 2 << 61 = 0x4000000000000000
         let shift = (surf_object as u64) >> 61;
-        assert_eq!(shift, 2,
+        assert_eq!(
+            shift, 2,
             "FLOAT surface shift should be 2 (log2(4)), got {} — \
              hipArrayGetDescriptor may be returning wrong format for 3D arrays",
-            shift);
+            shift
+        );
 
         api.cuSurfObjectDestroy(surf_object);
         api.cuArrayDestroy(array);
@@ -267,8 +277,11 @@ mod tests {
 
         // FLOAT * 4 channels = 16 bytes, trailing_zeros(16) = 4
         let shift = (surf_object as u64) >> 61;
-        assert_eq!(shift, 4,
-            "FLOAT4 surface shift should be 4 (log2(16)), got {}", shift);
+        assert_eq!(
+            shift, 4,
+            "FLOAT4 surface shift should be 4 (log2(16)), got {}",
+            shift
+        );
 
         api.cuSurfObjectDestroy(surf_object);
         api.cuArrayDestroy(array);
@@ -311,14 +324,19 @@ mod tests {
             let handle = surf_obj as u64;
             let top_bits = handle >> 61;
 
-            eprintln!("surface_object_has_no_shift_bits: raw handle = {:#x}, top_bits = {}", handle, top_bits);
+            eprintln!(
+                "surface_object_has_no_shift_bits: raw handle = {:#x}, top_bits = {}",
+                handle, top_bits
+            );
 
             // The raw hipSurfaceObject_t should NOT have shift bits — it's just a pointer.
             // This is exactly what the surfref path passes to kernels.
             // Our sust helpers extract shift from top 3 bits and get 0 instead of 2.
-            assert_eq!(top_bits, 0,
+            assert_eq!(
+                top_bits, 0,
                 "Raw hipSurfaceObject_t unexpectedly has non-zero top bits: {:#x}",
-                handle);
+                handle
+            );
 
             // For comparison: our cuSurfObjectCreate ADDS shift bits.
             // FLOAT (4 bytes) * 1 channel = 4 → trailing_zeros(4) = 2
@@ -327,8 +345,13 @@ mod tests {
             let encoded_shift = encoded >> 61;
             assert_eq!(encoded_shift, 2);
 
-            eprintln!("  raw handle {:#x} (shift=0) vs encoded {:#x} (shift=2)", handle, encoded);
-            eprintln!("  BUG: surfref path passes raw handle → kernel gets shift=0 → wrong x-offset");
+            eprintln!(
+                "  raw handle {:#x} (shift=0) vs encoded {:#x} (shift=2)",
+                handle, encoded
+            );
+            eprintln!(
+                "  BUG: surfref path passes raw handle → kernel gets shift=0 → wrong x-offset"
+            );
 
             hipDestroySurfaceObject(surf_obj).unwrap();
             hipFreeArray(array).unwrap();
@@ -365,7 +388,9 @@ mod tests {
         assert!(
             fmt == CUarray_format::CU_AD_FORMAT_FLOAT
                 || fmt == CUarray_format::CU_AD_FORMAT_UNSIGNED_INT32,
-            "3D descriptor format should be FLOAT or UINT32, got {:?}", fmt);
+            "3D descriptor format should be FLOAT or UINT32, got {:?}",
+            fmt
+        );
 
         api.cuArrayDestroy(array);
     }
@@ -406,10 +431,12 @@ mod tests {
 
         // The handle must have shift=2 in top 3 bits (FLOAT = 4 bytes, log2(4) = 2)
         let shift = (tex_object as u64) >> 61;
-        assert_eq!(shift, 2,
+        assert_eq!(
+            shift, 2,
             "cuTexObjectCreate handle has shift={} (expected 2 for FLOAT). \
              Texture objects used for sust need shift encoding. handle={:#x}",
-            shift, tex_object as u64);
+            shift, tex_object as u64
+        );
 
         api.cuTexObjectDestroy(tex_object);
         api.cuArrayDestroy(array);
@@ -449,23 +476,24 @@ mod tests {
 
             // Read the 32-byte image descriptor from device memory
             let mut words = [0u32; 8];
-            hipMemcpyDtoH(
-                words.as_mut_ptr() as _,
-                hipDeviceptr_t(surf_obj as _),
-                32,
-            ).unwrap();
+            hipMemcpyDtoH(words.as_mut_ptr() as _, hipDeviceptr_t(surf_obj as _), 32).unwrap();
 
             eprintln!("descriptor_format_readable: words = {:08x?}", words);
 
             // The descriptor should have non-zero content (valid image descriptor)
-            assert!(words[0] != 0 || words[1] != 0,
-                "Descriptor is all zeros — surface object is not a valid descriptor pointer");
+            assert!(
+                words[0] != 0 || words[1] != 0,
+                "Descriptor is all zeros — surface object is not a valid descriptor pointer"
+            );
 
             // AMDGPU descriptor word 3 contains data_format and num_format fields
             // that encode the pixel format. If we can read these, the sust helper
             // can compute the shift at runtime without top-3-bit encoding.
             let word3 = words[3];
-            eprintln!("  word3 = 0x{:08x} (contains data_format/num_format)", word3);
+            eprintln!(
+                "  word3 = 0x{:08x} (contains data_format/num_format)",
+                word3
+            );
             assert_ne!(word3, 0, "Descriptor word 3 should contain format info");
 
             hipDestroySurfaceObject(surf_obj).unwrap();

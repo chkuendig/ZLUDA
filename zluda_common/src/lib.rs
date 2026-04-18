@@ -240,6 +240,7 @@ from_cuda_nop!(
     CUmemAllocationProp,
     CUresult,
     CUfunction_attribute,
+    CUfunc_cache,
     CUgraphExecUpdateResultInfo,
     *mut *const cuda_types::cuda::CUgraphEdgeData,
     *mut cudnn9::cudnnHandle_t,

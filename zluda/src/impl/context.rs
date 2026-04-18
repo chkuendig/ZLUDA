@@ -223,7 +223,9 @@ pub(crate) fn get_current(pctx: &mut CUcontext) -> CUresult {
         Err(_) => {
             // Return primary context instead of NULL to prevent APEX from
             // passing NULL to ContextStorage_Set (which causes NULL deref crash)
-            super::driver::zluda_log("[ZLUDA] cuCtxGetCurrent: stack empty, returning primary context");
+            super::driver::zluda_log(
+                "[ZLUDA] cuCtxGetCurrent: stack empty, returning primary context",
+            );
             super::driver::zluda_log_err("cuCtxGetCurrent: stack empty, returning primary context");
             match super::device::get_primary_context(0) {
                 Ok((_, cu_ctx)) => *pctx = cu_ctx,
@@ -259,15 +261,21 @@ pub(crate) fn get_device_v2(dev: &mut hipDevice_t, ctx: MaybeContextRef) -> CUre
                         Err(_) => {
                             // Primary context fallback: return device 0
                             super::driver::zluda_log("[ZLUDA] cuCtxGetDevice: from_cuda failed, falling back to device 0");
-                            super::driver::zluda_log_err("cuCtxGetDevice: from_cuda failed, falling back to device 0");
+                            super::driver::zluda_log_err(
+                                "cuCtxGetDevice: from_cuda failed, falling back to device 0",
+                            );
                             0
                         }
                     }
                 }
                 Err(_) => {
                     // No context at all: return device 0 as PhysX expects
-                    super::driver::zluda_log("[ZLUDA] cuCtxGetDevice: no context, falling back to device 0");
-                    super::driver::zluda_log_err("cuCtxGetDevice: no context, falling back to device 0");
+                    super::driver::zluda_log(
+                        "[ZLUDA] cuCtxGetDevice: no context, falling back to device 0",
+                    );
+                    super::driver::zluda_log_err(
+                        "cuCtxGetDevice: no context, falling back to device 0",
+                    );
                     0
                 }
             }
@@ -336,7 +344,10 @@ pub(crate) unsafe fn destroy_v2(_ctx: CUcontext) -> CUresult {
     // stack, Wine always has a valid context pointer.
     // On real NVIDIA, dark API contexts survive cuCtxDestroy anyway.
     super::driver::zluda_log("[ZLUDA] cuCtxDestroy_v2: no-op (context kept on stack)");
-    super::driver::zluda_log_err(&format!("cuCtxDestroy_v2(ctx={:p}): no-op (context kept on stack)", _ctx.0));
+    super::driver::zluda_log_err(&format!(
+        "cuCtxDestroy_v2(ctx={:p}): no-op (context kept on stack)",
+        _ctx.0
+    ));
     Ok(())
 }
 
@@ -364,14 +375,10 @@ pub(crate) unsafe fn set_flags(flags: ::core::ffi::c_uint) -> CUresult {
 /// cudart64_55.dll calls this during context init. Previously unimplemented,
 /// which returned NOT_SUPPORTED, potentially causing the runtime to skip
 /// texture object creation (gParams NULL texture bug).
-pub(crate) unsafe fn get_shared_memory_config(
-    p_config: *mut CUsharedconfig,
-) -> hipError_t {
+pub(crate) unsafe fn get_shared_memory_config(p_config: *mut CUsharedconfig) -> hipError_t {
     let p_config = p_config as *mut hipSharedMemConfig;
     let result = hipCtxGetSharedMemConfig(p_config);
-    super::driver::zluda_log_err(&format!(
-        "cuCtxGetSharedMemConfig -> result={:?}", result
-    ));
+    super::driver::zluda_log_err(&format!("cuCtxGetSharedMemConfig -> result={:?}", result));
     match result {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -387,11 +394,10 @@ pub(crate) unsafe fn get_shared_memory_config(
 /// cuCtxSetSharedMemConfig — set shared memory bank size.
 /// No-op: hipCtxSetSharedMemConfig is unimplemented in ROCm (assertion failure).
 /// AMDGPU LDS always uses 32-bit bank mode, so this is safe to ignore.
-pub(crate) unsafe fn set_shared_memory_config(
-    config: CUsharedconfig,
-) -> hipError_t {
+pub(crate) unsafe fn set_shared_memory_config(config: CUsharedconfig) -> hipError_t {
     super::driver::zluda_log_err(&format!(
-        "cuCtxSetSharedMemConfig(config={}) -> no-op", config.0
+        "cuCtxSetSharedMemConfig(config={}) -> no-op",
+        config.0
     ));
     Ok(())
 }

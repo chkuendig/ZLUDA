@@ -264,7 +264,14 @@ fn run_statements<'input>(
                 // Handled here (not in run_instruction) because it expands to multiple statements
                 Statement::Instruction(ptx_parser::Instruction::Shfl {
                     data,
-                    arguments: ast::ShflArgs { dst, dst_pred, src, src_lane, src_opts },
+                    arguments:
+                        ast::ShflArgs {
+                            dst,
+                            dst_pred,
+                            src,
+                            src_lane,
+                            src_opts,
+                        },
                 }) => {
                     let membermask = resolver.register_unnamed(Some((
                         ast::Type::Scalar(ast::ScalarType::U32),
@@ -276,13 +283,12 @@ fn run_statements<'input>(
                         ptx_parser::ShuffleMode::BFly => "bfly",
                         ptx_parser::ShuffleMode::Idx => "idx",
                     };
-                    let mut result: SmallVec<[_; 3]> = smallvec![
-                        Statement::Constant(ConstantDefinition {
+                    let mut result: SmallVec<[_; 3]> =
+                        smallvec![Statement::Constant(ConstantDefinition {
                             dst: membermask,
                             typ: ast::ScalarType::U32,
                             value: ast::ImmediateValue::U64(0xFFFFFFFF),
-                        }),
-                    ];
+                        }),];
                     if let Some(dst_pred) = dst_pred {
                         // With predicate output: use _pred variant that returns v2.u32
                         let packed_var = resolver.register_unnamed(Some((
@@ -299,10 +305,22 @@ fn run_statements<'input>(
                             ptx_parser::StateSpace::Reg,
                         )];
                         let input_arguments = vec![
-                            (ast::Type::Scalar(ast::ScalarType::U32), ptx_parser::StateSpace::Reg),
-                            (ast::Type::Scalar(ast::ScalarType::U32), ptx_parser::StateSpace::Reg),
-                            (ast::Type::Scalar(ast::ScalarType::U32), ptx_parser::StateSpace::Reg),
-                            (ast::Type::Scalar(ast::ScalarType::U32), ptx_parser::StateSpace::Reg),
+                            (
+                                ast::Type::Scalar(ast::ScalarType::U32),
+                                ptx_parser::StateSpace::Reg,
+                            ),
+                            (
+                                ast::Type::Scalar(ast::ScalarType::U32),
+                                ptx_parser::StateSpace::Reg,
+                            ),
+                            (
+                                ast::Type::Scalar(ast::ScalarType::U32),
+                                ptx_parser::StateSpace::Reg,
+                            ),
+                            (
+                                ast::Type::Scalar(ast::ScalarType::U32),
+                                ptx_parser::StateSpace::Reg,
+                            ),
                         ];
                         let func = get_or_declare_function(
                             resolver,

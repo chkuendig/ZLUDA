@@ -1388,9 +1388,7 @@ impl Type {
                 }
             }
             // sizeof(textureReference) = 88, align 8
-            Type::Texref | Type::Surfref => unsafe {
-                Layout::from_size_align_unchecked(88, 8)
-            },
+            Type::Texref | Type::Surfref => unsafe { Layout::from_size_align_unchecked(88, 8) },
         }
     }
 }

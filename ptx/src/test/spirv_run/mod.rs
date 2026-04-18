@@ -3,6 +3,7 @@ use crate::pass;
 use cuda_types::cuda::CUstream;
 use hip_runtime_sys::hipError_t;
 use pretty_assertions;
+use std::cell::RefCell;
 use std::env;
 use std::error;
 use std::ffi::{CStr, CString};
@@ -504,26 +505,35 @@ test_ptx!(assertfail);
 test_ptx!(lanemask_lt);
 test_ptx!(extern_func);
 test_ptx!(trap);
-test_ptx!(shl_overflow, [0u32, 16u32, 32u32, 48u32], [1u32, 65536u32, 0u32, 0u32]);
+test_ptx!(
+    shl_overflow,
+    [0u32, 16u32, 32u32, 48u32],
+    [1u32, 65536u32, 0u32, 0u32]
+);
 // PhysX packed histogram: 1 << ((digit << 4) & 0xF0). Digits 0,1 produce nonzero; 2+ produce 0.
-test_ptx!(shl_packed, [0u32, 1u32, 2u32, 3u32], [1u32, 65536u32, 0u32, 0u32]);
+test_ptx!(
+    shl_packed,
+    [0u32, 1u32, 2u32, 3u32],
+    [1u32, 65536u32, 0u32, 0u32]
+);
 // PhysX packed histogram accumulation: word 0 for keys [0xFFFFFFFF, 0, 1, 2]
 // digit 15→0(clamped), digit 0→1, digit 1→0x10000, digit 2→0(clamped) = 0x10001
-test_ptx!(histogram_accum, [0xFFFFFFFFu32, 0u32, 1u32, 2u32], [0x00010001u32]);
+test_ptx!(
+    histogram_accum,
+    [0xFFFFFFFFu32, 0u32, 1u32, 2u32],
+    [0x00010001u32]
+);
 // Word 1 of packed histogram: 1 << ((digit*16)-32). Digits 2,3 produce nonzero.
 test_ptx!(histogram_word1, [2u32, 3u32, 4u32, 0u32], [0x00010001u32]);
 // Broadcast lane 31's value to all lanes. All 64 threads get 32 (warp 0) or 64 (warp 1).
 test_ptx_warp!(
     shfl_broadcast_31,
     [
-        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
-        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
-        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
-        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
-        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
-        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
-        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
-        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
+        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
+        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 32u32,
+        32u32, 32u32, 32u32, 32u32, 32u32, 32u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
+        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
+        64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32, 64u32,
     ]
 );
 // Multi-register shfl: read regA and regB from lane 0. All threads get [1, 100].
@@ -531,23 +541,18 @@ test_ptx_warp!(
 test_ptx_warp!(
     shfl_sync_idx_multi_reg,
     [
-        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
-        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
-        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
-        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
-        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
-        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
-        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
-        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32,
+        100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32,
+        100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
+        1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32, 1u32, 100u32,
         // warp 1: lane 0 has regA=33, regB=3300
-        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
-        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
-        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
-        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
-        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
-        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
-        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
-        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32,
+        3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32,
+        3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
+        33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32,
+        3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32, 33u32, 3300u32,
     ]
 );
 // Test shr.u64 by 32: high 32 bits of 0x00000000FFFFFFFF should be 0
@@ -594,7 +599,13 @@ fn lds_scatter_gather_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let input: Vec<u32> = (0..128).collect();
     // tid^1 swaps adjacent pairs: 0↔1, 2↔3, etc.
     let expected: Vec<u32> = (0..128u32).map(|i| i ^ 1).collect();
-    test_hip_assert("lds_scatter_gather_test", &ptx, Some(input.as_slice()), &expected, 128)
+    test_hip_assert(
+        "lds_scatter_gather_test",
+        &ptx,
+        Some(input.as_slice()),
+        &expected,
+        128,
+    )
 }
 
 // LDS exchange test: 128 threads write to smem[tid], barrier, read smem[(tid+1)%128]
@@ -606,7 +617,13 @@ fn lds_exchange_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let input: Vec<u32> = (0..128).collect();
     let mut expected: Vec<u32> = (1..128).collect();
     expected.push(0); // thread 127 reads from smem[0]
-    test_hip_assert("lds_exchange_test", &ptx, Some(input.as_slice()), &expected, 128)
+    test_hip_assert(
+        "lds_exchange_test",
+        &ptx,
+        Some(input.as_slice()),
+        &expected,
+        128,
+    )
 }
 
 // PhysX-style inclusive prefix sum via 5 cascading shfl.up with predicate
@@ -615,14 +632,11 @@ fn lds_exchange_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
 test_ptx_warp!(
     shfl_prefix_sum,
     [
-        1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32,
-        9u32, 10u32, 11u32, 12u32, 13u32, 14u32, 15u32, 16u32,
-        17u32, 18u32, 19u32, 20u32, 21u32, 22u32, 23u32, 24u32,
-        25u32, 26u32, 27u32, 28u32, 29u32, 30u32, 31u32, 32u32,
-        1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32,
-        9u32, 10u32, 11u32, 12u32, 13u32, 14u32, 15u32, 16u32,
-        17u32, 18u32, 19u32, 20u32, 21u32, 22u32, 23u32, 24u32,
-        25u32, 26u32, 27u32, 28u32, 29u32, 30u32, 31u32, 32u32,
+        1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32, 10u32, 11u32, 12u32, 13u32, 14u32,
+        15u32, 16u32, 17u32, 18u32, 19u32, 20u32, 21u32, 22u32, 23u32, 24u32, 25u32, 26u32, 27u32,
+        28u32, 29u32, 30u32, 31u32, 32u32, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32,
+        10u32, 11u32, 12u32, 13u32, 14u32, 15u32, 16u32, 17u32, 18u32, 19u32, 20u32, 21u32, 22u32,
+        23u32, 24u32, 25u32, 26u32, 27u32, 28u32, 29u32, 30u32, 31u32, 32u32,
     ]
 );
 test_ptx_warp!(
@@ -633,6 +647,40 @@ test_ptx_warp!(
         30u32, 31u32, 1029u32, 1030u32, 1031u32, 35u32, 36u32, 37u32, 38u32, 39u32, 40u32, 41u32,
         42u32, 43u32, 44u32, 45u32, 46u32, 47u32, 48u32, 49u32, 50u32, 51u32, 52u32, 53u32, 54u32,
         55u32, 56u32, 57u32, 58u32, 59u32, 60u32, 61u32, 62u32, 63u32, 1061u32, 1062u32, 1063u32,
+    ]
+);
+test_ptx_warp!(
+    shfl_sync_up_b32_pred_mask16,
+    [
+        1000u32, 0u32, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32, 10u32, 11u32, 12u32,
+        13u32, 14u32, 2016u32, 2017u32, 2018u32, 2019u32, 2020u32, 2021u32, 2022u32, 2023u32,
+        2024u32, 2025u32, 2026u32, 2027u32, 2028u32, 2029u32, 2030u32, 2031u32, 1032u32, 32u32,
+        33u32, 34u32, 35u32, 36u32, 37u32, 38u32, 39u32, 40u32, 41u32, 42u32, 43u32, 44u32, 45u32,
+        46u32, 2048u32, 2049u32, 2050u32, 2051u32, 2052u32, 2053u32, 2054u32, 2055u32, 2056u32,
+        2057u32, 2058u32, 2059u32, 2060u32, 2061u32, 2062u32, 2063u32,
+    ]
+);
+test_ptx_warp!(
+    shfl_down_upper_half_active,
+    [
+        2000u32, 2001u32, 2002u32, 2003u32, 2004u32, 2005u32, 2006u32, 2007u32, 2008u32, 2009u32,
+        2010u32, 2011u32, 2012u32, 2013u32, 2014u32, 2015u32, 17u32, 18u32, 19u32, 20u32, 21u32,
+        22u32, 23u32, 24u32, 25u32, 26u32, 27u32, 28u32, 29u32, 30u32, 31u32, 1031u32, 2032u32,
+        2033u32, 2034u32, 2035u32, 2036u32, 2037u32, 2038u32, 2039u32, 2040u32, 2041u32, 2042u32,
+        2043u32, 2044u32, 2045u32, 2046u32, 2047u32, 49u32, 50u32, 51u32, 52u32, 53u32, 54u32,
+        55u32, 56u32, 57u32, 58u32, 59u32, 60u32, 61u32, 62u32, 63u32, 1063u32,
+    ]
+);
+test_ptx_warp!(
+    shfl_scan_idx_lower_half_active_w16,
+    [
+        137u32, 139u32, 142u32, 146u32, 151u32, 157u32, 164u32, 172u32, 181u32, 191u32, 202u32,
+        214u32, 227u32, 241u32, 256u32, 272u32, 2016u32, 2017u32, 2018u32, 2019u32, 2020u32,
+        2021u32, 2022u32, 2023u32, 2024u32, 2025u32, 2026u32, 2027u32, 2028u32, 2029u32, 2030u32,
+        2031u32, 681u32, 715u32, 750u32, 786u32, 823u32, 861u32, 900u32, 940u32, 981u32, 1023u32,
+        1066u32, 1110u32, 1155u32, 1201u32, 1248u32, 1296u32, 2048u32, 2049u32, 2050u32, 2051u32,
+        2052u32, 2053u32, 2054u32, 2055u32, 2056u32, 2057u32, 2058u32, 2059u32, 2060u32, 2061u32,
+        2062u32, 2063u32,
     ]
 );
 test_ptx_warp!(
@@ -1314,6 +1362,67 @@ fn compare_llvm(name: &str, actual_ll: &str, expected_ll: &str) {
     }
 }
 
+fn defined_function_body<'a>(module_ll: &'a str, function_name: &str) -> Option<&'a str> {
+    let needle = format!("@{}(", function_name);
+    let start = module_ll.match_indices(&needle).find_map(|(idx, _)| {
+        let line_start = module_ll[..idx].rfind('\n').map(|offset| offset + 1).unwrap_or(0);
+        module_ll[line_start..idx]
+            .contains("define ")
+            .then_some(line_start)
+    })?;
+    let body_start = module_ll[start..].find('{')? + start;
+    let body_end = module_ll[body_start..].find("\n}")? + body_start + 2;
+    Some(&module_ll[start..=body_end])
+}
+
+#[test]
+fn linked_shfl_helpers_use_physical_laneid() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("shfl_down_upper_half_active.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    let ptx_impl = module.linked_bitcode();
+    let pass::Module {
+        context,
+        llvm_ir,
+        attributes_ir,
+        metadata,
+        ..
+    } = module;
+    let linked_ll = RefCell::new(None);
+    let _ = llvm_zluda::compile(
+        &context,
+        "gfx1030",
+        llvm_ir,
+        ptx_impl,
+        attributes_ir,
+        metadata,
+        Some(&|data, file_name| {
+            if file_name == "linked.ll" {
+                *linked_ll.borrow_mut() = Some(data.clone());
+            }
+        }),
+    )?;
+    let linked_ll = String::from_utf8(linked_ll.into_inner().unwrap())?;
+    let laneid_body = defined_function_body(&linked_ll, "__zluda_ptx_impl_sreg_laneid").unwrap();
+    assert!(laneid_body.contains("@llvm.amdgcn.workitem.id.x()"));
+    assert!(!laneid_body.contains("mbcnt"));
+    let shfl_body =
+        defined_function_body(&linked_ll, "__zluda_ptx_impl_shfl_sync_down_b32_pred").unwrap();
+    assert!(!shfl_body.contains("mbcnt"));
+    assert!(
+        shfl_body.contains("@__zluda_ptx_impl_sreg_laneid()")
+            || shfl_body.contains("@llvm.amdgcn.workitem.id.x()")
+    );
+    Ok(())
+}
+
 fn test_cuda_assert<
     Input: From<u8> + Debug + Copy + PartialEq,
     Output: From<u8> + Debug + Copy + PartialEq + Default,
@@ -1606,7 +1715,10 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ptx = match fs::read_to_string(ptx_path) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("SKIP: {} not found (run Batman AK once to extract)", ptx_path);
+            eprintln!(
+                "SKIP: {} not found (run Batman AK once to extract)",
+                ptx_path
+            );
             return Ok(());
         }
     };
@@ -1614,7 +1726,9 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -1625,7 +1739,10 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
         .to_str()
         .unwrap();
 
-    eprintln!("turbulencefs: compiling {} bytes PTX (31 kernels)...", ptx.len());
+    eprintln!(
+        "turbulencefs: compiling {} bytes PTX (31 kernels)...",
+        ptx.len()
+    );
     let ptx_impl = module.linked_bitcode();
     let elf = llvm_zluda::compile(
         &module.context,
@@ -1660,21 +1777,30 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let res_desc = hipResourceDesc {
         resType: hipResourceType::hipResourceTypeArray,
         res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
-            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
-                array: array,
-            },
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array: array },
         },
     };
     unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
-    eprintln!("turbulencefs: surface object created: {:#x}", surf_obj as u64);
+    eprintln!(
+        "turbulencefs: surface object created: {:#x}",
+        surf_obj as u64
+    );
 
     // Get the surfref and write the surface handle to it
     let mut surf_dptr = hipDeviceptr_t(std::ptr::null_mut());
     let mut surf_bytes = 0usize;
     let global_result = unsafe {
-        hipModuleGetGlobal(&mut surf_dptr, &mut surf_bytes, hip_mod, c"TurbulenceFS_dynamicgrid_clearSurf".as_ptr())
+        hipModuleGetGlobal(
+            &mut surf_dptr,
+            &mut surf_bytes,
+            hip_mod,
+            c"TurbulenceFS_dynamicgrid_clearSurf".as_ptr(),
+        )
     };
-    eprintln!("turbulencefs: clearSurf global -> {:?} dptr={:p} bytes={}", global_result, surf_dptr.0, surf_bytes);
+    eprintln!(
+        "turbulencefs: clearSurf global -> {:?} dptr={:p} bytes={}",
+        global_result, surf_dptr.0, surf_bytes
+    );
 
     if global_result.is_ok() && !surf_dptr.0.is_null() {
         // Write surf handle to device global
@@ -1682,16 +1808,26 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
         unsafe { hipStreamCreate(&mut stream) }.unwrap();
         let handle = surf_obj as u64;
         unsafe {
-            hipMemcpyWithStream(surf_dptr.0, &handle as *const _ as _, 8,
-                hipMemcpyKind::hipMemcpyHostToDevice, stream)
-        }.unwrap();
+            hipMemcpyWithStream(
+                surf_dptr.0,
+                &handle as *const _ as _,
+                8,
+                hipMemcpyKind::hipMemcpyHostToDevice,
+                stream,
+            )
+        }
+        .unwrap();
         unsafe { hipStreamSynchronize(stream) }.unwrap();
         eprintln!("turbulencefs: wrote surf handle to device global");
 
         // Try launching the clear kernel
         let mut kernel = unsafe { mem::zeroed() };
         let func_result = unsafe {
-            hipModuleGetFunction(&mut kernel, hip_mod, c"TurbulenceFS_dynamicGridClear2DKernel".as_ptr())
+            hipModuleGetFunction(
+                &mut kernel,
+                hip_mod,
+                c"TurbulenceFS_dynamicGridClear2DKernel".as_ptr(),
+            )
         };
         eprintln!("turbulencefs: GetFunction(Clear2D) -> {:?}", func_result);
 
@@ -1702,20 +1838,27 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
         // Try the ClearKernel (exists in this module, uses sust via helpers)
         let mut clear_kernel = unsafe { mem::zeroed() };
         let clear_result = unsafe {
-            hipModuleGetFunction(&mut clear_kernel, hip_mod, c"TurbulenceFS_dynamicGridClearKernel".as_ptr())
+            hipModuleGetFunction(
+                &mut clear_kernel,
+                hip_mod,
+                c"TurbulenceFS_dynamicGridClearKernel".as_ptr(),
+            )
         };
-        eprintln!("turbulencefs: GetFunction(ClearKernel) -> {:?}", clear_result);
+        eprintln!(
+            "turbulencefs: GetFunction(ClearKernel) -> {:?}",
+            clear_result
+        );
 
         if clear_result.is_ok() {
             // ClearKernel(param0: u64, param1: u16, param2-4: u32, param5: u64=surfHandle, param6: u32=elemType)
             // Game launches: grid=[32,8,8] block=[8,8,8]
-            let param0: u64 = 0;  // unused ptr
-            let param1: u16 = 0;  // unused
+            let param0: u64 = 0; // unused ptr
+            let param1: u16 = 0; // unused
             let param2: u32 = 64; // grid dim X
             let param3: u32 = 64; // grid dim Y
             let param4: u32 = 64; // grid dim Z
             let param5: u64 = surf_obj as u64; // surface handle
-            let param6: u32 = 4;  // element size (float = 4 bytes)
+            let param6: u32 = 4; // element size (float = 4 bytes)
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &param0 as *const _ as *mut _,
                 &param1 as *const _ as *mut _,
@@ -1725,10 +1868,24 @@ fn turbulencefs_compile_amdgpu() -> Result<(), Box<dyn error::Error>> {
                 &param5 as *const _ as *mut _,
                 &param6 as *const _ as *mut _,
             ];
-            eprintln!("turbulencefs: launching ClearKernel grid=[8,8,8] block=[8,8,8] surf={:#x}...", param5);
+            eprintln!(
+                "turbulencefs: launching ClearKernel grid=[8,8,8] block=[8,8,8] surf={:#x}...",
+                param5
+            );
             let launch_result = unsafe {
-                hipModuleLaunchKernel(clear_kernel, 8, 8, 8, 8, 8, 8, 0, stream,
-                    args.as_mut_ptr(), ptr::null_mut())
+                hipModuleLaunchKernel(
+                    clear_kernel,
+                    8,
+                    8,
+                    8,
+                    8,
+                    8,
+                    8,
+                    0,
+                    stream,
+                    args.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
             };
             eprintln!("turbulencefs: launch -> {:?}", launch_result);
 
@@ -1772,7 +1929,10 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ptx = match fs::read_to_string(ptx_path) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("SKIP: {} not found (run PhysX snippet once to extract)", ptx_path);
+            eprintln!(
+                "SKIP: {} not found (run PhysX snippet once to extract)",
+                ptx_path
+            );
             return Ok(());
         }
     };
@@ -1780,7 +1940,9 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -1843,7 +2005,9 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // Input keys: [0xFFFFFFFF, 0*18, 1, 2, 3, 4, 5, 6, 7, 8, 0xFFFFFFFF(sentinel)]
     let mut h_keys = vec![0u32; padded];
     h_keys[0] = 0xFFFFFFFF;
-    for i in 19..=26 { h_keys[i] = (i - 18) as u32; }
+    for i in 19..=26 {
+        h_keys[i] = (i - 18) as u32;
+    }
     h_keys[27] = 0xFFFFFFFF;
 
     let mut h_ranks: Vec<u32> = (0..27).collect();
@@ -1860,7 +2024,12 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
     unsafe {
         hipMemcpyHtoD(hipDeviceptr_t(d_in_keys), h_keys.as_ptr() as _, padded * 4).unwrap();
-        hipMemcpyHtoD(hipDeviceptr_t(d_in_ranks), h_ranks.as_ptr() as _, padded * 4).unwrap();
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_in_ranks),
+            h_ranks.as_ptr() as _,
+            padded * 4,
+        )
+        .unwrap();
         hipMemsetD8(hipDeviceptr_t(d_out_keys), 0, padded * 4).unwrap();
         hipMemsetD8(hipDeviceptr_t(d_out_ranks), 0, padded * 4).unwrap();
         hipMemsetD8(hipDeviceptr_t(d_rbc), 0, 16 * num_blocks as usize * 4).unwrap();
@@ -1876,19 +2045,30 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
     unsafe {
         hipModuleLaunchKernel(
             kernel,
-            num_blocks, 1, 1,
-            1024, 1, 1,
-            0, hipStream_t(ptr::null_mut()),
+            num_blocks,
+            1,
+            1,
+            1024,
+            1,
+            1,
+            0,
+            hipStream_t(ptr::null_mut()),
             args.as_mut_ptr(),
             ptr::null_mut(),
-        ).unwrap();
+        )
+        .unwrap();
         hipDeviceSynchronize().unwrap();
     }
 
     // Read back histogram
     let mut h_rbc = vec![0u32; 16 * num_blocks as usize];
     unsafe {
-        hipMemcpyDtoH(h_rbc.as_mut_ptr() as _, hipDeviceptr_t(d_rbc), h_rbc.len() * 4).unwrap();
+        hipMemcpyDtoH(
+            h_rbc.as_mut_ptr() as _,
+            hipDeviceptr_t(d_rbc),
+            h_rbc.len() * 4,
+        )
+        .unwrap();
     }
 
     // Extract block 0's counts (digit-major layout)
@@ -1896,9 +2076,14 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let total: u32 = block0.iter().sum();
     // Also dump the FULL first 64 entries (2 rows of 32) to see digit 0 AND digit 1
     let first64: Vec<u32> = h_rbc[0..64].to_vec();
-    let nonzero64: Vec<(usize, u32)> = first64.iter().enumerate()
-        .filter(|(_, &v)| v != 0).collect::<Vec<_>>()
-        .into_iter().map(|(i, &v)| (i, v)).collect();
+    let nonzero64: Vec<(usize, u32)> = first64
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v != 0)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|(i, &v)| (i, v))
+        .collect();
     eprintln!("radix_sort histogram: total={} block0={:?}", total, block0);
     eprintln!("  first 64 entries nonzero: {:?}", nonzero64);
 
@@ -1913,9 +2098,17 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // Also read debug value at offset 32 (r230 from lane 31)
     let mut h_r230 = [0u32; 1];
     unsafe {
-        hipMemcpyDtoH(h_r230.as_mut_ptr() as _, hipDeviceptr_t((d_out_keys as usize + 32) as _), 4).unwrap();
+        hipMemcpyDtoH(
+            h_r230.as_mut_ptr() as _,
+            hipDeviceptr_t((d_out_keys as usize + 32) as _),
+            4,
+        )
+        .unwrap();
     }
-    eprintln!("lane31 r230 (word0 prefix total >> shift): 0x{:08x}", h_r230[0]);
+    eprintln!(
+        "lane31 r230 (word0 prefix total >> shift): 0x{:08x}",
+        h_r230[0]
+    );
 
     // Assertions at the end (after debug output)
     let test_passed = total >= 27 && block0[1] > 0;
@@ -1941,6 +2134,638 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
 
 
+const SORT_REPLAY_CAPTURE_MAGIC: u32 = 0x5350_5243;
+const SORT_REPLAY_CAPTURE_VERSION: u32 = 6;
+const SORT_REPLAY_CAPTURE_FLAG_HAS_VALS: u32 = 1 << 0;
+const SORT_REPLAY_CAPTURE_FLAG_HAS_GRID_SHARE: u32 = 1 << 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SortReplayGridEvenShare {
+    total_grains: i32,
+    big_blocks: i32,
+    big_share: i32,
+    normal_share: i32,
+    normal_base_offset: i32,
+    num_items: i32,
+    grid_size: i32,
+    block_offset: i32,
+    block_end: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SortReplayCapture {
+    pass_n: u32,
+    begin_bit: u32,
+    n_items: usize,
+    capture_items: usize,
+    grid_dim_x: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+    first: u8,
+    last: u8,
+    overwrite: u8,
+    keys_in_ptr: u64,
+    keys_out_ptr: u64,
+    vals_in_ptr: u64,
+    vals_out_ptr: u64,
+    spine_ptr: u64,
+    stream_ptr: u64,
+    spine_words: Vec<u32>,
+    grid_share: Option<SortReplayGridEvenShare>,
+    keys_in: Vec<i32>,
+    vals_in: Option<Vec<i32>>,
+    keys_in_before: Vec<i32>,
+    vals_in_before: Option<Vec<i32>>,
+    keys_out_before: Vec<i32>,
+    vals_out_before: Option<Vec<i32>>,
+    keys_out: Vec<i32>,
+    vals_out: Option<Vec<i32>>,
+}
+
+fn read_le_u32(words: &[u8], offset: &mut usize) -> Result<u32, Box<dyn error::Error>> {
+    if *offset + 4 > words.len() {
+        return Err(format!("capture truncated at offset {}", *offset).into());
+    }
+    let value = u32::from_le_bytes(words[*offset..*offset + 4].try_into().unwrap());
+    *offset += 4;
+    Ok(value)
+}
+
+fn read_le_i32(words: &[u8], offset: &mut usize) -> Result<i32, Box<dyn error::Error>> {
+    Ok(read_le_u32(words, offset)? as i32)
+}
+
+fn read_le_u64(words: &[u8], offset: &mut usize) -> Result<u64, Box<dyn error::Error>> {
+    if *offset + 8 > words.len() {
+        return Err(format!("capture truncated at offset {}", *offset).into());
+    }
+    let value = u64::from_le_bytes(words[*offset..*offset + 8].try_into().unwrap());
+    *offset += 8;
+    Ok(value)
+}
+
+fn read_i32_vec(
+    words: &[u8],
+    offset: &mut usize,
+    len: usize,
+) -> Result<Vec<i32>, Box<dyn error::Error>> {
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_le_i32(words, offset)?);
+    }
+    Ok(values)
+}
+
+fn read_u32_vec(
+    words: &[u8],
+    offset: &mut usize,
+    len: usize,
+) -> Result<Vec<u32>, Box<dyn error::Error>> {
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_le_u32(words, offset)?);
+    }
+    Ok(values)
+}
+
+fn parse_sort_replay_capture(bytes: &[u8]) -> Result<SortReplayCapture, Box<dyn error::Error>> {
+    let mut offset = 0usize;
+    let magic = read_le_u32(bytes, &mut offset)?;
+    if magic != SORT_REPLAY_CAPTURE_MAGIC {
+        return Err(format!("bad capture magic: 0x{magic:08x}").into());
+    }
+    let version = read_le_u32(bytes, &mut offset)?;
+    if !(1..=SORT_REPLAY_CAPTURE_VERSION).contains(&version) {
+        return Err(format!("unsupported capture version: {}", version).into());
+    }
+    let pass_n = read_le_u32(bytes, &mut offset)?;
+    let begin_bit = read_le_u32(bytes, &mut offset)?;
+    let n_items = read_le_u32(bytes, &mut offset)? as usize;
+    let capture_items = if version >= 5 {
+        read_le_u32(bytes, &mut offset)? as usize
+    } else {
+        n_items
+    };
+    let grid_dim_x = read_le_u32(bytes, &mut offset)?;
+    let spine_word_count = read_le_u32(bytes, &mut offset)? as usize;
+    let flags = read_le_u32(bytes, &mut offset)?;
+    let (first, last, overwrite, block_dim_x, block_dim_y, block_dim_z, shared_mem_bytes) =
+        if version >= 2 {
+            let packed_launch_flags = read_le_u32(bytes, &mut offset)?;
+            (
+                (packed_launch_flags & 0xff) as u8,
+                ((packed_launch_flags >> 8) & 0xff) as u8,
+                ((packed_launch_flags >> 16) & 0xff) as u8,
+                read_le_u32(bytes, &mut offset)?,
+                read_le_u32(bytes, &mut offset)?,
+                read_le_u32(bytes, &mut offset)?,
+                read_le_u32(bytes, &mut offset)?,
+            )
+        } else {
+            let (first, last, overwrite) = infer_captured_sort_pass_flags(begin_bit)?;
+            (first, last, overwrite, 128, 1, 1, 0)
+        };
+    let (keys_in_ptr, keys_out_ptr, vals_in_ptr, vals_out_ptr, spine_ptr, stream_ptr) =
+        if version >= 3 {
+            (
+                read_le_u64(bytes, &mut offset)?,
+                read_le_u64(bytes, &mut offset)?,
+                read_le_u64(bytes, &mut offset)?,
+                read_le_u64(bytes, &mut offset)?,
+                read_le_u64(bytes, &mut offset)?,
+                read_le_u64(bytes, &mut offset)?,
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0)
+        };
+    let grid_share_words = [
+        read_le_i32(bytes, &mut offset)?,
+        read_le_i32(bytes, &mut offset)?,
+        read_le_i32(bytes, &mut offset)?,
+        read_le_i32(bytes, &mut offset)?,
+        read_le_i32(bytes, &mut offset)?,
+        read_le_i32(bytes, &mut offset)?,
+        read_le_i32(bytes, &mut offset)?,
+        read_le_i32(bytes, &mut offset)?,
+        read_le_i32(bytes, &mut offset)?,
+    ];
+    let keys_in = read_i32_vec(bytes, &mut offset, capture_items)?;
+    let vals_in = if (flags & SORT_REPLAY_CAPTURE_FLAG_HAS_VALS) != 0 {
+        Some(read_i32_vec(bytes, &mut offset, capture_items)?)
+    } else {
+        None
+    };
+    let (keys_in_before, vals_in_before) = if version >= 6 {
+        let keys_in_before = read_i32_vec(bytes, &mut offset, capture_items)?;
+        let vals_in_before = if (flags & SORT_REPLAY_CAPTURE_FLAG_HAS_VALS) != 0 {
+            Some(read_i32_vec(bytes, &mut offset, capture_items)?)
+        } else {
+            None
+        };
+        (keys_in_before, vals_in_before)
+    } else {
+        (Vec::new(), None)
+    };
+    let (keys_out_before, vals_out_before) = if version >= 4 {
+        let keys_out_before = read_i32_vec(bytes, &mut offset, capture_items)?;
+        let vals_out_before = if (flags & SORT_REPLAY_CAPTURE_FLAG_HAS_VALS) != 0 {
+            Some(read_i32_vec(bytes, &mut offset, capture_items)?)
+        } else {
+            None
+        };
+        (keys_out_before, vals_out_before)
+    } else {
+        (Vec::new(), None)
+    };
+    let keys_out = read_i32_vec(bytes, &mut offset, capture_items)?;
+    let vals_out = if (flags & SORT_REPLAY_CAPTURE_FLAG_HAS_VALS) != 0 {
+        Some(read_i32_vec(bytes, &mut offset, capture_items)?)
+    } else {
+        None
+    };
+    let spine_words = read_u32_vec(bytes, &mut offset, spine_word_count)?;
+    if offset != bytes.len() {
+        return Err(format!(
+            "unexpected trailing bytes: parsed {} of {}",
+            offset,
+            bytes.len()
+        )
+        .into());
+    }
+    let grid_share = if (flags & SORT_REPLAY_CAPTURE_FLAG_HAS_GRID_SHARE) != 0 {
+        Some(SortReplayGridEvenShare {
+            total_grains: grid_share_words[0],
+            big_blocks: grid_share_words[1],
+            big_share: grid_share_words[2],
+            normal_share: grid_share_words[3],
+            normal_base_offset: grid_share_words[4],
+            num_items: grid_share_words[5],
+            grid_size: grid_share_words[6],
+            block_offset: grid_share_words[7],
+            block_end: grid_share_words[8],
+        })
+    } else {
+        None
+    };
+    Ok(SortReplayCapture {
+        pass_n,
+        begin_bit,
+        n_items,
+        capture_items,
+        grid_dim_x,
+        block_dim_x,
+        block_dim_y,
+        block_dim_z,
+        shared_mem_bytes,
+        first,
+        last,
+        overwrite,
+        keys_in_ptr,
+        keys_out_ptr,
+        vals_in_ptr,
+        vals_out_ptr,
+        spine_ptr,
+        stream_ptr,
+        spine_words,
+        grid_share,
+        keys_in,
+        vals_in,
+        keys_in_before,
+        vals_in_before,
+        keys_out_before,
+        vals_out_before,
+        keys_out,
+        vals_out,
+    })
+}
+
+fn infer_captured_sort_pass_flags(begin_bit: u32) -> Result<(u8, u8, u8), Box<dyn error::Error>> {
+    match begin_bit {
+        0 => Ok((1, 0, 0)),
+        4 | 8 | 12 => Ok((0, 0, 0)),
+        16 => Ok((0, 1, 1)),
+        _ => Err(format!("cannot infer pass flags for begin_bit={}", begin_bit).into()),
+    }
+}
+
+fn latest_sort_replay_capture_path() -> Result<Option<String>, Box<dyn error::Error>> {
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in fs::read_dir("/tmp")? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("zluda_sort_replay_capture_bit") || !name.ends_with(".bin") {
+            continue;
+        }
+        let modified = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let path_str = path.to_string_lossy().into_owned();
+        match &newest {
+            Some((best_time, _)) if modified <= *best_time => {}
+            _ => newest = Some((modified, path_str)),
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
+}
+
+#[test]
+fn parse_sort_replay_capture_reads_expected_layout() -> Result<(), Box<dyn error::Error>> {
+    let mut bytes = Vec::new();
+    for word in [
+        SORT_REPLAY_CAPTURE_MAGIC,
+        SORT_REPLAY_CAPTURE_VERSION,
+        4756,
+        4,
+        2,
+        2,
+        5,
+        3,
+        SORT_REPLAY_CAPTURE_FLAG_HAS_VALS | SORT_REPLAY_CAPTURE_FLAG_HAS_GRID_SHARE,
+        0x0001_0100,
+        128,
+        1,
+        1,
+        256,
+    ] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in [0x1000u64, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in [5i32, 0, 3328, 1664, 0, 2, 5, 0, 0] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in [
+        10i32, 20, 100, 200, 11, 12, 110, 120, 21, 22, 210, 220, 30, 40, 300, 400,
+    ] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in [7u32, 8, 9] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let capture = parse_sort_replay_capture(&bytes)?;
+    assert_eq!(capture.pass_n, 4756);
+    assert_eq!(capture.begin_bit, 4);
+    assert_eq!(capture.n_items, 2);
+    assert_eq!(capture.capture_items, 2);
+    assert_eq!(capture.grid_dim_x, 5);
+    assert_eq!(capture.block_dim_x, 128);
+    assert_eq!(capture.block_dim_y, 1);
+    assert_eq!(capture.block_dim_z, 1);
+    assert_eq!(capture.shared_mem_bytes, 256);
+    assert_eq!(capture.first, 0);
+    assert_eq!(capture.last, 1);
+    assert_eq!(capture.overwrite, 1);
+    assert_eq!(capture.keys_in_ptr, 0x1000);
+    assert_eq!(capture.keys_out_ptr, 0x2000);
+    assert_eq!(capture.vals_in_ptr, 0x3000);
+    assert_eq!(capture.vals_out_ptr, 0x4000);
+    assert_eq!(capture.spine_ptr, 0x5000);
+    assert_eq!(capture.stream_ptr, 0x6000);
+    assert_eq!(capture.keys_in, vec![10, 20]);
+    assert_eq!(capture.vals_in, Some(vec![100, 200]));
+    assert_eq!(capture.keys_in_before, vec![11, 12]);
+    assert_eq!(capture.vals_in_before, Some(vec![110, 120]));
+    assert_eq!(capture.keys_out_before, vec![21, 22]);
+    assert_eq!(capture.vals_out_before, Some(vec![210, 220]));
+    assert_eq!(capture.keys_out, vec![30, 40]);
+    assert_eq!(capture.vals_out, Some(vec![300, 400]));
+    assert_eq!(capture.spine_words, vec![7, 8, 9]);
+    assert_eq!(
+        capture.grid_share,
+        Some(SortReplayGridEvenShare {
+            total_grains: 5,
+            big_blocks: 0,
+            big_share: 3328,
+            normal_share: 1664,
+            normal_base_offset: 0,
+            num_items: 2,
+            grid_size: 5,
+            block_offset: 0,
+            block_end: 0,
+        })
+    );
+    Ok(())
+}
+
+
+
+
+
+
+
+fn latest_sort_replay_capture_path_with_prefix_live(
+    prefix: &str,
+) -> Result<Option<String>, Box<dyn error::Error>> {
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in fs::read_dir("/tmp")? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(prefix) || !name.ends_with(".bin") {
+            continue;
+        }
+        let modified = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let path_str = path.to_string_lossy().into_owned();
+        match &newest {
+            Some((best_time, _)) if modified <= *best_time => {}
+            _ => newest = Some((modified, path_str)),
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
+}
+
+fn mismatch_positions_live<T: PartialEq>(left: &[T], right: &[T], limit: usize) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let len = left.len().min(right.len());
+    for idx in 0..len {
+        if left[idx] != right[idx] {
+            positions.push(idx);
+            if positions.len() >= limit {
+                return positions;
+            }
+        }
+    }
+    if positions.len() < limit && left.len() != right.len() {
+        positions.push(len);
+    }
+    positions
+}
+
+fn mismatch_count_live<T: PartialEq>(left: &[T], right: &[T]) -> usize {
+    let len = left.len().min(right.len());
+    let shared = (0..len).filter(|&idx| left[idx] != right[idx]).count();
+    shared + left.len().max(right.len()) - len
+}
+
+fn summarize_region_mismatch_live<T: PartialEq>(
+    left: &[T],
+    right: &[T],
+    logical_len: usize,
+    limit: usize,
+) -> String {
+    let logical_len = logical_len.min(left.len()).min(right.len());
+    let (left_prefix, left_tail) = left.split_at(logical_len);
+    let (right_prefix, right_tail) = right.split_at(logical_len);
+    format!(
+        "{}/{} {:?}/{:?}",
+        mismatch_count_live(left_prefix, right_prefix),
+        mismatch_count_live(left_tail, right_tail),
+        mismatch_positions_live(left_prefix, right_prefix, limit),
+        mismatch_positions_live(left_tail, right_tail, limit)
+    )
+}
+
+fn summarize_sort_replay_capture_diff_live(
+    good: &SortReplayCapture,
+    bad: &SortReplayCapture,
+) -> String {
+    let vals_in_good = good.vals_in.as_deref().unwrap_or(&[]);
+    let vals_in_bad = bad.vals_in.as_deref().unwrap_or(&[]);
+    let vals_in_before_good = good.vals_in_before.as_deref().unwrap_or(&[]);
+    let vals_in_before_bad = bad.vals_in_before.as_deref().unwrap_or(&[]);
+    let vals_out_before_good = good.vals_out_before.as_deref().unwrap_or(&[]);
+    let vals_out_before_bad = bad.vals_out_before.as_deref().unwrap_or(&[]);
+    let vals_out_good = good.vals_out.as_deref().unwrap_or(&[]);
+    let vals_out_bad = bad.vals_out.as_deref().unwrap_or(&[]);
+    format!(
+        "good={}::flags={}/{}/{} bad={}::flags={}/{}/{} meta_diff[bit={},n={},capture={},grid={},block={}/{}/{},smem={},grid_share={}] addr[ki=0x{:x}/0x{:x},ko=0x{:x}/0x{:x},vi=0x{:x}/0x{:x},vo=0x{:x}/0x{:x},sp=0x{:x}/0x{:x},stream=0x{:x}/0x{:x}] payload_diff[keys_in={}; vals_in={}; keys_in_before={}; vals_in_before={}; keys_out_before={}; vals_out_before={}; keys_out={}; vals_out={}; spine={} {:?}]",
+        good.pass_n,
+        good.first,
+        good.last,
+        good.overwrite,
+        bad.pass_n,
+        bad.first,
+        bad.last,
+        bad.overwrite,
+        good.begin_bit != bad.begin_bit,
+        good.n_items != bad.n_items,
+        good.capture_items != bad.capture_items,
+        good.grid_dim_x != bad.grid_dim_x,
+        good.block_dim_x != bad.block_dim_x,
+        good.block_dim_y != bad.block_dim_y,
+        good.block_dim_z != bad.block_dim_z,
+        good.shared_mem_bytes != bad.shared_mem_bytes,
+        good.grid_share != bad.grid_share,
+        good.keys_in_ptr,
+        bad.keys_in_ptr,
+        good.keys_out_ptr,
+        bad.keys_out_ptr,
+        good.vals_in_ptr,
+        bad.vals_in_ptr,
+        good.vals_out_ptr,
+        bad.vals_out_ptr,
+        good.spine_ptr,
+        bad.spine_ptr,
+        good.stream_ptr,
+        bad.stream_ptr,
+        summarize_region_mismatch_live(
+            &good.keys_in,
+            &bad.keys_in,
+            good.n_items.min(bad.n_items),
+            4
+        ),
+        summarize_region_mismatch_live(
+            vals_in_good,
+            vals_in_bad,
+            good.n_items.min(bad.n_items),
+            4
+        ),
+        summarize_region_mismatch_live(
+            &good.keys_in_before,
+            &bad.keys_in_before,
+            good.n_items.min(bad.n_items),
+            4
+        ),
+        summarize_region_mismatch_live(
+            vals_in_before_good,
+            vals_in_before_bad,
+            good.n_items.min(bad.n_items),
+            4
+        ),
+        summarize_region_mismatch_live(
+            &good.keys_out_before,
+            &bad.keys_out_before,
+            good.n_items.min(bad.n_items),
+            4
+        ),
+        summarize_region_mismatch_live(
+            vals_out_before_good,
+            vals_out_before_bad,
+            good.n_items.min(bad.n_items),
+            4
+        ),
+        summarize_region_mismatch_live(
+            &good.keys_out,
+            &bad.keys_out,
+            good.n_items.min(bad.n_items),
+            4
+        ),
+        summarize_region_mismatch_live(
+            vals_out_good,
+            vals_out_bad,
+            good.n_items.min(bad.n_items),
+            4
+        ),
+        mismatch_count_live(&good.spine_words, &bad.spine_words),
+        mismatch_positions_live(&good.spine_words, &bad.spine_words, 4),
+    )
+}
+
+#[test]
+fn summarize_sort_replay_capture_diff_live_reports_changed_fields() {
+    let good = SortReplayCapture {
+        pass_n: 0,
+        begin_bit: 0,
+        n_items: 4,
+        capture_items: 4,
+        grid_dim_x: 5,
+        block_dim_x: 128,
+        block_dim_y: 1,
+        block_dim_z: 1,
+        shared_mem_bytes: 0,
+        first: 0,
+        last: 1,
+        overwrite: 0,
+        keys_in_ptr: 0x1000,
+        keys_out_ptr: 0x2000,
+        vals_in_ptr: 0x3000,
+        vals_out_ptr: 0x4000,
+        spine_ptr: 0x5000,
+        stream_ptr: 0x6000,
+        spine_words: vec![7, 8, 9],
+        grid_share: Some(SortReplayGridEvenShare {
+            total_grains: 5,
+            big_blocks: 0,
+            big_share: 3328,
+            normal_share: 1664,
+            normal_base_offset: 0,
+            num_items: 4,
+            grid_size: 5,
+            block_offset: 0,
+            block_end: 0,
+        }),
+        keys_in: vec![10, 20, 30, 40],
+        vals_in: Some(vec![100, 200, 300, 400]),
+        keys_in_before: vec![8, 18, 28, 38],
+        vals_in_before: Some(vec![80, 180, 280, 380]),
+        keys_out_before: vec![9, 19, 29, 39],
+        vals_out_before: Some(vec![90, 190, 290, 390]),
+        keys_out: vec![11, 21, 31, 41],
+        vals_out: Some(vec![101, 201, 301, 401]),
+    };
+    let mut bad = good.clone();
+    bad.first = 1;
+    bad.keys_out_ptr = 0x2222;
+    bad.keys_in[2] = 999;
+    bad.keys_in_before[0] = 777;
+    bad.keys_out_before[1] = 1234;
+    bad.vals_out.as_mut().unwrap()[3] = 777;
+    bad.spine_words[1] = 42;
+    let summary = summarize_sort_replay_capture_diff_live(&good, &bad);
+    assert!(summary.contains("flags=0/1/0"));
+        assert!(summary.contains("flags=1/1/0"));
+        assert!(summary.contains("ko=0x2000/0x2222"));
+        assert!(summary.contains("keys_in=1/0 [2]/[]"));
+        assert!(summary.contains("keys_in_before=1/0 [0]/[]"));
+        assert!(summary.contains("keys_out_before=1/0 [1]/[]"));
+        assert!(summary.contains("vals_out=1/0 [3]/[]"));
+        assert!(summary.contains("spine=1 [1]"));
+}
+
+#[test]
+#[ignore]
+fn sort_replay_compare_good_and_bad_captures_live() -> Result<(), Box<dyn error::Error>> {
+    let good_path = match std::env::var("ZLUDA_SORT_REPLAY_GOOD_CAPTURE") {
+        Ok(path) => path,
+        Err(_) => {
+            match latest_sort_replay_capture_path_with_prefix_live(
+                "zluda_sort_replay_capture_good_bit",
+            )? {
+                Some(path) => path,
+                None => {
+                    eprintln!(
+                        "sort_replay_compare: no /tmp/zluda_sort_replay_capture_good_bit*_pass*.bin found"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let bad_path = match std::env::var("ZLUDA_SORT_REPLAY_BAD_CAPTURE") {
+        Ok(path) => path,
+        Err(_) => match latest_sort_replay_capture_path()? {
+            Some(path) => path,
+            None => {
+                eprintln!("sort_replay_compare: no /tmp/zluda_sort_replay_capture_bit*_pass*.bin found");
+                return Ok(());
+            }
+        },
+    };
+    let good = parse_sort_replay_capture(&fs::read(&good_path)?)?;
+    let bad = parse_sort_replay_capture(&fs::read(&bad_path)?)?;
+    eprintln!(
+        "sort_replay_compare: good={} bad={} {}",
+        good_path,
+        bad_path,
+        summarize_sort_replay_capture_diff_live(&good, &bad)
+    );
+    Ok(())
+}
+
+
+
 /// Regression test: sust.b.3d.b64 on 1-channel FLOAT surface.
 /// This is the actual crash bug: b64 writes use dmask:0x3 (2 channels) but
 /// the surface only has 1 channel. Must write to 2 consecutive x positions instead.
@@ -1956,7 +2781,9 @@ fn sust_3d_b64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -2000,9 +2827,7 @@ fn sust_3d_b64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let res_desc = hipResourceDesc {
         resType: hipResourceType::hipResourceTypeArray,
         res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
-            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
-                array: array,
-            },
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array: array },
         },
     };
     unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
@@ -2013,7 +2838,8 @@ fn sust_3d_b64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let encoded_handle = (surf_obj as usize | shift_amount) as u64;
     eprintln!(
         "sust_3d_b64: 1-ch FLOAT surface, encoded={:#x} shift={}",
-        encoded_handle, pixel_size.trailing_zeros()
+        encoded_handle,
+        pixel_size.trailing_zeros()
     );
 
     let mut out_buf = ptr::null_mut();
@@ -2035,8 +2861,17 @@ fn sust_3d_b64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     eprintln!("sust_3d_b64: launching grid=[4,8,8] block=[8,8,8]...");
     unsafe {
         hipModuleLaunchKernel(
-            kernel, 4, 8, 8, 8, 8, 8, 0, stream,
-            args.as_mut_ptr(), ptr::null_mut(),
+            kernel,
+            4,
+            8,
+            8,
+            8,
+            8,
+            8,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            ptr::null_mut(),
         )
     }
     .unwrap();
@@ -2048,8 +2883,11 @@ fn sust_3d_b64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let mut result = 0u32;
     unsafe {
         hipMemcpyAsync(
-            &mut result as *mut _ as _, out_buf, 4,
-            hipMemcpyKind::hipMemcpyDeviceToHost, stream,
+            &mut result as *mut _ as _,
+            out_buf,
+            4,
+            hipMemcpyKind::hipMemcpyDeviceToHost,
+            stream,
         )
     }
     .unwrap();
@@ -2081,7 +2919,9 @@ fn sust_divergent_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -2129,9 +2969,7 @@ fn sust_divergent_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
         let res_desc = hipResourceDesc {
             resType: hipResourceType::hipResourceTypeArray,
             res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
-                array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
-                    array,
-                },
+                array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array },
             },
         };
         unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
@@ -2142,7 +2980,10 @@ fn sust_divergent_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
     let handle_a = make_surf(array_a);
     let handle_b = make_surf(array_b);
-    eprintln!("sust_divergent: handle_a={:#x} handle_b={:#x}", handle_a, handle_b);
+    eprintln!(
+        "sust_divergent: handle_a={:#x} handle_b={:#x}",
+        handle_a, handle_b
+    );
 
     // Output marker buffer
     let mut out_buf = ptr::null_mut();
@@ -2164,8 +3005,17 @@ fn sust_divergent_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     eprintln!("sust_divergent: launching 64 threads...");
     unsafe {
         hipModuleLaunchKernel(
-            kernel, 1, 1, 1, 64, 1, 1, 0, stream,
-            args.as_mut_ptr(), ptr::null_mut(),
+            kernel,
+            1,
+            1,
+            1,
+            64,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            ptr::null_mut(),
         )
     }
     .unwrap();
@@ -2180,19 +3030,25 @@ fn sust_divergent_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     unsafe {
         hipMemcpyFromArray(
             data_a.as_mut_ptr() as _,
-            array_a, 0, 0,
+            array_a,
+            0,
+            0,
             64 * 4,
             hipMemcpyKind::hipMemcpyDeviceToHost,
         )
-    }.unwrap();
+    }
+    .unwrap();
     unsafe {
         hipMemcpyFromArray(
             data_b.as_mut_ptr() as _,
-            array_b, 0, 0,
+            array_b,
+            0,
+            0,
             64 * 4,
             hipMemcpyKind::hipMemcpyDeviceToHost,
         )
-    }.unwrap();
+    }
+    .unwrap();
 
     eprintln!("sust_divergent: surface A[0..8] = {:08x?}", &data_a[..8]);
     eprintln!("sust_divergent: surface B[0..8] = {:08x?}", &data_b[..8]);
@@ -2202,12 +3058,19 @@ fn sust_divergent_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let mut b_ok = 0;
     for i in 0..64usize {
         if i % 2 == 0 {
-            if data_a[i] == 0x42420000 { a_ok += 1; }
+            if data_a[i] == 0x42420000 {
+                a_ok += 1;
+            }
         } else {
-            if data_b[i] == 0x43430000 { b_ok += 1; }
+            if data_b[i] == 0x43430000 {
+                b_ok += 1;
+            }
         }
     }
-    eprintln!("sust_divergent: A correct={}/32, B correct={}/32", a_ok, b_ok);
+    eprintln!(
+        "sust_divergent: A correct={}/32, B correct={}/32",
+        a_ok, b_ok
+    );
 
     // Cleanup
     unsafe { hipFree(out_buf) }.unwrap();
@@ -2218,7 +3081,10 @@ fn sust_divergent_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
     // Key assertion: surface B MUST have writes from odd threads.
     // If CONSTANT_SPACE bug: all threads use surface A, B gets nothing.
-    assert!(b_ok > 0, "surface B should have writes from odd threads (got 0 — CONSTANT_SPACE scalar load bug!)");
+    assert!(
+        b_ok > 0,
+        "surface B should have writes from odd threads (got 0 — CONSTANT_SPACE scalar load bug!)"
+    );
     assert!(a_ok > 0, "surface A should have writes from even threads");
     Ok(())
 }
@@ -2239,7 +3105,9 @@ fn sust_3d_large_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -2283,9 +3151,7 @@ fn sust_3d_large_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let res_desc = hipResourceDesc {
         resType: hipResourceType::hipResourceTypeArray,
         res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
-            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
-                array: array,
-            },
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array: array },
         },
     };
     unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
@@ -2296,7 +3162,9 @@ fn sust_3d_large_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let encoded_handle = (surf_obj as usize | shift_amount) as u64;
     eprintln!(
         "sust_3d_large: raw_handle={:#x} encoded={:#x} shift={}",
-        surf_obj as u64, encoded_handle, pixel_size.trailing_zeros()
+        surf_obj as u64,
+        encoded_handle,
+        pixel_size.trailing_zeros()
     );
 
     // Allocate output buffer
@@ -2318,8 +3186,17 @@ fn sust_3d_large_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     eprintln!("sust_3d_large: launching grid=[8,8,8] block=[8,8,8]...");
     unsafe {
         hipModuleLaunchKernel(
-            kernel, 8, 8, 8, 8, 8, 8, 0, stream,
-            args.as_mut_ptr(), ptr::null_mut(),
+            kernel,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            ptr::null_mut(),
         )
     }
     .unwrap();
@@ -2369,7 +3246,9 @@ fn sust_2d_clear_8x8_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -2414,9 +3293,7 @@ fn sust_2d_clear_8x8_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let res_desc = hipResourceDesc {
         resType: hipResourceType::hipResourceTypeArray,
         res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
-            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
-                array: array,
-            },
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array: array },
         },
     };
     unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
@@ -2443,8 +3320,17 @@ fn sust_2d_clear_8x8_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // grid=[1,1,1] block=[16,16,1] → 256 threads for 64 pixels (192 OOB)
     unsafe {
         hipModuleLaunchKernel(
-            kernel, 1, 1, 1, 16, 16, 1, 0, stream,
-            args.as_mut_ptr(), ptr::null_mut(),
+            kernel,
+            1,
+            1,
+            1,
+            16,
+            16,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            ptr::null_mut(),
         )
     }
     .unwrap();
@@ -2471,10 +3357,14 @@ fn sust_2d_clear_8x8_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let written = readback.iter().filter(|&&v| v == clear_val).count();
     eprintln!(
         "sust_2d_clear_8x8: {}/{} pixels written (0x{:x})",
-        written, width * height, clear_val
+        written,
+        width * height,
+        clear_val
     );
     for y in 0..height {
-        let row: Vec<String> = (0..width).map(|x| format!("{:08x}", readback[y * width + x])).collect();
+        let row: Vec<String> = (0..width)
+            .map(|x| format!("{:08x}", readback[y * width + x]))
+            .collect();
         eprintln!("  row {}: {}", y, row.join(" "));
     }
 
@@ -2488,7 +3378,8 @@ fn sust_2d_clear_8x8_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     assert!(
         written >= 60,
         "Expected at least 60/64 pixels written, got {}/{}",
-        written, width * height
+        written,
+        width * height
     );
     Ok(())
 }
@@ -2507,7 +3398,9 @@ fn sust_2d_clear_exact_grid_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -2550,9 +3443,7 @@ fn sust_2d_clear_exact_grid_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let res_desc = hipResourceDesc {
         resType: hipResourceType::hipResourceTypeArray,
         res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
-            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
-                array: array,
-            },
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array: array },
         },
     };
     unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
@@ -2576,8 +3467,17 @@ fn sust_2d_clear_exact_grid_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // Exact match: grid=[1,1,1] block=[8,8,1] → 64 threads for 64 pixels
     unsafe {
         hipModuleLaunchKernel(
-            kernel, 1, 1, 1, 8, 8, 1, 0, stream,
-            args.as_mut_ptr(), ptr::null_mut(),
+            kernel,
+            1,
+            1,
+            1,
+            8,
+            8,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            ptr::null_mut(),
         )
     }
     .unwrap();
@@ -2602,10 +3502,13 @@ fn sust_2d_clear_exact_grid_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let written = readback.iter().filter(|&&v| v == clear_val).count();
     eprintln!(
         "sust_2d_clear_exact: {}/{} pixels written",
-        written, width * height
+        written,
+        width * height
     );
     for y in 0..height {
-        let row: Vec<String> = (0..width).map(|x| format!("{:08x}", readback[y * width + x])).collect();
+        let row: Vec<String> = (0..width)
+            .map(|x| format!("{:08x}", readback[y * width + x]))
+            .collect();
         eprintln!("  row {}: {}", y, row.join(" "));
     }
 
@@ -2638,7 +3541,9 @@ fn sust_2d_clear_8x8_depth0_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -2681,9 +3586,7 @@ fn sust_2d_clear_8x8_depth0_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let res_desc = hipResourceDesc {
         resType: hipResourceType::hipResourceTypeArray,
         res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
-            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
-                array: array,
-            },
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array: array },
         },
     };
     unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
@@ -2706,8 +3609,17 @@ fn sust_2d_clear_8x8_depth0_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // grid=[1,1,1] block=[16,16,1] → 256 threads, only 64 in-bounds
     unsafe {
         hipModuleLaunchKernel(
-            kernel, 1, 1, 1, 16, 16, 1, 0, stream,
-            args.as_mut_ptr(), ptr::null_mut(),
+            kernel,
+            1,
+            1,
+            1,
+            16,
+            16,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            ptr::null_mut(),
         )
     }
     .unwrap();
@@ -2756,7 +3668,9 @@ fn sust_2d_clear_depth0_64x64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> 
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -2801,9 +3715,7 @@ fn sust_2d_clear_depth0_64x64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> 
     let res_desc = hipResourceDesc {
         resType: hipResourceType::hipResourceTypeArray,
         res: hip_runtime_sys::hipResourceDesc__bindgen_ty_1 {
-            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 {
-                array: array,
-            },
+            array: hip_runtime_sys::hipResourceDesc__bindgen_ty_1__bindgen_ty_1 { array: array },
         },
     };
     unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) }.unwrap();
@@ -2811,7 +3723,11 @@ fn sust_2d_clear_depth0_64x64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> 
     let pixel_size: usize = 4; // UINT32
     let shift_amount = (pixel_size.trailing_zeros() as usize) << (usize::BITS - 3);
     let encoded_handle = (surf_obj as usize | shift_amount) as u64;
-    eprintln!("sust_2d_depth0_64: encoded={:#x} shift={}", encoded_handle, pixel_size.trailing_zeros());
+    eprintln!(
+        "sust_2d_depth0_64: encoded={:#x} shift={}",
+        encoded_handle,
+        pixel_size.trailing_zeros()
+    );
 
     let clear_val = 0xDEADBEEFu32;
     let mut kernel = unsafe { mem::zeroed() };
@@ -2827,8 +3743,17 @@ fn sust_2d_clear_depth0_64x64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> 
     // Exact game grid: [4,4,1] block=[16,16,1] → 64x64 threads, all in-bounds
     unsafe {
         hipModuleLaunchKernel(
-            kernel, 4, 4, 1, 16, 16, 1, 0, stream,
-            args.as_mut_ptr(), ptr::null_mut(),
+            kernel,
+            4,
+            4,
+            1,
+            16,
+            16,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            ptr::null_mut(),
         )
     }
     .unwrap();
@@ -2850,7 +3775,11 @@ fn sust_2d_clear_depth0_64x64_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> 
     unsafe { hipDrvMemcpy3D(&drv_copy) }.unwrap();
 
     let written = readback.iter().filter(|&&v| v == clear_val).count();
-    eprintln!("sust_2d_depth0_64: {}/{} pixels written", written, width * height);
+    eprintln!(
+        "sust_2d_depth0_64: {}/{} pixels written",
+        written,
+        width * height
+    );
 
     unsafe { hipStreamDestroy(stream) }.unwrap();
     unsafe { hipDestroySurfaceObject(surf_obj) }.unwrap();
@@ -2882,7 +3811,9 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -2928,10 +3859,12 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
             // Get the surface reference (ZLUDA compiles .surfref as a global variable,
             // so hipModuleGetTexRef finds it)
             let mut surf_ref: *mut textureReference = std::ptr::null_mut();
-            let surf_result = unsafe {
-                hipModuleGetTexRef(&mut surf_ref, hip_mod, c"testSurf".as_ptr())
-            };
-            eprintln!("sust_3d_gpu: hipModuleGetTexRef(testSurf) -> {:?} ref={:p}", surf_result, surf_ref);
+            let surf_result =
+                unsafe { hipModuleGetTexRef(&mut surf_ref, hip_mod, c"testSurf".as_ptr()) };
+            eprintln!(
+                "sust_3d_gpu: hipModuleGetTexRef(testSurf) -> {:?} ref={:p}",
+                surf_result, surf_ref
+            );
 
             // Create a surface object and write its handle to the device global
             // (this is how the game does it — stores handle in a global, kernel reads it)
@@ -2945,7 +3878,10 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
                 },
             };
             let surf_create_result = unsafe { hipCreateSurfaceObject(&mut surf_obj, &res_desc) };
-            eprintln!("sust_3d_gpu: hipCreateSurfaceObject -> {:?} obj={:#x}", surf_create_result, surf_obj as u64);
+            eprintln!(
+                "sust_3d_gpu: hipCreateSurfaceObject -> {:?} obj={:#x}",
+                surf_create_result, surf_obj as u64
+            );
             surf_create_result.unwrap();
 
             // Write the surface object handle to the device global (testSurf)
@@ -2953,8 +3889,12 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
                 // testSurf is a device global - write surf_obj handle to it
                 let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
                 let mut bytes = 0usize;
-                unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"testSurf".as_ptr()) }.unwrap();
-                eprintln!("sust_3d_gpu: testSurf global at {:p} ({} bytes)", dptr.0, bytes);
+                unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"testSurf".as_ptr()) }
+                    .unwrap();
+                eprintln!(
+                    "sust_3d_gpu: testSurf global at {:p} ({} bytes)",
+                    dptr.0, bytes
+                );
                 let mut stream_tmp = unsafe { mem::zeroed() };
                 unsafe { hipStreamCreate(&mut stream_tmp) }.unwrap();
                 let handle = surf_obj as u64;
@@ -2966,10 +3906,14 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
                         hipMemcpyKind::hipMemcpyHostToDevice,
                         stream_tmp,
                     )
-                }.unwrap();
+                }
+                .unwrap();
                 unsafe { hipStreamSynchronize(stream_tmp) }.unwrap();
                 unsafe { hipStreamDestroy(stream_tmp) }.unwrap();
-                eprintln!("sust_3d_gpu: wrote surf handle {:#x} to device global", handle);
+                eprintln!(
+                    "sust_3d_gpu: wrote surf handle {:#x} to device global",
+                    handle
+                );
             }
 
             // Allocate output buffer
@@ -2979,8 +3923,7 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
             // Get kernel and launch
             let mut kernel = unsafe { mem::zeroed() };
-            unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_3d_gpu".as_ptr()) }
-                .unwrap();
+            unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"sust_3d_gpu".as_ptr()) }.unwrap();
 
             let mut stream = unsafe { mem::zeroed() };
             unsafe { hipStreamCreate(&mut stream) }.unwrap();
@@ -2989,8 +3932,17 @@ fn sust_3d_gpu_amdgpu() -> Result<(), Box<dyn error::Error>> {
             eprintln!("sust_3d_gpu: launching kernel...");
             unsafe {
                 hipModuleLaunchKernel(
-                    kernel, 1, 1, 1, 1, 1, 1, 0, stream,
-                    args.as_mut_ptr(), ptr::null_mut(),
+                    kernel,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    args.as_mut_ptr(),
+                    ptr::null_mut(),
                 )
             }
             .unwrap();
@@ -3060,7 +4012,10 @@ fn hip_vulkan_stress_amdgpu() -> Result<(), Box<dyn error::Error>> {
     for i in 0..NUM_BUFS {
         let mut ptr = ptr::null_mut();
         let r = unsafe { hipMalloc(&mut ptr, BUF_SIZE) };
-        eprintln!("hip_vulkan_stress: hipMalloc[{}] -> {:?} ptr={:p}", i, r, ptr);
+        eprintln!(
+            "hip_vulkan_stress: hipMalloc[{}] -> {:?} ptr={:p}",
+            i, r, ptr
+        );
         r.unwrap();
         bufs.push(ptr);
     }
@@ -3076,7 +4031,10 @@ fn hip_vulkan_stress_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // Phase 3: Allocate host buffer for readback
     let mut host_buf = vec![0u32; 16];
 
-    eprintln!("hip_vulkan_stress: starting {} iterations (run vkcube in background)", NUM_ITERS);
+    eprintln!(
+        "hip_vulkan_stress: starting {} iterations (run vkcube in background)",
+        NUM_ITERS
+    );
 
     // Phase 4: Stress loop
     for i in 0..NUM_ITERS {
@@ -3092,7 +4050,10 @@ fn hip_vulkan_stress_amdgpu() -> Result<(), Box<dyn error::Error>> {
                 )
             };
             if r.is_err() {
-                eprintln!("hip_vulkan_stress: FAULT at iter {} buf {} memset: {:?}", i, b, r);
+                eprintln!(
+                    "hip_vulkan_stress: FAULT at iter {} buf {} memset: {:?}",
+                    i, b, r
+                );
                 panic!("hipMemsetD32Async failed: {:?}", r);
             }
         }
@@ -3107,14 +4068,8 @@ fn hip_vulkan_stress_amdgpu() -> Result<(), Box<dyn error::Error>> {
         }
 
         // Readback from first buffer to verify
-        unsafe {
-            hipMemcpyDtoH(
-                host_buf.as_mut_ptr() as *mut _,
-                hipDeviceptr_t(bufs[0]),
-                64,
-            )
-        }
-        .unwrap();
+        unsafe { hipMemcpyDtoH(host_buf.as_mut_ptr() as *mut _, hipDeviceptr_t(bufs[0]), 64) }
+            .unwrap();
 
         // Every 25 iters: free + realloc 2 buffers (forces TTM eviction)
         if i % 25 == 0 && i > 0 {
@@ -3128,7 +4083,10 @@ fn hip_vulkan_stress_amdgpu() -> Result<(), Box<dyn error::Error>> {
             unsafe { hipMalloc(&mut p2, BUF_SIZE) }.unwrap();
             bufs[idx1] = p1;
             bufs[idx2] = p2;
-            eprintln!("hip_vulkan_stress: realloc bufs[{},{}] at iter {}", idx1, idx2, i);
+            eprintln!(
+                "hip_vulkan_stress: realloc bufs[{},{}] at iter {}",
+                idx1, idx2, i
+            );
         }
 
         // Every 10 iters: print memory stats
@@ -3148,7 +4106,10 @@ fn hip_vulkan_stress_amdgpu() -> Result<(), Box<dyn error::Error>> {
         }
     }
 
-    eprintln!("hip_vulkan_stress: PASSED {} iterations with no faults", NUM_ITERS);
+    eprintln!(
+        "hip_vulkan_stress: PASSED {} iterations with no faults",
+        NUM_ITERS
+    );
 
     // Cleanup
     for s in streams {
@@ -3174,7 +4135,9 @@ fn const_global_perkernel_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -3203,14 +4166,17 @@ fn const_global_perkernel_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // Test hipModuleGetGlobal for gTestParams
     let mut dptr = hipDeviceptr_t(std::ptr::null_mut());
     let mut bytes = 0usize;
-    unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"gTestParams".as_ptr()) }
-        .unwrap();
+    unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"gTestParams".as_ptr()) }.unwrap();
     let dptr_val = dptr.0 as u64;
     eprintln!(
         "gTestParams: dptr={:#x} bytes={} {}",
         dptr_val,
         bytes,
-        if dptr_val >= 0x7f0000000000 { "DEV" } else { "HOST" }
+        if dptr_val >= 0x7f0000000000 {
+            "DEV"
+        } else {
+            "HOST"
+        }
     );
     assert!(bytes > 0, "gTestParams bytes should be > 0, got {}", bytes);
     assert!(
@@ -3229,9 +4195,17 @@ fn const_global_perkernel_amdgpu() -> Result<(), Box<dyn error::Error>> {
         "gTestBounds: dptr={:#x} bytes={} {}",
         dptr2_val,
         bytes2,
-        if dptr2_val >= 0x7f0000000000 { "DEV" } else { "HOST" }
+        if dptr2_val >= 0x7f0000000000 {
+            "DEV"
+        } else {
+            "HOST"
+        }
     );
-    assert!(bytes2 > 0, "gTestBounds bytes should be > 0, got {}", bytes2);
+    assert!(
+        bytes2 > 0,
+        "gTestBounds bytes should be > 0, got {}",
+        bytes2
+    );
     assert!(
         dptr.0 != dptr2.0,
         "gTestParams and gTestBounds should have distinct addresses"
@@ -3255,7 +4229,10 @@ fn const_global_flexfluids_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ptx = match fs::read_to_string(ptx_path) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("SKIP: {} not found (run Batman AK once to extract)", ptx_path);
+            eprintln!(
+                "SKIP: {} not found (run Batman AK once to extract)",
+                ptx_path
+            );
             return Ok(());
         }
     };
@@ -3263,7 +4240,9 @@ fn const_global_flexfluids_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -3274,7 +4253,10 @@ fn const_global_flexfluids_amdgpu() -> Result<(), Box<dyn error::Error>> {
         .to_str()
         .unwrap();
 
-    eprintln!("Compiling FlexFluids PTX ({} bytes, 45 kernels)...", ptx.len());
+    eprintln!(
+        "Compiling FlexFluids PTX ({} bytes, 45 kernels)...",
+        ptx.len()
+    );
     let ptx_impl = module.linked_bitcode();
     let elf = llvm_zluda::compile(
         &module.context,
@@ -3300,7 +4282,11 @@ fn const_global_flexfluids_amdgpu() -> Result<(), Box<dyn error::Error>> {
         "gParams: dptr={:#x} bytes={} {}",
         dptr_val,
         bytes,
-        if dptr_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+        if dptr_val >= 0x7f0000000000 {
+            "DEV ✓"
+        } else {
+            "HOST ✗"
+        }
     );
 
     // Test hipModuleGetGlobal for gBounds
@@ -3312,7 +4298,11 @@ fn const_global_flexfluids_amdgpu() -> Result<(), Box<dyn error::Error>> {
         "gBounds: dptr={:#x} bytes={} {}",
         dptr2_val,
         bytes2,
-        if dptr2_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+        if dptr2_val >= 0x7f0000000000 {
+            "DEV ✓"
+        } else {
+            "HOST ✗"
+        }
     );
 
     unsafe { hipModuleUnload(hip_mod) }.unwrap();
@@ -3365,7 +4355,9 @@ fn const_global_multimodule_amdgpu() -> Result<(), Box<dyn error::Error>> {
         let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
         let module = pass::to_llvm_module(
             ast,
-            pass::Attributes { clock_rate: 2124000 },
+            pass::Attributes {
+                clock_rate: 2124000,
+            },
             |_| {},
         )
         .unwrap();
@@ -3397,8 +4389,13 @@ fn const_global_multimodule_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let dptr_val = dptr.0 as u64;
     eprintln!(
         "gParams: dptr={:#x} bytes={} {}",
-        dptr_val, bytes,
-        if dptr_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+        dptr_val,
+        bytes,
+        if dptr_val >= 0x7f0000000000 {
+            "DEV ✓"
+        } else {
+            "HOST ✗"
+        }
     );
 
     let mut dptr2 = hipDeviceptr_t(std::ptr::null_mut());
@@ -3407,20 +4404,37 @@ fn const_global_multimodule_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let dptr2_val = dptr2.0 as u64;
     eprintln!(
         "gBounds: dptr={:#x} bytes={} {}",
-        dptr2_val, bytes2,
-        if dptr2_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+        dptr2_val,
+        bytes2,
+        if dptr2_val >= 0x7f0000000000 {
+            "DEV ✓"
+        } else {
+            "HOST ✗"
+        }
     );
 
     // Also test module 0's globals for comparison
     let mut dptr3 = hipDeviceptr_t(std::ptr::null_mut());
     let mut bytes3 = 0usize;
-    let result = unsafe { hipModuleGetGlobal(&mut dptr3, &mut bytes3, hip_modules[0], c"gKernelData".as_ptr()) };
+    let result = unsafe {
+        hipModuleGetGlobal(
+            &mut dptr3,
+            &mut bytes3,
+            hip_modules[0],
+            c"gKernelData".as_ptr(),
+        )
+    };
     if result.is_ok() {
         let dptr3_val = dptr3.0 as u64;
         eprintln!(
             "gKernelData (module 0): dptr={:#x} bytes={} {}",
-            dptr3_val, bytes3,
-            if dptr3_val >= 0x7f0000000000 { "DEV ✓" } else { "HOST ✗" }
+            dptr3_val,
+            bytes3,
+            if dptr3_val >= 0x7f0000000000 {
+                "DEV ✓"
+            } else {
+                "HOST ✗"
+            }
         );
     }
 
@@ -3471,10 +4485,15 @@ fn const_global_wine_elf_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let sentinel = dptr_val == 0xDEADBEEFDEADBEEF;
     eprintln!(
         "gParams: dptr={:#x} bytes={} {}",
-        dptr_val, bytes,
-        if sentinel { "SENTINEL (NOT WRITTEN!)" }
-        else if dptr_val >= 0x7f0000000000 { "DEV ✓" }
-        else { "HOST ✗" }
+        dptr_val,
+        bytes,
+        if sentinel {
+            "SENTINEL (NOT WRITTEN!)"
+        } else if dptr_val >= 0x7f0000000000 {
+            "DEV ✓"
+        } else {
+            "HOST ✗"
+        }
     );
 
     let mut dptr2 = hipDeviceptr_t(0xDEADBEEFDEADBEEFu64 as *mut _);
@@ -3484,17 +4503,29 @@ fn const_global_wine_elf_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let sentinel2 = dptr2_val == 0xDEADBEEFDEADBEEF;
     eprintln!(
         "gBounds: dptr={:#x} bytes={} {}",
-        dptr2_val, bytes2,
-        if sentinel2 { "SENTINEL (NOT WRITTEN!)" }
-        else if dptr2_val >= 0x7f0000000000 { "DEV ✓" }
-        else { "HOST ✗" }
+        dptr2_val,
+        bytes2,
+        if sentinel2 {
+            "SENTINEL (NOT WRITTEN!)"
+        } else if dptr2_val >= 0x7f0000000000 {
+            "DEV ✓"
+        } else {
+            "HOST ✗"
+        }
     );
 
     unsafe { hipModuleUnload(hip_mod) }.unwrap();
 
-    assert!(!sentinel, "gParams: HIP did not write output (sentinel untouched)");
+    assert!(
+        !sentinel,
+        "gParams: HIP did not write output (sentinel untouched)"
+    );
     assert!(bytes > 0, "gParams bytes should be > 0, got {}", bytes);
-    assert!(dptr_val >= 0x7f0000000000, "gParams should be DEV, got {:#x}", dptr_val);
+    assert!(
+        dptr_val >= 0x7f0000000000,
+        "gParams should be DEV, got {:#x}",
+        dptr_val
+    );
     Ok(())
 }
 
@@ -3532,7 +4563,9 @@ fn const_global_perkernel_threshold_amdgpu() -> Result<(), Box<dyn error::Error>
         let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
         let module = pass::to_llvm_module(
             ast,
-            pass::Attributes { clock_rate: 2124000 },
+            pass::Attributes {
+                clock_rate: 2124000,
+            },
             |_| {},
         )
         .unwrap();
@@ -3571,7 +4604,8 @@ fn const_global_perkernel_threshold_amdgpu() -> Result<(), Box<dyn error::Error>
         assert!(
             bytes > 0,
             "N={}: gTestParams bytes should be > 0, got {}",
-            n_kernels, bytes
+            n_kernels,
+            bytes
         );
         assert!(
             is_dev,
@@ -3615,20 +4649,30 @@ fn stale_global_memory_amdgpu() {
     let ast = ptx_parser::parse_module_checked(ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut dev_props = unsafe { mem::zeroed() };
     unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
     let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
-        .to_str().unwrap();
+        .to_str()
+        .unwrap();
 
     let ptx_impl = module.linked_bitcode();
     let elf = llvm_zluda::compile(
-        &module.context, gcn_arch, module.llvm_ir, ptx_impl,
-        module.attributes_ir, module.metadata, None,
-    ).unwrap();
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
 
     let mut hip_mod = unsafe { mem::zeroed() };
     unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
@@ -3659,22 +4703,44 @@ fn stale_global_memory_amdgpu() {
             &n as *const _ as *mut _,
             &reinit_mask_all as *const _ as *mut _,
         ];
-        unsafe { hipModuleLaunchKernel(
-            phase1, 1,1,1, 32,1,1, 0, stream,
-            args.as_mut_ptr() as _, ptr::null_mut(),
-        )}.unwrap();
+        unsafe {
+            hipModuleLaunchKernel(
+                phase1,
+                1,
+                1,
+                1,
+                32,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr() as _,
+                ptr::null_mut(),
+            )
+        }
+        .unwrap();
         unsafe { hipStreamSynchronize(stream) }.unwrap();
     }
     // phase2_mark: write -1 sentinels (simulates Stage_3 marking records)
     {
-        let mut args: [*mut std::ffi::c_void; 2] = [
-            &records_ptr as *const _ as *mut _,
-            &n as *const _ as *mut _,
-        ];
-        unsafe { hipModuleLaunchKernel(
-            phase2, 1,1,1, 32,1,1, 0, stream,
-            args.as_mut_ptr() as _, ptr::null_mut(),
-        )}.unwrap();
+        let mut args: [*mut std::ffi::c_void; 2] =
+            [&records_ptr as *const _ as *mut _, &n as *const _ as *mut _];
+        unsafe {
+            hipModuleLaunchKernel(
+                phase2,
+                1,
+                1,
+                1,
+                32,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr() as _,
+                ptr::null_mut(),
+            )
+        }
+        .unwrap();
         unsafe { hipStreamSynchronize(stream) }.unwrap();
     }
 
@@ -3686,10 +4752,22 @@ fn stale_global_memory_amdgpu() {
             &n as *const _ as *mut _,
             &reinit_mask_partial as *const _ as *mut _,
         ];
-        unsafe { hipModuleLaunchKernel(
-            phase1, 1,1,1, 32,1,1, 0, stream,
-            args.as_mut_ptr() as _, ptr::null_mut(),
-        )}.unwrap();
+        unsafe {
+            hipModuleLaunchKernel(
+                phase1,
+                1,
+                1,
+                1,
+                32,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr() as _,
+                ptr::null_mut(),
+            )
+        }
+        .unwrap();
         unsafe { hipStreamSynchronize(stream) }.unwrap();
     }
 
@@ -3703,23 +4781,43 @@ fn stale_global_memory_amdgpu() {
             &counters_ptr as *const _ as *mut _,
             &n as *const _ as *mut _,
         ];
-        unsafe { hipModuleLaunchKernel(
-            phase3, 1,1,1, 32,1,1, 0, stream,
-            args.as_mut_ptr() as _, ptr::null_mut(),
-        )}.unwrap();
+        unsafe {
+            hipModuleLaunchKernel(
+                phase3,
+                1,
+                1,
+                1,
+                32,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr() as _,
+                ptr::null_mut(),
+            )
+        }
+        .unwrap();
         unsafe { hipStreamSynchronize(stream) }.unwrap();
     }
 
     // All counters must be valid (non-negative). In the PhysX pipeline, negative
     // counters cause Stage_4 to scatter-write to wild addresses → GPU page fault.
     let mut host_counters = vec![0u32; n as usize];
-    unsafe { hipMemcpyDtoH(
-        host_counters.as_mut_ptr() as _, hipDeviceptr_t(counters_ptr),
-        (n as usize) * 4,
-    )}.unwrap();
+    unsafe {
+        hipMemcpyDtoH(
+            host_counters.as_mut_ptr() as _,
+            hipDeviceptr_t(counters_ptr),
+            (n as usize) * 4,
+        )
+    }
+    .unwrap();
     for (i, &val) in host_counters.iter().enumerate() {
-        assert!(val < 0x80000000,
-            "counter[{}] = 0x{:08x}: stale sentinel produced corrupt counter", i, val);
+        assert!(
+            val < 0x80000000,
+            "counter[{}] = 0x{:08x}: stale sentinel produced corrupt counter",
+            i,
+            val
+        );
     }
 
     unsafe { hipFree(records_ptr) }.unwrap();
@@ -3756,7 +4854,9 @@ fn null_stream_cross_thread_sync_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -3808,7 +4908,12 @@ fn null_stream_cross_thread_sync_amdgpu() -> Result<(), Box<dyn error::Error>> {
         eprintln!("  [{}] alloc done, writing stale marker", trial);
         let stale_marker: u32 = 0xDEADBEEF;
         unsafe {
-            hipMemcpyHtoD(hipDeviceptr_t(shared_buf), &stale_marker as *const _ as _, 4).unwrap();
+            hipMemcpyHtoD(
+                hipDeviceptr_t(shared_buf),
+                &stale_marker as *const _ as _,
+                4,
+            )
+            .unwrap();
         }
 
         // Create two streams (blocking = default, not hipStreamNonBlocking)
@@ -3843,11 +4948,18 @@ fn null_stream_cross_thread_sync_amdgpu() -> Result<(), Box<dyn error::Error>> {
             unsafe {
                 hipModuleLaunchKernel(
                     hipFunction_t(write_fn_addr as _),
-                    1, 1, 1, 1, 1, 1, 0,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
                     hipStream_t(stream_a_addr as _),
                     args.as_mut_ptr(),
                     ptr::null_mut(),
-                ).unwrap();
+                )
+                .unwrap();
             }
             // Do NOT synchronize — leave work pending on stream_a
         });
@@ -3862,10 +4974,14 @@ fn null_stream_cross_thread_sync_amdgpu() -> Result<(), Box<dyn error::Error>> {
                 &dummy_host as *const _ as *mut _,
                 4,
                 hipStream_t(ptr::null_mut()), // NULL stream = legacy default
-            ).unwrap();
+            )
+            .unwrap();
         }
 
-        eprintln!("  [{}] NULL stream barrier done, launching read kernel", trial);
+        eprintln!(
+            "  [{}] NULL stream barrier done, launching read kernel",
+            trial
+        );
         // Thread B: read shared_buf via copy kernel on stream_b
         let mut read_args: [*mut std::ffi::c_void; 2] = [
             &output_buf as *const _ as *mut _,
@@ -3874,11 +4990,18 @@ fn null_stream_cross_thread_sync_amdgpu() -> Result<(), Box<dyn error::Error>> {
         unsafe {
             hipModuleLaunchKernel(
                 copy_fn,
-                1, 1, 1, 1, 1, 1, 0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
                 stream_b,
                 read_args.as_mut_ptr(),
                 ptr::null_mut(),
-            ).unwrap();
+            )
+            .unwrap();
             hipStreamSynchronize(stream_b).unwrap();
         }
 
@@ -3889,7 +5012,10 @@ fn null_stream_cross_thread_sync_amdgpu() -> Result<(), Box<dyn error::Error>> {
         }
 
         if result != 0x42424242 {
-            eprintln!("trial {}: FAIL — got 0x{:08x}, expected 0x42424242", trial, result);
+            eprintln!(
+                "trial {}: FAIL — got 0x{:08x}, expected 0x42424242",
+                trial, result
+            );
             failures += 1;
         }
 
@@ -3903,11 +5029,17 @@ fn null_stream_cross_thread_sync_amdgpu() -> Result<(), Box<dyn error::Error>> {
         }
     }
 
-    eprintln!("null_stream_cross_thread_sync: {}/{} passed", num_trials - failures, num_trials);
-    assert_eq!(failures, 0,
+    eprintln!(
+        "null_stream_cross_thread_sync: {}/{} passed",
+        num_trials - failures,
+        num_trials
+    );
+    assert_eq!(
+        failures, 0,
         "NULL stream cross-thread sync failed {}/{} trials — \
          HIP's NULL stream does not provide CUDA's legacy bidirectional barrier",
-        failures, num_trials);
+        failures, num_trials
+    );
     Ok(())
 }
 
@@ -3933,7 +5065,9 @@ fn sust_surfref_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -3989,12 +5123,18 @@ fn sust_surfref_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let mut dptr = hipDeviceptr_t(ptr::null_mut());
     let mut bytes = 0usize;
     unsafe { hipModuleGetGlobal(&mut dptr, &mut bytes, hip_mod, c"testSurf".as_ptr()) }.unwrap();
-    eprintln!("sust_surfref_shift: testSurf global at {:p} ({} bytes)", dptr.0, bytes);
+    eprintln!(
+        "sust_surfref_shift: testSurf global at {:p} ({} bytes)",
+        dptr.0, bytes
+    );
 
     // Write raw handle (no shift encoding) to the device global
     let handle = surf_obj as u64;
     unsafe { hipMemcpyHtoD(dptr, &handle as *const _ as _, 8) }.unwrap();
-    eprintln!("sust_surfref_shift: wrote raw handle {:#x} (no shift encoding)", handle);
+    eprintln!(
+        "sust_surfref_shift: wrote raw handle {:#x} (no shift encoding)",
+        handle
+    );
 
     // PRIMARY CHECK: Read back the handle that the kernel will see.
     // For FLOAT (4 bytes), 1 channel: shift should be 2 (log2(4)).
@@ -4003,13 +5143,18 @@ fn sust_surfref_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let mut readback_handle = 0u64;
     unsafe { hipMemcpyDtoH(&mut readback_handle as *mut _ as _, dptr, 8) }.unwrap();
     let shift = readback_handle >> 61;
-    eprintln!("sust_surfref_shift: device handle = {:#x}, shift = {}", readback_handle, shift);
+    eprintln!(
+        "sust_surfref_shift: device handle = {:#x}, shift = {}",
+        readback_handle, shift
+    );
     // For a FLOAT surface, shift must be 2. If it's 0, the surfref path is broken.
-    assert_eq!(shift, 2,
+    assert_eq!(
+        shift, 2,
         "Surface handle in .surfref global has shift={} (expected 2 for FLOAT) — \
          surfref path doesn't encode pixel shift in top 3 bits. \
          Raw handle: {:#x}",
-        shift, readback_handle);
+        shift, readback_handle
+    );
 
     // Allocate output buffer
     let mut out_buf = ptr::null_mut();
@@ -4026,10 +5171,20 @@ fn sust_surfref_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let mut args = [&out_buf as *const _ as *mut std::ffi::c_void];
     unsafe {
         hipModuleLaunchKernel(
-            kernel, 1, 1, 1, 1, 1, 1, 0, stream,
-            args.as_mut_ptr(), ptr::null_mut(),
+            kernel,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            ptr::null_mut(),
         )
-    }.unwrap();
+    }
+    .unwrap();
 
     let sync_result = unsafe { hipStreamSynchronize(stream) };
     eprintln!("sust_surfref_shift: sync -> {:?}", sync_result);
@@ -4039,8 +5194,10 @@ fn sust_surfref_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     unsafe { hipMemcpyDtoH(&mut marker as *mut _ as _, hipDeviceptr_t(out_buf), 4) }.unwrap();
 
     if sync_result.is_err() || marker != 1 {
-        eprintln!("sust_surfref_shift: kernel faulted or didn't complete (marker={}, sync={:?})",
-            marker, sync_result);
+        eprintln!(
+            "sust_surfref_shift: kernel faulted or didn't complete (marker={}, sync={:?})",
+            marker, sync_result
+        );
         // GPU fault means the surface write went to unmapped memory — shift is definitely wrong
         unsafe { hipFree(out_buf) }.unwrap();
         unsafe { hipStreamDestroy(stream) }.unwrap();
@@ -4086,7 +5243,14 @@ fn sust_surfref_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     unsafe { hipDeviceSynchronize() }.unwrap();
 
     let mut readback = [0u32; 8];
-    unsafe { hipMemcpyDtoH(readback.as_mut_ptr() as _, hipDeviceptr_t(readback_buf), readback_size) }.unwrap();
+    unsafe {
+        hipMemcpyDtoH(
+            readback.as_mut_ptr() as _,
+            hipDeviceptr_t(readback_buf),
+            readback_size,
+        )
+    }
+    .unwrap();
 
     eprintln!("sust_surfref_shift: readback[0..8] = {:?}", readback);
     eprintln!("  element[0] = 0x{:08x} (expected 0)", readback[0]);
@@ -4100,12 +5264,17 @@ fn sust_surfref_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     unsafe { hipModuleUnload(hip_mod) }.unwrap();
     unsafe { hipFreeArray(array) }.unwrap();
 
-    assert_eq!(readback[0], 0,
-        "element[0] should be 0 (cleared), got 0x{:08x}", readback[0]);
-    assert_eq!(readback[1], 0x42424242,
+    assert_eq!(
+        readback[0], 0,
+        "element[0] should be 0 (cleared), got 0x{:08x}",
+        readback[0]
+    );
+    assert_eq!(
+        readback[1], 0x42424242,
         "element[1] should be 0x42424242 (sust at x=4 byte offset), got 0x{:08x} — \
          surfref surface handle is missing shift encoding (shift=0 instead of shift=2)",
-        readback[1]);
+        readback[1]
+    );
 
     Ok(())
 }
@@ -4132,7 +5301,9 @@ fn sust_texobj_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
-        pass::Attributes { clock_rate: 2124000 },
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
         |_| {},
     )
     .unwrap();
@@ -4161,7 +5332,9 @@ fn sust_texobj_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // Create 3D FLOAT array
     let mut array: hipArray_t = ptr::null_mut();
     let arr_desc = HIP_ARRAY3D_DESCRIPTOR {
-        Width: 8, Height: 8, Depth: 8,
+        Width: 8,
+        Height: 8,
+        Depth: 8,
         Format: hipArray_Format::HIP_AD_FORMAT_FLOAT,
         NumChannels: 1,
         Flags: 0x02,
@@ -4181,7 +5354,10 @@ fn sust_texobj_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     unsafe { hipTexObjectCreate(&mut tex_obj, &res_desc, &tex_desc, ptr::null()) }.unwrap();
     // Simulate what cuTexObjectCreate does: add shift encoding for FLOAT (shift=2)
     let tex_handle = (tex_obj as u64) | (2u64 << 61);
-    eprintln!("sust_texobj_shift: raw_tex={:#x} encoded_tex={:#x}", tex_obj as u64, tex_handle);
+    eprintln!(
+        "sust_texobj_shift: raw_tex={:#x} encoded_tex={:#x}",
+        tex_obj as u64, tex_handle
+    );
 
     // Also create a SURFACE object for comparison (our cuSurfObjectCreate adds shift)
     let mut surf_obj: hipSurfaceObject_t = unsafe { mem::zeroed() };
@@ -4210,15 +5386,30 @@ fn sust_texobj_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
         &out_buf as *const _ as *mut _,
     ];
     unsafe {
-        hipModuleLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0,
-            hipStream_t(ptr::null_mut()), args.as_mut_ptr(), ptr::null_mut()).unwrap();
+        hipModuleLaunchKernel(
+            kernel,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            hipStream_t(ptr::null_mut()),
+            args.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+        .unwrap();
         hipDeviceSynchronize().unwrap();
     }
 
     let mut result = [0u32; 2];
     unsafe { hipMemcpyDtoH(result.as_mut_ptr() as _, hipDeviceptr_t(out_buf), 8) }.unwrap();
     let tex_shift = result[0];
-    eprintln!("sust_texobj_shift: tex handle shift = {} (expected 2 after fix, 0 before fix)", tex_shift);
+    eprintln!(
+        "sust_texobj_shift: tex handle shift = {} (expected 2 after fix, 0 before fix)",
+        tex_shift
+    );
 
     // Test 2: Pass the ENCODED surface object handle (should always have shift=2)
     let mut args2: [*mut std::ffi::c_void; 2] = [
@@ -4226,15 +5417,30 @@ fn sust_texobj_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
         &out_buf as *const _ as *mut _,
     ];
     unsafe {
-        hipModuleLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0,
-            hipStream_t(ptr::null_mut()), args2.as_mut_ptr(), ptr::null_mut()).unwrap();
+        hipModuleLaunchKernel(
+            kernel,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            hipStream_t(ptr::null_mut()),
+            args2.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+        .unwrap();
         hipDeviceSynchronize().unwrap();
     }
 
     let mut result2 = [0u32; 2];
     unsafe { hipMemcpyDtoH(result2.as_mut_ptr() as _, hipDeviceptr_t(out_buf), 8) }.unwrap();
     let surf_shift = result2[0];
-    eprintln!("sust_texobj_shift: surf encoded shift = {} (expected 2)", surf_shift);
+    eprintln!(
+        "sust_texobj_shift: surf encoded shift = {} (expected 2)",
+        surf_shift
+    );
 
     // Cleanup
     unsafe {
@@ -4246,16 +5452,22 @@ fn sust_texobj_shift_amdgpu() -> Result<(), Box<dyn error::Error>> {
     }
 
     // The encoded surface handle should always give shift=2
-    assert_eq!(surf_shift, 2, "Encoded surface handle should give shift=2, got {}", surf_shift);
+    assert_eq!(
+        surf_shift, 2,
+        "Encoded surface handle should give shift=2, got {}",
+        surf_shift
+    );
 
     // The texture handle MUST give shift=2 for FLOAT surfaces.
     // Before fix: this FAILS (shift=0, no encoding on tex objects → TurbulenceFS crash)
     // After fix: this PASSES (sust helper computes shift correctly)
-    assert_eq!(tex_shift, 2,
+    assert_eq!(
+        tex_shift, 2,
         "Texture object handle used for sust has shift={} (expected 2 for FLOAT). \
          sust helper extracts shift from top 3 bits but tex objects have no encoding. \
          This causes wrong x-coordinate scaling → TurbulenceFS GPU page fault.",
-        tex_shift);
+        tex_shift
+    );
 
     Ok(())
 }
@@ -4337,7 +5549,10 @@ fn ms4_scatter_known_good_amdgpu() -> Result<(), Box<dyn error::Error>> {
         bases[j] = running;
         running += counts[j];
     }
-    assert_eq!(running, NUM_PARTICLES, "prefix sum should cover all particles");
+    assert_eq!(
+        running, NUM_PARTICLES,
+        "prefix sum should cover all particles"
+    );
 
     // 4. struct array (12 bytes per entry): first u32 = base, rest zero.
     //    MS_4 only reads struct[shape_idx].first_u32 = base.
@@ -4375,11 +5590,36 @@ fn ms4_scatter_known_good_amdgpu() -> Result<(), Box<dyn error::Error>> {
         hipMalloc(&mut d_shape_idx, h_shape_idx.len() * 4).unwrap();
         hipMalloc(&mut d_counter, h_counter.len() * 4).unwrap();
 
-        hipMemcpyHtoD(hipDeviceptr_t(d_flags), h_flags.as_ptr() as _, h_flags.len()).unwrap();
-        hipMemcpyHtoD(hipDeviceptr_t(d_struct), h_struct.as_ptr() as _, h_struct.len()).unwrap();
-        hipMemcpyHtoD(hipDeviceptr_t(d_scatter), h_scatter_init.as_ptr() as _, h_scatter_init.len() * 4).unwrap();
-        hipMemcpyHtoD(hipDeviceptr_t(d_shape_idx), h_shape_idx.as_ptr() as _, h_shape_idx.len() * 4).unwrap();
-        hipMemcpyHtoD(hipDeviceptr_t(d_counter), h_counter.as_ptr() as _, h_counter.len() * 4).unwrap();
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_flags),
+            h_flags.as_ptr() as _,
+            h_flags.len(),
+        )
+        .unwrap();
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_struct),
+            h_struct.as_ptr() as _,
+            h_struct.len(),
+        )
+        .unwrap();
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_scatter),
+            h_scatter_init.as_ptr() as _,
+            h_scatter_init.len() * 4,
+        )
+        .unwrap();
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_shape_idx),
+            h_shape_idx.as_ptr() as _,
+            h_shape_idx.len() * 4,
+        )
+        .unwrap();
+        hipMemcpyHtoD(
+            hipDeviceptr_t(d_counter),
+            h_counter.as_ptr() as _,
+            h_counter.len() * 4,
+        )
+        .unwrap();
     }
     eprintln!(
         "ms4: allocated + populated buffers (n={}, shapes={})",
@@ -4425,19 +5665,34 @@ fn ms4_scatter_known_good_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let t0 = std::time::Instant::now();
     let launch_result = unsafe {
         hipModuleLaunchKernel(
-            kernel, grid_x, 1, 1, 64, 1, 1, 0,
+            kernel,
+            grid_x,
+            1,
+            1,
+            64,
+            1,
+            1,
+            0,
             hipStream_t(ptr::null_mut()),
             args.as_mut_ptr(),
             ptr::null_mut(),
         )
     };
-    eprintln!("ms4: hipModuleLaunchKernel -> {:?} ({:?})", launch_result, t0.elapsed());
+    eprintln!(
+        "ms4: hipModuleLaunchKernel -> {:?} ({:?})",
+        launch_result,
+        t0.elapsed()
+    );
     launch_result.unwrap();
 
     eprintln!("ms4: calling hipDeviceSynchronize...");
     let t1 = std::time::Instant::now();
     let sync_result = unsafe { hipDeviceSynchronize() };
-    eprintln!("ms4: hipDeviceSynchronize -> {:?} ({:?})", sync_result, t1.elapsed());
+    eprintln!(
+        "ms4: hipDeviceSynchronize -> {:?} ({:?})",
+        sync_result,
+        t1.elapsed()
+    );
     if sync_result.is_err() {
         // Clean up before returning so the failure message is clear.
         unsafe {
@@ -4538,7 +5793,8 @@ fn ms4_scatter_known_good_amdgpu() -> Result<(), Box<dyn error::Error>> {
         expected.sort();
         assert_eq!(
             got, expected,
-            "shape {}: scatter bucket contents differ from expected", j
+            "shape {}: scatter bucket contents differ from expected",
+            j
         );
     }
 
@@ -4578,7 +5834,11 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
             return Ok(());
         }
     };
-    eprintln!("ms4_replay: loaded {} bytes from {}", capture.len(), capture_path);
+    eprintln!(
+        "ms4_replay: loaded {} bytes from {}",
+        capture.len(),
+        capture_path
+    );
 
     // Must mirror the layout in zluda/src/impl/function.rs::Ms4CaptureSlot.
     const MS4_CAPTURE_SLOTS: usize = 8;
@@ -4588,9 +5848,8 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
     const MS4_STRUCT_REGION_BYTES: usize = MS4_CAPTURE_MAX_SHAPES * 12;
     const MS4_COUNTER_REGION_BYTES: usize = MS4_CAPTURE_MAX_SHAPES * 4;
     const HEADER_BYTES: usize = 128;
-    const DATA_BYTES: usize = MS4_PARTICLE_REGION_BYTES * 2
-        + MS4_STRUCT_REGION_BYTES
-        + MS4_COUNTER_REGION_BYTES;
+    const DATA_BYTES: usize =
+        MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES + MS4_COUNTER_REGION_BYTES;
     const SLOT_BYTES: usize = HEADER_BYTES + DATA_BYTES;
     const MAGIC: u64 = 0x4d53344341505455;
 
@@ -4649,15 +5908,16 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
         let data_base = slot_off + HEADER_BYTES;
         let flags_region = &capture[data_base..data_base + MS4_PARTICLE_REGION_BYTES];
-        let shape_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES
-            ..data_base + MS4_PARTICLE_REGION_BYTES * 2];
+        let shape_region = &capture
+            [data_base + MS4_PARTICLE_REGION_BYTES..data_base + MS4_PARTICLE_REGION_BYTES * 2];
         let struct_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2
             ..data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES];
-        let counter_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2
-            + MS4_STRUCT_REGION_BYTES
-            ..data_base + MS4_PARTICLE_REGION_BYTES * 2
-                + MS4_STRUCT_REGION_BYTES
-                + MS4_COUNTER_REGION_BYTES];
+        let counter_region =
+            &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES
+                ..data_base
+                    + MS4_PARTICLE_REGION_BYTES * 2
+                    + MS4_STRUCT_REGION_BYTES
+                    + MS4_COUNTER_REGION_BYTES];
 
         // Quick diagnostic dump: first few counter values, first few bases,
         // check for any obviously bad flag patterns among active particles.
@@ -4798,7 +6058,9 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
         }
     }
 
-    unsafe { hipModuleUnload(hip_mod).ok(); }
+    unsafe {
+        hipModuleUnload(hip_mod).ok();
+    }
 
     eprintln!(
         "ms4_replay: replayed {}/{} slots, {} faulted",
@@ -4839,9 +6101,8 @@ fn ms4_replay_crashing_slot_amdgpu() -> Result<(), Box<dyn error::Error>> {
     const MS4_STRUCT_REGION_BYTES: usize = MS4_CAPTURE_MAX_SHAPES * 12;
     const MS4_COUNTER_REGION_BYTES: usize = MS4_CAPTURE_MAX_SHAPES * 4;
     const HEADER_BYTES: usize = 128;
-    const DATA_BYTES: usize = MS4_PARTICLE_REGION_BYTES * 2
-        + MS4_STRUCT_REGION_BYTES
-        + MS4_COUNTER_REGION_BYTES;
+    const DATA_BYTES: usize =
+        MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES + MS4_COUNTER_REGION_BYTES;
     const SLOT_BYTES: usize = HEADER_BYTES + DATA_BYTES;
     const MAGIC: u64 = 0x4d53344341505455;
 
@@ -4897,12 +6158,16 @@ fn ms4_replay_crashing_slot_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
     let data_base = off + HEADER_BYTES;
     let flags_region = &capture[data_base..data_base + MS4_PARTICLE_REGION_BYTES];
-    let shape_region = &capture
-        [data_base + MS4_PARTICLE_REGION_BYTES..data_base + MS4_PARTICLE_REGION_BYTES * 2];
+    let shape_region =
+        &capture[data_base + MS4_PARTICLE_REGION_BYTES..data_base + MS4_PARTICLE_REGION_BYTES * 2];
     let struct_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2
         ..data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES];
-    let counter_region = &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES
-        ..data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES + MS4_COUNTER_REGION_BYTES];
+    let counter_region =
+        &capture[data_base + MS4_PARTICLE_REGION_BYTES * 2 + MS4_STRUCT_REGION_BYTES
+            ..data_base
+                + MS4_PARTICLE_REGION_BYTES * 2
+                + MS4_STRUCT_REGION_BYTES
+                + MS4_COUNTER_REGION_BYTES];
 
     // Quick diagnostic of the captured state so the test output itself says
     // WHY we expect a fault (if we do).
@@ -4936,13 +6201,19 @@ fn ms4_replay_crashing_slot_amdgpu() -> Result<(), Box<dyn error::Error>> {
         .collect();
     eprintln!(
         "ms4_replay_crashing: n={} active={} shapes_used={} max_shape={}",
-        num_particles, active, shape_use.len(), max_shape
+        num_particles,
+        active,
+        shape_use.len(),
+        max_shape
     );
     eprintln!(
         "  counters (non-zero within max_shape): {:?}",
         nonzero_counters
     );
-    eprintln!("  bases    (non-zero within max_shape): {:?}", nonzero_bases);
+    eprintln!(
+        "  bases    (non-zero within max_shape): {:?}",
+        nonzero_bases
+    );
 
     // Compute expected behavior: for each shape used by active particles, is
     // `counter[shape] < use_count[shape]`? If yes, MS_4 will underflow.
@@ -5010,7 +6281,12 @@ fn ms4_replay_crashing_slot_amdgpu() -> Result<(), Box<dyn error::Error>> {
         )
         .unwrap();
         let sentinel: u32 = 0xDEADBEEF;
-        hipMemsetD32(hipDeviceptr_t(d_scatter), sentinel as _, num_particles as usize).unwrap();
+        hipMemsetD32(
+            hipDeviceptr_t(d_scatter),
+            sentinel as _,
+            num_particles as usize,
+        )
+        .unwrap();
     }
 
     let param0: u64 = 0;
@@ -5135,8 +6411,14 @@ fn bug_a_xkernel_coherency_amdgpu() -> Result<(), Box<dyn error::Error>> {
     // Compile the test PTX
     let ptx = read_test_file!("bug_a_xkernel.ptx");
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
-    let module = pass::to_llvm_module(ast, pass::Attributes { clock_rate: 2124000 }, |_| {})
-        .unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
 
     let mut dev_props = unsafe { mem::zeroed() };
     unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
@@ -5198,7 +6480,10 @@ fn bug_a_xkernel_coherency_amdgpu() -> Result<(), Box<dyn error::Error>> {
     unsafe { hipStreamCreate(&mut stream_r) }.unwrap();
 
     eprintln!("bug_a_xkernel: buffer={:?} fail={:?}", d_buffer, d_fail);
-    eprintln!("bug_a_xkernel: stream_w={:?} stream_r={:?}", stream_w, stream_r);
+    eprintln!(
+        "bug_a_xkernel: stream_w={:?} stream_r={:?}",
+        stream_w, stream_r
+    );
 
     let buffer_addr = d_buffer as u64;
     let fail_addr = d_fail as u64;
@@ -5218,8 +6503,17 @@ fn bug_a_xkernel_coherency_amdgpu() -> Result<(), Box<dyn error::Error>> {
         ];
         unsafe {
             hipModuleLaunchKernel(
-                writer, 1, 1, 1, 1, 1, 1, 0, stream_w,
-                writer_args.as_mut_ptr(), ptr::null_mut(),
+                writer,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                stream_w,
+                writer_args.as_mut_ptr(),
+                ptr::null_mut(),
             )
         }
         .unwrap();
@@ -5262,8 +6556,17 @@ fn bug_a_xkernel_coherency_amdgpu() -> Result<(), Box<dyn error::Error>> {
         ];
         unsafe {
             hipModuleLaunchKernel(
-                reader, 1, 1, 1, 1024, 1, 1, 0, stream_r,
-                reader_args.as_mut_ptr(), ptr::null_mut(),
+                reader,
+                1,
+                1,
+                1,
+                1024,
+                1,
+                1,
+                0,
+                stream_r,
+                reader_args.as_mut_ptr(),
+                ptr::null_mut(),
             )
         }
         .unwrap();

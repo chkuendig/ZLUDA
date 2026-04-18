@@ -7,7 +7,10 @@ pub(crate) fn compute_capability(major: &mut i32, minor: &mut i32, _dev: hipDevi
     let (major_cap, minor_cap) = driver::global_state()?.compute_capability;
     *major = major_cap;
     *minor = minor_cap;
-    super::driver::zluda_log(&format!("[ZLUDA] cuDeviceComputeCapability -> {}.{}", *major, *minor));
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuDeviceComputeCapability -> {}.{}",
+        *major, *minor
+    ));
     Ok(())
 }
 
@@ -447,8 +450,15 @@ pub(crate) fn total_memory(bytes: &mut ::core::ffi::c_uint, dev: hipDevice_t) ->
     let result = total_mem_v2(&mut total as *mut usize, dev);
     // Truncate to u32. For >4GB GPUs, report 4GB (0xF0000000) instead of
     // UINT_MAX which PhysX might interpret as an error sentinel.
-    *bytes = if total > 0xF0000000usize { 0xF0000000u32 } else { total as u32 };
-    super::driver::zluda_log(&format!("[ZLUDA] cuDeviceTotalMem_v1(dev={}) -> {} bytes (full={}), result={:?}", dev, *bytes, total, result));
+    *bytes = if total > 0xF0000000usize {
+        0xF0000000u32
+    } else {
+        total as u32
+    };
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuDeviceTotalMem_v1(dev={}) -> {} bytes (full={}), result={:?}",
+        dev, *bytes, total, result
+    ));
     result
 }
 
@@ -473,9 +483,17 @@ pub(crate) fn total_mem_v2(bytes: *mut usize, dev: hipDevice_t) -> hipError_t {
         unsafe { *bytes = vram_total };
         super::driver::zluda_log(&format!(
             "[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> {} bytes ({} MiB) (hip={}, sysfs_vram={})",
-            dev, unsafe { *bytes }, vram_total / (1024*1024), hip_total, vram_total));
+            dev,
+            unsafe { *bytes },
+            vram_total / (1024 * 1024),
+            hip_total,
+            vram_total
+        ));
     } else {
-        super::driver::zluda_log(&format!("[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> ERROR", dev));
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> ERROR",
+            dev
+        ));
     }
     result
 }
@@ -497,7 +515,10 @@ pub(crate) fn get_properties(prop: &mut CUdevprop, dev: hipDevice_t) -> hipError
 
 pub(crate) fn get_count(count: &mut ::core::ffi::c_int) -> hipError_t {
     let result = unsafe { hipGetDeviceCount(count) };
-    super::driver::zluda_log(&format!("[ZLUDA] cuDeviceGetCount -> count={}, result={:?}", *count, result));
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuDeviceGetCount -> count={}, result={:?}",
+        *count, result
+    ));
     result
 }
 
@@ -532,7 +553,10 @@ pub(crate) fn primary_context_set_flags_v2(
 }
 
 pub(crate) fn primary_context_retain(pctx: &mut CUcontext, hip_dev: hipDevice_t) -> CUresult {
-    super::driver::zluda_log(&format!("[ZLUDA] cuDevicePrimaryCtxRetain(dev={})", hip_dev));
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuDevicePrimaryCtxRetain(dev={})",
+        hip_dev
+    ));
     let (ctx, cu_ctx) = get_primary_context(hip_dev)?;
 
     ctx.with_state_mut(|state: &mut context::ContextState| {

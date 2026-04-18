@@ -498,7 +498,10 @@ pub fn parse_module_unchecked<'input>(text: &'input str) -> ast::Module<'input> 
             .map_err(|err| PtxError::Parser(err.into_inner()))
     };
     if !errors.is_empty() {
-        eprintln!("[ZLUDA PTX PARSER] WARNING: {} parse errors in module:", errors.len());
+        eprintln!(
+            "[ZLUDA PTX PARSER] WARNING: {} parse errors in module:",
+            errors.len()
+        );
         for err in &errors {
             match err {
                 PtxError::UnrecognizedStatement(text) => {
@@ -588,8 +591,7 @@ fn directive<'a, 'input>(
                 function.map(|(linking, func)| Some(ast::Directive::Method(linking, func))),
                 file.map(|_| None),
                 section.map(|_| None),
-                texref_surfref
-                    .map(|(linking, var)| Some(ast::Directive::Variable(linking, var))),
+                texref_surfref.map(|(linking, var)| Some(ast::Directive::Variable(linking, var))),
                 (module_variable, Token::Semicolon)
                     .map(|((linking, var), _)| Some(ast::Directive::Variable(linking, var))),
             )),
@@ -1689,40 +1691,56 @@ fn vote_instruction<'a, 'input>(
     use winnow::token::any;
 
     // Check if first modifier is .sync
-    let has_sync = opt(any.verify_map(|(t, _): (Token<'input>, _)| {
-        if t == Token::DotSync { Some(()) } else { None }
-    })).parse_next(stream)?.is_some();
+    let has_sync = opt(any.verify_map(
+        |(t, _): (Token<'input>, _)| {
+            if t == Token::DotSync {
+                Some(())
+            } else {
+                None
+            }
+        },
+    ))
+    .parse_next(stream)?
+    .is_some();
 
     // Parse mode: .all, .any, or .ballot (these may be DotIdent since no grammar rule generates them)
-    let mode = any.verify_map(|(t, _): (Token<'input>, _)| {
-        match t {
+    let mode = any
+        .verify_map(|(t, _): (Token<'input>, _)| match t {
             Token::DotIdent(".all") => Some(VoteMode::All),
             Token::DotIdent(".any") => Some(VoteMode::Any),
             Token::DotIdent(".ballot") => Some(VoteMode::Ballot),
             _ => None,
-        }
-    }).parse_next(stream)?;
+        })
+        .parse_next(stream)?;
 
     // Parse type: .pred or .b32
-    let _type_token = any.verify(|(t, _): &(Token<'input>, _)| {
-        *t == Token::DotPred || *t == Token::DotB32
-    }).parse_next(stream)?;
+    let _type_token = any
+        .verify(|(t, _): &(Token<'input>, _)| *t == Token::DotPred || *t == Token::DotB32)
+        .parse_next(stream)?;
 
     // Parse destination operand
     let dst = ParsedOperandStr::parse.parse_next(stream)?;
 
     // Parse comma + optional negate + source predicate
-    any.verify(|(t, _): &(Token<'input>, _)| *t == Token::Comma).parse_next(stream)?;
+    any.verify(|(t, _): &(Token<'input>, _)| *t == Token::Comma)
+        .parse_next(stream)?;
 
     let negate = opt(any.verify_map(|(t, _): (Token<'input>, _)| {
-        if t == Token::Exclamation { Some(()) } else { None }
-    })).parse_next(stream)?.is_some();
+        if t == Token::Exclamation {
+            Some(())
+        } else {
+            None
+        }
+    }))
+    .parse_next(stream)?
+    .is_some();
 
     let src1 = ParsedOperandStr::parse.parse_next(stream)?;
 
     if has_sync {
         // Sync form: parse comma + membermask
-        any.verify(|(t, _): &(Token<'input>, _)| *t == Token::Comma).parse_next(stream)?;
+        any.verify(|(t, _): &(Token<'input>, _)| *t == Token::Comma)
+            .parse_next(stream)?;
         let src2 = ParsedOperandStr::parse.parse_next(stream)?;
 
         Ok(ast::Instruction::Vote {
@@ -1835,9 +1853,7 @@ fn empty_call<'input>(
 }
 
 // Parse texture geometry modifier: .1d, .2d, .3d
-fn tex_geometry<'a, 'input>(
-    stream: &mut PtxParser<'a, 'input>,
-) -> PResult<ast::TextureGeometry> {
+fn tex_geometry<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::TextureGeometry> {
     any.verify_map(|(t, _)| match t {
         Token::Dot1d => Some(ast::TextureGeometry::Dim1d),
         Token::Dot2d => Some(ast::TextureGeometry::Dim2d),
@@ -1848,9 +1864,7 @@ fn tex_geometry<'a, 'input>(
 }
 
 // Parse surface clamp mode: .zero, .clamp, .trap
-fn surf_clamp_mode<'a, 'input>(
-    stream: &mut PtxParser<'a, 'input>,
-) -> PResult<ast::SurfClampMode> {
+fn surf_clamp_mode<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::SurfClampMode> {
     any.verify_map(|(t, _)| match t {
         Token::DotZero => Some(ast::SurfClampMode::Zero),
         Token::DotClamp => Some(ast::SurfClampMode::Clamp),
@@ -1866,9 +1880,8 @@ fn brace_vec_operand<'a, 'input>(
 ) -> PResult<ParsedOperandStr<'input>> {
     delimited(
         Token::LBrace,
-        separated(1..=8, reg_or_immediate, Token::Comma).map(|v: Vec<_>| {
-            ast::ParsedOperand::VecPack(v)
-        }),
+        separated(1..=8, reg_or_immediate, Token::Comma)
+            .map(|v: Vec<_>| ast::ParsedOperand::VecPack(v)),
         Token::RBrace,
     )
     .parse_next(stream)
@@ -1878,13 +1891,8 @@ fn brace_vec_operand<'a, 'input>(
 fn tex<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
-    let (geometry, _, channel_type, coord_type) = (
-        tex_geometry,
-        Token::DotV4,
-        scalar_type,
-        scalar_type,
-    )
-        .parse_next(stream)?;
+    let (geometry, _, channel_type, coord_type) =
+        (tex_geometry, Token::DotV4, scalar_type, scalar_type).parse_next(stream)?;
 
     let dst = brace_vec_operand.parse_next(stream)?;
     Token::Comma.parse_next(stream)?;

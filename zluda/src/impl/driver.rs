@@ -219,17 +219,129 @@ fn install_fault_signal_handler() {
             11 => "SIGSEGV",
             _ => "signal",
         };
+
+        // Dump the MS_4 and MS_2_Batched capture ring buffers to
+        // /tmp/ms4_captures.bin and /tmp/ms2b_captures.bin if capture was
+        // enabled. Uses raw open/write/close syscalls via libc since they're
+        // async-signal-safe (unlike std::fs::File which uses the allocator
+        // and mutexes indirectly).
+        unsafe fn dump_ring(host_ptr: usize, total_bytes: usize, path_cstr: *const libc::c_char) {
+            if host_ptr == 0 || total_bytes == 0 {
+                return;
+            }
+            let fd = libc::open(
+                path_cstr,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            );
+            if fd < 0 {
+                return;
+            }
+            let mut written = 0usize;
+            while written < total_bytes {
+                let n = libc::write(
+                    fd,
+                    (host_ptr + written) as *const libc::c_void,
+                    total_bytes - written,
+                );
+                if n <= 0 {
+                    break;
+                }
+                written += n as usize;
+            }
+            libc::close(fd);
+        }
+        let ms4_host_ptr =
+            super::function::MS4_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let ms4_total_bytes =
+            super::function::MS4_CAPTURE_TOTAL_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            ms4_host_ptr,
+            ms4_total_bytes,
+            c"/tmp/ms4_captures.bin".as_ptr(),
+        );
+
+        let ms2b_host_ptr =
+            super::function::MS2B_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let ms2b_total_bytes =
+            super::function::MS2B_CAPTURE_TOTAL_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            ms2b_host_ptr,
+            ms2b_total_bytes,
+            c"/tmp/ms2b_captures.bin".as_ptr(),
+        );
+
+        let ms3_host_ptr =
+            super::function::MS3_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let ms3_total_bytes =
+            super::function::MS3_CAPTURE_TOTAL_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            ms3_host_ptr,
+            ms3_total_bytes,
+            c"/tmp/ms3_captures.bin".as_ptr(),
+        );
+
+        let tfs_host_ptr =
+            super::function::TFS_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let tfs_total_bytes =
+            super::function::TFS_CAPTURE_TOTAL_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            tfs_host_ptr,
+            tfs_total_bytes,
+            c"/tmp/tfs_captures.bin".as_ptr(),
+        );
+
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open("/tmp/zluda_tex.log")
         {
-            let _ = write!(f, "\n*** {} (signal {}) — GPU fault likely ***\n", sig_name, sig);
+            let _ = write!(
+                f,
+                "\n*** {} (signal {}) — GPU fault likely ***\n",
+                sig_name, sig
+            );
+            if ms4_host_ptr != 0 && ms4_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** MS4 capture dumped to /tmp/ms4_captures.bin ({} bytes)\n",
+                    ms4_total_bytes
+                );
+            }
+            if ms2b_host_ptr != 0 && ms2b_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** MS2B capture dumped to /tmp/ms2b_captures.bin ({} bytes)\n",
+                    ms2b_total_bytes
+                );
+            }
+            if ms3_host_ptr != 0 && ms3_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** MS3 capture dumped to /tmp/ms3_captures.bin ({} bytes)\n",
+                    ms3_total_bytes
+                );
+            }
+            if tfs_host_ptr != 0 && tfs_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** TFS capture dumped to /tmp/tfs_captures.bin ({} bytes)\n",
+                    tfs_total_bytes
+                );
+            }
             if let Ok(guard) = KERNEL_RING.lock() {
                 let (ref buf, idx, total) = *guard;
-                let _ = write!(f, "*** Kernel launch history (total={}, newest last):\n", total);
+                let _ = write!(
+                    f,
+                    "*** Kernel launch history (total={}, newest last):\n",
+                    total
+                );
                 // Iterate from oldest to newest entry in the ring.
-                let start = if total >= KERNEL_RING_SIZE as u64 { idx } else { 0 };
+                let start = if total >= KERNEL_RING_SIZE as u64 {
+                    idx
+                } else {
+                    0
+                };
                 let count = if total >= KERNEL_RING_SIZE as u64 {
                     KERNEL_RING_SIZE
                 } else {
@@ -292,8 +404,8 @@ fn load_rocm_debug_agent() {
     // Default path in the self-contained agent dir (all deps co-located).
     // Override with ZLUDA_DEBUG_AGENT_PATH env var if needed.
     let default_path = "/home/deck/.local/share/Steam/compatibilitytools.d/proton-cuda/files/lib64/rocm_debug_agent/librocm-debug-agent.so.2";
-    let agent_path = std::env::var("ZLUDA_DEBUG_AGENT_PATH")
-        .unwrap_or_else(|_| default_path.to_string());
+    let agent_path =
+        std::env::var("ZLUDA_DEBUG_AGENT_PATH").unwrap_or_else(|_| default_path.to_string());
 
     zluda_log_err(&format!(
         "[ZLUDA] Loading ROCm debug agent from: {}",
@@ -312,9 +424,20 @@ fn load_rocm_debug_agent() {
     };
 
     // RTLD_NOW: resolve all symbols immediately (fail fast if deps missing).
-    // RTLD_GLOBAL: make agent's symbols visible to librocm-dbgapi.so.0.
-    let handle =
-        unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    // RTLD_LOCAL: keep the agent's symbols (and its transitive deps like
+    //             libamd_comgr.so.2) hidden from the main process, so HIP's
+    //             own comgr.so.3 calls don't collide with the agent's comgr.so.2.
+    // RTLD_DEEPBIND: force the agent and its deps to resolve symbols from their
+    //                own namespace first, not from the global scope. This is the
+    //                key bit: without DEEPBIND, librocm-dbgapi.so.0's comgr calls
+    //                may still get routed to HIP's already-loaded comgr.so.3,
+    //                which doesn't export the v2.0 symbols it needs → SIGSEGV.
+    let handle = unsafe {
+        libc::dlopen(
+            c_path.as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_DEEPBIND,
+        )
+    };
     if handle.is_null() {
         let err = unsafe { CStr::from_ptr(libc::dlerror()) };
         zluda_log_err(&format!(
@@ -328,19 +451,12 @@ fn load_rocm_debug_agent() {
     // Look up OnLoad. Signature from ROCr tool ABI (hsa_api_trace.h):
     //   bool OnLoad(void* api_table, uint64_t runtime_version,
     //               uint64_t failed_tool_count, const char* const* failed_tool_names)
-    let onload_sym = unsafe {
-        libc::dlsym(handle, c"OnLoad".as_ptr())
-    };
+    let onload_sym = unsafe { libc::dlsym(handle, c"OnLoad".as_ptr()) };
     if onload_sym.is_null() {
         zluda_log_err("[ZLUDA] Debug agent has no OnLoad symbol, skipping");
         return;
     }
-    type OnLoadFn = unsafe extern "C" fn(
-        *mut c_void,
-        u64,
-        u64,
-        *const *const i8,
-    ) -> bool;
+    type OnLoadFn = unsafe extern "C" fn(*mut c_void, u64, u64, *const *const i8) -> bool;
     let onload: OnLoadFn = unsafe { mem::transmute(onload_sym) };
 
     // Build an HsaApiTable populated with real function pointers resolved from
@@ -374,7 +490,10 @@ fn load_rocm_debug_agent() {
     // RTLD_DEFAULT searches all loaded shared objects.
     macro_rules! resolve {
         ($name:literal, $table:ident, $idx:expr) => {
-            let ptr = libc::dlsym(libc::RTLD_DEFAULT, concat!($name, "\0").as_ptr() as *const _);
+            let ptr = libc::dlsym(
+                libc::RTLD_DEFAULT,
+                concat!($name, "\0").as_ptr() as *const _,
+            );
             if !ptr.is_null() {
                 *$table.add($idx) = ptr as usize;
             }
@@ -394,9 +513,9 @@ fn load_rocm_debug_agent() {
         *ver.add(2) = 0x01; // HSA_API_TABLE_STEP_VERSION
         *ver.add(3) = 0;
         *hsa_tbl.add(2) = core_tbl as usize; // core_
-        *hsa_tbl.add(3) = amd_tbl as usize;  // amd_ext_
-        // finalizer_ext_, image_ext_, tools_, pc_sampling_ext_ left as null --
-        // the agent doesn't access them.
+        *hsa_tbl.add(3) = amd_tbl as usize; // amd_ext_
+                                            // finalizer_ext_, image_ext_, tools_, pc_sampling_ext_ left as null --
+                                            // the agent doesn't access them.
 
         // --- CoreApiTable version ---
         let ver = core_tbl as *mut u32;
@@ -409,131 +528,131 @@ fn load_rocm_debug_agent() {
         // The agent hooks [86] hsa_executable_destroy and [88] hsa_executable_freeze.
         // We populate all entries so the hooks have valid originals to call through.
         resolve!("hsa_init", core_tbl, 2);
-        resolve!("hsa_shut_down", core_tbl,3);
-        resolve!("hsa_system_get_info", core_tbl,4);
-        resolve!("hsa_system_extension_supported", core_tbl,5);
-        resolve!("hsa_system_get_extension_table", core_tbl,6);
-        resolve!("hsa_iterate_agents", core_tbl,7);
-        resolve!("hsa_agent_get_info", core_tbl,8);
-        resolve!("hsa_queue_create", core_tbl,9);
-        resolve!("hsa_soft_queue_create", core_tbl,10);
-        resolve!("hsa_queue_destroy", core_tbl,11);
-        resolve!("hsa_queue_inactivate", core_tbl,12);
-        resolve!("hsa_queue_load_read_index_scacquire", core_tbl,13);
-        resolve!("hsa_queue_load_read_index_relaxed", core_tbl,14);
-        resolve!("hsa_queue_load_write_index_scacquire", core_tbl,15);
-        resolve!("hsa_queue_load_write_index_relaxed", core_tbl,16);
-        resolve!("hsa_queue_store_write_index_relaxed", core_tbl,17);
-        resolve!("hsa_queue_store_write_index_screlease", core_tbl,18);
-        resolve!("hsa_queue_cas_write_index_scacq_screl", core_tbl,19);
-        resolve!("hsa_queue_cas_write_index_scacquire", core_tbl,20);
-        resolve!("hsa_queue_cas_write_index_relaxed", core_tbl,21);
-        resolve!("hsa_queue_cas_write_index_screlease", core_tbl,22);
-        resolve!("hsa_queue_add_write_index_scacq_screl", core_tbl,23);
-        resolve!("hsa_queue_add_write_index_scacquire", core_tbl,24);
-        resolve!("hsa_queue_add_write_index_relaxed", core_tbl,25);
-        resolve!("hsa_queue_add_write_index_screlease", core_tbl,26);
-        resolve!("hsa_queue_store_read_index_relaxed", core_tbl,27);
-        resolve!("hsa_queue_store_read_index_screlease", core_tbl,28);
-        resolve!("hsa_agent_iterate_regions", core_tbl,29);
-        resolve!("hsa_region_get_info", core_tbl,30);
-        resolve!("hsa_agent_get_exception_policies", core_tbl,31);
-        resolve!("hsa_agent_extension_supported", core_tbl,32);
-        resolve!("hsa_memory_register", core_tbl,33);
-        resolve!("hsa_memory_deregister", core_tbl,34);
-        resolve!("hsa_memory_allocate", core_tbl,35);
-        resolve!("hsa_memory_free", core_tbl,36);
-        resolve!("hsa_memory_copy", core_tbl,37);
-        resolve!("hsa_memory_assign_agent", core_tbl,38);
-        resolve!("hsa_signal_create", core_tbl,39);
-        resolve!("hsa_signal_destroy", core_tbl,40);
-        resolve!("hsa_signal_load_relaxed", core_tbl,41);
-        resolve!("hsa_signal_load_scacquire", core_tbl,42);
-        resolve!("hsa_signal_store_relaxed", core_tbl,43);
-        resolve!("hsa_signal_store_screlease", core_tbl,44);
-        resolve!("hsa_signal_wait_relaxed", core_tbl,45);
-        resolve!("hsa_signal_wait_scacquire", core_tbl,46);
-        resolve!("hsa_signal_and_relaxed", core_tbl,47);
-        resolve!("hsa_signal_and_scacquire", core_tbl,48);
-        resolve!("hsa_signal_and_screlease", core_tbl,49);
-        resolve!("hsa_signal_and_scacq_screl", core_tbl,50);
-        resolve!("hsa_signal_or_relaxed", core_tbl,51);
-        resolve!("hsa_signal_or_scacquire", core_tbl,52);
-        resolve!("hsa_signal_or_screlease", core_tbl,53);
-        resolve!("hsa_signal_or_scacq_screl", core_tbl,54);
-        resolve!("hsa_signal_xor_relaxed", core_tbl,55);
-        resolve!("hsa_signal_xor_scacquire", core_tbl,56);
-        resolve!("hsa_signal_xor_screlease", core_tbl,57);
-        resolve!("hsa_signal_xor_scacq_screl", core_tbl,58);
-        resolve!("hsa_signal_exchange_relaxed", core_tbl,59);
-        resolve!("hsa_signal_exchange_scacquire", core_tbl,60);
-        resolve!("hsa_signal_exchange_screlease", core_tbl,61);
-        resolve!("hsa_signal_exchange_scacq_screl", core_tbl,62);
-        resolve!("hsa_signal_add_relaxed", core_tbl,63);
-        resolve!("hsa_signal_add_scacquire", core_tbl,64);
-        resolve!("hsa_signal_add_screlease", core_tbl,65);
-        resolve!("hsa_signal_add_scacq_screl", core_tbl,66);
-        resolve!("hsa_signal_subtract_relaxed", core_tbl,67);
-        resolve!("hsa_signal_subtract_scacquire", core_tbl,68);
-        resolve!("hsa_signal_subtract_screlease", core_tbl,69);
-        resolve!("hsa_signal_subtract_scacq_screl", core_tbl,70);
-        resolve!("hsa_signal_cas_relaxed", core_tbl,71);
-        resolve!("hsa_signal_cas_scacquire", core_tbl,72);
-        resolve!("hsa_signal_cas_screlease", core_tbl,73);
-        resolve!("hsa_signal_cas_scacq_screl", core_tbl,74);
-        resolve!("hsa_isa_from_name", core_tbl,75);
-        resolve!("hsa_isa_get_info", core_tbl,76);
-        resolve!("hsa_isa_compatible", core_tbl,77);
-        resolve!("hsa_code_object_serialize", core_tbl,78);
-        resolve!("hsa_code_object_deserialize", core_tbl,79);
-        resolve!("hsa_code_object_destroy", core_tbl,80);
-        resolve!("hsa_code_object_get_info", core_tbl,81);
-        resolve!("hsa_code_object_get_symbol", core_tbl,82);
-        resolve!("hsa_code_symbol_get_info", core_tbl,83);
-        resolve!("hsa_code_object_iterate_symbols", core_tbl,84);
-        resolve!("hsa_executable_create", core_tbl,85);
-        resolve!("hsa_executable_destroy", core_tbl,86);       // agent hooks this
-        resolve!("hsa_executable_load_code_object", core_tbl,87);
-        resolve!("hsa_executable_freeze", core_tbl,88);        // agent hooks this
-        resolve!("hsa_executable_get_info", core_tbl,89);
-        resolve!("hsa_executable_global_variable_define", core_tbl,90);
-        resolve!("hsa_executable_agent_global_variable_define", core_tbl,91);
-        resolve!("hsa_executable_readonly_variable_define", core_tbl,92);
-        resolve!("hsa_executable_validate", core_tbl,93);
-        resolve!("hsa_executable_get_symbol", core_tbl,94);
-        resolve!("hsa_executable_symbol_get_info", core_tbl,95);
-        resolve!("hsa_executable_iterate_symbols", core_tbl,96);
-        resolve!("hsa_status_string", core_tbl,97);
+        resolve!("hsa_shut_down", core_tbl, 3);
+        resolve!("hsa_system_get_info", core_tbl, 4);
+        resolve!("hsa_system_extension_supported", core_tbl, 5);
+        resolve!("hsa_system_get_extension_table", core_tbl, 6);
+        resolve!("hsa_iterate_agents", core_tbl, 7);
+        resolve!("hsa_agent_get_info", core_tbl, 8);
+        resolve!("hsa_queue_create", core_tbl, 9);
+        resolve!("hsa_soft_queue_create", core_tbl, 10);
+        resolve!("hsa_queue_destroy", core_tbl, 11);
+        resolve!("hsa_queue_inactivate", core_tbl, 12);
+        resolve!("hsa_queue_load_read_index_scacquire", core_tbl, 13);
+        resolve!("hsa_queue_load_read_index_relaxed", core_tbl, 14);
+        resolve!("hsa_queue_load_write_index_scacquire", core_tbl, 15);
+        resolve!("hsa_queue_load_write_index_relaxed", core_tbl, 16);
+        resolve!("hsa_queue_store_write_index_relaxed", core_tbl, 17);
+        resolve!("hsa_queue_store_write_index_screlease", core_tbl, 18);
+        resolve!("hsa_queue_cas_write_index_scacq_screl", core_tbl, 19);
+        resolve!("hsa_queue_cas_write_index_scacquire", core_tbl, 20);
+        resolve!("hsa_queue_cas_write_index_relaxed", core_tbl, 21);
+        resolve!("hsa_queue_cas_write_index_screlease", core_tbl, 22);
+        resolve!("hsa_queue_add_write_index_scacq_screl", core_tbl, 23);
+        resolve!("hsa_queue_add_write_index_scacquire", core_tbl, 24);
+        resolve!("hsa_queue_add_write_index_relaxed", core_tbl, 25);
+        resolve!("hsa_queue_add_write_index_screlease", core_tbl, 26);
+        resolve!("hsa_queue_store_read_index_relaxed", core_tbl, 27);
+        resolve!("hsa_queue_store_read_index_screlease", core_tbl, 28);
+        resolve!("hsa_agent_iterate_regions", core_tbl, 29);
+        resolve!("hsa_region_get_info", core_tbl, 30);
+        resolve!("hsa_agent_get_exception_policies", core_tbl, 31);
+        resolve!("hsa_agent_extension_supported", core_tbl, 32);
+        resolve!("hsa_memory_register", core_tbl, 33);
+        resolve!("hsa_memory_deregister", core_tbl, 34);
+        resolve!("hsa_memory_allocate", core_tbl, 35);
+        resolve!("hsa_memory_free", core_tbl, 36);
+        resolve!("hsa_memory_copy", core_tbl, 37);
+        resolve!("hsa_memory_assign_agent", core_tbl, 38);
+        resolve!("hsa_signal_create", core_tbl, 39);
+        resolve!("hsa_signal_destroy", core_tbl, 40);
+        resolve!("hsa_signal_load_relaxed", core_tbl, 41);
+        resolve!("hsa_signal_load_scacquire", core_tbl, 42);
+        resolve!("hsa_signal_store_relaxed", core_tbl, 43);
+        resolve!("hsa_signal_store_screlease", core_tbl, 44);
+        resolve!("hsa_signal_wait_relaxed", core_tbl, 45);
+        resolve!("hsa_signal_wait_scacquire", core_tbl, 46);
+        resolve!("hsa_signal_and_relaxed", core_tbl, 47);
+        resolve!("hsa_signal_and_scacquire", core_tbl, 48);
+        resolve!("hsa_signal_and_screlease", core_tbl, 49);
+        resolve!("hsa_signal_and_scacq_screl", core_tbl, 50);
+        resolve!("hsa_signal_or_relaxed", core_tbl, 51);
+        resolve!("hsa_signal_or_scacquire", core_tbl, 52);
+        resolve!("hsa_signal_or_screlease", core_tbl, 53);
+        resolve!("hsa_signal_or_scacq_screl", core_tbl, 54);
+        resolve!("hsa_signal_xor_relaxed", core_tbl, 55);
+        resolve!("hsa_signal_xor_scacquire", core_tbl, 56);
+        resolve!("hsa_signal_xor_screlease", core_tbl, 57);
+        resolve!("hsa_signal_xor_scacq_screl", core_tbl, 58);
+        resolve!("hsa_signal_exchange_relaxed", core_tbl, 59);
+        resolve!("hsa_signal_exchange_scacquire", core_tbl, 60);
+        resolve!("hsa_signal_exchange_screlease", core_tbl, 61);
+        resolve!("hsa_signal_exchange_scacq_screl", core_tbl, 62);
+        resolve!("hsa_signal_add_relaxed", core_tbl, 63);
+        resolve!("hsa_signal_add_scacquire", core_tbl, 64);
+        resolve!("hsa_signal_add_screlease", core_tbl, 65);
+        resolve!("hsa_signal_add_scacq_screl", core_tbl, 66);
+        resolve!("hsa_signal_subtract_relaxed", core_tbl, 67);
+        resolve!("hsa_signal_subtract_scacquire", core_tbl, 68);
+        resolve!("hsa_signal_subtract_screlease", core_tbl, 69);
+        resolve!("hsa_signal_subtract_scacq_screl", core_tbl, 70);
+        resolve!("hsa_signal_cas_relaxed", core_tbl, 71);
+        resolve!("hsa_signal_cas_scacquire", core_tbl, 72);
+        resolve!("hsa_signal_cas_screlease", core_tbl, 73);
+        resolve!("hsa_signal_cas_scacq_screl", core_tbl, 74);
+        resolve!("hsa_isa_from_name", core_tbl, 75);
+        resolve!("hsa_isa_get_info", core_tbl, 76);
+        resolve!("hsa_isa_compatible", core_tbl, 77);
+        resolve!("hsa_code_object_serialize", core_tbl, 78);
+        resolve!("hsa_code_object_deserialize", core_tbl, 79);
+        resolve!("hsa_code_object_destroy", core_tbl, 80);
+        resolve!("hsa_code_object_get_info", core_tbl, 81);
+        resolve!("hsa_code_object_get_symbol", core_tbl, 82);
+        resolve!("hsa_code_symbol_get_info", core_tbl, 83);
+        resolve!("hsa_code_object_iterate_symbols", core_tbl, 84);
+        resolve!("hsa_executable_create", core_tbl, 85);
+        resolve!("hsa_executable_destroy", core_tbl, 86); // agent hooks this
+        resolve!("hsa_executable_load_code_object", core_tbl, 87);
+        resolve!("hsa_executable_freeze", core_tbl, 88); // agent hooks this
+        resolve!("hsa_executable_get_info", core_tbl, 89);
+        resolve!("hsa_executable_global_variable_define", core_tbl, 90);
+        resolve!("hsa_executable_agent_global_variable_define", core_tbl, 91);
+        resolve!("hsa_executable_readonly_variable_define", core_tbl, 92);
+        resolve!("hsa_executable_validate", core_tbl, 93);
+        resolve!("hsa_executable_get_symbol", core_tbl, 94);
+        resolve!("hsa_executable_symbol_get_info", core_tbl, 95);
+        resolve!("hsa_executable_iterate_symbols", core_tbl, 96);
+        resolve!("hsa_status_string", core_tbl, 97);
         // v1.1 additions
-        resolve!("hsa_extension_get_name", core_tbl,98);
-        resolve!("hsa_system_major_extension_supported", core_tbl,99);
-        resolve!("hsa_system_get_major_extension_table", core_tbl,100);
-        resolve!("hsa_agent_major_extension_supported", core_tbl,101);
-        resolve!("hsa_cache_get_info", core_tbl,102);
-        resolve!("hsa_agent_iterate_caches", core_tbl,103);
-        resolve!("hsa_signal_silent_store_relaxed", core_tbl,104);
-        resolve!("hsa_signal_silent_store_screlease", core_tbl,105);
-        resolve!("hsa_signal_group_create", core_tbl,106);
-        resolve!("hsa_signal_group_destroy", core_tbl,107);
-        resolve!("hsa_signal_group_wait_any_scacquire", core_tbl,108);
-        resolve!("hsa_signal_group_wait_any_relaxed", core_tbl,109);
-        resolve!("hsa_agent_iterate_isas", core_tbl,110);
-        resolve!("hsa_isa_get_info_alt", core_tbl,111);
-        resolve!("hsa_isa_get_exception_policies", core_tbl,112);
-        resolve!("hsa_isa_get_round_method", core_tbl,113);
-        resolve!("hsa_wavefront_get_info", core_tbl,114);
-        resolve!("hsa_isa_iterate_wavefronts", core_tbl,115);
-        resolve!("hsa_code_object_get_symbol_from_name", core_tbl,116);
-        resolve!("hsa_code_object_reader_create_from_file", core_tbl,117);
-        resolve!("hsa_code_object_reader_create_from_memory", core_tbl,118);
-        resolve!("hsa_code_object_reader_destroy", core_tbl,119);
-        resolve!("hsa_executable_create_alt", core_tbl,120);
-        resolve!("hsa_executable_load_program_code_object", core_tbl,121);
-        resolve!("hsa_executable_load_agent_code_object", core_tbl,122);
-        resolve!("hsa_executable_validate_alt", core_tbl,123);
-        resolve!("hsa_executable_get_symbol_by_name", core_tbl,124);
-        resolve!("hsa_executable_iterate_agent_symbols", core_tbl,125);
-        resolve!("hsa_executable_iterate_program_symbols", core_tbl,126);
+        resolve!("hsa_extension_get_name", core_tbl, 98);
+        resolve!("hsa_system_major_extension_supported", core_tbl, 99);
+        resolve!("hsa_system_get_major_extension_table", core_tbl, 100);
+        resolve!("hsa_agent_major_extension_supported", core_tbl, 101);
+        resolve!("hsa_cache_get_info", core_tbl, 102);
+        resolve!("hsa_agent_iterate_caches", core_tbl, 103);
+        resolve!("hsa_signal_silent_store_relaxed", core_tbl, 104);
+        resolve!("hsa_signal_silent_store_screlease", core_tbl, 105);
+        resolve!("hsa_signal_group_create", core_tbl, 106);
+        resolve!("hsa_signal_group_destroy", core_tbl, 107);
+        resolve!("hsa_signal_group_wait_any_scacquire", core_tbl, 108);
+        resolve!("hsa_signal_group_wait_any_relaxed", core_tbl, 109);
+        resolve!("hsa_agent_iterate_isas", core_tbl, 110);
+        resolve!("hsa_isa_get_info_alt", core_tbl, 111);
+        resolve!("hsa_isa_get_exception_policies", core_tbl, 112);
+        resolve!("hsa_isa_get_round_method", core_tbl, 113);
+        resolve!("hsa_wavefront_get_info", core_tbl, 114);
+        resolve!("hsa_isa_iterate_wavefronts", core_tbl, 115);
+        resolve!("hsa_code_object_get_symbol_from_name", core_tbl, 116);
+        resolve!("hsa_code_object_reader_create_from_file", core_tbl, 117);
+        resolve!("hsa_code_object_reader_create_from_memory", core_tbl, 118);
+        resolve!("hsa_code_object_reader_destroy", core_tbl, 119);
+        resolve!("hsa_executable_create_alt", core_tbl, 120);
+        resolve!("hsa_executable_load_program_code_object", core_tbl, 121);
+        resolve!("hsa_executable_load_agent_code_object", core_tbl, 122);
+        resolve!("hsa_executable_validate_alt", core_tbl, 123);
+        resolve!("hsa_executable_get_symbol_by_name", core_tbl, 124);
+        resolve!("hsa_executable_iterate_agent_symbols", core_tbl, 125);
+        resolve!("hsa_executable_iterate_program_symbols", core_tbl, 126);
 
         // --- AmdExtTable version ---
         let ver = amd_tbl as *mut u32;
@@ -544,61 +663,69 @@ fn load_rocm_debug_agent() {
 
         // AmdExtTable function pointers. Populate the critical ones the agent
         // may use during fault handling (e.g. hsa_amd_register_system_event_handler).
-        resolve!("hsa_amd_coherency_get_type", amd_tbl,2);
-        resolve!("hsa_amd_coherency_set_type", amd_tbl,3);
-        resolve!("hsa_amd_profiling_set_profiler_enabled", amd_tbl,4);
-        resolve!("hsa_amd_profiling_async_copy_enable", amd_tbl,5);
-        resolve!("hsa_amd_profiling_get_dispatch_time", amd_tbl,6);
-        resolve!("hsa_amd_profiling_get_async_copy_time", amd_tbl,7);
-        resolve!("hsa_amd_profiling_convert_tick_to_system_domain", amd_tbl,8);
-        resolve!("hsa_amd_signal_async_handler", amd_tbl,9);
-        resolve!("hsa_amd_async_function", amd_tbl,10);
-        resolve!("hsa_amd_signal_wait_any", amd_tbl,11);
-        resolve!("hsa_amd_queue_cu_set_mask", amd_tbl,12);
-        resolve!("hsa_amd_memory_pool_get_info", amd_tbl,13);
-        resolve!("hsa_amd_agent_iterate_memory_pools", amd_tbl,14);
-        resolve!("hsa_amd_memory_pool_allocate", amd_tbl,15);
-        resolve!("hsa_amd_memory_pool_free", amd_tbl,16);
-        resolve!("hsa_amd_memory_async_copy", amd_tbl,17);
-        resolve!("hsa_amd_memory_async_copy_on_engine", amd_tbl,18);
-        resolve!("hsa_amd_memory_copy_engine_status", amd_tbl,19);
-        resolve!("hsa_amd_agent_memory_pool_get_info", amd_tbl,20);
-        resolve!("hsa_amd_agents_allow_access", amd_tbl,21);
-        resolve!("hsa_amd_memory_pool_can_migrate", amd_tbl,22);
-        resolve!("hsa_amd_memory_migrate", amd_tbl,23);
-        resolve!("hsa_amd_memory_lock", amd_tbl,24);
-        resolve!("hsa_amd_memory_unlock", amd_tbl,25);
-        resolve!("hsa_amd_memory_fill", amd_tbl,26);
-        resolve!("hsa_amd_interop_map_buffer", amd_tbl,27);
-        resolve!("hsa_amd_interop_unmap_buffer", amd_tbl,28);
-        resolve!("hsa_amd_image_create", amd_tbl,29);
-        resolve!("hsa_amd_pointer_info", amd_tbl,30);
-        resolve!("hsa_amd_pointer_info_set_userdata", amd_tbl,31);
-        resolve!("hsa_amd_ipc_memory_create", amd_tbl,32);
-        resolve!("hsa_amd_ipc_memory_attach", amd_tbl,33);
-        resolve!("hsa_amd_ipc_memory_detach", amd_tbl,34);
-        resolve!("hsa_amd_signal_create", amd_tbl,35);
-        resolve!("hsa_amd_ipc_signal_create", amd_tbl,36);
-        resolve!("hsa_amd_ipc_signal_attach", amd_tbl,37);
-        resolve!("hsa_amd_register_system_event_handler", amd_tbl,38);
-        resolve!("hsa_amd_queue_intercept_create", amd_tbl,39);
-        resolve!("hsa_amd_queue_intercept_register", amd_tbl,40);
-        resolve!("hsa_amd_queue_set_priority", amd_tbl,41);
-        resolve!("hsa_amd_memory_async_copy_rect", amd_tbl,42);
-        resolve!("hsa_amd_runtime_queue_create_register", amd_tbl,43);
-        resolve!("hsa_amd_memory_lock_to_pool", amd_tbl,44);
-        resolve!("hsa_amd_register_deallocation_callback", amd_tbl,45);
-        resolve!("hsa_amd_deregister_deallocation_callback", amd_tbl,46);
-        resolve!("hsa_amd_signal_value_pointer", amd_tbl,47);
+        resolve!("hsa_amd_coherency_get_type", amd_tbl, 2);
+        resolve!("hsa_amd_coherency_set_type", amd_tbl, 3);
+        resolve!("hsa_amd_profiling_set_profiler_enabled", amd_tbl, 4);
+        resolve!("hsa_amd_profiling_async_copy_enable", amd_tbl, 5);
+        resolve!("hsa_amd_profiling_get_dispatch_time", amd_tbl, 6);
+        resolve!("hsa_amd_profiling_get_async_copy_time", amd_tbl, 7);
+        resolve!(
+            "hsa_amd_profiling_convert_tick_to_system_domain",
+            amd_tbl,
+            8
+        );
+        resolve!("hsa_amd_signal_async_handler", amd_tbl, 9);
+        resolve!("hsa_amd_async_function", amd_tbl, 10);
+        resolve!("hsa_amd_signal_wait_any", amd_tbl, 11);
+        resolve!("hsa_amd_queue_cu_set_mask", amd_tbl, 12);
+        resolve!("hsa_amd_memory_pool_get_info", amd_tbl, 13);
+        resolve!("hsa_amd_agent_iterate_memory_pools", amd_tbl, 14);
+        resolve!("hsa_amd_memory_pool_allocate", amd_tbl, 15);
+        resolve!("hsa_amd_memory_pool_free", amd_tbl, 16);
+        resolve!("hsa_amd_memory_async_copy", amd_tbl, 17);
+        resolve!("hsa_amd_memory_async_copy_on_engine", amd_tbl, 18);
+        resolve!("hsa_amd_memory_copy_engine_status", amd_tbl, 19);
+        resolve!("hsa_amd_agent_memory_pool_get_info", amd_tbl, 20);
+        resolve!("hsa_amd_agents_allow_access", amd_tbl, 21);
+        resolve!("hsa_amd_memory_pool_can_migrate", amd_tbl, 22);
+        resolve!("hsa_amd_memory_migrate", amd_tbl, 23);
+        resolve!("hsa_amd_memory_lock", amd_tbl, 24);
+        resolve!("hsa_amd_memory_unlock", amd_tbl, 25);
+        resolve!("hsa_amd_memory_fill", amd_tbl, 26);
+        resolve!("hsa_amd_interop_map_buffer", amd_tbl, 27);
+        resolve!("hsa_amd_interop_unmap_buffer", amd_tbl, 28);
+        resolve!("hsa_amd_image_create", amd_tbl, 29);
+        resolve!("hsa_amd_pointer_info", amd_tbl, 30);
+        resolve!("hsa_amd_pointer_info_set_userdata", amd_tbl, 31);
+        resolve!("hsa_amd_ipc_memory_create", amd_tbl, 32);
+        resolve!("hsa_amd_ipc_memory_attach", amd_tbl, 33);
+        resolve!("hsa_amd_ipc_memory_detach", amd_tbl, 34);
+        resolve!("hsa_amd_signal_create", amd_tbl, 35);
+        resolve!("hsa_amd_ipc_signal_create", amd_tbl, 36);
+        resolve!("hsa_amd_ipc_signal_attach", amd_tbl, 37);
+        resolve!("hsa_amd_register_system_event_handler", amd_tbl, 38);
+        resolve!("hsa_amd_queue_intercept_create", amd_tbl, 39);
+        resolve!("hsa_amd_queue_intercept_register", amd_tbl, 40);
+        resolve!("hsa_amd_queue_set_priority", amd_tbl, 41);
+        resolve!("hsa_amd_memory_async_copy_rect", amd_tbl, 42);
+        resolve!("hsa_amd_runtime_queue_create_register", amd_tbl, 43);
+        resolve!("hsa_amd_memory_lock_to_pool", amd_tbl, 44);
+        resolve!("hsa_amd_register_deallocation_callback", amd_tbl, 45);
+        resolve!("hsa_amd_deregister_deallocation_callback", amd_tbl, 46);
+        resolve!("hsa_amd_signal_value_pointer", amd_tbl, 47);
 
         // Log how many functions we resolved
         let mut core_count = 0usize;
         for i in 2..128 {
-            if *core_tbl.add(i) != 0 { core_count += 1; }
+            if *core_tbl.add(i) != 0 {
+                core_count += 1;
+            }
         }
         let mut amd_count = 0usize;
         for i in 2..128 {
-            if *amd_tbl.add(i) != 0 { amd_count += 1; }
+            if *amd_tbl.add(i) != 0 {
+                amd_count += 1;
+            }
         }
         zluda_log_err(&format!(
             "[ZLUDA] HSA API table: {} core + {} amd_ext functions resolved",
@@ -629,13 +756,15 @@ fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> Result<(), cuda_type
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     let builder = std::thread::Builder::new().name("zluda-hip-init".into());
-    let handle = builder.spawn(move || {
-        let result = unsafe { hipInit(flags) };
-        tx.send(result).ok();
-    }).map_err(|e| {
-        zluda_log(&format!("[ZLUDA] Failed to spawn hipInit thread: {}", e));
-        cuda_types::cuda::CUerror::UNKNOWN
-    })?;
+    let handle = builder
+        .spawn(move || {
+            let result = unsafe { hipInit(flags) };
+            tx.send(result).ok();
+        })
+        .map_err(|e| {
+            zluda_log(&format!("[ZLUDA] Failed to spawn hipInit thread: {}", e));
+            cuda_types::cuda::CUerror::UNKNOWN
+        })?;
     handle.join().map_err(|_| {
         zluda_log("[ZLUDA] hipInit thread panicked");
         cuda_types::cuda::CUerror::UNKNOWN
@@ -658,7 +787,11 @@ fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> Result<(), cuda_type
 
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log(&format!("[ZLUDA] cuInit({})", flags));
-    zluda_log_err(&format!("=== ZLUDA init (flags={}) LOG_ALL={} ===", flags, crate::is_log_all_enabled()));
+    zluda_log_err(&format!(
+        "=== ZLUDA init (flags={}) LOG_ALL={} ===",
+        flags,
+        crate::is_log_all_enabled()
+    ));
     // Disable SDMA before HIP init. Wine's SIGUSR1 APC delivery interrupts the
     // KFD ioctl that waits for SDMA completion, causing hangs. On APUs (unified
     // memory), blit kernels are the correct path anyway — SDMA is for discrete GPUs.
@@ -751,7 +884,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         result: *mut cuda_types::cuda::CUmodule,
         fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper,
     ) -> cuda_types::cuda::CUresult {
-        zluda_log_err(&format!("dark_api::get_module_from_cubin(fatbinc={:p})", fatbinc_wrapper));
+        zluda_log_err(&format!(
+            "dark_api::get_module_from_cubin(fatbinc={:p})",
+            fatbinc_wrapper
+        ));
         let result = match result.as_mut() {
             Some(p) => p,
             None => return CUresult::ERROR_INVALID_VALUE,
@@ -777,7 +913,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
 
         let (_, cu_ctx) = device::get_primary_context(hip_dev)?;
         *pctx = cu_ctx;
-        zluda_log_err(&format!("dark_api::cudart_interface_fn2 -> OK (ctx={:p})", cu_ctx.0));
+        zluda_log_err(&format!(
+            "dark_api::cudart_interface_fn2 -> OK (ctx={:p})",
+            cu_ctx.0
+        ));
         Ok(())
     }
 
@@ -788,7 +927,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         dev: hipDevice_t,
         flags: std::ffi::c_uint,
     ) -> cuda_types::cuda::CUresult {
-        zluda_log_err(&format!("dark_api::set_device_flags(dev={}, flags={})", dev, flags));
+        zluda_log_err(&format!(
+            "dark_api::set_device_flags(dev={}, flags={})",
+            dev, flags
+        ));
         let mut active_dev = 0i32;
         hipGetDevice(&mut active_dev)?;
         if dev != active_dev {
@@ -802,9 +944,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         Ok(())
     }
 
-    unsafe extern "system" fn set_device(
-        dev: hipDevice_t,
-    ) -> cuda_types::cuda::CUresult {
+    unsafe extern "system" fn set_device(dev: hipDevice_t) -> cuda_types::cuda::CUresult {
         zluda_log_err(&format!("dark_api::set_device(dev={})", dev));
         hipSetDevice(dev)?;
         Ok(())
@@ -818,9 +958,14 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         arg5: u32,
     ) -> cuda_types::cuda::CUresult {
         zluda_log("[ZLUDA] dark_api::get_module_from_cubin_ext1");
-        zluda_log_err(&format!("dark_api::get_module_from_cubin_ext1(fatbinc={:p})", fatbinc_wrapper));
+        zluda_log_err(&format!(
+            "dark_api::get_module_from_cubin_ext1(fatbinc={:p})",
+            fatbinc_wrapper
+        ));
         if arg3 != ptr::null_mut() || arg4 != ptr::null_mut() || arg5 != 0 {
-            zluda_log("[ZLUDA] dark_api::get_module_from_cubin_ext1 -> NOT_SUPPORTED (non-null args)");
+            zluda_log(
+                "[ZLUDA] dark_api::get_module_from_cubin_ext1 -> NOT_SUPPORTED (non-null args)",
+            );
             zluda_log_err("dark_api::get_module_from_cubin_ext1 -> NOT_SUPPORTED (non-null args)");
             return CUresult::ERROR_NOT_SUPPORTED;
         }
@@ -833,13 +978,19 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             .as_ref()
             .ok_or(CUerror::INVALID_VALUE)?;
         let r = module::load_data(result, data);
-        zluda_log(&format!("[ZLUDA] dark_api::get_module_from_cubin_ext1 -> {:?}", r));
+        zluda_log(&format!(
+            "[ZLUDA] dark_api::get_module_from_cubin_ext1 -> {:?}",
+            r
+        ));
         zluda_log_err(&format!("dark_api::get_module_from_cubin_ext1 -> {:?}", r));
         r
     }
 
     unsafe extern "system" fn cudart_interface_fn7(_arg1: usize) -> () {
-        zluda_log_err(&format!("dark_api::cudart_interface_fn7(arg1=0x{:x})", _arg1));
+        zluda_log_err(&format!(
+            "dark_api::cudart_interface_fn7(arg1=0x{:x})",
+            _arg1
+        ));
     }
 
     unsafe extern "system" fn get_module_from_cubin_ext2(
@@ -849,7 +1000,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         arg4: *mut std::ffi::c_void,
         arg5: u32,
     ) -> cuda_types::cuda::CUresult {
-        zluda_log_err(&format!("dark_api::get_module_from_cubin_ext2(fatbin={:p})", fatbin_header));
+        zluda_log_err(&format!(
+            "dark_api::get_module_from_cubin_ext2(fatbin={:p})",
+            fatbin_header
+        ));
         if arg3 != ptr::null_mut() || arg4 != ptr::null_mut() || arg5 != 0 {
             zluda_log_err("dark_api::get_module_from_cubin_ext2 -> NOT_SUPPORTED (non-null args)");
             return CUresult::ERROR_NOT_SUPPORTED;
@@ -873,7 +1027,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     ) -> () {
         *ptr = UNKNOWN_BUFFER1.buffer.get() as *mut std::ffi::c_void;
         *size = UNKNOWN_BUFFER1.len();
-        zluda_log_err(&format!("dark_api::get_unknown_buffer1 -> ptr={:p}, size={}", *ptr, *size));
+        zluda_log_err(&format!(
+            "dark_api::get_unknown_buffer1 -> ptr={:p}, size={}",
+            *ptr, *size
+        ));
     }
 
     unsafe extern "system" fn get_unknown_buffer2(
@@ -882,7 +1039,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     ) -> () {
         *ptr = UNKNOWN_BUFFER2.buffer.get() as *mut std::ffi::c_void;
         *size = UNKNOWN_BUFFER2.len();
-        zluda_log_err(&format!("dark_api::get_unknown_buffer2 -> ptr={:p}, size={}", *ptr, *size));
+        zluda_log_err(&format!(
+            "dark_api::get_unknown_buffer2 -> ptr={:p}, size={}",
+            *ptr, *size
+        ));
     }
 
     unsafe extern "system" fn context_local_storage_put(
@@ -891,7 +1051,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         value: *mut c_void,
         dtor_cb: Option<extern "system" fn(CUcontext, *mut c_void, *mut c_void)>,
     ) -> CUresult {
-        zluda_log_err(&format!("dark_api::context_local_storage_put(ctx={:p}, key={:p}, val={:p})", cu_ctx.0, key, value));
+        zluda_log_err(&format!(
+            "dark_api::context_local_storage_put(ctx={:p}, key={:p}, val={:p})",
+            cu_ctx.0, key, value
+        ));
         let _ctx = if cu_ctx.0 != ptr::null_mut() {
             cu_ctx
         } else {
@@ -918,7 +1081,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         cu_ctx: CUcontext,
         key: *mut c_void,
     ) -> CUresult {
-        zluda_log_err(&format!("dark_api::context_local_storage_delete(ctx={:p}, key={:p})", cu_ctx.0, key));
+        zluda_log_err(&format!(
+            "dark_api::context_local_storage_delete(ctx={:p}, key={:p})",
+            cu_ctx.0, key
+        ));
         let ctx_obj: &context::Context = FromCuda::<_, CUerror>::from_cuda(&cu_ctx)?;
         ctx_obj.with_state_mut(|state: &mut context::ContextState| {
             state.storage.remove(&(key as usize));
@@ -932,7 +1098,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         cu_ctx: CUcontext,
         key: *mut c_void,
     ) -> CUresult {
-        zluda_log_err(&format!("dark_api::context_local_storage_get(ctx={:p}, key={:p})", cu_ctx.0, key));
+        zluda_log_err(&format!(
+            "dark_api::context_local_storage_get(ctx={:p}, key={:p})",
+            cu_ctx.0, key
+        ));
         let mut _ctx: CUcontext;
         if cu_ctx.0 == ptr::null_mut() {
             _ctx = context::get_current_context()?;
@@ -955,15 +1124,24 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         flags: ::std::os::raw::c_uint,
         dev: cuda_types::cuda::CUdevice,
     ) -> cuda_types::cuda::CUresult {
-        zluda_log(&format!("[ZLUDA] dark_api::ctx_create_v2_bypass(dev={}, flags={})", dev, flags));
-        zluda_log_err(&format!("dark_api::ctx_create_v2_bypass(dev={}, flags={})", dev, flags));
+        zluda_log(&format!(
+            "[ZLUDA] dark_api::ctx_create_v2_bypass(dev={}, flags={})",
+            dev, flags
+        ));
+        zluda_log_err(&format!(
+            "dark_api::ctx_create_v2_bypass(dev={}, flags={})",
+            dev, flags
+        ));
         // PhysX uses this dark API to create a context without the normal
         // overhead. Implement it the same as cuCtxCreate_v2.
         let result = match pctx.as_mut() {
             Some(pctx) => r#impl::context::create_v2(pctx, flags, dev),
             None => Err(cuda_types::cuda::CUerror::INVALID_VALUE),
         };
-        zluda_log(&format!("[ZLUDA] dark_api::ctx_create_v2_bypass -> {:?}", result));
+        zluda_log(&format!(
+            "[ZLUDA] dark_api::ctx_create_v2_bypass -> {:?}",
+            result
+        ));
         zluda_log_err(&format!("dark_api::ctx_create_v2_bypass -> {:?}", result));
         result
     }
@@ -973,7 +1151,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _arg2: usize,
         _arg3: usize,
     ) -> cuda_types::cuda::CUresult {
-        zluda_log_err(&format!("dark_api::heap_alloc(arg2=0x{:x}, arg3=0x{:x})", _arg2, _arg3));
+        zluda_log_err(&format!(
+            "dark_api::heap_alloc(arg2=0x{:x}, arg3=0x{:x})",
+            _arg2, _arg3
+        ));
         Err(r#impl::unimplemented())
     }
 
@@ -981,7 +1162,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _heap_alloc_record_ptr: *const std::ffi::c_void,
         _arg2: *mut usize,
     ) -> cuda_types::cuda::CUresult {
-        zluda_log_err(&format!("dark_api::heap_free(ptr={:p})", _heap_alloc_record_ptr));
+        zluda_log_err(&format!(
+            "dark_api::heap_free(ptr={:p})",
+            _heap_alloc_record_ptr
+        ));
         Err(r#impl::unimplemented())
     }
 
@@ -991,7 +1175,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _unknown: std::ffi::c_int,
         _result: *mut [usize; 2],
     ) -> cuda_types::cuda::CUresult {
-        zluda_log_err(&format!("dark_api::device_get_attribute_ext(dev={}, attr={}, unknown={})", _dev, _attribute, _unknown));
+        zluda_log_err(&format!(
+            "dark_api::device_get_attribute_ext(dev={}, attr={}, unknown={})",
+            _dev, _attribute, _unknown
+        ));
         Err(r#impl::unimplemented())
     }
 
@@ -1008,7 +1195,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         unix_seconds: u64,
         result: *mut [u64; 2],
     ) -> cuda_types::cuda::CUresult {
-        zluda_log_err(&format!("dark_api::integrity_check(version={}, unix_seconds={})", version, unix_seconds));
+        zluda_log_err(&format!(
+            "dark_api::integrity_check(version={}, unix_seconds={})",
+            version, unix_seconds
+        ));
         let current_process = std::process::id();
         let current_thread = os::current_thread();
 
@@ -1059,7 +1249,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         let name = CStr::from_ptr(name)
             .to_str()
             .map_err(|_| CUerror::INVALID_VALUE)?;
-        zluda_log_err(&format!("dark_api::hybrid_runtime_load_get_proc_address(name='{}')", name));
+        zluda_log_err(&format!(
+            "dark_api::hybrid_runtime_load_get_proc_address(name='{}')",
+            name
+        ));
         if name != "nvcudart_hybrid64.dll" && name != "nvcudart_hybrid64a.dll" {
             return CUresult::ERROR_INVALID_VALUE;
         }
@@ -1155,12 +1348,21 @@ pub(crate) fn get_export_table(
         p_export_table_id.bytes[14], p_export_table_id.bytes[15]);
     if let Some(table) = EXPORT_TABLE.get(p_export_table_id) {
         *pp_export_table = table.start();
-        zluda_log(&format!("[ZLUDA] cuGetExportTable({}) -> SUCCESS", guid_str));
+        zluda_log(&format!(
+            "[ZLUDA] cuGetExportTable({}) -> SUCCESS",
+            guid_str
+        ));
         zluda_log_err(&format!("cuGetExportTable({}) -> SUCCESS", guid_str));
         cuda_types::cuda::CUresult::SUCCESS
     } else {
-        zluda_log(&format!("[ZLUDA] cuGetExportTable({}) -> ERROR_INVALID_VALUE (unknown GUID!)", guid_str));
-        zluda_log_err(&format!("cuGetExportTable({}) -> ERROR_INVALID_VALUE (unknown GUID!)", guid_str));
+        zluda_log(&format!(
+            "[ZLUDA] cuGetExportTable({}) -> ERROR_INVALID_VALUE (unknown GUID!)",
+            guid_str
+        ));
+        zluda_log_err(&format!(
+            "cuGetExportTable({}) -> ERROR_INVALID_VALUE (unknown GUID!)",
+            guid_str
+        ));
         cuda_types::cuda::CUresult::ERROR_INVALID_VALUE
     }
 }
@@ -1193,11 +1395,27 @@ pub(crate) unsafe fn get_proc_address_v2(
         include!("../../../zluda_bindgen/src/process_table.rs")
     }
     let fn_ptr = raw_match(symbol.to_bytes(), flags, cuda_version);
-    let status_str = if fn_ptr as usize == 0 { "NOT_FOUND" } else if fn_ptr as usize == usize::MAX { "VERSION_NOT_SUFFICIENT" } else { "FOUND" };
-    zluda_log(&format!("[ZLUDA] cuGetProcAddress('{}', ver={}, flags={}) -> {:?}",
-        symbol.to_string_lossy(), cuda_version, flags, status_str));
-    zluda_log_err(&format!("cuGetProcAddress('{}', ver={}, flags={}) -> {}",
-        symbol.to_string_lossy(), cuda_version, flags, status_str));
+    let status_str = if fn_ptr as usize == 0 {
+        "NOT_FOUND"
+    } else if fn_ptr as usize == usize::MAX {
+        "VERSION_NOT_SUFFICIENT"
+    } else {
+        "FOUND"
+    };
+    zluda_log(&format!(
+        "[ZLUDA] cuGetProcAddress('{}', ver={}, flags={}) -> {:?}",
+        symbol.to_string_lossy(),
+        cuda_version,
+        flags,
+        status_str
+    ));
+    zluda_log_err(&format!(
+        "cuGetProcAddress('{}', ver={}, flags={}) -> {}",
+        symbol.to_string_lossy(),
+        cuda_version,
+        flags,
+        status_str
+    ));
     match fn_ptr as usize {
         0 => {
             if let Some(symbol_status) = symbol_status {

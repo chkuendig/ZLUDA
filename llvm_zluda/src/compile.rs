@@ -4,9 +4,8 @@ use crate::{ffi::LLVMZludaLinkWithLLD, utils::Module};
 use llvm_sys::{
     core::*,
     target::{
-        LLVMInitializeAMDGPUAsmParser, LLVMInitializeAMDGPUAsmPrinter,
-        LLVMInitializeAMDGPUTarget, LLVMInitializeAMDGPUTargetInfo,
-        LLVMInitializeAMDGPUTargetMC,
+        LLVMInitializeAMDGPUAsmParser, LLVMInitializeAMDGPUAsmPrinter, LLVMInitializeAMDGPUTarget,
+        LLVMInitializeAMDGPUTargetInfo, LLVMInitializeAMDGPUTargetMC,
     },
     target_machine::{
         LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMGetTargetFromTriple,

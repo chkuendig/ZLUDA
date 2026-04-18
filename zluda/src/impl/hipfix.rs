@@ -391,10 +391,7 @@ mod tests {
     #[test]
     fn inverse_returns_none_for_mismatched_format() {
         // hack_flag set but format doesn't match a known transformation -> None
-        assert_eq!(
-            get_broken_format_impl(2, F::HIP_AD_FORMAT_FLOAT),
-            None
-        );
+        assert_eq!(get_broken_format_impl(2, F::HIP_AD_FORMAT_FLOAT), None);
         assert_eq!(
             get_broken_format_impl(1, F::HIP_AD_FORMAT_UNSIGNED_INT32),
             None

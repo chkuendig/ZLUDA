@@ -81,5 +81,15 @@ opt-level = 2
 [profile.dev.package.llvm_zluda]
 opt-level = 2
 
+# Also optimize the zluda runtime crate in dev so the game doesn't trip
+# Steam's IPC watchdog. Debug assertions are INTENTIONALLY LEFT ON — ZLUDA has
+# `#[cfg(debug_assertions)] fn unimplemented() { unimplemented!() }` which
+# panics on any unimplemented CUDA API call. That's our early-warning system
+# for newly-hit UNIMPL paths. When an UNIMPL crash happens, the correct fix
+# is to implement the function (e.g. cuFuncSetCacheConfig → no-op on AMD),
+# not to suppress the assertion.
+[profile.dev.package.zluda]
+opt-level = 2
+
 [patch.crates-io]
 highs-sys = { path = "ext/highs-sys" }

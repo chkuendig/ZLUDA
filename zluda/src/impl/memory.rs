@@ -45,9 +45,7 @@ pub(crate) fn update_alloc_range(addr: u64, size: u64) {
 /// non-negligible runtime cost we don't want to pay in normal operation.
 fn vram_log_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ZLUDA_VRAM_LOG").map_or(false, |v| v == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_VRAM_LOG").map_or(false, |v| v == "1"))
 }
 
 /// Read current VRAM usage from sysfs. Returns bytes used, or 0 on error
@@ -76,8 +74,11 @@ pub(crate) fn log_vram_delta(label: &str, vram_before: u64, vram_after: u64, siz
     let placement = if delta > 1024 { "VRAM" } else { "GTT/other" };
     super::driver::zluda_log_err(&format!(
         "{} size={} KiB vram_delta={:+} KiB total_vram={} MiB ({})",
-        label, size / 1024, delta / 1024,
-        vram_after / (1024 * 1024), placement
+        label,
+        size / 1024,
+        delta / 1024,
+        vram_after / (1024 * 1024),
+        placement
     ));
 }
 
@@ -158,9 +159,15 @@ pub(crate) fn copy_hto_d_v2(
         let data = src_host as *const u64;
         // Texture object handles at known offsets in gParams (from CollideConvexes PTX)
         let tex_offsets: &[(usize, &str)] = &[
-            (40, "320:positions"), (41, "328:SDFTex"), (47, "376:grid"),
-            (48, "384:convexIdx"), (49, "392:convexPlanes1"), (50, "400:convexPlanes2"),
-            (51, "408:convexNormals"), (52, "416:convexPos"), (53, "424:convexRot"),
+            (40, "320:positions"),
+            (41, "328:SDFTex"),
+            (47, "376:grid"),
+            (48, "384:convexIdx"),
+            (49, "392:convexPlanes1"),
+            (50, "400:convexPlanes2"),
+            (51, "408:convexNormals"),
+            (52, "416:convexPos"),
+            (53, "424:convexRot"),
         ];
         let alloc_min = ALLOC_MIN.load(std::sync::atomic::Ordering::Relaxed);
         let alloc_max = ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
@@ -176,7 +183,13 @@ pub(crate) fn copy_hto_d_v2(
         let num_convexes = unsafe { *(src_host as *const u32).add(32) }; // offset 128 = u32 index 32
         super::driver::zluda_log_err(&format!(
             "cuMemcpyHtoD gParams dst={:p} numConvex={} bad_ptrs={}",
-            dst_device.0, num_convexes, if bad_ptrs.is_empty() { "none".to_string() } else { bad_ptrs.join(", ") }
+            dst_device.0,
+            num_convexes,
+            if bad_ptrs.is_empty() {
+                "none".to_string()
+            } else {
+                bad_ptrs.join(", ")
+            }
         ));
     }
     let result = unsafe { hipMemcpyHtoD(dst_device, src_host.cast_mut(), byte_count) };
@@ -301,8 +314,11 @@ pub(crate) fn get_info_v2(free: *mut usize, total: *mut usize) -> hipError_t {
         };
         super::driver::zluda_log_err(&format!(
             "cuMemGetInfo -> free={} MiB, total={} MiB (hip_free={}, hip_total={})",
-            reported_free / (1024*1024), reported_total / (1024*1024),
-            hip_free / (1024*1024), hip_total / (1024*1024)));
+            reported_free / (1024 * 1024),
+            reported_total / (1024 * 1024),
+            hip_free / (1024 * 1024),
+            hip_total / (1024 * 1024)
+        ));
     }
     result
 }
@@ -314,10 +330,7 @@ pub(crate) unsafe fn free_host(ptr: *mut ::core::ffi::c_void) -> CUresult {
     Ok(hip_result?)
 }
 
-pub(crate) unsafe fn alloc_host_v2(
-    pp: &mut *mut ::core::ffi::c_void,
-    bytesize: usize,
-) -> CUresult {
+pub(crate) unsafe fn alloc_host_v2(pp: &mut *mut ::core::ffi::c_void, bytesize: usize) -> CUresult {
     host_alloc(pp, bytesize, 0)
 }
 
@@ -347,7 +360,10 @@ pub(crate) unsafe fn host_alloc(
     let _ = hipHostGetDevicePointer(&mut dev_ptr, *pp, 0);
     super::driver::zluda_log_err(&format!(
         "cuMemHostAlloc size={} host={:p} dev={:p} same={}",
-        bytesize, *pp, dev_ptr, *pp == dev_ptr
+        bytesize,
+        *pp,
+        dev_ptr,
+        *pp == dev_ptr
     ));
     track_host_alloc(*pp, dev_ptr, bytesize);
     add_allocation(*pp, bytesize, context)?;
@@ -412,8 +428,12 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
         let alloc_max = ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
         // Check texture object handles at known gParams offsets
         let tex_offsets: &[(usize, &str)] = &[
-            (40, "320:pos"), (41, "328:sdf"), (47, "376:grid"),
-            (48, "384:cidx"), (49, "392:cp1"), (50, "400:cp2"),
+            (40, "320:pos"),
+            (41, "328:sdf"),
+            (47, "376:grid"),
+            (48, "384:cidx"),
+            (49, "392:cp1"),
+            (50, "400:cp2"),
         ];
         let mut bad = Vec::new();
         for &(idx, label) in tex_offsets {
@@ -426,7 +446,13 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
         let num_convex = *(src_host as *const u32).add(32); // offset 128
         super::driver::zluda_log_err(&format!(
             "cuMemcpyHtoDAsync gParams dst={:p} nConvex={} bad={}",
-            dst_device.0, num_convex, if bad.is_empty() { "none".to_string() } else { bad.join(",") }
+            dst_device.0,
+            num_convex,
+            if bad.is_empty() {
+                "none".to_string()
+            } else {
+                bad.join(",")
+            }
         ));
     }
     let _guard = super::stream::null_stream_sync(stream);
@@ -465,6 +491,12 @@ pub(crate) unsafe fn copy_dto_d_v2(
     src_device: hipDeviceptr_t,
     byte_count: usize,
 ) -> hipError_t {
+    super::function::maybe_log_creategrid_sorted_keys_copy(
+        dst_device.0 as u64,
+        src_device.0 as u64,
+        byte_count,
+        hipStream_t(std::ptr::null_mut()),
+    );
     hipMemcpyDtoD(dst_device, src_device, byte_count)
 }
 
@@ -474,6 +506,12 @@ pub(crate) unsafe fn copy_dto_d_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    super::function::maybe_log_creategrid_sorted_keys_copy(
+        dst_device.0 as u64,
+        src_device.0 as u64,
+        byte_count,
+        stream,
+    );
     let _guard = super::stream::null_stream_sync(stream);
     hipMemcpyDtoDAsync(dst_device, src_device, byte_count, stream)
 }
@@ -521,7 +559,12 @@ pub(crate) unsafe fn alloc_pitch_v2(
     log_vram_delta("hipMemAllocPitch", vram_before, vram_used_bytes(), size);
     super::driver::zluda_log_err(&format!(
         "ALLOC_PITCH {:?} {}x{} elem={} ~{} KiB",
-        unsafe { *dptr }, width_in_bytes, height, element_size_bytes, size / 1024));
+        unsafe { *dptr },
+        width_in_bytes,
+        height,
+        element_size_bytes,
+        size / 1024
+    ));
     Ok(())
 }
 
@@ -555,7 +598,9 @@ mod tests {
     #[test]
     fn memcpy_htod_data_integrity() {
         unsafe {
-            if hipInit(0).is_err() { return; } // Skip if no GPU
+            if hipInit(0).is_err() {
+                return;
+            } // Skip if no GPU
 
             // Allocate device memory
             let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -563,11 +608,7 @@ mod tests {
 
             // Write a known pattern via hipMemcpyHtoD
             let host_data: Vec<u64> = (0..32).map(|i| 0xDEAD_BEEF_0000_0000u64 + i).collect();
-            hipMemcpyHtoD(
-                hipDeviceptr_t(dev_ptr),
-                host_data.as_ptr() as *mut _,
-                256,
-            ).unwrap();
+            hipMemcpyHtoD(hipDeviceptr_t(dev_ptr), host_data.as_ptr() as *mut _, 256).unwrap();
 
             // Read back and verify
             let mut readback = vec![0u64; 32];
@@ -575,7 +616,8 @@ mod tests {
                 readback.as_mut_ptr() as *mut _,
                 hipDeviceptr_t(dev_ptr),
                 256,
-            ).unwrap();
+            )
+            .unwrap();
 
             for i in 0..32 {
                 assert_eq!(

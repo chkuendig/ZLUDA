@@ -28,7 +28,7 @@ define amdgpu_kernel void @shared_ptr_32(ptr addrspace(4) byref(i64) %"44", ptr 
   store i64 %7, ptr addrspace(3) %"64", align 8
   %8 = load i32, ptr addrspace(5) %"48", align 4
   %"65" = inttoptr i32 %8 to ptr addrspace(3)
-  %"42" = getelementptr inbounds i8, ptr addrspace(3) %"65", i64 0
+  %"42" = getelementptr inbounds i8, ptr addrspace(3) %"65", i32 0
   %9 = load i64, ptr addrspace(3) %"42", align 8
   store i64 %9, ptr addrspace(5) %"50", align 8
   %10 = load i64, ptr addrspace(5) %"47", align 8

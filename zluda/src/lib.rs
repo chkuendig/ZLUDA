@@ -1,7 +1,7 @@
 use cuda_types::cuda::CUerror;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 /// Global call counter for rate-limiting high-frequency API logging.
@@ -17,7 +17,10 @@ static ZLUDA_LOG_ALL: AtomicU8 = AtomicU8::new(0);
 
 /// Milliseconds since ZLUDA was first loaded.
 pub(crate) fn elapsed_ms() -> u64 {
-    PROCESS_START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    PROCESS_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// When ZLUDA_LOG_ALL=1, log every CUDA API call without rate-limiting.
@@ -49,7 +52,8 @@ fn is_debug_enabled() -> bool {
             let enabled = std::env::var("ZLUDA_DEBUG").map_or(false, |v| v == "1");
             if enabled {
                 if let Ok(f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
+                    .create(true)
+                    .append(true)
                     .open("/tmp/zluda_debug.log")
                 {
                     if let Ok(mut guard) = DEBUG_LOG.lock() {
@@ -93,13 +97,8 @@ macro_rules! unimplemented {
             #[allow(unused_variables)]
             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
                 // Always log unimplemented calls to catch missing APIs
-                {
-                    use std::io::Write;
-                    let ms = elapsed_ms();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-                        let _ = writeln!(f, "[{}ms] UNIMPL {}", ms, stringify!($fn_name));
-                    }
-                }
+                crate::r#impl::driver::zluda_log_err(
+                    &format!("UNIMPL {}", stringify!($fn_name)));
                 if is_debug_enabled() {
                     debug_log(&format!("[ZLUDA] UNIMPLEMENTED: {}", stringify!($fn_name)));
                 }
@@ -129,7 +128,6 @@ macro_rules! implemented {
                 // Log calls to lightweight log for investigation
                 // ZLUDA_LOG_ALL=1: log every call; otherwise rate-limit
                 {
-                    use std::io::Write;
                     let fn_name = stringify!($fn_name);
                     let count = CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
                     let log_all = is_log_all_enabled();
@@ -138,18 +136,11 @@ macro_rules! implemented {
                         || count % LOG_SAMPLE_INTERVAL == 0
                         || result.is_err();
                     if should_log {
-                        let ms = elapsed_ms();
                         match &result {
-                            Ok(()) => {
-                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-                                    let _ = writeln!(f, "[{}ms #{}] OK {}", ms, count, fn_name);
-                                }
-                            }
-                            Err(ref e) => {
-                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-                                    let _ = writeln!(f, "[{}ms #{}] ERR {} -> {:?}", ms, count, fn_name, e);
-                                }
-                            }
+                            Ok(()) => crate::r#impl::driver::zluda_log_err(
+                                &format!("#{} OK {}", count, fn_name)),
+                            Err(ref e) => crate::r#impl::driver::zluda_log_err(
+                                &format!("#{} ERR {} -> {:?}", count, fn_name, e)),
                         }
                     }
                 }
@@ -179,7 +170,6 @@ macro_rules! implemented_in_function {
                 }
                 // Log calls to lightweight log for investigation
                 {
-                    use std::io::Write;
                     let fn_name = stringify!($fn_name);
                     let count = CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
                     let log_all = is_log_all_enabled();
@@ -188,18 +178,11 @@ macro_rules! implemented_in_function {
                         || count % LOG_SAMPLE_INTERVAL == 0
                         || result.is_err();
                     if should_log {
-                        let ms = elapsed_ms();
                         match &result {
-                            Ok(()) => {
-                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-                                    let _ = writeln!(f, "[{}ms #{}] OK {}", ms, count, fn_name);
-                                }
-                            }
-                            Err(ref e) => {
-                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/zluda_tex.log") {
-                                    let _ = writeln!(f, "[{}ms #{}] ERR {} -> {:?}", ms, count, fn_name, e);
-                                }
-                            }
+                            Ok(()) => crate::r#impl::driver::zluda_log_err(
+                                &format!("#{} OK {}", count, fn_name)),
+                            Err(ref e) => crate::r#impl::driver::zluda_log_err(
+                                &format!("#{} ERR {} -> {:?}", count, fn_name, e)),
                         }
                     }
                 }
@@ -262,6 +245,7 @@ cuda_macros::cuda_function_declarations!(
             cuEventSynchronize,
             cuFuncGetAttribute,
             cuFuncSetAttribute,
+            cuFuncSetCacheConfig,
             cuGetErrorString,
             cuGetExportTable,
             cuGetProcAddress_v2,

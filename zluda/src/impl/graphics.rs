@@ -81,10 +81,7 @@ pub(crate) unsafe fn map_resources(
     resources: &mut CUgraphicsResource,
     h_stream: hipStream_t,
 ) -> CUresult {
-    super::driver::zluda_log_err(&format!(
-        "[ZLUDA] cuGraphicsMapResources(count={})",
-        count
-    ));
+    super::driver::zluda_log_err(&format!("[ZLUDA] cuGraphicsMapResources(count={})", count));
     hip_to_cuda(hipGraphicsMapResources(
         count as i32,
         resources as *mut CUgraphicsResource as *mut hipGraphicsResource_t,
@@ -172,22 +169,19 @@ pub(crate) unsafe fn resource_set_map_flags_v2(
 }
 
 /// cuGraphicsResourceSetMapFlags (v1)
-pub(crate) unsafe fn resource_set_map_flags(
-    resource: CUgraphicsResource,
-    flags: u32,
-) -> CUresult {
+pub(crate) unsafe fn resource_set_map_flags(resource: CUgraphicsResource, flags: u32) -> CUresult {
     resource_set_map_flags_v2(resource, flags)
 }
 
 /// cuGraphicsUnregisterResource
-pub(crate) unsafe fn unregister_resource(
-    resource: CUgraphicsResource,
-) -> CUresult {
+pub(crate) unsafe fn unregister_resource(resource: CUgraphicsResource) -> CUresult {
     super::driver::zluda_log_err(&format!(
         "[ZLUDA] cuGraphicsUnregisterResource(resource={:p})",
         resource
     ));
-    hip_to_cuda(hipGraphicsUnregisterResource(resource as hipGraphicsResource_t))
+    hip_to_cuda(hipGraphicsUnregisterResource(
+        resource as hipGraphicsResource_t,
+    ))
 }
 
 /// cuGraphicsResourceGetMappedMipmappedArray — not implemented.
@@ -227,9 +221,7 @@ pub unsafe extern "system" fn cuGraphicsD3D11RegisterResource(
     // Allocate a dummy device buffer
     let mut dev_ptr: *mut ::core::ffi::c_void = ptr::null_mut();
     if let Err(e) = hipMalloc(&mut dev_ptr, D3D11_DUMMY_SIZE) {
-        super::driver::zluda_log_err(&format!(
-            "[ZLUDA] D3D11 interop: hipMalloc failed: {:?}", e
-        ));
+        super::driver::zluda_log_err(&format!("[ZLUDA] D3D11 interop: hipMalloc failed: {:?}", e));
         return Err(CUerror::UNKNOWN);
     }
     let _ = hipMemsetD8(hipDeviceptr_t(dev_ptr), 0, D3D11_DUMMY_SIZE);

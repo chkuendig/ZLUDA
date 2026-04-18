@@ -29,6 +29,15 @@ fn as_tex_ref(texref: CUtexref) -> *mut textureReference {
     texref as *mut textureReference
 }
 
+/// Gate texref format/array diagnostic logging. Off by default because the
+/// game issues thousands of legacy texref binds per frame, and per-call
+/// `zluda_log_err` on that hot path adds enough host-thread latency to shift
+/// PhysX crash timing. Set `ZLUDA_TEXREF_LOG=1` to enable.
+fn texref_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_TEXREF_LOG").map_or(false, |v| v == "1"))
+}
+
 pub(crate) unsafe fn ref_set_address_v2(
     byte_offset: *mut usize,
     h_tex_ref: CUtexref,
@@ -54,7 +63,11 @@ pub(crate) unsafe fn ref_set_address_v2(
     }
     let mut unused = 0;
     hipTexRefSetAddress(
-        if byte_offset.is_null() { &mut unused } else { &mut *byte_offset },
+        if byte_offset.is_null() {
+            &mut unused
+        } else {
+            &mut *byte_offset
+        },
         tex_ref,
         dptr,
         bytes,
@@ -81,11 +94,7 @@ pub(crate) unsafe fn ref_set_address_2d_v3(
     Ok(())
 }
 
-pub(crate) unsafe fn ref_set_array(
-    h_tex_ref: CUtexref,
-    h_array: CUarray,
-    flags: u32,
-) -> CUresult {
+pub(crate) unsafe fn ref_set_array(h_tex_ref: CUtexref, h_array: CUarray, flags: u32) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
     if (flags & !1u32) != 0 {
         return Err(CUerror::NOT_SUPPORTED);
@@ -93,12 +102,22 @@ pub(crate) unsafe fn ref_set_array(
     // Get array descriptor to know the format and channel count
     let mut desc: HIP_ARRAY_DESCRIPTOR = mem::zeroed();
     hipArrayGetDescriptor(&mut desc, h_array as hipArray_t)?;
-    hipTexRefSetFormat(tex_ref, desc.Format, desc.NumChannels as i32)?;
-    hipTexRefSetArray(
-        tex_ref,
-        h_array as hipArray_t,
-        CU_TRSA_OVERRIDE_FORMAT,
-    )?;
+    if texref_log_enabled() {
+        let hack = super::hipfix::get_array_hack(h_array as hipArray_t);
+        super::driver::zluda_log_err(&format!(
+            "TEXREF_SET_ARRAY tex={:p} array={:p} stored_fmt={} ch={} flags={} hack={:?}",
+            tex_ref, h_array, desc.Format.0, desc.NumChannels, flags, hack
+        ));
+    }
+    let set_fmt_res = hipTexRefSetFormat(tex_ref, desc.Format, desc.NumChannels as i32);
+    if set_fmt_res.is_err() && texref_log_enabled() {
+        super::driver::zluda_log_err(&format!(
+            "TEXREF_SET_ARRAY hipTexRefSetFormat FAILED tex={:p} fmt={} ch={}",
+            tex_ref, desc.Format.0, desc.NumChannels
+        ));
+    }
+    set_fmt_res?;
+    hipTexRefSetArray(tex_ref, h_array as hipArray_t, CU_TRSA_OVERRIDE_FORMAT)?;
     // Sync the newly created texture object to device global if synthetic
     sync_synthetic_texref(tex_ref);
     Ok(())
@@ -110,11 +129,7 @@ pub(crate) unsafe fn ref_set_mipmapped_array(
     flags: u32,
 ) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
-    hipTexRefSetMipmappedArray(
-        tex_ref,
-        h_mipmapped_array as hipMipmappedArray_t,
-        flags,
-    )?;
+    hipTexRefSetMipmappedArray(tex_ref, h_mipmapped_array as hipMipmappedArray_t, flags)?;
     Ok(())
 }
 
@@ -124,7 +139,20 @@ pub(crate) unsafe fn ref_set_format(
     num_packed_components: i32,
 ) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
-    hipTexRefSetFormat(tex_ref, mem::transmute(fmt), num_packed_components)?;
+    let fmt_hip: hipArray_Format = mem::transmute(fmt);
+    let res = hipTexRefSetFormat(tex_ref, fmt_hip, num_packed_components);
+    if texref_log_enabled() {
+        // Log raw format request — legacy texref path does NOT apply the lsh
+        // hipfix substitution (unlike cuTexObjectCreate), so if IOFX requests
+        // HALF / SIGNED_INT8 / SIGNED_INT16 here, watching the broken_hack_flag
+        // field tells us whether the bind is going through a broken format.
+        let (hack_flag, _) = super::hipfix::get_non_broken_format(fmt_hip);
+        super::driver::zluda_log_err(&format!(
+            "TEXREF_SET_FORMAT tex={:p} fmt={} ch={} broken_hack_flag={} res={:?}",
+            tex_ref, fmt_hip.0, num_packed_components, hack_flag, res
+        ));
+    }
+    res?;
     reset(tex_ref)
 }
 
@@ -138,10 +166,7 @@ pub(crate) unsafe fn ref_set_address_mode(
     reset(tex_ref)
 }
 
-pub(crate) unsafe fn ref_set_filter_mode(
-    h_tex_ref: CUtexref,
-    fm: CUfilter_mode,
-) -> CUresult {
+pub(crate) unsafe fn ref_set_filter_mode(h_tex_ref: CUtexref, fm: CUfilter_mode) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
     hipTexRefSetFilterMode(tex_ref, mem::transmute(fm))?;
     reset(tex_ref)
@@ -156,10 +181,7 @@ pub(crate) unsafe fn ref_set_mipmap_filter_mode(
     reset(tex_ref)
 }
 
-pub(crate) unsafe fn ref_set_mipmap_level_bias(
-    h_tex_ref: CUtexref,
-    bias: f32,
-) -> CUresult {
+pub(crate) unsafe fn ref_set_mipmap_level_bias(h_tex_ref: CUtexref, bias: f32) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
     hipTexRefSetMipmapLevelBias(tex_ref, bias)?;
     reset(tex_ref)
@@ -175,10 +197,7 @@ pub(crate) unsafe fn ref_set_mipmap_level_clamp(
     reset(tex_ref)
 }
 
-pub(crate) unsafe fn ref_set_max_anisotropy(
-    h_tex_ref: CUtexref,
-    max_aniso: u32,
-) -> CUresult {
+pub(crate) unsafe fn ref_set_max_anisotropy(h_tex_ref: CUtexref, max_aniso: u32) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
     hipTexRefSetMaxAnisotropy(tex_ref, max_aniso)?;
     reset(tex_ref)
@@ -193,10 +212,7 @@ pub(crate) unsafe fn ref_set_border_color(
     reset(tex_ref)
 }
 
-pub(crate) unsafe fn ref_set_flags(
-    h_tex_ref: CUtexref,
-    flags: u32,
-) -> CUresult {
+pub(crate) unsafe fn ref_set_flags(h_tex_ref: CUtexref, flags: u32) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
     hipTexRefSetFlags(tex_ref, flags)?;
     reset(tex_ref)
@@ -220,7 +236,8 @@ pub(crate) unsafe fn object_create(
             hip_res_desc.res.array.hArray = p_res_desc.res.array.hArray as hipArray_t;
         }
         CUresourcetype::CU_RESOURCE_TYPE_MIPMAPPED_ARRAY => {
-            hip_res_desc.res.mipmap.hMipmappedArray = p_res_desc.res.mipmap.hMipmappedArray as hipMipmappedArray_t;
+            hip_res_desc.res.mipmap.hMipmappedArray =
+                p_res_desc.res.mipmap.hMipmappedArray as hipMipmappedArray_t;
         }
         CUresourcetype::CU_RESOURCE_TYPE_LINEAR => {
             hip_res_desc.res.linear.devPtr = hipDeviceptr_t(p_res_desc.res.linear.devPtr.0);
@@ -290,12 +307,15 @@ pub(crate) unsafe fn object_create(
             minimal_tex.filterMode = hip_tex_desc.filterMode;
             minimal_tex.addressMode = hip_tex_desc.addressMode;
             minimal_tex.flags = hip_tex_desc.flags;
-            (hipTexObjectCreate(
-                p_tex_object as *mut CUtexObject as *mut hipTextureObject_t,
-                &hip_res_desc,
-                &minimal_tex,
-                view_desc_ptr,
-            ), "minimal")
+            (
+                hipTexObjectCreate(
+                    p_tex_object as *mut CUtexObject as *mut hipTextureObject_t,
+                    &hip_res_desc,
+                    &minimal_tex,
+                    view_desc_ptr,
+                ),
+                "minimal",
+            )
         }
         ok => (ok, "full"),
     };
@@ -303,15 +323,17 @@ pub(crate) unsafe fn object_create(
     // operations that can trigger ROCm ProfilingSignal pool race conditions.
     {
         static LOG_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let log_all = *LOG_ALL.get_or_init(|| {
-            std::env::var("ZLUDA_LOG_ALL").map_or(false, |v| v == "1")
-        });
+        let log_all =
+            *LOG_ALL.get_or_init(|| std::env::var("ZLUDA_LOG_ALL").map_or(false, |v| v == "1"));
         if log_all {
             match result {
                 Ok(()) => super::driver::zluda_log_err(&format!(
-                    "texObj OK ({}) obj={:#x}", path, *p_tex_object)),
-                Err(ref e) => super::driver::zluda_log_err(&format!(
-                    "texObj FAIL ({}) {:?}", path, e)),
+                    "texObj OK ({}) obj={:#x}",
+                    path, *p_tex_object
+                )),
+                Err(ref e) => {
+                    super::driver::zluda_log_err(&format!("texObj FAIL ({}) {:?}", path, e))
+                }
             }
         }
     }
@@ -329,7 +351,11 @@ pub(crate) unsafe fn object_create(
             let mut arr_desc: hip_runtime_sys::HIP_ARRAY_DESCRIPTOR = mem::zeroed();
             if hip_runtime_sys::hipArrayGetDescriptor(&mut arr_desc, array).is_ok() {
                 let fmt_size = super::surf::format_size(arr_desc.Format).unwrap_or(4);
-                let num_ch = if arr_desc.NumChannels == 0 { 1 } else { arr_desc.NumChannels as usize };
+                let num_ch = if arr_desc.NumChannels == 0 {
+                    1
+                } else {
+                    arr_desc.NumChannels as usize
+                };
                 let pixel_size = fmt_size * num_ch;
                 if pixel_size > 0 {
                     let shift = pixel_size.trailing_zeros() as usize;
@@ -342,9 +368,7 @@ pub(crate) unsafe fn object_create(
     Ok(())
 }
 
-pub(crate) unsafe fn object_destroy(
-    tex_object: CUtexObject,
-) -> CUresult {
+pub(crate) unsafe fn object_destroy(tex_object: CUtexObject) -> CUresult {
     // Strip top 3 bits (shift encoding) before passing to HIP
     let raw = ((tex_object as usize) << 3) >> 3;
     hipTexObjectDestroy(raw as hipTextureObject_t)?;
@@ -409,9 +433,7 @@ unsafe fn reset(tex_ref: *mut textureReference) -> CUresult {
 
 // Unit tests at end of file
 
-fn from_channel_format_desc(
-    desc: hipChannelFormatDesc,
-) -> Result<(hipArray_Format, u32), CUerror> {
+fn from_channel_format_desc(desc: hipChannelFormatDesc) -> Result<(hipArray_Format, u32), CUerror> {
     if desc.x != desc.y || desc.x != desc.z || desc.x != desc.w {
         return Err(CUerror::NOT_SUPPORTED);
     }
