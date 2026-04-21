@@ -1,0 +1,290 @@
+.version 3.2
+.target sm_30
+.address_size 64
+
+// Middle ground between the full alias-reload reproducer and the fixed-word test:
+// seed each lane's 13-word transposed window directly, run the real begin_bit=0
+// u16 counter updates, then reread the same 13-word window as u32.
+.visible .entry lds_u16_u32_alias_three_lane_reread_test(
+    .param .u64 lds_u16_u32_alias_three_lane_reread_test_param_0,
+    .param .u64 lds_u16_u32_alias_three_lane_reread_test_param_1
+)
+.maxntid 3, 1, 1
+{
+    .reg .pred %p<2>;
+    .reg .u32 %r<48>;
+    .reg .u64 %rd<8>;
+    .shared .align 4 .u32 smem[2100];
+
+    ld.param.u64 %rd0, [lds_u16_u32_alias_three_lane_reread_test_param_0];
+    ld.param.u64 %rd1, [lds_u16_u32_alias_three_lane_reread_test_param_1];
+    cvta.to.global.u64 %rd2, %rd0;
+    cvta.to.global.u64 %rd3, %rd1;
+
+    mov.u32 %r0, %tid.x;
+    setp.ge.u32 %p0, %r0, 3;
+    @%p0 bra DONE;
+
+    mov.u32 %r1, smem;
+    mul.lo.u32 %r2, %r0, 4;
+    mul.lo.u32 %r3, %r0, 52;
+    cvt.u64.u32 %rd4, %r3;
+    add.u64 %rd5, %rd2, %rd4;
+
+    mul.lo.u32 %r17, %r0, 52;
+    add.u32 %r18, %r1, %r17;
+    add.u32 %r18, %r18, 136;
+
+    ld.global.u32 %r4, [%rd5+0];
+    st.shared.u32 [%r18+0], %r4;
+    ld.global.u32 %r5, [%rd5+4];
+    st.shared.u32 [%r18+4], %r5;
+    ld.global.u32 %r6, [%rd5+8];
+    st.shared.u32 [%r18+8], %r6;
+    ld.global.u32 %r7, [%rd5+12];
+    st.shared.u32 [%r18+12], %r7;
+    ld.global.u32 %r8, [%rd5+16];
+    st.shared.u32 [%r18+16], %r8;
+    ld.global.u32 %r9, [%rd5+20];
+    st.shared.u32 [%r18+20], %r9;
+    ld.global.u32 %r10, [%rd5+24];
+    st.shared.u32 [%r18+24], %r10;
+    ld.global.u32 %r11, [%rd5+28];
+    st.shared.u32 [%r18+28], %r11;
+    ld.global.u32 %r12, [%rd5+32];
+    st.shared.u32 [%r18+32], %r12;
+    ld.global.u32 %r13, [%rd5+36];
+    st.shared.u32 [%r18+36], %r13;
+    ld.global.u32 %r14, [%rd5+40];
+    st.shared.u32 [%r18+40], %r14;
+    ld.global.u32 %r15, [%rd5+44];
+    st.shared.u32 [%r18+44], %r15;
+    ld.global.u32 %r16, [%rd5+48];
+    st.shared.u32 [%r18+48], %r16;
+
+    bar.sync 0;
+
+    xor.b32 %r4, %r4, 0x80000000;
+    xor.b32 %r5, %r5, 0x80000000;
+    xor.b32 %r6, %r6, 0x80000000;
+    xor.b32 %r7, %r7, 0x80000000;
+    xor.b32 %r8, %r8, 0x80000000;
+    xor.b32 %r9, %r9, 0x80000000;
+    xor.b32 %r10, %r10, 0x80000000;
+    xor.b32 %r11, %r11, 0x80000000;
+    xor.b32 %r12, %r12, 0x80000000;
+    xor.b32 %r13, %r13, 0x80000000;
+    xor.b32 %r14, %r14, 0x80000000;
+    xor.b32 %r15, %r15, 0x80000000;
+    xor.b32 %r16, %r16, 0x80000000;
+
+    mov.u32 %r19, 0;
+    st.shared.u32 [%r1+160], %r19;
+    st.shared.u32 [%r1+672], %r19;
+    st.shared.u32 [%r1+1184], %r19;
+    st.shared.u32 [%r1+1696], %r19;
+    st.shared.u32 [%r1+2208], %r19;
+    st.shared.u32 [%r1+2720], %r19;
+    st.shared.u32 [%r1+3232], %r19;
+    st.shared.u32 [%r1+3744], %r19;
+    st.shared.u32 [%r1+4256], %r19;
+    st.shared.u32 [%r1+4768], %r19;
+    st.shared.u32 [%r1+5280], %r19;
+    st.shared.u32 [%r1+5792], %r19;
+    st.shared.u32 [%r1+6304], %r19;
+    st.shared.u32 [%r1+6816], %r19;
+    st.shared.u32 [%r1+7328], %r19;
+    st.shared.u32 [%r1+7840], %r19;
+    st.shared.u32 [%r1+8352], %r19;
+
+    bfe.u32 %r20, %r4, 0, 1;
+    bfe.u32 %r21, %r4, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r5, 0, 1;
+    bfe.u32 %r21, %r5, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r6, 0, 1;
+    bfe.u32 %r21, %r6, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r7, 0, 1;
+    bfe.u32 %r21, %r7, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r8, 0, 1;
+    bfe.u32 %r21, %r8, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r9, 0, 1;
+    bfe.u32 %r21, %r9, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r10, 0, 1;
+    bfe.u32 %r21, %r10, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r11, 0, 1;
+    bfe.u32 %r21, %r11, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r12, 0, 1;
+    bfe.u32 %r21, %r12, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r13, 0, 1;
+    bfe.u32 %r21, %r13, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r14, 0, 1;
+    bfe.u32 %r21, %r14, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r15, 0, 1;
+    bfe.u32 %r21, %r15, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bfe.u32 %r20, %r16, 0, 1;
+    bfe.u32 %r21, %r16, 4, 4;
+    mul.lo.u32 %r22, %r21, 512;
+    add.u32 %r22, %r22, %r1;
+    add.u32 %r22, %r22, 160;
+    add.u32 %r22, %r22, %r2;
+    shl.b32 %r23, %r20, 1;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.u16 %r24, [%r22];
+    add.u32 %r24, %r24, 1;
+    st.shared.u16 [%r22], %r24;
+
+    bar.sync 0;
+
+    ld.shared.u32 %r4, [%r18+0];
+    ld.shared.u32 %r5, [%r18+4];
+    ld.shared.u32 %r6, [%r18+8];
+    ld.shared.u32 %r7, [%r18+12];
+    ld.shared.u32 %r8, [%r18+16];
+    ld.shared.u32 %r9, [%r18+20];
+    ld.shared.u32 %r10, [%r18+24];
+    ld.shared.u32 %r11, [%r18+28];
+    ld.shared.u32 %r12, [%r18+32];
+    ld.shared.u32 %r13, [%r18+36];
+    ld.shared.u32 %r14, [%r18+40];
+    ld.shared.u32 %r15, [%r18+44];
+    ld.shared.u32 %r16, [%r18+48];
+
+    cvt.u64.u32 %rd6, %r3;
+    add.u64 %rd7, %rd3, %rd6;
+    st.global.u32 [%rd7+0], %r4;
+    st.global.u32 [%rd7+4], %r5;
+    st.global.u32 [%rd7+8], %r6;
+    st.global.u32 [%rd7+12], %r7;
+    st.global.u32 [%rd7+16], %r8;
+    st.global.u32 [%rd7+20], %r9;
+    st.global.u32 [%rd7+24], %r10;
+    st.global.u32 [%rd7+28], %r11;
+    st.global.u32 [%rd7+32], %r12;
+    st.global.u32 [%rd7+36], %r13;
+    st.global.u32 [%rd7+40], %r14;
+    st.global.u32 [%rd7+44], %r15;
+    st.global.u32 [%rd7+48], %r16;
+
+DONE:
+    ret;
+}

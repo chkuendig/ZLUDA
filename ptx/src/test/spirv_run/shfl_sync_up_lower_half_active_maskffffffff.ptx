@@ -1,0 +1,37 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+.visible .entry shfl_sync_up_lower_half_active_maskffffffff(
+    .param .u64 output
+)
+{
+    .reg .u64       out_addr;
+    .reg .u64       out_index;
+    .reg .u32       thread_id;
+    .reg .u32       lane_id;
+    .reg .u32       result;
+    .reg .pred      active;
+    .reg .pred      in_range;
+
+    ld.param.u64    out_addr, [output];
+    mov.u32         thread_id, %tid.x;
+    mov.u32         lane_id, %laneid;
+    mov.u32         result, thread_id;
+
+    setp.lt.u32     active, lane_id, 16;
+    @!active add.u32 result, result, 2000;
+    @!active bra STORE;
+
+    // Deliberately mirror the legacy shfl rewrite shape: full-width opts and a
+    // full membermask inside lower-half-only divergence.
+    shfl.sync.up.b32 result|in_range, thread_id, 1, 0, 0xFFFFFFFF;
+    @!in_range add.u32 result, result, 1000;
+
+STORE:
+    cvt.u64.u32     out_index, thread_id;
+    mul.lo.u64      out_index, out_index, 4;
+    add.u64         out_addr, out_addr, out_index;
+    st.u32          [out_addr], result;
+    ret;
+}

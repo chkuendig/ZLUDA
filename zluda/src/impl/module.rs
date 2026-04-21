@@ -278,6 +278,11 @@ fn get_best_ptx_and_compile(
         elf_module.len(),
         from_cache
     ));
+    maybe_dump_radixsort_downsweep_module(
+        text.as_ref().map(|text| text.as_ref()),
+        &elf_module,
+        from_cache,
+    );
     let mut hip_module = unsafe { mem::zeroed() };
     super::driver::zluda_log("[ZLUDA]   calling hipModuleLoadData");
     unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) }?;
@@ -336,6 +341,46 @@ fn get_cache_key<'a, 'b>(
     })
 }
 
+fn should_dump_radixsort_downsweep_module(text: &str) -> bool {
+    text.contains("RadixSortDownsweepKernel") && text.contains("GridEvenShare")
+}
+
+fn maybe_dump_radixsort_downsweep_module(text: Option<&str>, elf_module: &[u8], from_cache: bool) {
+    let Some(text) = text else {
+        return;
+    };
+    if !should_dump_radixsort_downsweep_module(text) {
+        return;
+    }
+    static DID_DUMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DID_DUMP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let dump_dir = "/tmp/zluda_live_sort_module";
+    let _ = fs::create_dir_all(dump_dir);
+    let ptx_path = format!("{dump_dir}/radixsort_downsweep.ptx");
+    let elf_path = format!("{dump_dir}/radixsort_downsweep.elf");
+    let meta_path = format!("{dump_dir}/meta.txt");
+    let ptx_hash = blake3::hash(text.as_bytes());
+    let elf_hash = blake3::hash(elf_module);
+    let _ = fs::write(&ptx_path, text);
+    let _ = fs::write(&elf_path, elf_module);
+    let _ = fs::write(
+        &meta_path,
+        format!(
+            "from_cache={from_cache}\nptx_bytes={}\nelf_bytes={}\nptx_hash={}\nelf_hash={}\n",
+            text.len(),
+            elf_module.len(),
+            ptx_hash,
+            elf_hash
+        ),
+    );
+    super::driver::zluda_log_err(&format!(
+        "LIVE SORT MODULE DUMPED: ptx={} elf={} meta={}",
+        ptx_path, elf_path, meta_path
+    ));
+}
+
 fn load_cached_binary(
     cache_with_key: &mut Option<(zluda_cache::ModuleCache, zluda_cache::ModuleKey)>,
 ) -> Option<(Vec<u8>, u32)> {
@@ -384,22 +429,11 @@ fn compile_and_cache(
             format!("compile #{}", n),
         );
     }
-    let hook = move |data: &Vec<u8>, name: String| {
-        let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
-        let path = format!("/tmp/zluda_ir_dump/module_{}_{}", n, name);
-        super::driver::zluda_log_err(&format!(
-            "IR DUMP: {} ({} bytes) -> {}",
-            name,
-            data.len(),
-            path
-        ));
-        let _ = std::fs::write(&path, data);
-    };
     // Compile in a forked subprocess to survive LLVM abort() crashes.
     // The AMDGPU backend can crash in loadRegFromStackSlot for very large
     // kernels (e.g. BasicIOS_simulateKernel_templ). A subprocess isolates
     // the crash so the game can continue without the affected module.
-    let elf_module = compile_in_subprocess(gcn_arch, llvm_module).map_err(|e| {
+    let elf_module = compile_in_subprocess(gcn_arch, llvm_module, n).map_err(|e| {
         super::driver::zluda_log(&format!("[ZLUDA]   compile_in_subprocess FAILED: {:?}", e));
         e
     })?;
@@ -416,7 +450,11 @@ fn compile_and_cache(
 }
 
 #[allow(dead_code)]
-fn compile_in_subprocess(gcn_arch: &str, llvm_module: ptx::Module) -> Result<Vec<u8>, CUerror> {
+fn compile_in_subprocess(
+    gcn_arch: &str,
+    llvm_module: ptx::Module,
+    compile_n: u32,
+) -> Result<Vec<u8>, CUerror> {
     use std::io::Write;
     // Create a temp file for the output
     let output_path = format!("/tmp/zluda_compile_{}.elf", std::process::id());
@@ -430,6 +468,7 @@ fn compile_in_subprocess(gcn_arch: &str, llvm_module: ptx::Module) -> Result<Vec
     }
     if pid == 0 {
         // Child process — do the compilation
+        let hook = move |data: &Vec<u8>, name: String| dump_compile_artifact(compile_n, data, name);
         let result = llvm_zluda::compile(
             &llvm_module.context,
             gcn_arch,
@@ -437,7 +476,7 @@ fn compile_in_subprocess(gcn_arch: &str, llvm_module: ptx::Module) -> Result<Vec
             ptx_impl,
             llvm_module.attributes_ir,
             llvm_module.metadata,
-            None,
+            Some(&hook),
         );
         match result {
             Ok(elf_module) => {
@@ -500,6 +539,18 @@ fn compile_in_subprocess(gcn_arch: &str, llvm_module: ptx::Module) -> Result<Vec
         return Err(CUerror::UNKNOWN);
     }
     Ok(elf_module)
+}
+
+fn dump_compile_artifact(n: u32, data: &Vec<u8>, name: String) {
+    let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
+    let path = format!("/tmp/zluda_ir_dump/module_{}_{}", n, name);
+    super::driver::zluda_log_err(&format!(
+        "IR DUMP: {} ({} bytes) -> {}",
+        name,
+        data.len(),
+        path
+    ));
+    let _ = std::fs::write(&path, data);
 }
 
 pub(crate) fn load(module: &mut CUmodule, fname: &CStr) -> CUresult {
@@ -853,5 +904,18 @@ mod tests {
                 "bytes out-pointer must be written with the global's size (4 for u32)"
             );
         }
+    }
+
+    #[test]
+    fn detects_radixsort_downsweep_modules() {
+        assert!(super::should_dump_radixsort_downsweep_module(
+            ".visible .entry _ZN3cub24RadixSortDownsweepKernel(...)\nGridEvenShare"
+        ));
+        assert!(!super::should_dump_radixsort_downsweep_module(
+            ".visible .entry SomeOtherKernel(...)\nGridEvenShare"
+        ));
+        assert!(!super::should_dump_radixsort_downsweep_module(
+            ".visible .entry _ZN3cub24RadixSortDownsweepKernel(...)"
+        ));
     }
 }

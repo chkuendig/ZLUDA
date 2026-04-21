@@ -2,8 +2,10 @@ use super::read_test_file;
 use crate::pass;
 use cuda_types::cuda::CUstream;
 use hip_runtime_sys::hipError_t;
+use std::collections::HashMap;
 use pretty_assertions;
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::error;
 use std::ffi::{CStr, CString};
@@ -626,6 +628,292 @@ fn lds_exchange_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
     )
 }
 
+// Minimal reproduction of the Downsweep 13x32 LDS transpose used by the key path:
+// row-view stores via group*416 + lane, then transposed loads via group*416 + 13*lane.
+// With this fixture's input layout, a correct overlapping-view roundtrip yields
+// the same linear sequence with only the key xor flipback applied.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_transpose_13x32_xor_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_transpose_13x32_xor.ptx");
+    let input: Vec<u32> = (0..(3 * 13 * 32) as u32)
+        .map(|i| 0x1000_0000u32.wrapping_add(i))
+        .collect();
+    let expected: Vec<u32> = input.iter().map(|value| value ^ 0x8000_0000).collect();
+    test_hip_assert(
+        "lds_transpose_13x32_xor_test",
+        &ptx,
+        Some(input.as_slice()),
+        &expected,
+        96,
+    )
+}
+
+fn lds_transpose_13x32_xor_expected(input: &[u32]) -> Vec<u32> {
+    (0..13)
+        .flat_map(|item| (0..32).map(move |lane| input[(13 * lane + item) as usize] ^ 0x8000_0000))
+        .collect()
+}
+
+fn lds_transpose_counter_feed_alias_reload_expected(input: &[u32]) -> Vec<u32> {
+    fn load_u16(smem: &[u8], addr: usize) -> u16 {
+        u16::from_le_bytes([smem[addr], smem[addr + 1]])
+    }
+
+    fn store_u16(smem: &mut [u8], addr: usize, value: u16) {
+        smem[addr..addr + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn load_u32(smem: &[u8], addr: usize) -> u32 {
+        u32::from_le_bytes([smem[addr], smem[addr + 1], smem[addr + 2], smem[addr + 3]])
+    }
+
+    fn store_u32(smem: &mut [u8], addr: usize, value: u32) {
+        smem[addr..addr + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    let mut smem = vec![0u8; 2100 * 4];
+    for lane in 0..32usize {
+        for item in 0..13usize {
+            let global_idx = lane + 32 * item;
+            let row_addr = 136 + 4 * lane + 128 * item;
+            store_u32(&mut smem, row_addr, input[global_idx]);
+        }
+    }
+
+    let transposed_values: Vec<u32> = (0..13usize)
+        .flat_map(|item| (0..32usize).map(move |lane| input[lane + 32 * item]))
+        .collect();
+
+    for word in 0..17usize {
+        store_u32(&mut smem, 160 + 512 * word, 0);
+    }
+
+    for lane in 0..32usize {
+        let lane_byte = 4 * lane;
+        for item in 0..13usize {
+            let value = transposed_values[13 * lane + item] ^ 0x8000_0000;
+            let bit = (value & 1) as usize;
+            let word = ((value >> 4) & 0xF) as usize;
+            let counter_addr = 160 + 512 * word + lane_byte + 2 * bit;
+            let next = load_u16(&smem, counter_addr).wrapping_add(1);
+            store_u16(&mut smem, counter_addr, next);
+        }
+    }
+
+    let mut expected = Vec::with_capacity(13 * 32);
+    for item in 0..13usize {
+        for lane in 0..32usize {
+            let transposed_addr = 136 + 52 * lane + 4 * item;
+            expected.push(load_u32(&smem, transposed_addr));
+        }
+    }
+    expected
+}
+
+fn lds_u16_u32_alias_three_lane_reread_expected(input: &[u32]) -> Vec<u32> {
+    fn load_u16(smem: &[u8], addr: usize) -> u16 {
+        u16::from_le_bytes([smem[addr], smem[addr + 1]])
+    }
+
+    fn store_u16(smem: &mut [u8], addr: usize, value: u16) {
+        smem[addr..addr + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn load_u32(smem: &[u8], addr: usize) -> u32 {
+        u32::from_le_bytes([smem[addr], smem[addr + 1], smem[addr + 2], smem[addr + 3]])
+    }
+
+    fn store_u32(smem: &mut [u8], addr: usize, value: u32) {
+        smem[addr..addr + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    let mut smem = vec![0u8; 2100 * 4];
+    for lane in 0..3usize {
+        for item in 0..13usize {
+            let addr = 136 + 52 * lane + 4 * item;
+            store_u32(&mut smem, addr, input[13 * lane + item]);
+        }
+    }
+
+    let loaded_values = input.to_vec();
+
+    for word in 0..17usize {
+        store_u32(&mut smem, 160 + 512 * word, 0);
+    }
+
+    for lane in 0..3usize {
+        let lane_byte = 4 * lane;
+        for item in 0..13usize {
+            let value = loaded_values[13 * lane + item] ^ 0x8000_0000;
+            let bit = (value & 1) as usize;
+            let word = ((value >> 4) & 0xF) as usize;
+            let counter_addr = 160 + 512 * word + lane_byte + 2 * bit;
+            let next = load_u16(&smem, counter_addr).wrapping_add(1);
+            store_u16(&mut smem, counter_addr, next);
+        }
+    }
+
+    let mut expected = Vec::with_capacity(3 * 13);
+    for lane in 0..3usize {
+        for item in 0..13usize {
+            expected.push(load_u32(&smem, 136 + 52 * lane + 4 * item));
+        }
+    }
+    expected
+}
+
+fn lds_u16_u32_alias_three_lane_scalar_item6_expected(input: &[u32]) -> Vec<u32> {
+    let reread = lds_u16_u32_alias_three_lane_reread_expected(input);
+    vec![reread[6], reread[19], reread[32]]
+}
+
+// Same 13x32 transpose as above, but with the packed-counter shared-memory reuse
+// inserted between the LDS reload and the final key xor/writeout. The kernel writes
+// back the already-transposed register values, so the expected output keeps the
+// [13 * lane + item] ordering from the reload path.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_transpose_counter_zero_xor_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_transpose_counter_zero_xor.ptx");
+    let input: Vec<u32> = (0..(13 * 32) as u32)
+        .map(|i| 0x1000_0000u32.wrapping_add(i))
+        .collect();
+    let expected = lds_transpose_13x32_xor_expected(&input);
+    test_hip_assert(
+        "lds_transpose_counter_zero_xor_test",
+        &ptx,
+        Some(input.as_slice()),
+        &expected,
+        32,
+    )
+}
+
+// Same reload path again, but now add the real begin_bit=0 packed-counter feed
+// (u16 increments into the 160 + 512*word histogram layout) before writing the
+// register-held keys back out.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_transpose_counter_feed_xor_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_transpose_counter_feed_xor.ptx");
+    let input: Vec<u32> = (0..(13 * 32) as u32)
+        .map(|i| 0x1000_0000u32.wrapping_add(i))
+        .collect();
+    let expected = lds_transpose_13x32_xor_expected(&input);
+    test_hip_assert(
+        "lds_transpose_counter_feed_xor_test",
+        &ptx,
+        Some(input.as_slice()),
+        &expected,
+        32,
+    )
+}
+
+// Same begin_bit=0 packed-counter feed again, but now re-read the overlapping
+// transposed LDS view after the u16 updates and barrier. This covers the aliasing
+// pattern the live kernel actually relies on, rather than only proving that the
+// original register-held keys survived the counter writes.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_transpose_counter_feed_alias_reload_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_transpose_counter_feed_alias_reload_test.ptx");
+    let input: Vec<u32> = (0..(13 * 32) as u32)
+        .map(|i| 0x1000_0000u32.wrapping_add(i))
+        .collect();
+    let expected = lds_transpose_counter_feed_alias_reload_expected(&input);
+    test_hip_assert(
+        "lds_transpose_counter_feed_alias_reload_test",
+        &ptx,
+        Some(input.as_slice()),
+        &expected,
+        32,
+    )
+}
+
+// Smaller follow-up to the alias-reload reproducer: operate directly on the three
+// failing shared words (160/200/280) without the transpose/bfe address setup.
+// This tells us whether the failure is a generic overlapped u16->u32 shared-memory
+// issue or whether it still needs more of the begin_bit=0 path around it.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_u16_u32_alias_fixed_words_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_u16_u32_alias_fixed_words_test.ptx");
+    let expected = [0x0007_0006u32, 0x1000_0011u32, 0x1000_0025u32];
+    test_hip_assert(
+        "lds_u16_u32_alias_fixed_words_test",
+        &ptx,
+        None::<&[u32]>,
+        &expected,
+        3,
+    )
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_u16_u32_alias_three_lane_reread_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_u16_u32_alias_three_lane_reread_test.ptx");
+    let input: Vec<u32> = (0..3u32)
+        .flat_map(|lane| (0..13u32).map(move |item| 0x1000_0000u32 + lane + 32 * item))
+        .collect();
+    let expected = lds_u16_u32_alias_three_lane_reread_expected(&input);
+    test_hip_assert(
+        "lds_u16_u32_alias_three_lane_reread_test",
+        &ptx,
+        Some(input.as_slice()),
+        &expected,
+        3,
+    )
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_u16_u32_alias_three_lane_scalar_item6_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_u16_u32_alias_three_lane_scalar_item6_test.ptx");
+    let input: Vec<u32> = (0..3u32)
+        .flat_map(|lane| (0..13u32).map(move |item| 0x1000_0000u32 + lane + 32 * item))
+        .collect();
+    let expected = lds_u16_u32_alias_three_lane_scalar_item6_expected(&input);
+    test_hip_assert(
+        "lds_u16_u32_alias_three_lane_scalar_item6_test",
+        &ptx,
+        Some(input.as_slice()),
+        &expected,
+        3,
+    )
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_u16_split_halves_single_word_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_u16_split_halves_single_word_test.ptx");
+    let expected = [0x0001_0002u32];
+    test_hip_assert(
+        "lds_u16_split_halves_single_word_test",
+        &ptx,
+        None::<&[u32]>,
+        &expected,
+        1,
+    )
+}
+
+// Minimal reproduction of the Downsweep key block-exchange stage:
+// scatter to dynamic base+136+4*rank, then gather from blocked 136+512*item+4*tid.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn lds_block_exchange_13x128_test_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_block_exchange_13x128.ptx");
+    let expected: Vec<u32> = (0..(13 * 128) as u32)
+        .map(|out_idx| 0x1000_0000u32 + 128 * (out_idx % 13) + (out_idx / 13))
+        .collect();
+    test_hip_assert(
+        "lds_block_exchange_13x128_test",
+        &ptx,
+        None::<&[u32]>,
+        &expected,
+        128,
+    )
+}
+
 // PhysX-style inclusive prefix sum via 5 cascading shfl.up with predicate
 // Each lane starts with 1, output should be lane_id + 1 (for first 32 lanes)
 // Second warp (lanes 32-63) also starts fresh at 1, so same pattern
@@ -639,6 +927,21 @@ test_ptx_warp!(
         23u32, 24u32, 25u32, 26u32, 27u32, 28u32, 29u32, 30u32, 31u32, 32u32,
     ]
 );
+
+#[cfg(feature = "has_rocm")]
+#[test]
+fn shfl_block_prefix_carry_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("shfl_block_prefix_carry.ptx");
+    let expected: Vec<u32> = (1..=128u32).collect();
+    test_hip_assert(
+        "shfl_block_prefix_carry",
+        &ptx,
+        None::<&[u8]>,
+        &expected,
+        128,
+    )
+}
+
 test_ptx_warp!(
     shfl_sync_down_b32_pred,
     [
@@ -660,6 +963,77 @@ test_ptx_warp!(
         2057u32, 2058u32, 2059u32, 2060u32, 2061u32, 2062u32, 2063u32,
     ]
 );
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: can wedge GPU while investigating divergent shuffle behavior"]
+fn shfl_sync_up_b32_pred_mask16_one_warp_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("shfl_sync_up_b32_pred_mask16.ptx");
+    let output = [
+        1000u32, 0u32, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32, 10u32, 11u32, 12u32,
+        13u32, 14u32, 2016u32, 2017u32, 2018u32, 2019u32, 2020u32, 2021u32, 2022u32, 2023u32,
+        2024u32, 2025u32, 2026u32, 2027u32, 2028u32, 2029u32, 2030u32, 2031u32,
+    ];
+    test_hip_assert(
+        "shfl_sync_up_b32_pred_mask16",
+        &ptx,
+        None::<&[u8]>,
+        &output,
+        32,
+    )
+}
+
+test_ptx_warp!(
+    shfl_up_lower_half_active,
+    [
+        1000u32, 0u32, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32, 10u32, 11u32, 12u32,
+        13u32, 14u32, 2016u32, 2017u32, 2018u32, 2019u32, 2020u32, 2021u32, 2022u32, 2023u32,
+        2024u32, 2025u32, 2026u32, 2027u32, 2028u32, 2029u32, 2030u32, 2031u32, 1032u32, 32u32,
+        33u32, 34u32, 35u32, 36u32, 37u32, 38u32, 39u32, 40u32, 41u32, 42u32, 43u32, 44u32, 45u32,
+        46u32, 2048u32, 2049u32, 2050u32, 2051u32, 2052u32, 2053u32, 2054u32, 2055u32, 2056u32,
+        2057u32, 2058u32, 2059u32, 2060u32, 2061u32, 2062u32, 2063u32,
+    ]
+);
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: can wedge GPU while investigating divergent shuffle behavior"]
+fn shfl_up_lower_half_active_one_warp_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("shfl_up_lower_half_active.ptx");
+    let output = [
+        1000u32, 0u32, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32, 10u32, 11u32, 12u32,
+        13u32, 14u32, 2016u32, 2017u32, 2018u32, 2019u32, 2020u32, 2021u32, 2022u32, 2023u32,
+        2024u32, 2025u32, 2026u32, 2027u32, 2028u32, 2029u32, 2030u32, 2031u32,
+    ];
+    test_hip_assert(
+        "shfl_up_lower_half_active",
+        &ptx,
+        None::<&[u8]>,
+        &output,
+        32,
+    )
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: can wedge GPU while investigating divergent shuffle behavior"]
+fn shfl_sync_up_lower_half_active_maskffffffff_one_warp_amdgpu() -> Result<(), Box<dyn error::Error>>
+{
+    let ptx = read_test_file!("shfl_sync_up_lower_half_active_maskffffffff.ptx");
+    let output = [
+        1000u32, 0u32, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32, 10u32, 11u32, 12u32,
+        13u32, 14u32, 2016u32, 2017u32, 2018u32, 2019u32, 2020u32, 2021u32, 2022u32, 2023u32,
+        2024u32, 2025u32, 2026u32, 2027u32, 2028u32, 2029u32, 2030u32, 2031u32,
+    ];
+    test_hip_assert(
+        "shfl_sync_up_lower_half_active_maskffffffff",
+        &ptx,
+        None::<&[u8]>,
+        &output,
+        32,
+    )
+}
+
 test_ptx_warp!(
     shfl_down_upper_half_active,
     [
@@ -1365,7 +1739,10 @@ fn compare_llvm(name: &str, actual_ll: &str, expected_ll: &str) {
 fn defined_function_body<'a>(module_ll: &'a str, function_name: &str) -> Option<&'a str> {
     let needle = format!("@{}(", function_name);
     let start = module_ll.match_indices(&needle).find_map(|(idx, _)| {
-        let line_start = module_ll[..idx].rfind('\n').map(|offset| offset + 1).unwrap_or(0);
+        let line_start = module_ll[..idx]
+            .rfind('\n')
+            .map(|offset| offset + 1)
+            .unwrap_or(0);
         module_ll[line_start..idx]
             .contains("define ")
             .then_some(line_start)
@@ -1375,9 +1752,7 @@ fn defined_function_body<'a>(module_ll: &'a str, function_name: &str) -> Option<
     Some(&module_ll[start..=body_end])
 }
 
-#[test]
-fn linked_shfl_helpers_use_physical_laneid() -> Result<(), Box<dyn error::Error>> {
-    let ptx = read_test_file!("shfl_down_upper_half_active.ptx");
+fn compile_fixture_linked_ll(ptx: String) -> Result<String, Box<dyn error::Error>> {
     let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
     let module = pass::to_llvm_module(
         ast,
@@ -1409,7 +1784,82 @@ fn linked_shfl_helpers_use_physical_laneid() -> Result<(), Box<dyn error::Error>
             }
         }),
     )?;
-    let linked_ll = String::from_utf8(linked_ll.into_inner().unwrap())?;
+    Ok(String::from_utf8(linked_ll.into_inner().unwrap())?)
+}
+
+fn compile_fixture_artifacts(
+    ptx: String,
+) -> Result<HashMap<String, Vec<u8>>, Box<dyn error::Error>> {
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    let ptx_impl = module.linked_bitcode();
+    let pass::Module {
+        context,
+        llvm_ir,
+        attributes_ir,
+        metadata,
+        ..
+    } = module;
+    let artifacts = RefCell::new(HashMap::<String, Vec<u8>>::new());
+    let _ = llvm_zluda::compile(
+        &context,
+        "gfx1030",
+        llvm_ir,
+        ptx_impl,
+        attributes_ir,
+        metadata,
+        Some(&|data, file_name| {
+            artifacts
+                .borrow_mut()
+                .insert(file_name, data.clone());
+        }),
+    )?;
+    Ok(artifacts.into_inner())
+}
+
+fn canonicalize_linked_function_body(body: &str) -> String {
+    let mut canonical = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' && chars.peek() == Some(&'"') {
+            canonical.push(ch);
+            canonical.push(chars.next().unwrap());
+            while matches!(chars.peek(), Some(next) if next.is_ascii_digit()) {
+                chars.next();
+            }
+            canonical.push('N');
+            if chars.peek() == Some(&'"') {
+                canonical.push(chars.next().unwrap());
+            }
+            continue;
+        }
+        if ch == '"' && matches!(chars.peek(), Some(next) if next.is_ascii_digit()) {
+            canonical.push(ch);
+            while matches!(chars.peek(), Some(next) if next.is_ascii_digit()) {
+                chars.next();
+            }
+            canonical.push('N');
+            if chars.peek() == Some(&'"') {
+                canonical.push(chars.next().unwrap());
+            }
+            continue;
+        }
+        canonical.push(ch);
+    }
+    canonical
+}
+
+#[test]
+fn linked_shfl_helpers_use_physical_laneid() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("shfl_down_upper_half_active.ptx");
+    let linked_ll = compile_fixture_linked_ll(ptx)?;
     let laneid_body = defined_function_body(&linked_ll, "__zluda_ptx_impl_sreg_laneid").unwrap();
     assert!(laneid_body.contains("@llvm.amdgcn.workitem.id.x()"));
     assert!(!laneid_body.contains("mbcnt"));
@@ -1420,6 +1870,95 @@ fn linked_shfl_helpers_use_physical_laneid() -> Result<(), Box<dyn error::Error>
         shfl_body.contains("@__zluda_ptx_impl_sreg_laneid()")
             || shfl_body.contains("@llvm.amdgcn.workitem.id.x()")
     );
+    assert!(shfl_body.contains("@llvm.amdgcn.ds.bpermute"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "diagnostic: dumps linked LLVM for the mixed-width shared alias reload probe"]
+fn dump_alias_reload_linked_ll() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("lds_transpose_counter_feed_alias_reload_test.ptx");
+    let linked_ll = compile_fixture_linked_ll(ptx)?;
+    fs::write("/tmp/alias_reload.linked.ll", &linked_ll)?;
+    let body = defined_function_body(&linked_ll, "lds_transpose_counter_feed_alias_reload_test")
+        .ok_or_else(|| "missing alias reload fixture body".to_string())?;
+    assert!(body.contains("load i16"));
+    assert!(body.contains("store i16"));
+    assert!(body.contains("load i32"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "diagnostic: dumps linked LLVM for the passing fixed-word and failing three-lane alias probes"]
+fn dump_alias_followup_linked_ll() -> Result<(), Box<dyn error::Error>> {
+    let fixed_ptx = read_test_file!("lds_u16_u32_alias_fixed_words_test.ptx");
+    let fixed_ll = compile_fixture_linked_ll(fixed_ptx)?;
+    fs::write("/tmp/alias_fixed_words.linked.ll", &fixed_ll)?;
+    let fixed_body =
+        defined_function_body(&fixed_ll, "lds_u16_u32_alias_fixed_words_test")
+            .ok_or_else(|| "missing fixed-word fixture body".to_string())?;
+    assert!(fixed_body.contains("load i16"));
+    assert!(fixed_body.contains("store i16"));
+    assert!(fixed_body.contains("load i32"));
+
+    let three_lane_ptx = read_test_file!("lds_u16_u32_alias_three_lane_reread_test.ptx");
+    let three_lane_ll = compile_fixture_linked_ll(three_lane_ptx)?;
+    fs::write("/tmp/alias_three_lane.linked.ll", &three_lane_ll)?;
+    let three_lane_body =
+        defined_function_body(&three_lane_ll, "lds_u16_u32_alias_three_lane_reread_test")
+            .ok_or_else(|| "missing three-lane fixture body".to_string())?;
+    assert!(three_lane_body.contains("load i16"));
+    assert!(three_lane_body.contains("store i16"));
+    assert!(three_lane_body.contains("load i32"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "diagnostic: dumps backend asm for the fixed-word and three-lane alias probes"]
+fn dump_alias_followup_asm() -> Result<(), Box<dyn error::Error>> {
+    let fixed = compile_fixture_artifacts(read_test_file!("lds_u16_u32_alias_fixed_words_test.ptx"))?;
+    fs::write(
+        "/tmp/alias_fixed_words.asm",
+        fixed
+            .get("asm")
+            .ok_or_else(|| "missing fixed-word asm".to_string())?,
+    )?;
+
+    let three_lane =
+        compile_fixture_artifacts(read_test_file!("lds_u16_u32_alias_three_lane_reread_test.ptx"))?;
+    fs::write(
+        "/tmp/alias_three_lane.asm",
+        three_lane
+            .get("asm")
+            .ok_or_else(|| "missing three-lane asm".to_string())?,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn linked_old_shfl_matches_explicit_activemask_sync() -> Result<(), Box<dyn error::Error>> {
+    let old_linked_ll =
+        compile_fixture_linked_ll(read_test_file!("shfl_up_lower_half_active.ptx"))?;
+    let sync_linked_ll = compile_fixture_linked_ll(read_test_file!(
+        "shfl_sync_up_lower_half_active_activemask.ptx"
+    ))?;
+
+    let old_body = canonicalize_linked_function_body(
+        &defined_function_body(&old_linked_ll, "shfl_up_lower_half_active")
+            .unwrap()
+            .replace("shfl_up_lower_half_active", "shfl_kernel"),
+    );
+    let sync_body = canonicalize_linked_function_body(
+        &defined_function_body(&sync_linked_ll, "shfl_sync_up_lower_half_active_activemask")
+            .unwrap()
+            .replace("shfl_sync_up_lower_half_active_activemask", "shfl_kernel"),
+    );
+
+    for body in [&old_body, &sync_body] {
+        assert!(body.contains("@__zluda_ptx_impl_activemask()"));
+        assert!(body.contains("@__zluda_ptx_impl_shfl_sync_up_b32_pred("));
+        assert!(!body.contains("i32 -1)"));
+    }
     Ok(())
 }
 
@@ -1537,7 +2076,8 @@ impl DynamicCuda {
     const CUDA_PATH: &'static str = "C:\\Windows\\System32\\nvcuda.dll";
 
     pub fn new() -> Result<Self, libloading::Error> {
-        let lib = unsafe { libloading::Library::new(Self::CUDA_PATH) }?;
+        let cuda_path = std::env::var("ZLUDA_CUDA_LIB").unwrap_or_else(|_| Self::CUDA_PATH.into());
+        let lib = unsafe { libloading::Library::new(cuda_path) }?;
         Ok(Self { lib })
     }
 }
@@ -1650,6 +2190,651 @@ fn run_hip<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + Def
         unsafe { hipModuleUnload(module) }.unwrap();
     }
     Ok(result)
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: runtime baseline tracing"]
+fn ld_st_runtime_trace_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+
+    eprintln!("ld_st trace: start");
+    unsafe { hipInit(0) }.unwrap();
+    eprintln!("ld_st trace: hipInit ok");
+
+    let ptx = read_test_file!("ld_st.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    eprintln!("ld_st trace: PTX -> LLVM ok");
+
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+    eprintln!("ld_st trace: stream created");
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+    eprintln!("ld_st trace: gcn_arch={}", gcn_arch);
+
+    let ptx_impl = module.linked_bitcode();
+    let elf_module = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+    eprintln!("ld_st trace: compile ok, elf={} bytes", elf_module.len());
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf_module.as_ptr() as _) }.unwrap();
+    eprintln!("ld_st trace: module loaded");
+
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"ld_st".as_ptr()) }.unwrap();
+    eprintln!("ld_st trace: function loaded");
+
+    let mut inp_b = ptr::null_mut();
+    let mut out_b = ptr::null_mut();
+    unsafe { hipMalloc(&mut inp_b, mem::size_of::<u64>()) }.unwrap();
+    unsafe { hipMalloc(&mut out_b, mem::size_of::<u64>()) }.unwrap();
+    eprintln!("ld_st trace: buffers allocated");
+
+    let input = [1u64];
+    unsafe {
+        hipMemcpyWithStream(
+            inp_b,
+            input.as_ptr() as _,
+            mem::size_of::<u64>(),
+            hipMemcpyKind::hipMemcpyHostToDevice,
+            stream,
+        )
+    }
+    .unwrap();
+    eprintln!("ld_st trace: input copied");
+
+    unsafe { hipMemset(out_b, 0, mem::size_of::<u64>()) }.unwrap();
+    eprintln!("ld_st trace: output zeroed");
+
+    let mut args = [&inp_b, &out_b];
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1024,
+            stream,
+            args.as_mut_ptr() as _,
+            ptr::null_mut(),
+        )
+    }
+    .unwrap();
+    eprintln!("ld_st trace: launch ok");
+
+    let mut result = [0u64];
+    unsafe {
+        hipMemcpyAsync(
+            result.as_mut_ptr() as _,
+            out_b,
+            mem::size_of::<u64>(),
+            hipMemcpyKind::hipMemcpyDeviceToHost,
+            stream,
+        )
+    }
+    .unwrap();
+    eprintln!("ld_st trace: readback queued");
+
+    unsafe { hipStreamSynchronize(stream) }.unwrap();
+    eprintln!("ld_st trace: sync ok, result={:?}", result);
+
+    unsafe { hipFree(inp_b) }.unwrap();
+    unsafe { hipFree(out_b) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    Ok(())
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: null-stream runtime baseline tracing"]
+fn ld_st_nullstream_trace_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+
+    eprintln!("ld_st nullstream: start");
+    unsafe { hipInit(0) }.unwrap();
+    eprintln!("ld_st nullstream: hipInit ok");
+
+    let ptx = read_test_file!("ld_st.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    eprintln!("ld_st nullstream: PTX -> LLVM ok");
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+    eprintln!("ld_st nullstream: gcn_arch={}", gcn_arch);
+
+    let ptx_impl = module.linked_bitcode();
+    let elf_module = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+    eprintln!(
+        "ld_st nullstream: compile ok, elf={} bytes",
+        elf_module.len()
+    );
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf_module.as_ptr() as _) }.unwrap();
+    eprintln!("ld_st nullstream: module loaded");
+
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut kernel, hip_mod, c"ld_st".as_ptr()) }.unwrap();
+    eprintln!("ld_st nullstream: function loaded");
+
+    let mut inp_b = ptr::null_mut();
+    let mut out_b = ptr::null_mut();
+    unsafe { hipMalloc(&mut inp_b, mem::size_of::<u64>()) }.unwrap();
+    unsafe { hipMalloc(&mut out_b, mem::size_of::<u64>()) }.unwrap();
+    eprintln!("ld_st nullstream: buffers allocated");
+
+    let input = [1u64];
+    unsafe {
+        hipMemcpy(
+            inp_b,
+            input.as_ptr() as _,
+            mem::size_of::<u64>(),
+            hipMemcpyKind::hipMemcpyHostToDevice,
+        )
+    }
+    .unwrap();
+    eprintln!("ld_st nullstream: input copied");
+
+    unsafe { hipMemset(out_b, 0, mem::size_of::<u64>()) }.unwrap();
+    eprintln!("ld_st nullstream: output zeroed");
+
+    let null_stream: hipStream_t = unsafe { mem::zeroed() };
+    let mut args = [&inp_b, &out_b];
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1024,
+            null_stream,
+            args.as_mut_ptr() as _,
+            ptr::null_mut(),
+        )
+    }
+    .unwrap();
+    eprintln!("ld_st nullstream: launch ok");
+
+    unsafe { hipDeviceSynchronize() }.unwrap();
+    eprintln!("ld_st nullstream: device sync ok");
+
+    let mut result = [0u64];
+    unsafe {
+        hipMemcpy(
+            result.as_mut_ptr() as _,
+            out_b,
+            mem::size_of::<u64>(),
+            hipMemcpyKind::hipMemcpyDeviceToHost,
+        )
+    }
+    .unwrap();
+    eprintln!("ld_st nullstream: readback ok, result={:?}", result);
+
+    unsafe { hipFree(inp_b) }.unwrap();
+    unsafe { hipFree(out_b) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    Ok(())
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: module-load copy poisoning trace"]
+fn ld_st_module_load_then_copy_trace_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+
+    eprintln!("ld_st load-only trace: start");
+    unsafe { hipInit(0) }.unwrap();
+    eprintln!("ld_st load-only trace: hipInit ok");
+
+    let ptx = read_test_file!("ld_st.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    eprintln!("ld_st load-only trace: PTX -> LLVM ok");
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+    eprintln!("ld_st load-only trace: gcn_arch={}", gcn_arch);
+
+    let ptx_impl = module.linked_bitcode();
+    let elf_module = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+    eprintln!(
+        "ld_st load-only trace: compile ok, elf={} bytes",
+        elf_module.len()
+    );
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf_module.as_ptr() as _) }.unwrap();
+    eprintln!("ld_st load-only trace: module loaded");
+
+    let mut inp_b = ptr::null_mut();
+    unsafe { hipMalloc(&mut inp_b, mem::size_of::<u64>()) }.unwrap();
+    eprintln!("ld_st load-only trace: input buffer allocated");
+
+    let input = [1u64];
+    unsafe {
+        hipMemcpy(
+            inp_b,
+            input.as_ptr() as _,
+            mem::size_of::<u64>(),
+            hipMemcpyKind::hipMemcpyHostToDevice,
+        )
+    }
+    .unwrap();
+    eprintln!("ld_st load-only trace: input copied");
+
+    unsafe { hipFree(inp_b) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    Ok(())
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: dump zluda ld_st elf"]
+fn dump_ld_st_elf_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+
+    let output_path = env::var("ZLUDA_DUMP_ELF_PATH")
+        .unwrap_or_else(|_| "/tmp/zluda_ld_st_trace.elf".to_string());
+    eprintln!("dump ld_st elf: start -> {}", output_path);
+    unsafe { hipInit(0) }.unwrap();
+    eprintln!("dump ld_st elf: hipInit ok");
+
+    let ptx = read_test_file!("ld_st.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    eprintln!("dump ld_st elf: PTX -> LLVM ok");
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+    eprintln!("dump ld_st elf: gcn_arch={}", gcn_arch);
+
+    let ptx_impl = module.linked_bitcode();
+    let elf_module = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+    eprintln!("dump ld_st elf: compile ok, elf={} bytes", elf_module.len());
+
+    fs::write(&output_path, elf_module)?;
+    eprintln!("dump ld_st elf: wrote {}", output_path);
+    Ok(())
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: module unload restores copy trace"]
+fn ld_st_module_unload_then_copy_trace_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+
+    eprintln!("ld_st unload trace: start");
+    unsafe { hipInit(0) }.unwrap();
+    eprintln!("ld_st unload trace: hipInit ok");
+
+    let ptx = read_test_file!("ld_st.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    eprintln!("ld_st unload trace: PTX -> LLVM ok");
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+    eprintln!("ld_st unload trace: gcn_arch={}", gcn_arch);
+
+    let ptx_impl = module.linked_bitcode();
+    let elf_module = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+    eprintln!(
+        "ld_st unload trace: compile ok, elf={} bytes",
+        elf_module.len()
+    );
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf_module.as_ptr() as _) }.unwrap();
+    eprintln!("ld_st unload trace: module loaded");
+
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    eprintln!("ld_st unload trace: module unloaded");
+
+    let mut inp_b = ptr::null_mut();
+    unsafe { hipMalloc(&mut inp_b, mem::size_of::<u64>()) }.unwrap();
+    eprintln!("ld_st unload trace: input buffer allocated");
+
+    let input = [1u64];
+    unsafe {
+        hipMemcpy(
+            inp_b,
+            input.as_ptr() as _,
+            mem::size_of::<u64>(),
+            hipMemcpyKind::hipMemcpyHostToDevice,
+        )
+    }
+    .unwrap();
+    eprintln!("ld_st unload trace: input copied");
+
+    unsafe { hipFree(inp_b) }.unwrap();
+    Ok(())
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: runtime baseline tracing"]
+fn shfl_sync_up_b32_pred_mask16_runtime_trace_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+
+    eprintln!("shfl mask16 trace: start");
+    unsafe { hipInit(0) }.unwrap();
+    eprintln!("shfl mask16 trace: hipInit ok");
+
+    let ptx = read_test_file!("shfl_sync_up_b32_pred_mask16.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    eprintln!("shfl mask16 trace: PTX -> LLVM ok");
+
+    let mut stream = unsafe { mem::zeroed() };
+    unsafe { hipStreamCreate(&mut stream) }.unwrap();
+    eprintln!("shfl mask16 trace: stream created");
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+    eprintln!("shfl mask16 trace: gcn_arch={}", gcn_arch);
+
+    let ptx_impl = module.linked_bitcode();
+    let elf_module = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+    eprintln!(
+        "shfl mask16 trace: compile ok, elf={} bytes",
+        elf_module.len()
+    );
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf_module.as_ptr() as _) }.unwrap();
+    eprintln!("shfl mask16 trace: module loaded");
+
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe {
+        hipModuleGetFunction(
+            &mut kernel,
+            hip_mod,
+            c"shfl_sync_up_b32_pred_mask16".as_ptr(),
+        )
+    }
+    .unwrap();
+    eprintln!("shfl mask16 trace: function loaded");
+
+    let mut out_b = ptr::null_mut();
+    unsafe { hipMalloc(&mut out_b, 64 * mem::size_of::<u32>()) }.unwrap();
+    eprintln!("shfl mask16 trace: output allocated");
+
+    unsafe { hipMemset(out_b, 0, 64 * mem::size_of::<u32>()) }.unwrap();
+    eprintln!("shfl mask16 trace: output zeroed");
+
+    let mut args = [&out_b, &out_b];
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel,
+            1,
+            1,
+            1,
+            64,
+            1,
+            1,
+            1024,
+            stream,
+            args.as_mut_ptr() as _,
+            ptr::null_mut(),
+        )
+    }
+    .unwrap();
+    eprintln!("shfl mask16 trace: launch ok");
+
+    unsafe { hipStreamSynchronize(stream) }.unwrap();
+    eprintln!("shfl mask16 trace: post-launch sync ok");
+
+    let mut result = [0u32; 64];
+    unsafe {
+        hipMemcpy(
+            result.as_mut_ptr() as _,
+            out_b,
+            64 * mem::size_of::<u32>(),
+            hipMemcpyKind::hipMemcpyDeviceToHost,
+        )
+    }
+    .unwrap();
+    eprintln!("shfl mask16 trace: readback ok, first8={:?}", &result[..8]);
+
+    unsafe { hipFree(out_b) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    unsafe { hipStreamDestroy(stream) }.unwrap();
+    Ok(())
+}
+
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "diagnostic: null-stream runtime baseline tracing"]
+fn shfl_sync_up_b32_pred_mask16_nullstream_trace_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+
+    eprintln!("shfl mask16 nullstream: start");
+    unsafe { hipInit(0) }.unwrap();
+    eprintln!("shfl mask16 nullstream: hipInit ok");
+
+    let ptx = read_test_file!("shfl_sync_up_b32_pred_mask16.ptx");
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    eprintln!("shfl mask16 nullstream: PTX -> LLVM ok");
+
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap();
+    eprintln!("shfl mask16 nullstream: gcn_arch={}", gcn_arch);
+
+    let ptx_impl = module.linked_bitcode();
+    let elf_module = llvm_zluda::compile(
+        &module.context,
+        gcn_arch,
+        module.llvm_ir,
+        ptx_impl,
+        module.attributes_ir,
+        module.metadata,
+        None,
+    )
+    .unwrap();
+    eprintln!(
+        "shfl mask16 nullstream: compile ok, elf={} bytes",
+        elf_module.len()
+    );
+
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf_module.as_ptr() as _) }.unwrap();
+    eprintln!("shfl mask16 nullstream: module loaded");
+
+    let mut kernel = unsafe { mem::zeroed() };
+    unsafe {
+        hipModuleGetFunction(
+            &mut kernel,
+            hip_mod,
+            c"shfl_sync_up_b32_pred_mask16".as_ptr(),
+        )
+    }
+    .unwrap();
+    eprintln!("shfl mask16 nullstream: function loaded");
+
+    let mut out_b = ptr::null_mut();
+    unsafe { hipMalloc(&mut out_b, 64 * mem::size_of::<u32>()) }.unwrap();
+    eprintln!("shfl mask16 nullstream: output allocated");
+
+    unsafe { hipMemset(out_b, 0, 64 * mem::size_of::<u32>()) }.unwrap();
+    eprintln!("shfl mask16 nullstream: output zeroed");
+
+    let null_stream: hipStream_t = unsafe { mem::zeroed() };
+    let mut args = [&out_b, &out_b];
+    unsafe {
+        hipModuleLaunchKernel(
+            kernel,
+            1,
+            1,
+            1,
+            64,
+            1,
+            1,
+            1024,
+            null_stream,
+            args.as_mut_ptr() as _,
+            ptr::null_mut(),
+        )
+    }
+    .unwrap();
+    eprintln!("shfl mask16 nullstream: launch ok");
+
+    unsafe { hipDeviceSynchronize() }.unwrap();
+    eprintln!("shfl mask16 nullstream: device sync ok");
+
+    let mut result = [0u32; 64];
+    unsafe {
+        hipMemcpy(
+            result.as_mut_ptr() as _,
+            out_b,
+            64 * mem::size_of::<u32>(),
+            hipMemcpyKind::hipMemcpyDeviceToHost,
+        )
+    }
+    .unwrap();
+    eprintln!(
+        "shfl mask16 nullstream: readback ok, first8={:?}",
+        &result[..8]
+    );
+
+    unsafe { hipFree(out_b) }.unwrap();
+    unsafe { hipModuleUnload(hip_mod) }.unwrap();
+    Ok(())
 }
 
 pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_module: &[u8]) {
@@ -2134,6 +3319,12 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
 
 
+
+
+
+
+
+
 const SORT_REPLAY_CAPTURE_MAGIC: u32 = 0x5350_5243;
 const SORT_REPLAY_CAPTURE_VERSION: u32 = 6;
 const SORT_REPLAY_CAPTURE_FLAG_HAS_VALS: u32 = 1 << 0;
@@ -2150,6 +3341,67 @@ struct SortReplayGridEvenShare {
     grid_size: i32,
     block_offset: i32,
     block_end: i32,
+}
+
+impl SortReplayGridEvenShare {
+    fn block_count(&self) -> usize {
+        self.grid_size.max(self.total_grains).max(0) as usize
+    }
+
+    fn item_count(&self, limit: usize) -> usize {
+        let num_items = usize::try_from(self.num_items.max(0)).unwrap_or(0);
+        if num_items == 0 {
+            limit
+        } else {
+            std::cmp::min(limit, num_items)
+        }
+    }
+
+    fn block_range(&self, block_idx: usize, limit: usize) -> Option<(usize, usize)> {
+        let item_count = self.item_count(limit);
+        if item_count == 0 || block_idx >= self.block_count() {
+            return None;
+        }
+        let big_blocks = self.big_blocks.max(0) as usize;
+        let (start_i32, share_i32) = if block_idx < big_blocks {
+            (
+                i32::try_from(block_idx).ok()?.checked_mul(self.big_share)?,
+                self.big_share,
+            )
+        } else {
+            let normal_idx = i32::try_from(block_idx - big_blocks).ok()?;
+            (
+                self.normal_base_offset
+                    .checked_add(normal_idx.checked_mul(self.normal_share)?)?,
+                self.normal_share,
+            )
+        };
+        let start = usize::try_from(start_i32).ok()?;
+        let share = usize::try_from(share_i32).ok()?;
+        let end = start.saturating_add(share).min(item_count);
+        if start >= end {
+            None
+        } else {
+            Some((start, end))
+        }
+    }
+
+    fn block_for_index(&self, index: usize, limit: usize) -> Option<(usize, usize, usize)> {
+        let item_count = self.item_count(limit);
+        if index >= item_count {
+            return None;
+        }
+        (0..self.block_count()).find_map(|block_idx| {
+            self.block_range(block_idx, item_count)
+                .and_then(|(start, end)| {
+                    if index >= start && index < end {
+                        Some((block_idx, start, end))
+                    } else {
+                        None
+                    }
+                })
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2182,6 +3434,53 @@ struct SortReplayCapture {
     vals_out_before: Option<Vec<i32>>,
     keys_out: Vec<i32>,
     vals_out: Option<Vec<i32>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedSortPassLive {
+    keys_out: Vec<i32>,
+    values_out: Vec<i32>,
+    output_to_input: Vec<usize>,
+}
+
+fn sort_pass_radix_digit_live(key: i32, begin_bit: u32) -> u32 {
+    ((key as u32) >> begin_bit) & 0xf
+}
+
+fn reconstruct_expected_sort_pass_live(
+    keys_in: &[i32],
+    values_in: &[i32],
+    begin_bit: u32,
+) -> Option<ExpectedSortPassLive> {
+    if keys_in.is_empty() || keys_in.len() != values_in.len() {
+        return None;
+    }
+    let mut counts = [0usize; 16];
+    for &key in keys_in {
+        counts[sort_pass_radix_digit_live(key, begin_bit) as usize] += 1;
+    }
+    let mut offsets = [0usize; 16];
+    let mut running = 0usize;
+    for (digit, count) in counts.into_iter().enumerate() {
+        offsets[digit] = running;
+        running += count;
+    }
+    let mut keys_out = vec![0i32; keys_in.len()];
+    let mut values_out = vec![0i32; values_in.len()];
+    let mut output_to_input = vec![0usize; keys_in.len()];
+    for (input_idx, (&key, &value)) in keys_in.iter().zip(values_in.iter()).enumerate() {
+        let digit = sort_pass_radix_digit_live(key, begin_bit) as usize;
+        let out_idx = offsets[digit];
+        keys_out[out_idx] = key;
+        values_out[out_idx] = value;
+        output_to_input[out_idx] = input_idx;
+        offsets[digit] += 1;
+    }
+    Some(ExpectedSortPassLive {
+        keys_out,
+        values_out,
+        output_to_input,
+    })
 }
 
 fn read_le_u32(words: &[u8], offset: &mut usize) -> Result<u32, Box<dyn error::Error>> {
@@ -2390,6 +3689,147 @@ fn infer_captured_sort_pass_flags(begin_bit: u32) -> Result<(u8, u8, u8), Box<dy
     }
 }
 
+fn build_sort_replay_downsweep_raw_args(
+    keys_in: u64,
+    keys_out: u64,
+    vals_in: u64,
+    vals_out: u64,
+    spine_ptr: u64,
+    n_items: u32,
+    begin_bit: u32,
+    first: u8,
+    last: u8,
+    overwrite: u8,
+    grid_share: &SortReplayGridEvenShare,
+) -> Vec<u8> {
+    let mut raw_args = vec![0u8; 88];
+    raw_args[0..8].copy_from_slice(&keys_in.to_le_bytes());
+    raw_args[8..16].copy_from_slice(&keys_out.to_le_bytes());
+    raw_args[16..24].copy_from_slice(&vals_in.to_le_bytes());
+    raw_args[24..32].copy_from_slice(&vals_out.to_le_bytes());
+    raw_args[32..40].copy_from_slice(&spine_ptr.to_le_bytes());
+    raw_args[40..44].copy_from_slice(&n_items.to_le_bytes());
+    raw_args[44..48].copy_from_slice(&begin_bit.to_le_bytes());
+    raw_args[48] = first;
+    raw_args[49] = last;
+    raw_args[50] = overwrite;
+    for (idx, word) in [
+        grid_share.total_grains,
+        grid_share.big_blocks,
+        grid_share.big_share,
+        grid_share.normal_share,
+        grid_share.normal_base_offset,
+        grid_share.num_items,
+        grid_share.grid_size,
+        grid_share.block_offset,
+        grid_share.block_end,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let start = 52 + idx * 4;
+        raw_args[start..start + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    raw_args
+}
+
+// PhysX downsweep PTX writes through param_1/param_3 and never reads param_9
+// (`overwrite`), so replay must follow the captured pointer aliasing.
+fn sort_replay_keys_output_aliases_input(capture: &SortReplayCapture) -> bool {
+    capture.keys_in_ptr == capture.keys_out_ptr
+}
+
+fn sort_replay_vals_output_aliases_input(capture: &SortReplayCapture) -> bool {
+    capture.vals_in.is_some()
+        && capture.vals_out.is_some()
+        && capture.vals_in_ptr == capture.vals_out_ptr
+}
+
+fn sort_replay_any_output_aliases_input(capture: &SortReplayCapture) -> bool {
+    sort_replay_keys_output_aliases_input(capture) || sort_replay_vals_output_aliases_input(capture)
+}
+
+fn sort_replay_capture_buffers<'a>(
+    capture: &'a SortReplayCapture,
+) -> Vec<(&'static str, u64, usize, bool, &'a [i32])> {
+    let mut buffers = vec![(
+        "keys_in",
+        capture.keys_in_ptr,
+        capture.n_items.saturating_mul(mem::size_of::<i32>()),
+        true,
+        &capture.keys_in[..capture.n_items.min(capture.keys_in.len())],
+    )];
+    buffers.push((
+        "keys_out",
+        capture.keys_out_ptr,
+        capture.n_items.saturating_mul(mem::size_of::<i32>()),
+        false,
+        &capture.keys_out[..capture.n_items.min(capture.keys_out.len())],
+    ));
+    if let Some(vals_in) = capture.vals_in.as_ref() {
+        buffers.push((
+            "vals_in",
+            capture.vals_in_ptr,
+            capture.n_items.saturating_mul(mem::size_of::<i32>()),
+            true,
+            &vals_in[..capture.n_items.min(vals_in.len())],
+        ));
+    }
+    if let Some(vals_out) = capture.vals_out.as_ref() {
+        buffers.push((
+            "vals_out",
+            capture.vals_out_ptr,
+            capture.n_items.saturating_mul(mem::size_of::<i32>()),
+            false,
+            &vals_out[..capture.n_items.min(vals_out.len())],
+        ));
+    }
+    buffers
+}
+
+fn capture_pointer_ranges_overlap(
+    lhs_ptr: u64,
+    lhs_len: usize,
+    rhs_ptr: u64,
+    rhs_len: usize,
+) -> bool {
+    if lhs_ptr == 0 || rhs_ptr == 0 || lhs_len == 0 || rhs_len == 0 {
+        return false;
+    }
+    let lhs_end = lhs_ptr.saturating_add(lhs_len as u64);
+    let rhs_end = rhs_ptr.saturating_add(rhs_len as u64);
+    lhs_ptr < rhs_end && rhs_ptr < lhs_end
+}
+
+fn sort_replay_capture_pointer_overlap_pairs(capture: &SortReplayCapture) -> Vec<String> {
+    let buffers = sort_replay_capture_buffers(capture);
+    let mut overlaps = Vec::new();
+    for lhs_idx in 0..buffers.len() {
+        for rhs_idx in lhs_idx + 1..buffers.len() {
+            let (lhs_name, lhs_ptr, lhs_len, _, _) = buffers[lhs_idx];
+            let (rhs_name, rhs_ptr, rhs_len, _, _) = buffers[rhs_idx];
+            if !capture_pointer_ranges_overlap(lhs_ptr, lhs_len, rhs_ptr, rhs_len) {
+                continue;
+            }
+            let overlap_lo = lhs_ptr.max(rhs_ptr);
+            let overlap_hi = lhs_ptr
+                .saturating_add(lhs_len as u64)
+                .min(rhs_ptr.saturating_add(rhs_len as u64));
+            let exact = lhs_ptr == rhs_ptr && lhs_len == rhs_len;
+            overlaps.push(format!(
+                "{}<->{} exact={} overlap=[0x{:x}..0x{:x}) bytes={}",
+                lhs_name,
+                rhs_name,
+                exact,
+                overlap_lo,
+                overlap_hi,
+                overlap_hi.saturating_sub(overlap_lo)
+            ));
+        }
+    }
+    overlaps
+}
+
 fn latest_sort_replay_capture_path() -> Result<Option<String>, Box<dyn error::Error>> {
     let mut newest: Option<(std::time::SystemTime, String)> = None;
     for entry in fs::read_dir("/tmp")? {
@@ -2419,19 +3859,103 @@ fn sort_pass_digit(key: i32, begin_bit: u32) -> u32 {
 }
 
 fn first_sort_replay_capture_mismatch_index(capture: &SortReplayCapture) -> Option<usize> {
-    let mut expected_order: Vec<usize> = (0..capture.keys_in.len()).collect();
-    expected_order.sort_by_key(|&idx| sort_pass_digit(capture.keys_in[idx], capture.begin_bit));
-    let vals_in = capture.vals_in.as_ref();
-    let vals_out = capture.vals_out.as_ref();
-    expected_order.into_iter().enumerate().find_map(|(out_idx, in_idx)| {
-        let keys_match = capture.keys_out.get(out_idx) == capture.keys_in.get(in_idx);
-        let vals_match = match (vals_in, vals_out) {
-            (Some(vals_in), Some(vals_out)) => vals_out.get(out_idx) == vals_in.get(in_idx),
-            _ => true,
-        };
-        (!keys_match || !vals_match).then_some(out_idx)
-    })
+    let keys_in = capture.keys_in.get(..capture.n_items)?;
+    let keys_out = capture.keys_out.get(..capture.n_items)?;
+    let vals_in = capture
+        .vals_in
+        .as_ref()
+        .and_then(|vals| vals.get(..capture.n_items));
+    let vals_out = capture
+        .vals_out
+        .as_ref()
+        .and_then(|vals| vals.get(..capture.n_items));
+    let mut expected_order: Vec<usize> = (0..keys_in.len()).collect();
+    expected_order.sort_by_key(|&idx| sort_pass_digit(keys_in[idx], capture.begin_bit));
+    expected_order
+        .into_iter()
+        .enumerate()
+        .find_map(|(out_idx, in_idx)| {
+            let keys_match = keys_out.get(out_idx) == keys_in.get(in_idx);
+            let vals_match = match (vals_in, vals_out) {
+                (Some(vals_in), Some(vals_out)) => vals_out.get(out_idx) == vals_in.get(in_idx),
+                _ => true,
+            };
+            (!keys_match || !vals_match).then_some(out_idx)
+        })
 }
+
+fn select_sort_replay_sample_index(
+    capture: &SortReplayCapture,
+    isolated_mismatch_idx: Option<usize>,
+) -> Option<usize> {
+    let model_mismatch_idx = first_sort_replay_capture_mismatch_index(capture);
+    if sort_replay_any_output_aliases_input(capture) {
+        model_mismatch_idx.or(isolated_mismatch_idx)
+    } else {
+        isolated_mismatch_idx.or(model_mismatch_idx)
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+fn patch_iofx_actor_range_raw_args(
+    raw_args: &mut [u8],
+    input_ptr_324: u64,
+    output_ptr_326: u64,
+    output_ptr_327: u64,
+    output_ptr_328: u64,
+    input_ptr_329: u64,
+) -> Result<(), Box<dyn error::Error>> {
+    for (offset, value) in [
+        (24usize, input_ptr_324),
+        (40usize, output_ptr_326),
+        (48usize, output_ptr_327),
+        (56usize, output_ptr_328),
+        (64usize, input_ptr_329),
+    ] {
+        if offset + 8 > raw_args.len() {
+            return Err(format!(
+                "iofx raw args too short for pointer patch at {} (len={})",
+                offset,
+                raw_args.len()
+            )
+            .into());
+        }
+        raw_args[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+
+
+
+
+
+
+
+
+
+
+
 
 #[test]
 fn parse_sort_replay_capture_reads_expected_layout() -> Result<(), Box<dyn error::Error>> {
@@ -2514,6 +4038,138 @@ fn parse_sort_replay_capture_reads_expected_layout() -> Result<(), Box<dyn error
 }
 
 #[test]
+fn build_sort_replay_downsweep_raw_args_writes_live_layout() {
+    let grid_share = SortReplayGridEvenShare {
+        total_grains: 5,
+        big_blocks: 1,
+        big_share: 3328,
+        normal_share: 1664,
+        normal_base_offset: 3328,
+        num_items: 4688,
+        grid_size: 3,
+        block_offset: 0,
+        block_end: 0,
+    };
+    let raw_args = build_sort_replay_downsweep_raw_args(
+        0x1111,
+        0x2222,
+        0x3333,
+        0x4444,
+        0x5555,
+        4688,
+        0,
+        0,
+        1,
+        0,
+        &grid_share,
+    );
+    assert_eq!(raw_args.len(), 88);
+    assert_eq!(
+        u64::from_le_bytes(raw_args[0..8].try_into().unwrap()),
+        0x1111
+    );
+    assert_eq!(
+        u64::from_le_bytes(raw_args[8..16].try_into().unwrap()),
+        0x2222
+    );
+    assert_eq!(
+        u64::from_le_bytes(raw_args[16..24].try_into().unwrap()),
+        0x3333
+    );
+    assert_eq!(
+        u64::from_le_bytes(raw_args[24..32].try_into().unwrap()),
+        0x4444
+    );
+    assert_eq!(
+        u64::from_le_bytes(raw_args[32..40].try_into().unwrap()),
+        0x5555
+    );
+    assert_eq!(
+        u32::from_le_bytes(raw_args[40..44].try_into().unwrap()),
+        4688
+    );
+    assert_eq!(u32::from_le_bytes(raw_args[44..48].try_into().unwrap()), 0);
+    assert_eq!(raw_args[48], 0);
+    assert_eq!(raw_args[49], 1);
+    assert_eq!(raw_args[50], 0);
+    assert_eq!(i32::from_le_bytes(raw_args[52..56].try_into().unwrap()), 5);
+    assert_eq!(i32::from_le_bytes(raw_args[56..60].try_into().unwrap()), 1);
+    assert_eq!(
+        i32::from_le_bytes(raw_args[60..64].try_into().unwrap()),
+        3328
+    );
+    assert_eq!(
+        i32::from_le_bytes(raw_args[64..68].try_into().unwrap()),
+        1664
+    );
+    assert_eq!(
+        i32::from_le_bytes(raw_args[68..72].try_into().unwrap()),
+        3328
+    );
+    assert_eq!(
+        i32::from_le_bytes(raw_args[72..76].try_into().unwrap()),
+        4688
+    );
+    assert_eq!(i32::from_le_bytes(raw_args[76..80].try_into().unwrap()), 3);
+    assert_eq!(i32::from_le_bytes(raw_args[80..84].try_into().unwrap()), 0);
+    assert_eq!(i32::from_le_bytes(raw_args[84..88].try_into().unwrap()), 0);
+}
+
+
+
+
+
+
+
+#[test]
+fn patch_iofx_actor_range_raw_args_rewrites_only_pointer_fields(
+) -> Result<(), Box<dyn error::Error>> {
+    let mut raw_args = vec![0xa5u8; 96];
+    raw_args[12..16].copy_from_slice(&6214u32.to_le_bytes());
+    patch_iofx_actor_range_raw_args(
+        &mut raw_args,
+        0x1111_2222_3333_4444,
+        0x5555_6666_7777_8888,
+        0x9999_aaaa_bbbb_cccc,
+        0xdddd_eeee_ffff_0001,
+        0x1234_5678_9abc_def0,
+    )?;
+    assert_eq!(
+        u32::from_le_bytes(raw_args[12..16].try_into().unwrap()),
+        6214
+    );
+    assert_eq!(
+        u64::from_le_bytes(raw_args[24..32].try_into().unwrap()),
+        0x1111_2222_3333_4444
+    );
+    assert_eq!(
+        u64::from_le_bytes(raw_args[40..48].try_into().unwrap()),
+        0x5555_6666_7777_8888
+    );
+    assert_eq!(
+        u64::from_le_bytes(raw_args[48..56].try_into().unwrap()),
+        0x9999_aaaa_bbbb_cccc
+    );
+    assert_eq!(
+        u64::from_le_bytes(raw_args[56..64].try_into().unwrap()),
+        0xdddd_eeee_ffff_0001
+    );
+    assert_eq!(
+        u64::from_le_bytes(raw_args[64..72].try_into().unwrap()),
+        0x1234_5678_9abc_def0
+    );
+    assert_eq!(raw_args[0], 0xa5);
+    assert_eq!(raw_args[95], 0xa5);
+    Ok(())
+}
+
+
+
+
+
+
+
+#[test]
 fn first_sort_replay_capture_mismatch_index_finds_first_bad_pair() {
     let capture = SortReplayCapture {
         pass_n: 1,
@@ -2547,6 +4203,250 @@ fn first_sort_replay_capture_mismatch_index_finds_first_bad_pair() {
     };
     assert_eq!(first_sort_replay_capture_mismatch_index(&capture), Some(2));
 }
+
+#[test]
+fn first_sort_replay_capture_mismatch_index_ignores_padded_tail() {
+    let capture = SortReplayCapture {
+        pass_n: 0,
+        begin_bit: 0,
+        n_items: 2,
+        capture_items: 4,
+        grid_dim_x: 1,
+        block_dim_x: 128,
+        block_dim_y: 1,
+        block_dim_z: 1,
+        shared_mem_bytes: 0,
+        first: 0,
+        last: 1,
+        overwrite: 0,
+        keys_in_ptr: 0,
+        keys_out_ptr: 0,
+        vals_in_ptr: 0,
+        vals_out_ptr: 0,
+        spine_ptr: 0,
+        stream_ptr: 0,
+        spine_words: vec![],
+        grid_share: None,
+        keys_in: vec![0x12, 0x13, 0x00, 0x01],
+        vals_in: Some(vec![12, 13, 0, 1]),
+        keys_in_before: vec![],
+        vals_in_before: None,
+        keys_out_before: vec![],
+        vals_out_before: None,
+        keys_out: vec![0x12, 0x13, 0, 0],
+        vals_out: Some(vec![12, 13, 0, 0]),
+    };
+
+    assert_eq!(first_sort_replay_capture_mismatch_index(&capture), None);
+}
+
+#[test]
+fn sort_replay_output_alias_tracks_captured_pointer_equality() {
+    let mut capture = SortReplayCapture {
+        pass_n: 0,
+        begin_bit: 0,
+        n_items: 1,
+        capture_items: 1,
+        grid_dim_x: 1,
+        block_dim_x: 1,
+        block_dim_y: 1,
+        block_dim_z: 1,
+        shared_mem_bytes: 0,
+        first: 0,
+        last: 0,
+        overwrite: 1,
+        keys_in_ptr: 0x1000,
+        keys_out_ptr: 0x1000,
+        vals_in_ptr: 0x2000,
+        vals_out_ptr: 0x2000,
+        spine_ptr: 0,
+        stream_ptr: 0,
+        spine_words: vec![],
+        grid_share: None,
+        keys_in: vec![1],
+        vals_in: Some(vec![10]),
+        keys_in_before: vec![],
+        vals_in_before: None,
+        keys_out_before: vec![],
+        vals_out_before: None,
+        keys_out: vec![1],
+        vals_out: Some(vec![10]),
+    };
+    assert!(sort_replay_keys_output_aliases_input(&capture));
+    assert!(sort_replay_vals_output_aliases_input(&capture));
+    assert!(sort_replay_any_output_aliases_input(&capture));
+
+    capture.keys_out_ptr = 0x3000;
+    capture.vals_out_ptr = 0x4000;
+    assert!(!sort_replay_keys_output_aliases_input(&capture));
+    assert!(!sort_replay_vals_output_aliases_input(&capture));
+    assert!(!sort_replay_any_output_aliases_input(&capture));
+}
+
+#[test]
+fn sort_replay_capture_pointer_overlap_pairs_detects_cross_type_overlap() {
+    let capture = SortReplayCapture {
+        pass_n: 0,
+        begin_bit: 0,
+        n_items: 4,
+        capture_items: 4,
+        grid_dim_x: 1,
+        block_dim_x: 1,
+        block_dim_y: 1,
+        block_dim_z: 1,
+        shared_mem_bytes: 0,
+        first: 0,
+        last: 0,
+        overwrite: 0,
+        keys_in_ptr: 0x1000,
+        keys_out_ptr: 0x2008,
+        vals_in_ptr: 0x2000,
+        vals_out_ptr: 0x3000,
+        spine_ptr: 0,
+        stream_ptr: 0,
+        spine_words: vec![],
+        grid_share: None,
+        keys_in: vec![1, 2, 3, 4],
+        vals_in: Some(vec![10, 20, 30, 40]),
+        keys_in_before: vec![],
+        vals_in_before: None,
+        keys_out_before: vec![],
+        vals_out_before: None,
+        keys_out: vec![1, 2, 3, 4],
+        vals_out: Some(vec![10, 20, 30, 40]),
+    };
+    let overlaps = sort_replay_capture_pointer_overlap_pairs(&capture);
+    assert_eq!(
+        overlaps,
+        vec!["keys_out<->vals_in exact=false overlap=[0x2008..0x2010) bytes=8"]
+    );
+}
+
+#[test]
+fn select_sort_replay_sample_index_prefers_model_mismatch_for_aliased_captures() {
+    let capture = SortReplayCapture {
+        pass_n: 0,
+        begin_bit: 4,
+        n_items: 4,
+        capture_items: 4,
+        grid_dim_x: 1,
+        block_dim_x: 128,
+        block_dim_y: 1,
+        block_dim_z: 1,
+        shared_mem_bytes: 0,
+        first: 0,
+        last: 1,
+        overwrite: 1,
+        keys_in_ptr: 0,
+        keys_out_ptr: 0,
+        vals_in_ptr: 0,
+        vals_out_ptr: 0,
+        spine_ptr: 0,
+        stream_ptr: 0,
+        spine_words: vec![],
+        grid_share: None,
+        keys_in: vec![0x10, 0x20, 0x01, 0x11],
+        vals_in: Some(vec![10, 20, 1, 11]),
+        keys_in_before: vec![0x10, 0x20, 0x01, 0x11],
+        vals_in_before: Some(vec![10, 20, 1, 11]),
+        keys_out_before: vec![0, 0, 0, 0],
+        vals_out_before: Some(vec![0, 0, 0, 0]),
+        keys_out: vec![0x01, 0x10, 0x20, 0x11],
+        vals_out: Some(vec![1, 10, 20, 11]),
+    };
+    assert_eq!(first_sort_replay_capture_mismatch_index(&capture), Some(2));
+    assert_eq!(select_sort_replay_sample_index(&capture, Some(0)), Some(2));
+}
+
+#[test]
+fn select_sort_replay_sample_index_prefers_isolated_mismatch_for_distinct_outputs() {
+    let capture = SortReplayCapture {
+        pass_n: 0,
+        begin_bit: 4,
+        n_items: 4,
+        capture_items: 4,
+        grid_dim_x: 1,
+        block_dim_x: 128,
+        block_dim_y: 1,
+        block_dim_z: 1,
+        shared_mem_bytes: 0,
+        first: 0,
+        last: 1,
+        overwrite: 1,
+        keys_in_ptr: 0x1000,
+        keys_out_ptr: 0x3000,
+        vals_in_ptr: 0x2000,
+        vals_out_ptr: 0x4000,
+        spine_ptr: 0,
+        stream_ptr: 0,
+        spine_words: vec![],
+        grid_share: None,
+        keys_in: vec![0x10, 0x20, 0x01, 0x11],
+        vals_in: Some(vec![10, 20, 1, 11]),
+        keys_in_before: vec![0x10, 0x20, 0x01, 0x11],
+        vals_in_before: Some(vec![10, 20, 1, 11]),
+        keys_out_before: vec![0, 0, 0, 0],
+        vals_out_before: Some(vec![0, 0, 0, 0]),
+        keys_out: vec![0x01, 0x10, 0x20, 0x11],
+        vals_out: Some(vec![1, 10, 20, 11]),
+    };
+
+    assert_eq!(select_sort_replay_sample_index(&capture, Some(0)), Some(0));
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+fn default_iofx_actor_range_ptx_path() -> Option<String> {
+    [
+        "/tmp/zluda_ptx_017.ptx",
+        "/tmp/zluda_ptx_055.ptx",
+        "/tmp/zluda_ptx_dump/module_17.ptx",
+        "/tmp/zluda_ptx_dump/module_55.ptx",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).exists())
+    .map(str::to_string)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2607,6 +4507,526 @@ fn mismatch_count_live<T: PartialEq>(left: &[T], right: &[T]) -> usize {
     let len = left.len().min(right.len());
     let shared = (0..len).filter(|&idx| left[idx] != right[idx]).count();
     shared + left.len().max(right.len()) - len
+}
+
+fn mismatch_runs_live<T: PartialEq>(left: &[T], right: &[T]) -> Vec<(usize, usize)> {
+    let len = left.len().min(right.len());
+    let mut runs = Vec::new();
+    let mut run_start = None;
+    for idx in 0..len {
+        if left[idx] != right[idx] {
+            if run_start.is_none() {
+                run_start = Some(idx);
+            }
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, idx));
+        }
+    }
+    if let Some(start) = run_start.take() {
+        runs.push((start, len));
+    }
+    if left.len() != right.len() {
+        runs.push((len, left.len().max(right.len())));
+    }
+    runs
+}
+
+fn negative_runs_live(values: &[i32]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut run_start = None;
+    for (idx, &value) in values.iter().enumerate() {
+        if value < 0 {
+            if run_start.is_none() {
+                run_start = Some(idx);
+            }
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, idx));
+        }
+    }
+    if let Some(start) = run_start.take() {
+        runs.push((start, values.len()));
+    }
+    runs
+}
+
+fn pair_mismatch_runs_live(
+    expected_keys: &[i32],
+    actual_keys: &[i32],
+    expected_vals: &[i32],
+    actual_vals: &[i32],
+) -> Vec<(usize, usize)> {
+    let len = expected_keys
+        .len()
+        .min(actual_keys.len())
+        .min(expected_vals.len())
+        .min(actual_vals.len());
+    let mut runs = Vec::new();
+    let mut run_start = None;
+    for idx in 0..len {
+        let mismatched =
+            expected_keys[idx] != actual_keys[idx] || expected_vals[idx] != actual_vals[idx];
+        if mismatched {
+            if run_start.is_none() {
+                run_start = Some(idx);
+            }
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, idx));
+        }
+    }
+    if let Some(start) = run_start.take() {
+        runs.push((start, len));
+    }
+    runs
+}
+
+fn format_runs_live(runs: &[(usize, usize)], limit: usize) -> String {
+    if runs.is_empty() {
+        return "[]".to_string();
+    }
+    let shown = runs
+        .iter()
+        .take(limit)
+        .map(|(start, end)| format!("{}..{}", start, end))
+        .collect::<Vec<_>>();
+    let suffix = if runs.len() > limit {
+        format!(", +{} more", runs.len() - limit)
+    } else {
+        String::new()
+    };
+    format!("[{}{}]", shown.join(", "), suffix)
+}
+
+fn summarize_mismatch_runs_live<T: PartialEq>(left: &[T], right: &[T], limit: usize) -> String {
+    let runs = mismatch_runs_live(left, right);
+    format!(
+        "count={} runs={}",
+        mismatch_count_live(left, right),
+        format_runs_live(&runs, limit)
+    )
+}
+
+fn summarize_negative_runs_live(values: &[i32], limit: usize) -> String {
+    let runs = negative_runs_live(values);
+    let count = runs.iter().map(|(start, end)| end - start).sum::<usize>();
+    format!("count={} runs={}", count, format_runs_live(&runs, limit))
+}
+
+fn build_pair_source_map_live(keys: &[i32], vals: &[i32]) -> BTreeMap<(i32, i32), Vec<usize>> {
+    let mut map = BTreeMap::new();
+    for (idx, (&key, &val)) in keys.iter().zip(vals.iter()).enumerate() {
+        map.entry((key, val)).or_insert_with(Vec::new).push(idx);
+    }
+    map
+}
+
+fn top_block_pair_labels(block_pair_hist: &BTreeMap<(usize, usize), usize>) -> Vec<String> {
+    let mut top_pairs = block_pair_hist
+        .iter()
+        .map(|(&(expected_block, actual_block), &count)| (count, expected_block, actual_block))
+        .collect::<Vec<_>>();
+    top_pairs.sort_by(|lhs, rhs| rhs.cmp(lhs));
+    top_pairs
+        .into_iter()
+        .take(12)
+        .map(|(count, expected_block, actual_block)| {
+            format!("{}->{}:{}", expected_block, actual_block, count)
+        })
+        .collect()
+}
+
+fn unique_pair_source_index_live(
+    pair_sources: &BTreeMap<(i32, i32), Vec<usize>>,
+    key: i32,
+    val: i32,
+) -> Option<usize> {
+    let indices = pair_sources.get(&(key, val))?;
+    (indices.len() == 1).then_some(indices[0])
+}
+
+fn build_value_source_map_live(values: &[i32]) -> BTreeMap<i32, Vec<usize>> {
+    let mut map = BTreeMap::new();
+    for (idx, &value) in values.iter().enumerate() {
+        map.entry(value).or_insert_with(Vec::new).push(idx);
+    }
+    map
+}
+
+fn unique_value_source_index_live(
+    value_sources: &BTreeMap<i32, Vec<usize>>,
+    value: i32,
+) -> Option<usize> {
+    let indices = value_sources.get(&value)?;
+    (indices.len() == 1).then_some(indices[0])
+}
+
+fn radix_digit_live(key: i32, begin_bit: u32) -> u32 {
+    ((key as u32) >> begin_bit) & 0x1f
+}
+
+fn summarize_same_slot_pairs_live(
+    runs: &[(usize, usize)],
+    left_keys: &[i32],
+    left_vals: &[i32],
+    right_keys: &[i32],
+    right_vals: &[i32],
+    limit: usize,
+) -> String {
+    if runs.is_empty() {
+        return "count=0 overlap=[]".to_string();
+    }
+    let len = left_keys
+        .len()
+        .min(left_vals.len())
+        .min(right_keys.len())
+        .min(right_vals.len());
+    let mut rendered = Vec::new();
+    for &(start, end) in runs.iter().take(limit) {
+        let end = end.min(len);
+        let mut same_pairs = 0usize;
+        for idx in start.min(len)..end {
+            if left_keys[idx] == right_keys[idx] && left_vals[idx] == right_vals[idx] {
+                same_pairs += 1;
+            }
+        }
+        rendered.push(format!(
+            "{}..{}={}/{}",
+            start,
+            end,
+            same_pairs,
+            end.saturating_sub(start)
+        ));
+    }
+    let suffix = if runs.len() > limit {
+        format!(", +{} more", runs.len() - limit)
+    } else {
+        String::new()
+    };
+    format!(
+        "count={} overlap=[{}{}]",
+        runs.len(),
+        rendered.join(", "),
+        suffix
+    )
+}
+
+fn format_usize_set_live(values: &BTreeSet<usize>) -> String {
+    if values.is_empty() {
+        "?".to_string()
+    } else {
+        format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn format_index_span_live(indices: &[usize]) -> String {
+    if indices.is_empty() {
+        "?".to_string()
+    } else {
+        let min = indices.iter().copied().min().unwrap();
+        let max = indices.iter().copied().max().unwrap() + 1;
+        format!("{}..{}", min, max)
+    }
+}
+
+fn summarize_pair_source_routes_live(
+    runs: &[(usize, usize)],
+    expected_keys: &[i32],
+    actual_keys: &[i32],
+    expected_vals: &[i32],
+    actual_vals: &[i32],
+    input_keys: &[i32],
+    input_vals: &[i32],
+    grid_share: &SortReplayGridEvenShare,
+    limit: usize,
+) -> String {
+    if runs.is_empty() {
+        return "count=0 routes=[]".to_string();
+    }
+    let pair_sources = build_pair_source_map_live(input_keys, input_vals);
+    let mut rendered = Vec::new();
+    for &(start, end) in runs.iter().take(limit) {
+        let mut dst_blocks = BTreeSet::new();
+        let mut dst_block_starts = BTreeSet::new();
+        let mut expected_source_blocks = BTreeSet::new();
+        let mut actual_source_blocks = BTreeSet::new();
+        let mut expected_source_indices = Vec::new();
+        let mut actual_source_indices = Vec::new();
+        let mut expected_unknown = 0usize;
+        let mut actual_unknown = 0usize;
+
+        for idx in start..end {
+            if let Some((block_idx, block_start, _)) =
+                grid_share.block_for_index(idx, expected_keys.len())
+            {
+                dst_blocks.insert(block_idx);
+                dst_block_starts.insert(block_start);
+            }
+
+            match unique_pair_source_index_live(
+                &pair_sources,
+                expected_keys[idx],
+                expected_vals[idx],
+            ) {
+                Some(source_idx) => {
+                    expected_source_indices.push(source_idx);
+                    if let Some((block_idx, _, _)) =
+                        grid_share.block_for_index(source_idx, input_keys.len())
+                    {
+                        expected_source_blocks.insert(block_idx);
+                    }
+                }
+                None => expected_unknown += 1,
+            }
+
+            match unique_pair_source_index_live(&pair_sources, actual_keys[idx], actual_vals[idx]) {
+                Some(source_idx) => {
+                    actual_source_indices.push(source_idx);
+                    if let Some((block_idx, _, _)) =
+                        grid_share.block_for_index(source_idx, input_keys.len())
+                    {
+                        actual_source_blocks.insert(block_idx);
+                    }
+                }
+                None => actual_unknown += 1,
+            }
+        }
+
+        let dst_rel = if dst_block_starts.len() == 1 {
+            let block_start = dst_block_starts.iter().next().copied().unwrap();
+            format!("{}..{}", start - block_start, end - block_start)
+        } else {
+            "?".to_string()
+        };
+        let unknown_note = if expected_unknown == 0 && actual_unknown == 0 {
+            String::new()
+        } else {
+            format!(" unknown={}/{}", expected_unknown, actual_unknown)
+        };
+        rendered.push(format!(
+            "{}..{} dst_blocks={} dst_rel={} exp_blocks={} act_blocks={} exp_src={} act_src={}{}",
+            start,
+            end,
+            format_usize_set_live(&dst_blocks),
+            dst_rel,
+            format_usize_set_live(&expected_source_blocks),
+            format_usize_set_live(&actual_source_blocks),
+            format_index_span_live(&expected_source_indices),
+            format_index_span_live(&actual_source_indices),
+            unknown_note
+        ));
+    }
+    let suffix = if runs.len() > limit {
+        format!(", +{} more", runs.len() - limit)
+    } else {
+        String::new()
+    };
+    format!(
+        "count={} routes=[{}{}]",
+        runs.len(),
+        rendered.join("; "),
+        suffix
+    )
+}
+
+fn summarize_value_source_routes_live(
+    runs: &[(usize, usize)],
+    expected_vals: &[i32],
+    actual_vals: &[i32],
+    input_vals: &[i32],
+    grid_share: &SortReplayGridEvenShare,
+    limit: usize,
+) -> String {
+    if runs.is_empty() {
+        return "count=0 routes=[]".to_string();
+    }
+    let value_sources = build_value_source_map_live(input_vals);
+    let mut rendered = Vec::new();
+    for &(start, end) in runs.iter().take(limit) {
+        let mut dst_blocks = BTreeSet::new();
+        let mut dst_block_starts = BTreeSet::new();
+        let mut expected_source_blocks = BTreeSet::new();
+        let mut actual_source_blocks = BTreeSet::new();
+        let mut expected_source_indices = Vec::new();
+        let mut actual_source_indices = Vec::new();
+        let mut expected_unknown = 0usize;
+        let mut actual_unknown = 0usize;
+
+        for idx in start..end {
+            if let Some((block_idx, block_start, _)) =
+                grid_share.block_for_index(idx, expected_vals.len())
+            {
+                dst_blocks.insert(block_idx);
+                dst_block_starts.insert(block_start);
+            }
+
+            match unique_value_source_index_live(&value_sources, expected_vals[idx]) {
+                Some(source_idx) => {
+                    expected_source_indices.push(source_idx);
+                    if let Some((block_idx, _, _)) =
+                        grid_share.block_for_index(source_idx, input_vals.len())
+                    {
+                        expected_source_blocks.insert(block_idx);
+                    }
+                }
+                None => expected_unknown += 1,
+            }
+
+            match unique_value_source_index_live(&value_sources, actual_vals[idx]) {
+                Some(source_idx) => {
+                    actual_source_indices.push(source_idx);
+                    if let Some((block_idx, _, _)) =
+                        grid_share.block_for_index(source_idx, input_vals.len())
+                    {
+                        actual_source_blocks.insert(block_idx);
+                    }
+                }
+                None => actual_unknown += 1,
+            }
+        }
+
+        let dst_rel = if dst_block_starts.len() == 1 {
+            let block_start = dst_block_starts.iter().next().copied().unwrap();
+            format!("{}..{}", start - block_start, end - block_start)
+        } else {
+            "?".to_string()
+        };
+        let unknown_note = if expected_unknown == 0 && actual_unknown == 0 {
+            String::new()
+        } else {
+            format!(" unknown={}/{}", expected_unknown, actual_unknown)
+        };
+        rendered.push(format!(
+            "{}..{} dst_blocks={} dst_rel={} exp_blocks={} act_blocks={} exp_src={} act_src={}{}",
+            start,
+            end,
+            format_usize_set_live(&dst_blocks),
+            dst_rel,
+            format_usize_set_live(&expected_source_blocks),
+            format_usize_set_live(&actual_source_blocks),
+            format_index_span_live(&expected_source_indices),
+            format_index_span_live(&actual_source_indices),
+            unknown_note
+        ));
+    }
+    let suffix = if runs.len() > limit {
+        format!(", +{} more", runs.len() - limit)
+    } else {
+        String::new()
+    };
+    format!(
+        "count={} routes=[{}{}]",
+        runs.len(),
+        rendered.join("; "),
+        suffix
+    )
+}
+
+fn summarize_value_route_triplets_live(
+    runs: &[(usize, usize)],
+    expected_output_to_input: &[usize],
+    captured_vals: &[i32],
+    replay_vals: &[i32],
+    input_vals: &[i32],
+    grid_share: &SortReplayGridEvenShare,
+    limit: usize,
+) -> String {
+    if runs.is_empty() {
+        return "count=0 routes=[]".to_string();
+    }
+    let value_sources = build_value_source_map_live(input_vals);
+    let mut rendered = Vec::new();
+    for &(start, end) in runs.iter().take(limit) {
+        let mut dst_blocks = BTreeSet::new();
+        let mut dst_block_starts = BTreeSet::new();
+        let mut expected_source_blocks = BTreeSet::new();
+        let mut captured_source_blocks = BTreeSet::new();
+        let mut replay_source_blocks = BTreeSet::new();
+        let mut expected_source_indices = Vec::new();
+        let mut captured_source_indices = Vec::new();
+        let mut replay_source_indices = Vec::new();
+        let mut captured_unknown = 0usize;
+        let mut replay_unknown = 0usize;
+        for idx in start..end {
+            if let Some((block_idx, block_start, _)) =
+                grid_share.block_for_index(idx, expected_output_to_input.len())
+            {
+                dst_blocks.insert(block_idx);
+                dst_block_starts.insert(block_start);
+            }
+            if let Some(&source_idx) = expected_output_to_input.get(idx) {
+                expected_source_indices.push(source_idx);
+                if let Some((block_idx, _, _)) =
+                    grid_share.block_for_index(source_idx, input_vals.len())
+                {
+                    expected_source_blocks.insert(block_idx);
+                }
+            }
+            match unique_value_source_index_live(&value_sources, captured_vals[idx]) {
+                Some(source_idx) => {
+                    captured_source_indices.push(source_idx);
+                    if let Some((block_idx, _, _)) =
+                        grid_share.block_for_index(source_idx, input_vals.len())
+                    {
+                        captured_source_blocks.insert(block_idx);
+                    }
+                }
+                None => captured_unknown += 1,
+            }
+            match unique_value_source_index_live(&value_sources, replay_vals[idx]) {
+                Some(source_idx) => {
+                    replay_source_indices.push(source_idx);
+                    if let Some((block_idx, _, _)) =
+                        grid_share.block_for_index(source_idx, input_vals.len())
+                    {
+                        replay_source_blocks.insert(block_idx);
+                    }
+                }
+                None => replay_unknown += 1,
+            }
+        }
+        let dst_rel = if dst_block_starts.len() == 1 {
+            let block_start = dst_block_starts.iter().next().copied().unwrap();
+            format!("{}..{}", start - block_start, end - block_start)
+        } else {
+            "?".to_string()
+        };
+        let unknown_note = if captured_unknown == 0 && replay_unknown == 0 {
+            String::new()
+        } else {
+            format!(" unknown={}/{}", captured_unknown, replay_unknown)
+        };
+        rendered.push(format!(
+            "{}..{} dst_blocks={} dst_rel={} exp_blocks={} live_blocks={} replay_blocks={} exp_src={} live_src={} replay_src={}{}",
+            start,
+            end,
+            format_usize_set_live(&dst_blocks),
+            dst_rel,
+            format_usize_set_live(&expected_source_blocks),
+            format_usize_set_live(&captured_source_blocks),
+            format_usize_set_live(&replay_source_blocks),
+            format_index_span_live(&expected_source_indices),
+            format_index_span_live(&captured_source_indices),
+            format_index_span_live(&replay_source_indices),
+            unknown_note
+        ));
+    }
+    let suffix = if runs.len() > limit {
+        format!(", +{} more", runs.len() - limit)
+    } else {
+        String::new()
+    };
+    format!(
+        "count={} routes=[{}{}]",
+        runs.len(),
+        rendered.join("; "),
+        suffix
+    )
 }
 
 fn summarize_region_mismatch_live<T: PartialEq>(
@@ -2775,13 +5195,108 @@ fn summarize_sort_replay_capture_diff_live_reports_changed_fields() {
     bad.spine_words[1] = 42;
     let summary = summarize_sort_replay_capture_diff_live(&good, &bad);
     assert!(summary.contains("flags=0/1/0"));
-        assert!(summary.contains("flags=1/1/0"));
-        assert!(summary.contains("ko=0x2000/0x2222"));
-        assert!(summary.contains("keys_in=1/0 [2]/[]"));
-        assert!(summary.contains("keys_in_before=1/0 [0]/[]"));
-        assert!(summary.contains("keys_out_before=1/0 [1]/[]"));
-        assert!(summary.contains("vals_out=1/0 [3]/[]"));
-        assert!(summary.contains("spine=1 [1]"));
+    assert!(summary.contains("flags=1/1/0"));
+    assert!(summary.contains("ko=0x2000/0x2222"));
+    assert!(summary.contains("keys_in=1/0 [2]/[]"));
+    assert!(summary.contains("keys_in_before=1/0 [0]/[]"));
+    assert!(summary.contains("keys_out_before=1/0 [1]/[]"));
+    assert!(summary.contains("vals_out=1/0 [3]/[]"));
+    assert!(summary.contains("spine=1 [1]"));
+}
+
+#[test]
+fn summarize_mismatch_runs_live_groups_contiguous_ranges() {
+    let left = [0, 1, 99, 98, 4, 5, 42];
+    let right = [0, 1, 2, 3, 4, 5, 6];
+    assert_eq!(mismatch_runs_live(&left, &right), vec![(2, 4), (6, 7)]);
+    assert_eq!(
+        summarize_mismatch_runs_live(&left, &right, 8),
+        "count=3 runs=[2..4, 6..7]"
+    );
+}
+
+#[test]
+fn summarize_negative_runs_live_groups_contiguous_ranges() {
+    let values = [1, -1, -2, 3, -4, -5, -6, 7];
+    assert_eq!(negative_runs_live(&values), vec![(1, 3), (4, 7)]);
+    assert_eq!(
+        summarize_negative_runs_live(&values, 8),
+        "count=5 runs=[1..3, 4..7]"
+    );
+}
+
+#[test]
+fn summarize_same_slot_pairs_live_reports_run_overlap() {
+    let runs = vec![(2, 4), (6, 7)];
+    let left_keys = [0, 1, 2, 3, 4, 5, 6];
+    let left_vals = [10, 11, 12, 13, 14, 15, 16];
+    let right_keys = [9, 9, 2, 99, 9, 9, 6];
+    let right_vals = [0, 0, 12, 13, 0, 0, 77];
+    assert_eq!(
+        summarize_same_slot_pairs_live(&runs, &left_keys, &left_vals, &right_keys, &right_vals, 8),
+        "count=2 overlap=[2..4=1/2, 6..7=0/1]"
+    );
+}
+
+#[test]
+fn summarize_pair_source_routes_live_reports_block_routing() {
+    let grid_share = SortReplayGridEvenShare {
+        total_grains: 4,
+        big_blocks: 0,
+        big_share: 2,
+        normal_share: 2,
+        normal_base_offset: 0,
+        num_items: 8,
+        grid_size: 4,
+        block_offset: 0,
+        block_end: 0,
+    };
+    let input_keys = [10, 11, 20, 21, 30, 31, 40, 41];
+    let input_vals = [100, 101, 200, 201, 300, 301, 400, 401];
+    let expected_keys = [10, 11, 30, 31, 40, 41, 20, 21];
+    let expected_vals = [100, 101, 300, 301, 400, 401, 200, 201];
+    let actual_keys = [10, 11, 20, 21, 40, 41, 20, 21];
+    let actual_vals = [100, 101, 200, 201, 400, 401, 200, 201];
+    let runs = pair_mismatch_runs_live(&expected_keys, &actual_keys, &expected_vals, &actual_vals);
+    assert_eq!(runs, vec![(2, 4)]);
+    assert_eq!(
+        summarize_pair_source_routes_live(
+            &runs,
+            &expected_keys,
+            &actual_keys,
+            &expected_vals,
+            &actual_vals,
+            &input_keys,
+            &input_vals,
+            &grid_share,
+            8
+        ),
+        "count=1 routes=[2..4 dst_blocks=[1] dst_rel=0..2 exp_blocks=[2] act_blocks=[1] exp_src=4..6 act_src=2..4]"
+    );
+    assert_eq!(
+        summarize_value_source_routes_live(
+            &runs,
+            &expected_vals,
+            &actual_vals,
+            &input_vals,
+            &grid_share,
+            8
+        ),
+        "count=1 routes=[2..4 dst_blocks=[1] dst_rel=0..2 exp_blocks=[2] act_blocks=[1] exp_src=4..6 act_src=2..4]"
+    );
+    let expected_output_to_input = [0usize, 1, 4, 5, 6, 7, 2, 3];
+    assert_eq!(
+        summarize_value_route_triplets_live(
+            &runs,
+            &expected_output_to_input,
+            &expected_vals,
+            &actual_vals,
+            &input_vals,
+            &grid_share,
+            8
+        ),
+        "count=1 routes=[2..4 dst_blocks=[1] dst_rel=0..2 exp_blocks=[2] live_blocks=[2] replay_blocks=[1] exp_src=4..6 live_src=4..6 replay_src=2..4]"
+    );
 }
 
 #[test]
@@ -2805,13 +5320,15 @@ fn sort_replay_compare_good_and_bad_captures_live() -> Result<(), Box<dyn error:
     };
     let bad_path = match std::env::var("ZLUDA_SORT_REPLAY_BAD_CAPTURE") {
         Ok(path) => path,
-        Err(_) => match latest_sort_replay_capture_path()? {
-            Some(path) => path,
-            None => {
-                eprintln!("sort_replay_compare: no /tmp/zluda_sort_replay_capture_bit*_pass*.bin found");
-                return Ok(());
+        Err(_) => {
+            match latest_sort_replay_capture_path()? {
+                Some(path) => path,
+                None => {
+                    eprintln!("sort_replay_compare: no /tmp/zluda_sort_replay_capture_bit*_pass*.bin found");
+                    return Ok(());
+                }
             }
-        },
+        }
     };
     let good = parse_sort_replay_capture(&fs::read(&good_path)?)?;
     let bad = parse_sort_replay_capture(&fs::read(&bad_path)?)?;
@@ -5912,7 +8429,11 @@ fn ms4_replay_captured_inputs_amdgpu() -> Result<(), Box<dyn error::Error>> {
     const SLOT_BYTES: usize = HEADER_BYTES + DATA_BYTES;
     const MAGIC: u64 = 0x4d53344341505455;
 
-    assert_eq!(capture.len() % SLOT_BYTES, 0, "unexpected capture file size");
+    assert_eq!(
+        capture.len() % SLOT_BYTES,
+        0,
+        "unexpected capture file size"
+    );
     let capture_slots = capture.len() / SLOT_BYTES;
 
     let elf_path = "/tmp/zluda_ir_dump/module_3_elf";
@@ -6172,7 +8693,11 @@ fn ms4_replay_crashing_slot_amdgpu() -> Result<(), Box<dyn error::Error>> {
             return Ok(());
         }
     };
-    assert_eq!(capture.len() % SLOT_BYTES, 0, "unexpected capture file size");
+    assert_eq!(
+        capture.len() % SLOT_BYTES,
+        0,
+        "unexpected capture file size"
+    );
     let capture_slots = capture.len() / SLOT_BYTES;
 
     // Find the slot with the highest launch_n (that's the most recent — the

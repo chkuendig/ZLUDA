@@ -291,6 +291,16 @@ fn install_fault_signal_handler() {
             c"/tmp/tfs_captures.bin".as_ptr(),
         );
 
+        let iofx_host_ptr = super::function::IOFX_ACTOR_RANGE_CAPTURE_HOST_PTR
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let iofx_total_bytes = super::function::IOFX_ACTOR_RANGE_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            iofx_host_ptr,
+            iofx_total_bytes,
+            c"/tmp/iofx_actor_range_captures.bin".as_ptr(),
+        );
+
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -327,6 +337,13 @@ fn install_fault_signal_handler() {
                     f,
                     "*** TFS capture dumped to /tmp/tfs_captures.bin ({} bytes)\n",
                     tfs_total_bytes
+                );
+            }
+            if iofx_host_ptr != 0 && iofx_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** IOFX actorRange capture dumped to /tmp/iofx_actor_range_captures.bin ({} bytes)\n",
+                    iofx_total_bytes
                 );
             }
             if let Ok(guard) = KERNEL_RING.lock() {
@@ -792,9 +809,11 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
         flags,
         crate::is_log_all_enabled()
     ));
-    // Disable SDMA before HIP init. Wine's SIGUSR1 APC delivery interrupts the
-    // KFD ioctl that waits for SDMA completion, causing hangs. On APUs (unified
-    // memory), blit kernels are the correct path anyway — SDMA is for discrete GPUs.
+    // Disable SDMA before HIP init. On Steam Deck / gfx10.3 we now see SDMA
+    // queue exhaustion ("No more SDMA queue to allocate") and follow-on copy
+    // hangs in module/copy probes; Wine's SIGUSR1 APC delivery can also
+    // interrupt the KFD ioctl that waits for SDMA completion. On APUs (unified
+    // memory), blit kernels are the safer path anyway.
     // Uses setenv with overwrite=0 so user can still override with HSA_ENABLE_SDMA=1.
     unsafe { libc::setenv(c"HSA_ENABLE_SDMA".as_ptr(), c"0".as_ptr(), 0) };
     // Enable HSA VM fault messages for GPU page fault diagnostics.

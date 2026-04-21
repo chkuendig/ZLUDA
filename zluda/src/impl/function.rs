@@ -1862,6 +1862,17 @@ const SORT_PASS_KEYS_OUT_BEFORE_OFFSET: usize = SORT_PASS_VALS_IN_BEFORE_OFFSET 
 const SORT_PASS_VALS_OUT_BEFORE_OFFSET: usize = SORT_PASS_KEYS_OUT_BEFORE_OFFSET + F5_SCRATCH_BYTES;
 const SORT_PASS_SPINE_OFFSET: usize = SORT_PASS_VALS_OUT_BEFORE_OFFSET + F5_SCRATCH_BYTES;
 const SORT_PASS_TOTAL_SCRATCH_BYTES: usize = SORT_PASS_SPINE_OFFSET + SORT_PASS_SPINE_BYTES;
+const SORT_PASS_QUEUE_SLOT_OFFSETS: [usize; 8] = [
+    SORT_PASS_KEYS_IN_OFFSET,
+    SORT_PASS_KEYS_OUT_OFFSET,
+    SORT_PASS_VALS_IN_OFFSET,
+    SORT_PASS_VALS_OUT_OFFSET,
+    SORT_PASS_KEYS_IN_BEFORE_OFFSET,
+    SORT_PASS_VALS_IN_BEFORE_OFFSET,
+    SORT_PASS_KEYS_OUT_BEFORE_OFFSET,
+    SORT_PASS_VALS_OUT_BEFORE_OFFSET,
+];
+const SORT_PASS_QUEUE_MAX_PENDING: usize = SORT_PASS_QUEUE_SLOT_OFFSETS.len();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SortedKeySummary {
@@ -1871,6 +1882,15 @@ struct SortedKeySummary {
     negative_count: u32,
     huge_count: u32,
     first_violation: Option<usize>,
+    first_bad_value: Option<(usize, i32)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyDomainSummary {
+    min_key: i32,
+    max_key: i32,
+    negative_count: u32,
+    huge_count: u32,
     first_bad_value: Option<(usize, i32)>,
 }
 
@@ -1914,6 +1934,40 @@ fn summarize_sorted_keys(keys: &[i32]) -> Option<SortedKeySummary> {
             summary.first_bad_value = Some((i, key));
         }
         prev = key;
+    }
+    Some(summary)
+}
+
+fn summarize_key_domain(keys: &[i32]) -> Option<KeyDomainSummary> {
+    let (&first, rest) = keys.split_first()?;
+    let mut summary = KeyDomainSummary {
+        min_key: first,
+        max_key: first,
+        negative_count: u32::from(first < 0),
+        huge_count: u32::from(first > 16_000_000),
+        first_bad_value: if first < 0 || first > 16_000_000 {
+            Some((0, first))
+        } else {
+            None
+        },
+    };
+    for (idx, &key) in rest.iter().enumerate() {
+        let i = idx + 1;
+        if key < summary.min_key {
+            summary.min_key = key;
+        }
+        if key > summary.max_key {
+            summary.max_key = key;
+        }
+        if key < 0 {
+            summary.negative_count += 1;
+        }
+        if key > 16_000_000 {
+            summary.huge_count += 1;
+        }
+        if summary.first_bad_value.is_none() && (key < 0 || key > 16_000_000) {
+            summary.first_bad_value = Some((i, key));
+        }
     }
     Some(summary)
 }
@@ -1997,6 +2051,7 @@ fn summarize_sort_values(values_in: &[i32], values_out: &[i32]) -> Option<SortVa
 enum GoodSortReplayCaptureKind {
     TargetBit0N8109,
     FallbackBit0LargeClean,
+    LateBit16N4688Clean,
 }
 
 fn classify_good_sort_replay_capture(
@@ -2007,10 +2062,7 @@ fn classify_good_sort_replay_capture(
     summary_out: SortedKeySummary,
     vals_summary: Option<SortValueSummary>,
 ) -> Option<GoodSortReplayCaptureKind> {
-    if begin_bit != 0
-        || first != 0
-        || overwrite != 0
-        || summary_out.negative_count != 0
+    if summary_out.negative_count != 0
         || !vals_summary
             .map(|summary| {
                 summary.negative_count == 0
@@ -2021,10 +2073,12 @@ fn classify_good_sort_replay_capture(
     {
         return None;
     }
-    if n_items == 8109 {
+    if begin_bit == 0 && first == 0 && overwrite == 0 && n_items == 8109 {
         Some(GoodSortReplayCaptureKind::TargetBit0N8109)
-    } else if n_items >= 1024 {
+    } else if begin_bit == 0 && first == 0 && overwrite == 0 && n_items >= 1024 {
         Some(GoodSortReplayCaptureKind::FallbackBit0LargeClean)
+    } else if begin_bit == 16 && overwrite != 0 && n_items == 4688 {
+        Some(GoodSortReplayCaptureKind::LateBit16N4688Clean)
     } else {
         None
     }
@@ -2044,6 +2098,12 @@ fn good_sort_replay_capture_path(
             )
         }
         GoodSortReplayCaptureKind::FallbackBit0LargeClean => {
+            format!(
+                "/tmp/zluda_sort_replay_capture_good_bit{}_n{}_pass{}.bin",
+                begin_bit, n_items, pass_n
+            )
+        }
+        GoodSortReplayCaptureKind::LateBit16N4688Clean => {
             format!(
                 "/tmp/zluda_sort_replay_capture_good_bit{}_n{}_pass{}.bin",
                 begin_bit, n_items, pass_n
@@ -2130,6 +2190,41 @@ fn summarize_sort_pair_window_diff(
         mismatches,
         mismatch_runs
     ))
+}
+
+fn contiguous_index_runs(indices: &[usize]) -> Vec<(usize, usize)> {
+    let Some((&first, rest)) = indices.split_first() else {
+        return Vec::new();
+    };
+    let mut runs = Vec::new();
+    let mut run_start = first;
+    let mut run_end = first + 1;
+    for &idx in rest {
+        if idx == run_end {
+            run_end += 1;
+        } else {
+            runs.push((run_start, run_end));
+            run_start = idx;
+            run_end = idx + 1;
+        }
+    }
+    runs.push((run_start, run_end));
+    runs
+}
+
+fn format_index_runs(indices: &[usize]) -> String {
+    let runs = contiguous_index_runs(indices);
+    if runs.is_empty() {
+        "[]".to_string()
+    } else {
+        format!(
+            "[{}]",
+            runs.iter()
+                .map(|(start, end)| format!("{}..{}", start, end))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
 }
 
 fn find_value_positions(values: &[i32], target: i32, limit: usize) -> Vec<usize> {
@@ -3272,6 +3367,25 @@ fn analyze_downsweep_block_capture(
         expected_source_block,
         actual_source_block,
     );
+    let block_key_mismatches = (start..end)
+        .filter(|&idx| expected.keys_out[idx] != keys_out[idx])
+        .collect::<Vec<_>>();
+    let block_value_mismatches = (start..end)
+        .filter(|&idx| expected.values_out[idx] != values_out[idx])
+        .collect::<Vec<_>>();
+    let block_negative_keys = (start..end)
+        .filter(|&idx| keys_out[idx] < 0)
+        .collect::<Vec<_>>();
+    let _ = writeln!(
+        &mut capture_text,
+        "DEST_BLOCK_RUNS key_mismatch={} runs={} value_mismatch={} runs={} neg={} runs={}",
+        block_key_mismatches.len(),
+        format_index_runs(&block_key_mismatches),
+        block_value_mismatches.len(),
+        format_index_runs(&block_value_mismatches),
+        block_negative_keys.len(),
+        format_index_runs(&block_negative_keys),
+    );
     append_downsweep_block_capture_rows(
         &mut capture_text,
         "DEST_BLOCK",
@@ -3367,6 +3481,18 @@ fn format_sorted_key_window(
         .first_bad_value
         .map(|(idx, _)| idx)
         .or(summary.first_violation)?;
+    let start = center.saturating_sub(5);
+    let end = (center + 5).min(keys.len());
+    let around: Vec<String> = (start..end)
+        .map(|i| format!("{}[{}]={}", label, i, keys[i]))
+        .collect();
+    Some(around.join(", "))
+}
+
+fn format_key_window_around(keys: &[i32], center: usize, label: &str) -> Option<String> {
+    if center >= keys.len() {
+        return None;
+    }
     let start = center.saturating_sub(5);
     let end = (center + 5).min(keys.len());
     let around: Vec<String> = (start..end)
@@ -3475,6 +3601,68 @@ fn creategrid_safe_validator_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_VALIDATE_SORT_SAFE").map_or(false, |v| v == "1"))
 }
 
+fn creategrid_sort_touch_log_start_from_value(value: Option<&str>) -> Option<u32> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("0") => None,
+        Some("1") => Some(0),
+        Some(value) => value.parse().ok(),
+    }
+}
+
+fn creategrid_sort_touch_log_start() -> Option<u32> {
+    static START: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *START.get_or_init(|| {
+        creategrid_sort_touch_log_start_from_value(
+            std::env::var("ZLUDA_CREATEGRID_TOUCH_LOG").ok().as_deref(),
+        )
+    })
+}
+
+fn creategrid_snapshot_log_start() -> Option<u32> {
+    static START: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *START.get_or_init(|| {
+        creategrid_sort_touch_log_start_from_value(
+            std::env::var("ZLUDA_CREATEGRID_SNAPSHOT_LOG")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn createcell_snapshot_log_start() -> Option<u32> {
+    static START: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *START.get_or_init(|| {
+        creategrid_sort_touch_log_start_from_value(
+            std::env::var("ZLUDA_CREATECELL_SNAPSHOT_LOG")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn sort_replay_capture_begin_bit() -> u32 {
+    static BEGIN_BIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BEGIN_BIT.get_or_init(|| {
+        std::env::var("ZLUDA_SORT_REPLAY_CAPTURE_BIT")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn should_queue_sort_replay_capture(
+    begin_bit: u32,
+    creategrid_call_n: u32,
+    start_call: Option<u32>,
+    capture_begin_bit: u32,
+) -> bool {
+    start_call
+        .map(|start| begin_bit == capture_begin_bit && creategrid_call_n >= start)
+        .unwrap_or(false)
+}
+
 fn zero_sort_input_slack_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
@@ -3501,6 +3689,51 @@ static LAST_CREATEGRID_SORTED_KEYS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static LAST_CREATEGRID_KEY_COUNT: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+static CREATEGRID_LOG_CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CREATECELL_SNAPSHOT_LOG_CALL_N: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+static SORT_PASS_SNAPSHOT_CALL_N: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+#[derive(Clone, Copy)]
+struct PendingCreateCellSnapshot {
+    call_n: u32,
+    n: usize,
+    read_n: usize,
+    hash_out_dev: u64,
+    stream: hipStream_t,
+    grid_dim_x: u32,
+    grid_dim_y: u32,
+    grid_dim_z: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+}
+
+static PENDING_CREATECELL_SNAPSHOT: Mutex<Option<PendingCreateCellSnapshot>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct PendingSortPassSnapshot {
+    snapshot_n: u32,
+    begin_bit: u32,
+    n_items: usize,
+    read_n: usize,
+    keys_in: u64,
+    keys_out: u64,
+    first: u8,
+    last: u8,
+    overwrite: u8,
+    stream: hipStream_t,
+    grid_dim_x: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+    scratch_slot: usize,
+}
+
+static PENDING_SORT_PASS_SNAPSHOTS: Mutex<Vec<PendingSortPassSnapshot>> = Mutex::new(Vec::new());
 
 fn note_creategrid_sorted_keys(sorted_keys: u64, n: usize) {
     if sorted_keys == 0 || n == 0 || n > u32::MAX as usize {
@@ -3530,6 +3763,12 @@ enum CreateGridSortBufferRole {
     CopySource,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CreateGridSortBufferHit {
+    role: CreateGridSortBufferRole,
+    byte_offset: usize,
+}
+
 fn classify_creategrid_sort_buffer(
     sorted_keys: u64,
     n: usize,
@@ -3548,6 +3787,33 @@ fn classify_creategrid_sort_buffer(
     None
 }
 
+fn locate_creategrid_sort_buffer_hit(
+    sorted_keys: u64,
+    n: usize,
+    buffer: u64,
+) -> Option<CreateGridSortBufferHit> {
+    if sorted_keys == 0 || n == 0 || buffer == 0 {
+        return None;
+    }
+    let buffer_bytes = n.checked_mul(4)?;
+    let copy_src = sorted_keys.checked_add(buffer_bytes as u64)?;
+    let input_end = sorted_keys.checked_add(buffer_bytes as u64)?;
+    let copy_end = copy_src.checked_add(buffer_bytes as u64)?;
+    if (sorted_keys..input_end).contains(&buffer) {
+        return Some(CreateGridSortBufferHit {
+            role: CreateGridSortBufferRole::CreateGridInput,
+            byte_offset: (buffer - sorted_keys) as usize,
+        });
+    }
+    if (copy_src..copy_end).contains(&buffer) {
+        return Some(CreateGridSortBufferHit {
+            role: CreateGridSortBufferRole::CopySource,
+            byte_offset: (buffer - copy_src) as usize,
+        });
+    }
+    None
+}
+
 fn creategrid_sort_buffer_role_name(role: CreateGridSortBufferRole) -> &'static str {
     match role {
         CreateGridSortBufferRole::CreateGridInput => "creategrid_input",
@@ -3558,11 +3824,18 @@ fn creategrid_sort_buffer_role_name(role: CreateGridSortBufferRole) -> &'static 
 const CREATEGRID_SORT_TOUCH_MAX_EXTRA_BYTES: usize = 160;
 const CREATEGRID_SORT_TOUCH_MAX_RECENT: usize = 64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreateGridSortTouchArgLocation {
+    ExtraOffset(usize),
+    KernelParamIndex(usize),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CreateGridSortTouchArg {
-    extra_offset: usize,
+    location: CreateGridSortTouchArgLocation,
     buffer: u64,
     role: CreateGridSortBufferRole,
+    byte_offset: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -3594,20 +3867,877 @@ fn scan_launch_extra_for_creategrid_sort_refs(
         let mut raw = [0u8; 8];
         raw.copy_from_slice(&buffer[extra_offset..extra_offset + 8]);
         let candidate = u64::from_le_bytes(raw);
-        let Some(role) = classify_creategrid_sort_buffer(sorted_keys, n, candidate) else {
+        let Some(hit) = locate_creategrid_sort_buffer_hit(sorted_keys, n, candidate) else {
             continue;
         };
         refs.push(CreateGridSortTouchArg {
-            extra_offset,
+            location: CreateGridSortTouchArgLocation::ExtraOffset(extra_offset),
             buffer: candidate,
-            role,
+            role: hit.role,
+            byte_offset: hit.byte_offset,
         });
     }
     refs
 }
 
+unsafe fn scan_launch_kernel_params_for_creategrid_sort_refs(
+    sorted_keys: u64,
+    n: usize,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+) -> Vec<CreateGridSortTouchArg> {
+    if sorted_keys == 0 || n == 0 || kernel_params.is_null() {
+        return Vec::new();
+    }
+    let mut refs = Vec::new();
+    for arg_index in 0..16usize {
+        let param_ptr = *kernel_params.add(arg_index);
+        if param_ptr.is_null() {
+            break;
+        }
+        let candidate = std::ptr::read_unaligned(param_ptr as *const u64);
+        let Some(hit) = locate_creategrid_sort_buffer_hit(sorted_keys, n, candidate) else {
+            continue;
+        };
+        refs.push(CreateGridSortTouchArg {
+            location: CreateGridSortTouchArgLocation::KernelParamIndex(arg_index),
+            buffer: candidate,
+            role: hit.role,
+            byte_offset: hit.byte_offset,
+        });
+    }
+    refs
+}
+
+unsafe fn collect_creategrid_sort_refs_for_launch(
+    sorted_keys: u64,
+    n: usize,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> Vec<CreateGridSortTouchArg> {
+    let mut refs = if !extra.is_null() {
+        let extra_arr = std::slice::from_raw_parts(extra, 5);
+        if extra_arr[0] == (0x1usize as *mut _) && !extra_arr[1].is_null() {
+            let buffer_size = if extra_arr[2] == (0x2usize as *mut _) && !extra_arr[3].is_null() {
+                std::ptr::read_unaligned(extra_arr[3] as *const usize)
+            } else {
+                CREATEGRID_SORT_TOUCH_MAX_EXTRA_BYTES
+            };
+            if buffer_size >= 8 {
+                scan_launch_extra_for_creategrid_sort_refs(
+                    sorted_keys,
+                    n,
+                    std::slice::from_raw_parts(extra_arr[1] as *const u8, buffer_size),
+                )
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    refs.extend(scan_launch_kernel_params_for_creategrid_sort_refs(
+        sorted_keys,
+        n,
+        kernel_params,
+    ));
+    refs
+}
+
+fn format_creategrid_sort_touch_refs(refs: &[CreateGridSortTouchArg]) -> String {
+    refs.iter()
+        .map(|arg| {
+            let location = match arg.location {
+                CreateGridSortTouchArgLocation::ExtraOffset(offset) => {
+                    format!("extra+{}", offset)
+                }
+                CreateGridSortTouchArgLocation::KernelParamIndex(index) => {
+                    format!("arg{}", index)
+                }
+            };
+            if arg.byte_offset == 0 {
+                format!(
+                    "{}=0x{:x}({})",
+                    location,
+                    arg.buffer,
+                    creategrid_sort_buffer_role_name(arg.role)
+                )
+            } else {
+                format!(
+                    "{}=0x{:x}({}+0x{:x})",
+                    location,
+                    arg.buffer,
+                    creategrid_sort_buffer_role_name(arg.role),
+                    arg.byte_offset
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+unsafe fn log_creategrid_snapshot_direct(
+    call_n: u32,
+    n: usize,
+    sorted_keys_dev: u64,
+    stream: hipStream_t,
+    grid_dim_x: u32,
+    grid_dim_y: u32,
+    grid_dim_z: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+) {
+    use hip_runtime_sys::*;
+
+    let read_n = n.min(F5_MAX_KEYS);
+    if read_n == 0 {
+        return;
+    }
+
+    let mut guard = match CREATEGRID_VALIDATOR.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    createGrid_validator_init(&mut guard);
+    let validator = match guard.as_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let copy_result = hipMemcpyDtoDAsync(
+        hipDeviceptr_t(validator.scratch_dev),
+        hipDeviceptr_t(sorted_keys_dev as *mut std::ffi::c_void),
+        read_n * 4,
+        stream,
+    );
+    if copy_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_SNAPSHOT_DIRECT creategrid#{}: copy failed {:?} sk=0x{:x} n={} read={} stream={:?}",
+            call_n, copy_result, sorted_keys_dev, n, read_n, stream
+        ));
+        return;
+    }
+
+    let sync_result = hipStreamSynchronize(stream);
+    if sync_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_SNAPSHOT_DIRECT creategrid#{}: stream sync failed {:?} sk=0x{:x} n={} read={} stream={:?}",
+            call_n, sync_result, sorted_keys_dev, n, read_n, stream
+        ));
+        return;
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    log_pending_createcell_snapshot_after_sync();
+    log_pending_sort_pass_snapshots_after_sync(call_n, n, sorted_keys_dev);
+    log_pending_sort_replay_capture_after_sync();
+
+    let keys = std::slice::from_raw_parts(validator.scratch_host as *const i32, read_n);
+    let Some(summary) = summarize_sorted_keys(keys) else {
+        return;
+    };
+    let restored = restore_signed_radix_residue(keys);
+    let restored_summary = summarize_sorted_keys(&restored);
+    super::driver::zluda_log_err(&format!(
+        "    SORT_SNAPSHOT_DIRECT creategrid#{} grid=[{},{},{}] block=[{},{},{}] shared={} stream={:?} n={} read={} sk=0x{:x} A[min={},max={},viol={},neg={},huge={}]{}",
+        call_n,
+        grid_dim_x,
+        grid_dim_y,
+        grid_dim_z,
+        block_dim_x,
+        block_dim_y,
+        block_dim_z,
+        shared_mem_bytes,
+        stream,
+        n,
+        read_n,
+        sorted_keys_dev,
+        summary.min_key,
+        summary.max_key,
+        summary.violations,
+        summary.negative_count,
+        summary.huge_count,
+        restored_summary
+            .map(|restored| format!(
+                " A_XOR[min={},max={},viol={},neg={},huge={}]",
+                restored.min_key,
+                restored.max_key,
+                restored.violations,
+                restored.negative_count,
+                restored.huge_count
+            ))
+            .unwrap_or_default()
+    ));
+    if let Some(window) = format_sorted_key_window(keys, &summary, "A") {
+        super::driver::zluda_log_err(&format!("        {}", window));
+    }
+}
+
+unsafe fn queue_createcell_snapshot_direct(
+    call_n: u32,
+    n: usize,
+    hash_out_dev: u64,
+    stream: hipStream_t,
+    grid_dim_x: u32,
+    grid_dim_y: u32,
+    grid_dim_z: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+) {
+    use hip_runtime_sys::*;
+
+    let read_n = n.min(F5_MAX_KEYS);
+    if read_n == 0 {
+        return;
+    }
+
+    let mut guard = match CREATECELL_SNAPSHOT_VALIDATOR.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    createGrid_validator_init(&mut guard);
+    let validator = match guard.as_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let copy_result = hipMemcpyDtoDAsync(
+        hipDeviceptr_t(validator.scratch_dev),
+        hipDeviceptr_t(hash_out_dev as *mut std::ffi::c_void),
+        read_n * 4,
+        stream,
+    );
+    if copy_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** CREATECELL_SNAPSHOT_DIRECT createcell#{}: copy failed {:?} out=0x{:x} n={} read={} stream={:?}",
+            call_n, copy_result, hash_out_dev, n, read_n, stream
+        ));
+        return;
+    }
+
+    let mut pending = match PENDING_CREATECELL_SNAPSHOT.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    *pending = Some(PendingCreateCellSnapshot {
+        call_n,
+        n,
+        read_n,
+        hash_out_dev,
+        stream,
+        grid_dim_x,
+        grid_dim_y,
+        grid_dim_z,
+        block_dim_x,
+        block_dim_y,
+        block_dim_z,
+        shared_mem_bytes,
+    });
+}
+
+fn log_pending_createcell_snapshot_after_sync() {
+    let pending = {
+        let mut guard = match PENDING_CREATECELL_SNAPSHOT.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.take()
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+
+    let guard = match CREATECELL_SNAPSHOT_VALIDATOR.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let Some(validator) = guard.as_ref() else {
+        return;
+    };
+
+    let keys =
+        unsafe { std::slice::from_raw_parts(validator.scratch_host as *const i32, pending.read_n) };
+    let Some(summary) = summarize_key_domain(keys) else {
+        return;
+    };
+    super::driver::zluda_log_err(&format!(
+        "    CREATECELL_SNAPSHOT_DIRECT createcell#{} grid=[{},{},{}] block=[{},{},{}] shared={} stream={:?} n={} read={} out=0x{:x} OUT[min={},max={},neg={},huge={}]",
+        pending.call_n,
+        pending.grid_dim_x,
+        pending.grid_dim_y,
+        pending.grid_dim_z,
+        pending.block_dim_x,
+        pending.block_dim_y,
+        pending.block_dim_z,
+        pending.shared_mem_bytes,
+        pending.stream,
+        pending.n,
+        pending.read_n,
+        pending.hash_out_dev,
+        summary.min_key,
+        summary.max_key,
+        summary.negative_count,
+        summary.huge_count,
+    ));
+    if let Some((idx, _)) = summary.first_bad_value {
+        if let Some(window) = format_key_window_around(keys, idx, "OUT") {
+            super::driver::zluda_log_err(&format!("        {}", window));
+        }
+    }
+}
+
+unsafe fn queue_sort_downsweep_snapshot(
+    begin_bit: u32,
+    n_items: usize,
+    keys_in: u64,
+    keys_out: u64,
+    first: u8,
+    last: u8,
+    overwrite: u8,
+    stream: hipStream_t,
+    grid_dim_x: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+) {
+    use hip_runtime_sys::*;
+
+    let read_n = n_items.min(F5_MAX_KEYS);
+    if read_n == 0 || keys_out == 0 {
+        return;
+    }
+
+    let mut pending = match PENDING_SORT_PASS_SNAPSHOTS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if pending.len() >= SORT_PASS_QUEUE_MAX_PENDING {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_PASS_QUEUE: overflow before CreateGrid sync; dropping {} pending snapshots",
+            pending.len()
+        ));
+        pending.clear();
+    }
+    let scratch_slot = pending.len();
+    let Some(scratch_offset) = sort_pass_queue_slot_offset(scratch_slot) else {
+        return;
+    };
+
+    let mut guard = match SORT_PASS_TRACKER.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    sort_pass_tracker_init(&mut guard);
+    let tracker = match guard.as_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let copy_result = hipMemcpyDtoDAsync(
+        hipDeviceptr_t((tracker.scratch_dev as usize + scratch_offset) as _),
+        hipDeviceptr_t(keys_out as *mut std::ffi::c_void),
+        read_n * 4,
+        stream,
+    );
+    if copy_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_PASS_QUEUE: copy failed {:?} bit={} keys_out=0x{:x} n={} read={} stream={:?}",
+            copy_result, begin_bit, keys_out, n_items, read_n, stream
+        ));
+        return;
+    }
+
+    pending.push(PendingSortPassSnapshot {
+        snapshot_n: SORT_PASS_SNAPSHOT_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        begin_bit,
+        n_items,
+        read_n,
+        keys_in,
+        keys_out,
+        first,
+        last,
+        overwrite,
+        stream,
+        grid_dim_x,
+        block_dim_x,
+        block_dim_y,
+        block_dim_z,
+        shared_mem_bytes,
+        scratch_slot,
+    });
+}
+
+fn log_pending_sort_pass_snapshots_after_sync(call_n: u32, n: usize, sorted_keys_dev: u64) {
+    let pending = {
+        let mut guard = match PENDING_SORT_PASS_SNAPSHOTS.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        std::mem::take(&mut *guard)
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    let guard = match SORT_PASS_TRACKER.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let Some(tracker) = guard.as_ref() else {
+        return;
+    };
+
+    for snapshot in pending {
+        let Some(scratch_offset) = sort_pass_queue_slot_offset(snapshot.scratch_slot) else {
+            continue;
+        };
+        let keys = unsafe {
+            std::slice::from_raw_parts(
+                tracker.scratch_host.add(scratch_offset) as *const i32,
+                snapshot.read_n,
+            )
+        };
+        let logical_n = snapshot.n_items.min(snapshot.read_n);
+        let keys = &keys[..logical_n];
+        let Some(summary) = summarize_sorted_keys(keys) else {
+            continue;
+        };
+        let restored_summary = if summary.negative_count > 0 {
+            let restored = restore_signed_radix_residue(keys);
+            summarize_sorted_keys(&restored)
+        } else {
+            None
+        };
+        let in_role = classify_creategrid_sort_buffer(sorted_keys_dev, n, snapshot.keys_in)
+            .map(creategrid_sort_buffer_role_name)
+            .unwrap_or("-");
+        let out_role = classify_creategrid_sort_buffer(sorted_keys_dev, n, snapshot.keys_out)
+            .map(creategrid_sort_buffer_role_name)
+            .unwrap_or("-");
+        super::driver::zluda_log_err(&format!(
+            "    SORT_PASS_QUEUE_DIRECT creategrid#{} snap#{} bit={} first={} last={} ow={} grid={} block=[{},{},{}] shared={} stream={:?} keys_in=0x{:x}({}) keys_out=0x{:x}({}) OUT[min={},max={},viol={},neg={},huge={}]{}",
+            call_n,
+            snapshot.snapshot_n,
+            snapshot.begin_bit,
+            snapshot.first,
+            snapshot.last,
+            snapshot.overwrite,
+            snapshot.grid_dim_x,
+            snapshot.block_dim_x,
+            snapshot.block_dim_y,
+            snapshot.block_dim_z,
+            snapshot.shared_mem_bytes,
+            snapshot.stream,
+            snapshot.keys_in,
+            in_role,
+            snapshot.keys_out,
+            out_role,
+            summary.min_key,
+            summary.max_key,
+            summary.violations,
+            summary.negative_count,
+            summary.huge_count,
+            restored_summary
+                .map(|restored| format!(
+                    " OUT_XOR[min={},max={},viol={},neg={},huge={}]",
+                    restored.min_key,
+                    restored.max_key,
+                    restored.violations,
+                    restored.negative_count,
+                    restored.huge_count
+                ))
+                .unwrap_or_default()
+        ));
+        if let Some(window) = format_sorted_key_window(keys, &summary, "OUT") {
+            super::driver::zluda_log_err(&format!("        {}", window));
+        }
+    }
+}
+
+unsafe fn queue_sort_downsweep_replay_capture_prelaunch(
+    args: SortDownsweepLaunchArgs,
+    stream: hipStream_t,
+    grid_dim_x: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+) {
+    use hip_runtime_sys::*;
+
+    if args.begin_bit != sort_replay_capture_begin_bit() {
+        return;
+    }
+    let read_n = sort_pass_capture_len(args.n_items, Some(args.grid_share));
+    if read_n == 0 || args.keys_in == 0 || args.keys_out == 0 {
+        return;
+    }
+
+    let mut guard = match SORT_PASS_REPLAY_QUEUE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    sort_pass_tracker_init(&mut guard);
+    let tracker = match guard.as_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let queued = [
+        (SORT_PASS_KEYS_IN_OFFSET, args.keys_in, "keys_in", true),
+        (
+            SORT_PASS_KEYS_IN_BEFORE_OFFSET,
+            args.keys_in,
+            "keys_in_before",
+            true,
+        ),
+        (
+            SORT_PASS_KEYS_OUT_BEFORE_OFFSET,
+            args.keys_out,
+            "keys_out_before",
+            true,
+        ),
+    ];
+    for (offset, src, label, required) in queued {
+        let result = hipMemcpyDtoDAsync(
+            hipDeviceptr_t((tracker.scratch_dev as usize + offset) as _),
+            hipDeviceptr_t(src as *mut std::ffi::c_void),
+            read_n * 4,
+            stream,
+        );
+        if required && result.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "*** SORT_REPLAY_QUEUE: prelaunch {} copy failed {:?} bit={} ptr=0x{:x} n={} stream={:?}",
+                label, result, args.begin_bit, src, read_n, stream
+            ));
+            return;
+        }
+    }
+    if args.vals_in != 0 {
+        for (offset, src, label) in [
+            (SORT_PASS_VALS_IN_OFFSET, args.vals_in, "vals_in"),
+            (
+                SORT_PASS_VALS_IN_BEFORE_OFFSET,
+                args.vals_in,
+                "vals_in_before",
+            ),
+            (
+                SORT_PASS_VALS_OUT_BEFORE_OFFSET,
+                args.vals_out,
+                "vals_out_before",
+            ),
+        ] {
+            let result = hipMemcpyDtoDAsync(
+                hipDeviceptr_t((tracker.scratch_dev as usize + offset) as _),
+                hipDeviceptr_t(src as *mut std::ffi::c_void),
+                read_n * 4,
+                stream,
+            );
+            if result.is_err() {
+                super::driver::zluda_log_err(&format!(
+                    "*** SORT_REPLAY_QUEUE: prelaunch {} copy failed {:?} bit={} ptr=0x{:x} n={} stream={:?}",
+                    label, result, args.begin_bit, src, read_n, stream
+                ));
+                return;
+            }
+        }
+    }
+
+    let mut pending = match PENDING_SORT_REPLAY_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(previous) = *pending {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_REPLAY_QUEUE: overwriting pending capture prev=bit{}#{} n={} keys_in=0x{:x} keys_out=0x{:x} stream={:?} next=bit{} n={} keys_in=0x{:x} keys_out=0x{:x} stream={:?}",
+            previous.begin_bit,
+            previous.capture_n,
+            previous.n_items,
+            previous.keys_in,
+            previous.keys_out,
+            previous.stream,
+            args.begin_bit,
+            args.n_items,
+            args.keys_in,
+            args.keys_out,
+            stream,
+        ));
+    }
+    *pending = Some(PendingSortReplayCapture {
+        capture_n: SORT_PASS_SNAPSHOT_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        begin_bit: args.begin_bit,
+        n_items: args.n_items,
+        read_n,
+        keys_in: args.keys_in,
+        keys_out: args.keys_out,
+        vals_in: args.vals_in,
+        vals_out: args.vals_out,
+        spine_ptr: args.spine_ptr,
+        first: args.first,
+        last: args.last,
+        overwrite: args.overwrite,
+        grid_share: Some(args.grid_share),
+        stream,
+        grid_dim_x,
+        block_dim_x,
+        block_dim_y,
+        block_dim_z,
+        shared_mem_bytes,
+    });
+}
+
+unsafe fn queue_sort_downsweep_replay_capture_postlaunch(
+    args: SortDownsweepLaunchArgs,
+    stream: hipStream_t,
+) {
+    use hip_runtime_sys::*;
+
+    if args.begin_bit != sort_replay_capture_begin_bit() {
+        return;
+    }
+    let pending = {
+        let guard = match PENDING_SORT_REPLAY_CAPTURE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+    if pending.begin_bit != args.begin_bit
+        || pending.n_items != args.n_items
+        || pending.keys_in != args.keys_in
+        || pending.keys_out != args.keys_out
+    {
+        super::driver::zluda_log_err(&format!(
+            "*** SORT_REPLAY_QUEUE: postlaunch mismatch pending=bit{}#{} n={} keys_in=0x{:x} keys_out=0x{:x} stream={:?} launch=bit{} n={} keys_in=0x{:x} keys_out=0x{:x} stream={:?}",
+            pending.begin_bit,
+            pending.capture_n,
+            pending.n_items,
+            pending.keys_in,
+            pending.keys_out,
+            pending.stream,
+            args.begin_bit,
+            args.n_items,
+            args.keys_in,
+            args.keys_out,
+            stream,
+        ));
+        return;
+    }
+
+    let mut guard = match SORT_PASS_REPLAY_QUEUE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let tracker = match guard.as_mut() {
+        Some(v) => v,
+        None => return,
+    };
+    for (offset, src, label, bytes) in [
+        (
+            SORT_PASS_KEYS_OUT_OFFSET,
+            args.keys_out,
+            "keys_out",
+            pending.read_n * 4,
+        ),
+        (
+            SORT_PASS_VALS_OUT_OFFSET,
+            args.vals_out,
+            "vals_out",
+            pending.read_n * 4,
+        ),
+    ] {
+        if src == 0 {
+            continue;
+        }
+        let result = hipMemcpyDtoDAsync(
+            hipDeviceptr_t((tracker.scratch_dev as usize + offset) as _),
+            hipDeviceptr_t(src as *mut std::ffi::c_void),
+            bytes,
+            stream,
+        );
+        if result.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "*** SORT_REPLAY_QUEUE: postlaunch {} copy failed {:?} bit={} ptr=0x{:x} n={} stream={:?}",
+                label, result, args.begin_bit, src, pending.read_n, stream
+            ));
+            return;
+        }
+    }
+    let spine_words = ((pending.grid_dim_x as usize) * 16).min(SORT_PASS_SPINE_MAX_WORDS);
+    if pending.spine_ptr != 0 && spine_words > 0 {
+        let result = hipMemcpyDtoDAsync(
+            hipDeviceptr_t((tracker.scratch_dev as usize + SORT_PASS_SPINE_OFFSET) as _),
+            hipDeviceptr_t(pending.spine_ptr as *mut std::ffi::c_void),
+            spine_words * 4,
+            stream,
+        );
+        if result.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "*** SORT_REPLAY_QUEUE: postlaunch spine copy failed {:?} bit={} spine=0x{:x} words={} stream={:?}",
+                result, args.begin_bit, pending.spine_ptr, spine_words, stream
+            ));
+        }
+    }
+}
+
+fn log_pending_sort_replay_capture_after_sync() {
+    let pending = {
+        let mut guard = match PENDING_SORT_REPLAY_CAPTURE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.take()
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+
+    let guard = match SORT_PASS_REPLAY_QUEUE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let Some(tracker) = guard.as_ref() else {
+        return;
+    };
+
+    let keys_in = unsafe {
+        std::slice::from_raw_parts(
+            tracker.scratch_host.add(SORT_PASS_KEYS_IN_OFFSET) as *const i32,
+            pending.read_n,
+        )
+    };
+    let keys_in_before = unsafe {
+        std::slice::from_raw_parts(
+            tracker.scratch_host.add(SORT_PASS_KEYS_IN_BEFORE_OFFSET) as *const i32,
+            pending.read_n,
+        )
+    };
+    let keys_out_before = unsafe {
+        std::slice::from_raw_parts(
+            tracker.scratch_host.add(SORT_PASS_KEYS_OUT_BEFORE_OFFSET) as *const i32,
+            pending.read_n,
+        )
+    };
+    let keys_out = unsafe {
+        std::slice::from_raw_parts(
+            tracker.scratch_host.add(SORT_PASS_KEYS_OUT_OFFSET) as *const i32,
+            pending.read_n,
+        )
+    };
+    let vals_in = if pending.vals_in != 0 {
+        Some(unsafe {
+            std::slice::from_raw_parts(
+                tracker.scratch_host.add(SORT_PASS_VALS_IN_OFFSET) as *const i32,
+                pending.read_n,
+            )
+        })
+    } else {
+        None
+    };
+    let vals_in_before = if pending.vals_in != 0 {
+        Some(unsafe {
+            std::slice::from_raw_parts(
+                tracker.scratch_host.add(SORT_PASS_VALS_IN_BEFORE_OFFSET) as *const i32,
+                pending.read_n,
+            )
+        })
+    } else {
+        None
+    };
+    let vals_out_before = if pending.vals_out != 0 {
+        Some(unsafe {
+            std::slice::from_raw_parts(
+                tracker.scratch_host.add(SORT_PASS_VALS_OUT_BEFORE_OFFSET) as *const i32,
+                pending.read_n,
+            )
+        })
+    } else {
+        None
+    };
+    let vals_out = if pending.vals_out != 0 {
+        Some(unsafe {
+            std::slice::from_raw_parts(
+                tracker.scratch_host.add(SORT_PASS_VALS_OUT_OFFSET) as *const i32,
+                pending.read_n,
+            )
+        })
+    } else {
+        None
+    };
+    let spine_words_len = ((pending.grid_dim_x as usize) * 16).min(SORT_PASS_SPINE_MAX_WORDS);
+    let spine_words = unsafe {
+        std::slice::from_raw_parts(
+            tracker.scratch_host.add(SORT_PASS_SPINE_OFFSET) as *const u32,
+            spine_words_len,
+        )
+    };
+    let logical_n = pending.n_items.min(pending.read_n);
+    let Some(summary_out) = summarize_sorted_keys(&keys_out[..logical_n]) else {
+        return;
+    };
+    if summary_out.negative_count == 0 && summary_out.huge_count == 0 {
+        return;
+    }
+    let capture = match serialize_sort_pass_replay_capture(
+        pending.capture_n,
+        pending.begin_bit,
+        pending.n_items,
+        pending.grid_dim_x,
+        pending.block_dim_x,
+        pending.block_dim_y,
+        pending.block_dim_z,
+        pending.shared_mem_bytes,
+        pending.first,
+        pending.last,
+        pending.overwrite,
+        pending.keys_in,
+        pending.keys_out,
+        pending.vals_in,
+        pending.vals_out,
+        pending.spine_ptr,
+        pending.stream.0 as u64,
+        keys_in,
+        vals_in,
+        keys_in_before,
+        vals_in_before,
+        keys_out_before,
+        vals_out_before,
+        keys_out,
+        vals_out,
+        spine_words,
+        pending.grid_share,
+    ) {
+        Some(capture) => capture,
+        None => return,
+    };
+    let path = format!(
+        "/tmp/zluda_sort_replay_capture_bit{}_pass{}.bin",
+        pending.begin_bit, pending.capture_n
+    );
+    let capture_line = match std::fs::write(&path, &capture) {
+        Ok(()) => format!(
+            "SORT_REPLAY_CAPTURE bit={} n={} grid={} spine_words={} path={}",
+            pending.begin_bit, pending.n_items, pending.grid_dim_x, spine_words_len, path
+        ),
+        Err(err) => format!(
+            "SORT_REPLAY_CAPTURE bit={} n={} grid={} spine_words={} path={} write_err={}",
+            pending.begin_bit, pending.n_items, pending.grid_dim_x, spine_words_len, path, err
+        ),
+    };
+    super::driver::zluda_log_err(&format!("    {}", capture_line));
+}
+
 unsafe fn maybe_capture_creategrid_sort_buffer_touch(
     name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
     shared_mem_bytes: u32,
     stream: hipStream_t,
@@ -3623,26 +4753,10 @@ unsafe fn maybe_capture_creategrid_sort_buffer_touch(
     }
     let sorted_keys = LAST_CREATEGRID_SORTED_KEYS.load(std::sync::atomic::Ordering::Relaxed);
     let n = LAST_CREATEGRID_KEY_COUNT.load(std::sync::atomic::Ordering::Relaxed) as usize;
-    if sorted_keys == 0 || n == 0 || extra.is_null() {
+    if sorted_keys == 0 || n == 0 || (extra.is_null() && kernel_params.is_null()) {
         return;
     }
-    let extra_arr = std::slice::from_raw_parts(extra, 5);
-    if extra_arr[0] != (0x1usize as *mut _) || extra_arr[1].is_null() {
-        return;
-    }
-    let buffer_size = if extra_arr[2] == (0x2usize as *mut _) && !extra_arr[3].is_null() {
-        std::ptr::read_unaligned(extra_arr[3] as *const usize)
-    } else {
-        CREATEGRID_SORT_TOUCH_MAX_EXTRA_BYTES
-    };
-    if buffer_size < 8 {
-        return;
-    }
-    let refs = scan_launch_extra_for_creategrid_sort_refs(
-        sorted_keys,
-        n,
-        std::slice::from_raw_parts(extra_arr[1] as *const u8, buffer_size),
-    );
+    let refs = collect_creategrid_sort_refs_for_launch(sorted_keys, n, kernel_params, extra);
     if refs.is_empty() {
         return;
     }
@@ -3682,19 +4796,7 @@ fn dump_recent_creategrid_sort_buffer_touches(call_n: u32, n: usize, sorted_keys
         .take(12)
     {
         matched += 1;
-        let refs = record
-            .refs
-            .iter()
-            .map(|arg| {
-                format!(
-                    "extra+{}=0x{:x}({})",
-                    arg.extra_offset,
-                    arg.buffer,
-                    creategrid_sort_buffer_role_name(arg.role)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+        let refs = format_creategrid_sort_touch_refs(&record.refs);
         super::driver::zluda_log_err(&format!(
             "    SORT_TOUCH_MATCH creategrid#{} launch#{} '{}' grid=[{},{},{}] block=[{},{},{}] shared={} stream={} refs=[{}]",
             call_n,
@@ -3795,6 +4897,36 @@ unsafe impl Send for SortPassTracker {}
 unsafe impl Sync for SortPassTracker {}
 
 static SORT_PASS_TRACKER: Mutex<Option<SortPassTracker>> = Mutex::new(None);
+static SORT_PASS_REPLAY_QUEUE: Mutex<Option<SortPassTracker>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct PendingSortReplayCapture {
+    capture_n: u32,
+    begin_bit: u32,
+    n_items: usize,
+    read_n: usize,
+    keys_in: u64,
+    keys_out: u64,
+    vals_in: u64,
+    vals_out: u64,
+    spine_ptr: u64,
+    first: u8,
+    last: u8,
+    overwrite: u8,
+    grid_share: Option<SortGridEvenShare>,
+    stream: hipStream_t,
+    grid_dim_x: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+}
+
+static PENDING_SORT_REPLAY_CAPTURE: Mutex<Option<PendingSortReplayCapture>> = Mutex::new(None);
+
+fn sort_pass_queue_slot_offset(slot: usize) -> Option<usize> {
+    SORT_PASS_QUEUE_SLOT_OFFSETS.get(slot).copied()
+}
 
 unsafe fn sort_pass_tracker_init(state: &mut Option<SortPassTracker>) {
     if state.is_some() {
@@ -4218,11 +5350,14 @@ unsafe fn capture_sort_downsweep_safe(
         std::sync::atomic::AtomicBool::new(false);
     static GOOD_FALLBACK_CAPTURED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static GOOD_LATE_4688_CAPTURED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     if let Some(kind) = good_capture_kind {
         let path = good_sort_replay_capture_path(kind, begin_bit, n_items, pass_n);
         let captured = match kind {
             GoodSortReplayCaptureKind::TargetBit0N8109 => &GOOD_TARGET_CAPTURED,
             GoodSortReplayCaptureKind::FallbackBit0LargeClean => &GOOD_FALLBACK_CAPTURED,
+            GoodSortReplayCaptureKind::LateBit16N4688Clean => &GOOD_LATE_4688_CAPTURED,
         };
         if let Some(capture_line) = write_good_sort_replay_capture_once(
             captured,
@@ -4714,6 +5849,7 @@ unsafe impl Send for CreateGridValidator {}
 unsafe impl Sync for CreateGridValidator {}
 
 static CREATEGRID_VALIDATOR: Mutex<Option<CreateGridValidator>> = Mutex::new(None);
+static CREATECELL_SNAPSHOT_VALIDATOR: Mutex<Option<CreateGridValidator>> = Mutex::new(None);
 
 unsafe fn createGrid_validator_init(state: &mut Option<CreateGridValidator>) {
     if state.is_some() {
@@ -5416,10 +6552,10 @@ unsafe fn scan_ms4_shape_idx(
 // struct. Does NOT yet follow the GPU pointers — that's V2.
 //
 // Gated on `ZLUDA_TFS_CAPTURE=1`. Off by default. The capture ring is a
-// 64-slot pinned host-mapped buffer dumped from the SIGABRT handler to
+// 256-slot pinned host-mapped buffer dumped from the SIGABRT handler to
 // `/tmp/tfs_captures.bin` (same dump pattern as MS_4 / MS_2_Batched / MS_3).
 
-const TFS_CAPTURE_SLOTS: usize = 64;
+const TFS_CAPTURE_SLOTS: usize = 256;
 const TFS_DESC_BYTES: usize = 456;
 const TFS_KERNEL_NAME_BYTES: usize = 64;
 const TFS_RAW_ARGS_BYTES: usize = 512; // covers struct + scalar args + extras
@@ -5442,11 +6578,11 @@ struct TfsCaptureSlot {
     raw_args_len: u32,                        // 52 — actual bytes captured
     kernel_name: [u8; TFS_KERNEL_NAME_BYTES], // 56 — null-padded ASCII
     raw_args: [u8; TFS_RAW_ARGS_BYTES],       // 120 — kernel arg flat buffer dump
-    _pad: [u8; 8],                            // 632 — round to 640
+    arg_meta: [u8; 8],                        // 632 — launch encoding flags
 }
 
-// Kernel IDs (compact identifier for which TurbulenceFS kernel — used by
-// the post-mortem analyzer to find the right replay slot configuration).
+// Kernel IDs (compact identifier for which captured downstream kernel — used
+// by the post-mortem analyzer to find the right replay slot configuration).
 const TFS_KERNEL_ID_OTHER: u32 = 0; // any TFS_* not specifically known
 const TFS_KERNEL_ID_CLEAR: u32 = 1;
 const TFS_KERNEL_ID_ADVECT: u32 = 2;
@@ -5457,10 +6593,29 @@ const TFS_KERNEL_ID_MIGRATE: u32 = 6;
 const TFS_KERNEL_ID_COUPLE_FROM_PARTICLES: u32 = 7;
 const TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX: u32 = 8;
 const TFS_KERNEL_ID_PARTICLE_DENSITY_SMOOTH: u32 = 9;
+const TFS_KERNEL_ID_INIT_COLL_DATA_AND_APPLY_CONSTRAINTS: u32 = 10;
+const TFS_KERNEL_ID_FINALIZE_COLLISION: u32 = 11;
+const TFS_KERNEL_ID_PARTICLE_COLLISION_STATIC_BOX: u32 = 12;
+const TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS1: u32 = 13;
+const TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED: u32 = 14;
+const TFS_KERNEL_ID_FIELD_SAMPLER_POINTS: u32 = 15;
+const TFS_KERNEL_ID_IOFX_ACTOR_RANGE: u32 = 16;
 
 fn classify_tfs_kernel(name: &str) -> Option<u32> {
     if !name.starts_with("TurbulenceFS_") {
-        return None;
+        return Some(match name {
+            "InitCollDataAndApplyConstraints" => TFS_KERNEL_ID_INIT_COLL_DATA_AND_APPLY_CONSTRAINTS,
+            "FinalizeCollision" => TFS_KERNEL_ID_FINALIZE_COLLISION,
+            "ParticleCollisionStaticBox" => TFS_KERNEL_ID_PARTICLE_COLLISION_STATIC_BOX,
+            "CreateParticleShapesIncremental_MultiStage_1" => {
+                TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS1
+            }
+            "CreateParticleShapesIncremental_MultiStage_2_Batched" => {
+                TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED
+            }
+            "IOFX_actorRangeKernel" => TFS_KERNEL_ID_IOFX_ACTOR_RANGE,
+            _ => return None,
+        });
     }
     let id = if name.contains("ClearKernel") {
         TFS_KERNEL_ID_CLEAR
@@ -5480,6 +6635,8 @@ fn classify_tfs_kernel(name: &str) -> Option<u32> {
         TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX
     } else if name.contains("ParticleDensitySmooth") {
         TFS_KERNEL_ID_PARTICLE_DENSITY_SMOOTH
+    } else if name.contains("fieldSamplerPointsKernel") {
+        TFS_KERNEL_ID_FIELD_SAMPLER_POINTS
     } else {
         TFS_KERNEL_ID_OTHER
     };
@@ -5501,9 +6658,331 @@ pub(crate) static TFS_CAPTURE_HOST_PTR: std::sync::atomic::AtomicUsize =
 pub(crate) static TFS_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+const IOFX_CAPTURE_SLOTS: usize = 16;
+const IOFX_ACTOR_RANGE_MAX_COUNT: usize = 8192;
+const IOFX_ACTOR_RANGE_INPUT_BYTES: usize = IOFX_ACTOR_RANGE_MAX_COUNT * 4;
+
+#[repr(C)]
+struct IofxActorRangeCaptureSlot {
+    magic: u64,                         // 0: "IOFXCAPT"
+    launch_n: u64,                      // 8
+    timestamp_ms: u64,                  // 16
+    grid_x: u32,                        // 24
+    block_x: u32,                       // 28
+    count: u32,                         // 32: param 322
+    input_bytes: u32,                   // 36
+    input_ptr_324: u64,                 // 40: read-only input array
+    output_ptr_326: u64,                // 48: write-only output array
+    output_ptr_327: u64,                // 56: write-only output array
+    output_ptr_328: u64,                // 64: write-only output array
+    input_ptr_329: u64,                 // 72: read-only input array
+    raw_args_len: u32,                  // 80
+    shared_mem_bytes: u32,              // 84
+    arg_meta: [u8; 8],                  // 88
+    _pad1: [u8; 32],                    // 96
+    raw_args: [u8; TFS_RAW_ARGS_BYTES], // 128
+    input_324: [u8; IOFX_ACTOR_RANGE_INPUT_BYTES],
+    input_329: [u8; IOFX_ACTOR_RANGE_INPUT_BYTES],
+    output_326: [u8; IOFX_ACTOR_RANGE_INPUT_BYTES],
+    output_327: [u8; IOFX_ACTOR_RANGE_INPUT_BYTES],
+    output_328: [u8; IOFX_ACTOR_RANGE_INPUT_BYTES],
+    pre_output_326: [u8; IOFX_ACTOR_RANGE_INPUT_BYTES],
+    pre_output_327: [u8; IOFX_ACTOR_RANGE_INPUT_BYTES],
+    pre_output_328: [u8; IOFX_ACTOR_RANGE_INPUT_BYTES],
+}
+
+const IOFX_ACTOR_RANGE_CAPTURE_MAGIC: u64 = 0x494f4658_43415054; // "IOFXCAPT"
+const IOFX_ACTOR_RANGE_SLOT_SIZE: usize = std::mem::size_of::<IofxActorRangeCaptureSlot>();
+const IOFX_ACTOR_RANGE_RAW_ARGS_OFF: usize = 128;
+const IOFX_ACTOR_RANGE_INPUT_324_OFF: usize = IOFX_ACTOR_RANGE_RAW_ARGS_OFF + TFS_RAW_ARGS_BYTES;
+const IOFX_ACTOR_RANGE_INPUT_329_OFF: usize =
+    IOFX_ACTOR_RANGE_INPUT_324_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES;
+const IOFX_ACTOR_RANGE_OUTPUT_326_OFF: usize =
+    IOFX_ACTOR_RANGE_INPUT_329_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES;
+const IOFX_ACTOR_RANGE_OUTPUT_327_OFF: usize =
+    IOFX_ACTOR_RANGE_OUTPUT_326_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES;
+const IOFX_ACTOR_RANGE_OUTPUT_328_OFF: usize =
+    IOFX_ACTOR_RANGE_OUTPUT_327_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES;
+const IOFX_ACTOR_RANGE_PRE_OUTPUT_326_OFF: usize =
+    IOFX_ACTOR_RANGE_OUTPUT_328_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES;
+const IOFX_ACTOR_RANGE_PRE_OUTPUT_327_OFF: usize =
+    IOFX_ACTOR_RANGE_PRE_OUTPUT_326_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES;
+const IOFX_ACTOR_RANGE_PRE_OUTPUT_328_OFF: usize =
+    IOFX_ACTOR_RANGE_PRE_OUTPUT_327_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES;
+const IOFX_ACTOR_RANGE_CAPTURE_TOTAL_SIZE: usize = IOFX_ACTOR_RANGE_SLOT_SIZE * IOFX_CAPTURE_SLOTS;
+
+struct IofxActorRangeCaptureState {
+    host_ptr: *mut u8,
+    dev_ptr: *mut std::ffi::c_void,
+    launch_counter: u64,
+}
+unsafe impl Send for IofxActorRangeCaptureState {}
+unsafe impl Sync for IofxActorRangeCaptureState {}
+
+static IOFX_ACTOR_RANGE_CAPTURE: Mutex<Option<IofxActorRangeCaptureState>> = Mutex::new(None);
+
+pub(crate) static IOFX_ACTOR_RANGE_CAPTURE_HOST_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static IOFX_ACTOR_RANGE_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IofxActorRangeArgs {
+    count: u32,
+    input_ptr_324: u64,
+    output_ptr_326: u64,
+    output_ptr_327: u64,
+    output_ptr_328: u64,
+    input_ptr_329: u64,
+}
+
 fn tfs_capture_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_TFS_CAPTURE").map_or(false, |v| v == "1"))
+}
+
+fn iofx_actor_range_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_IOFX_CAPTURE").map_or(false, |v| v == "1"))
+}
+
+unsafe fn iofx_actor_range_capture_init(state: &mut Option<IofxActorRangeCaptureState>) {
+    if state.is_some() {
+        return;
+    }
+    let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let alloc_result = unsafe {
+        hipHostMalloc(
+            &mut host_ptr,
+            IOFX_ACTOR_RANGE_CAPTURE_TOTAL_SIZE,
+            hipHostMallocMapped,
+        )
+    };
+    if alloc_result.is_err() || host_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] IOFX capture: hipHostMalloc({}) failed: {:?}",
+            IOFX_ACTOR_RANGE_CAPTURE_TOTAL_SIZE, alloc_result
+        ));
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, IOFX_ACTOR_RANGE_CAPTURE_TOTAL_SIZE);
+    }
+    let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
+    if map_result.is_err() || dev_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] IOFX capture: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] IOFX capture: {} slots × {} KB = {} KB pinned; host=0x{:x} dev=0x{:x}",
+        IOFX_CAPTURE_SLOTS,
+        IOFX_ACTOR_RANGE_SLOT_SIZE / 1024,
+        IOFX_ACTOR_RANGE_CAPTURE_TOTAL_SIZE / 1024,
+        host_ptr as usize,
+        dev_ptr as usize,
+    ));
+    IOFX_ACTOR_RANGE_CAPTURE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::SeqCst);
+    IOFX_ACTOR_RANGE_CAPTURE_TOTAL_BYTES.store(
+        IOFX_ACTOR_RANGE_CAPTURE_TOTAL_SIZE,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    *state = Some(IofxActorRangeCaptureState {
+        host_ptr: host_ptr as *mut u8,
+        dev_ptr,
+        launch_counter: 0,
+    });
+}
+
+unsafe fn read_iofx_actor_range_args(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> Option<IofxActorRangeArgs> {
+    let count: u32 = unsafe { read_kernel_arg(kernel_params, extra, 12, 2) }?;
+    let input_ptr_324: u64 = unsafe { read_kernel_arg(kernel_params, extra, 24, 4) }?;
+    let output_ptr_326: u64 = unsafe { read_kernel_arg(kernel_params, extra, 40, 6) }?;
+    let output_ptr_327: u64 = unsafe { read_kernel_arg(kernel_params, extra, 48, 7) }?;
+    let output_ptr_328: u64 = unsafe { read_kernel_arg(kernel_params, extra, 56, 8) }?;
+    let input_ptr_329: u64 = unsafe { read_kernel_arg(kernel_params, extra, 64, 9) }?;
+    if count == 0
+        || count as usize > IOFX_ACTOR_RANGE_MAX_COUNT
+        || input_ptr_324 == 0
+        || output_ptr_326 == 0
+        || output_ptr_327 == 0
+        || output_ptr_328 == 0
+        || input_ptr_329 == 0
+    {
+        return None;
+    }
+    Some(IofxActorRangeArgs {
+        count,
+        input_ptr_324,
+        output_ptr_326,
+        output_ptr_327,
+        output_ptr_328,
+        input_ptr_329,
+    })
+}
+
+fn iofx_actor_range_output_copy_bytes(
+    output_ptr_326: u64,
+    output_ptr_327: u64,
+    output_ptr_328: u64,
+    input_bytes: usize,
+) -> usize {
+    let mut min_gap = u64::MAX;
+    for lhs in [output_ptr_326, output_ptr_327, output_ptr_328] {
+        for rhs in [output_ptr_326, output_ptr_327, output_ptr_328] {
+            if rhs > lhs {
+                min_gap = min_gap.min(rhs - lhs);
+            }
+        }
+    }
+    if min_gap == u64::MAX {
+        input_bytes
+    } else {
+        input_bytes.min(min_gap as usize)
+    }
+}
+
+unsafe fn capture_iofx_actor_range_inputs(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    grid_x: u32,
+    block_x: u32,
+    shared_mem_bytes: u32,
+) -> Option<usize> {
+    if !iofx_actor_range_capture_enabled() {
+        return None;
+    }
+    let args = match unsafe { read_iofx_actor_range_args(kernel_params, extra) } {
+        Some(args) => args,
+        None => return None,
+    };
+
+    let mut guard = match IOFX_ACTOR_RANGE_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    unsafe { iofx_actor_range_capture_init(&mut guard) };
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let this_launch = state.launch_counter;
+    state.launch_counter += 1;
+    let slot_index = (this_launch as usize) % IOFX_CAPTURE_SLOTS;
+    let slot_host = state.host_ptr.add(slot_index * IOFX_ACTOR_RANGE_SLOT_SIZE)
+        as *mut IofxActorRangeCaptureSlot;
+    let slot_dev_base =
+        (state.dev_ptr as usize + slot_index * IOFX_ACTOR_RANGE_SLOT_SIZE) as *mut u8;
+    std::ptr::write_bytes(slot_host as *mut u8, 0, IOFX_ACTOR_RANGE_SLOT_SIZE);
+    (*slot_host).magic = IOFX_ACTOR_RANGE_CAPTURE_MAGIC;
+    (*slot_host).launch_n = this_launch;
+    (*slot_host).timestamp_ms = crate::elapsed_ms();
+    (*slot_host).grid_x = grid_x;
+    (*slot_host).block_x = block_x;
+    (*slot_host).count = args.count;
+    (*slot_host).input_bytes = (args.count as usize * 4).min(IOFX_ACTOR_RANGE_INPUT_BYTES) as u32;
+    (*slot_host).input_ptr_324 = args.input_ptr_324;
+    (*slot_host).output_ptr_326 = args.output_ptr_326;
+    (*slot_host).output_ptr_327 = args.output_ptr_327;
+    (*slot_host).output_ptr_328 = args.output_ptr_328;
+    (*slot_host).input_ptr_329 = args.input_ptr_329;
+    (*slot_host).shared_mem_bytes = shared_mem_bytes;
+    (*slot_host).arg_meta = encode_launch_arg_meta(kernel_params, extra);
+    let raw_dst = (*slot_host).raw_args.as_mut_ptr();
+    let raw_len = dump_kernel_args_raw(kernel_params, extra, raw_dst, TFS_RAW_ARGS_BYTES);
+    (*slot_host).raw_args_len = raw_len as u32;
+
+    let input_bytes = (*slot_host).input_bytes as usize;
+    let _ = hipMemcpyDtoD(
+        hipDeviceptr_t(slot_dev_base.add(IOFX_ACTOR_RANGE_INPUT_324_OFF) as _),
+        hipDeviceptr_t(args.input_ptr_324 as _),
+        input_bytes,
+    );
+    let _ = hipMemcpyDtoD(
+        hipDeviceptr_t(slot_dev_base.add(IOFX_ACTOR_RANGE_INPUT_329_OFF) as _),
+        hipDeviceptr_t(args.input_ptr_329 as _),
+        input_bytes,
+    );
+    Some(slot_index)
+}
+
+unsafe fn capture_iofx_actor_range_outputs(
+    slot_index: usize,
+    stream: hipStream_t,
+    prelaunch: bool,
+) {
+    if !iofx_actor_range_capture_enabled() {
+        return;
+    }
+
+    let guard = match IOFX_ACTOR_RANGE_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let slot_host = state.host_ptr.add(slot_index * IOFX_ACTOR_RANGE_SLOT_SIZE)
+        as *const IofxActorRangeCaptureSlot;
+    let slot_dev_base =
+        (state.dev_ptr as usize + slot_index * IOFX_ACTOR_RANGE_SLOT_SIZE) as *mut u8;
+    let output_bytes = iofx_actor_range_output_copy_bytes(
+        (*slot_host).output_ptr_326,
+        (*slot_host).output_ptr_327,
+        (*slot_host).output_ptr_328,
+        (*slot_host).input_bytes as usize,
+    );
+    if output_bytes == 0 {
+        return;
+    }
+    let dst_offsets = if prelaunch {
+        [
+            IOFX_ACTOR_RANGE_PRE_OUTPUT_326_OFF,
+            IOFX_ACTOR_RANGE_PRE_OUTPUT_327_OFF,
+            IOFX_ACTOR_RANGE_PRE_OUTPUT_328_OFF,
+        ]
+    } else {
+        [
+            IOFX_ACTOR_RANGE_OUTPUT_326_OFF,
+            IOFX_ACTOR_RANGE_OUTPUT_327_OFF,
+            IOFX_ACTOR_RANGE_OUTPUT_328_OFF,
+        ]
+    };
+    for (src_ptr, dst_off) in [
+        ((*slot_host).output_ptr_326, dst_offsets[0]),
+        ((*slot_host).output_ptr_327, dst_offsets[1]),
+        ((*slot_host).output_ptr_328, dst_offsets[2]),
+    ] {
+        if src_ptr == 0 {
+            continue;
+        }
+        let _ = hipMemcpyDtoDAsync(
+            hipDeviceptr_t(slot_dev_base.add(dst_off) as _),
+            hipDeviceptr_t(src_ptr as _),
+            output_bytes,
+            stream,
+        );
+    }
+}
+
+unsafe fn capture_iofx_actor_range_pre(slot_index: usize, stream: hipStream_t) {
+    unsafe { capture_iofx_actor_range_outputs(slot_index, stream, true) };
+}
+
+unsafe fn capture_iofx_actor_range_post(slot_index: usize, stream: hipStream_t) {
+    unsafe { capture_iofx_actor_range_outputs(slot_index, stream, false) };
 }
 
 unsafe fn tfs_capture_init(state: &mut Option<TfsCaptureState>) {
@@ -5587,31 +7066,107 @@ unsafe fn dump_kernel_args_raw(
                 return read_len;
             }
         }
-        return 0;
     }
     if !kernel_params.is_null() {
-        // Pack args sequentially into dst. We don't know exact arg sizes
-        // from kernel_params alone, so we copy 8 bytes per arg index up to
-        // 16 indices (= 128 bytes max). This is enough for scalar args;
-        // the 456-byte struct itself is pointed at by one of the entries
-        // and would need separate handling. For TurbulenceFS launches that
-        // PhysX makes via cuLaunchKernel (which uses extra/flat-buffer),
-        // we should rarely hit this branch.
-        let mut written = 0usize;
-        for i in 0..16 {
-            if written + 8 > max_len {
-                break;
-            }
+        // Pack up to 16 arg slots sequentially into dst, 8 bytes per slot.
+        // Null entries are recorded as zero-filled 8-byte holes instead of
+        // terminating the dump, because some PhysX launches leave early slots
+        // null while still passing meaningful later arguments (for example the
+        // adjacent CreateParticleShapesIncremental_MultiStage_2_Batched crash
+        // window we now capture).
+        let slot_count = (max_len / 8).min(16);
+        for i in 0..slot_count {
+            let dst_slot = dst.add(i * 8);
+            std::ptr::write_bytes(dst_slot, 0, 8);
             let p = *kernel_params.add(i);
-            if p.is_null() {
-                break;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(p as *const u8, dst_slot, 8);
             }
-            std::ptr::copy_nonoverlapping(p as *const u8, dst.add(written), 8);
-            written += 8;
         }
-        return written;
+        return slot_count * 8;
     }
     0
+}
+
+unsafe fn dump_kernel_param_ptrs(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    dst: *mut u8,
+    max_len: usize,
+) -> usize {
+    if kernel_params.is_null() {
+        return 0;
+    }
+    let slot_count = (max_len / 8).min(16);
+    for i in 0..slot_count {
+        let dst_slot = dst.add(i * 8) as *mut u64;
+        std::ptr::write_unaligned(dst_slot, (*kernel_params.add(i)) as usize as u64);
+    }
+    slot_count * 8
+}
+
+unsafe fn summarize_launch_arg_encoding(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> String {
+    let mut summary = String::new();
+    let extra_flat = if extra.is_null() {
+        false
+    } else {
+        let extra_arr = std::slice::from_raw_parts(extra, 5);
+        extra_arr[0] == (0x1usize as *mut ::core::ffi::c_void)
+            && extra_arr[2] == (0x2usize as *mut ::core::ffi::c_void)
+    };
+    let _ = write!(
+        &mut summary,
+        "extra_null={} extra_flat={} kernel_params_null={}",
+        extra.is_null(),
+        extra_flat,
+        kernel_params.is_null()
+    );
+    if !extra.is_null() {
+        let extra_arr = std::slice::from_raw_parts(extra, 5);
+        let _ = write!(&mut summary, " extra=[");
+        for (i, ptr) in extra_arr.iter().enumerate() {
+            if i > 0 {
+                summary.push_str(", ");
+            }
+            let _ = write!(&mut summary, "{}:0x{:x}", i, *ptr as usize);
+        }
+        summary.push(']');
+    }
+    summary
+}
+
+unsafe fn encode_launch_arg_meta(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> [u8; 8] {
+    let mut meta = [0u8; 8];
+    meta[0] = extra.is_null() as u8;
+    meta[1] = kernel_params.is_null() as u8;
+    if !extra.is_null() {
+        let extra_arr = std::slice::from_raw_parts(extra, 5);
+        meta[2] = (extra_arr[0] == (0x1usize as *mut ::core::ffi::c_void)) as u8;
+        meta[3] = (extra_arr[2] == (0x2usize as *mut ::core::ffi::c_void)) as u8;
+        meta[4] = extra_arr[1].is_null() as u8;
+        meta[5] = extra_arr[3].is_null() as u8;
+    }
+    meta
+}
+
+fn should_skip_tfs_raw_arg_dump(name: &str) -> bool {
+    matches!(
+        name,
+        "CreateParticleShapesIncremental_MultiStage_1"
+            | "CreateParticleShapesIncremental_MultiStage_2_Batched"
+            | "InitCollDataAndApplyConstraints"
+            | "FinalizeCollision"
+            | "ParticleCollisionStaticBox"
+    )
+}
+
+fn should_capture_ms2b(name: &str, grid_x: u32) -> bool {
+    name == "CreateParticleShapesIncremental_MultiStage_2_Batched" && grid_x >= 3
 }
 
 /// Capture a TurbulenceFS kernel launch into the ring buffer. Called from
@@ -5671,6 +7226,17 @@ unsafe fn capture_tfs_launch(
         (*slot_ptr).kernel_name.as_mut_ptr(),
         copy_len,
     );
+
+    (*slot_ptr).arg_meta = encode_launch_arg_meta(kernel_params, extra);
+
+    if should_skip_tfs_raw_arg_dump(name) {
+        (*slot_ptr).raw_args_len = dump_kernel_param_ptrs(
+            kernel_params,
+            (*slot_ptr).raw_args.as_mut_ptr(),
+            TFS_RAW_ARGS_BYTES,
+        ) as u32;
+        return;
+    }
 
     // Dump the raw kernel argument bytes.
     let raw_dst = (*slot_ptr).raw_args.as_mut_ptr();
@@ -5778,6 +7344,12 @@ struct SortDownsweepLaunchArgs {
     grid_share: SortGridEvenShare,
 }
 
+#[derive(Clone, Copy)]
+struct CreateCellIndicesSnapshotArgs {
+    n_items: usize,
+    hash_out: u64,
+}
+
 unsafe fn read_sort_downsweep_launch_args(
     extra: *mut *mut ::core::ffi::c_void,
 ) -> Option<SortDownsweepLaunchArgs> {
@@ -5804,6 +7376,18 @@ unsafe fn read_sort_downsweep_launch_args(
             std::ptr::read_unaligned(buf.add(52 + idx * 4) as *const i32)
         })),
     })
+}
+
+unsafe fn read_createcell_snapshot_args(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> Option<CreateCellIndicesSnapshotArgs> {
+    let n_items = read_kernel_arg::<u32>(kernel_params, extra, 0, 0)? as usize;
+    let hash_out = read_kernel_arg::<u64>(kernel_params, extra, 24, 3)?;
+    if n_items == 0 || hash_out == 0 {
+        return None;
+    }
+    Some(CreateCellIndicesSnapshotArgs { n_items, hash_out })
 }
 
 unsafe fn snapshot_sort_downsweep_prelaunch_state(
@@ -6166,11 +7750,13 @@ pub(crate) fn launch_kernel(
             }
         }
     }
-    // TurbulenceFS launch capture (ZLUDA_TFS_CAPTURE=1) — host-side dump
-    // of the kernel argument flat buffer (incl. the 456-byte DynamicGrid
-    // descriptor struct) for any TurbulenceFS_* kernel. Cheap (no GPU
-    // ops, no sync). Captures into a 64-slot pinned ring dumped from the
-    // SIGABRT handler to /tmp/tfs_captures.bin for post-mortem replay.
+    // TurbulenceFS / adjacent-physics launch capture (ZLUDA_TFS_CAPTURE=1) —
+    // host-side dump of the kernel argument flat buffer (incl. the 456-byte
+    // DynamicGrid descriptor struct when present) for any TurbulenceFS_* kernel
+    // plus the nearby non-TurbulenceFS collision/particle-shape kernels that
+    // keep appearing in the same early-SIGSEGV window. Cheap (no GPU ops, no
+    // sync). Captures into a 64-slot pinned ring dumped from the SIGABRT
+    // handler to /tmp/tfs_captures.bin for post-mortem replay.
     if let Some(tfs_kernel_id) = classify_tfs_kernel(&name) {
         unsafe {
             capture_tfs_launch(
@@ -6187,10 +7773,24 @@ pub(crate) fn launch_kernel(
             );
         }
     }
+    let iofx_actor_range_slot = if name == "IOFX_actorRangeKernel" {
+        unsafe {
+            capture_iofx_actor_range_inputs(
+                kernel_params,
+                extra,
+                grid_dim_x,
+                block_dim_x,
+                shared_mem_bytes,
+            )
+        }
+    } else {
+        None
+    };
     if creategrid_safe_validator_enabled() {
         unsafe {
             maybe_capture_creategrid_sort_buffer_touch(
                 &name,
+                kernel_params,
                 extra,
                 shared_mem_bytes,
                 stream,
@@ -6208,6 +7808,74 @@ pub(crate) fn launch_kernel(
         let sorted_keys: u64 = unsafe { read_kernel_arg(kernel_params, extra, 8, 1).unwrap_or(0) };
         if n > 0 && sorted_keys != 0 {
             note_creategrid_sorted_keys(sorted_keys, n as usize);
+            let touch_start = creategrid_sort_touch_log_start();
+            let snapshot_start = creategrid_snapshot_log_start();
+            let call_n = if touch_start.is_some() || snapshot_start.is_some() {
+                Some(CREATEGRID_LOG_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            } else {
+                None
+            };
+            if let (Some(start_call), Some(call_n)) = (touch_start, call_n) {
+                if call_n >= start_call {
+                    let refs = unsafe {
+                        collect_creategrid_sort_refs_for_launch(
+                            sorted_keys,
+                            n as usize,
+                            kernel_params,
+                            extra,
+                        )
+                    };
+                    if refs.is_empty() {
+                        super::driver::zluda_log_err(&format!(
+                            "    SORT_TOUCH_DIRECT creategrid#{} grid=[{},{},{}] block=[{},{},{}] shared={} stream={:?} refs=[] sk=0x{:x} n={}",
+                            call_n,
+                            grid_dim_x,
+                            grid_dim_y,
+                            grid_dim_z,
+                            block_dim_x,
+                            block_dim_y,
+                            block_dim_z,
+                            shared_mem_bytes,
+                            stream,
+                            sorted_keys,
+                            n
+                        ));
+                    } else {
+                        super::driver::zluda_log_err(&format!(
+                            "    SORT_TOUCH_DIRECT creategrid#{} grid=[{},{},{}] block=[{},{},{}] shared={} stream={:?} refs=[{}]",
+                            call_n,
+                            grid_dim_x,
+                            grid_dim_y,
+                            grid_dim_z,
+                            block_dim_x,
+                            block_dim_y,
+                            block_dim_z,
+                            shared_mem_bytes,
+                            stream,
+                            format_creategrid_sort_touch_refs(&refs)
+                        ));
+                    }
+                }
+            }
+            if let (Some(start_call), Some(call_n)) = (snapshot_start, call_n) {
+                if call_n >= start_call {
+                    unsafe {
+                        log_creategrid_snapshot_direct(
+                            call_n,
+                            n as usize,
+                            sorted_keys,
+                            stream,
+                            grid_dim_x,
+                            grid_dim_y,
+                            grid_dim_z,
+                            block_dim_x,
+                            block_dim_y,
+                            block_dim_z,
+                            shared_mem_bytes,
+                        );
+                    }
+                }
+            }
         }
         if creategrid_safe_validator_enabled() {
             unsafe {
@@ -6221,8 +7889,11 @@ pub(crate) fn launch_kernel(
     // pre vs post and reveal whether MS_2_Batched is what turns counter[0..7]
     // from `[19,39,16,22,2,10,8,7]` into `[-2,-2,-2,-2,-2,-2,-2,-2]`.
     // Returns the slot index to thread into the post-capture.
-    // MS_2B capture — disabled (does D2D)
-    let ms2b_slot: Option<usize> = None;
+    let ms2b_slot = if should_capture_ms2b(&name, grid_dim_x) {
+        unsafe { capture_ms2b_inputs(kernel_params, extra, grid_dim_x, block_dim_x) }
+    } else {
+        None
+    };
     // MS_3 pre-capture — snapshot every tracked counter pointer BEFORE the
     // kernel runs, so the post-capture below can diff the two and reveal
     // whether MS_3 is what turns counter[0] from its MS_2_Batched value into
@@ -6278,12 +7949,21 @@ pub(crate) fn launch_kernel(
     // The guard holds a lock to prevent other threads from submitting work between
     // our sync and our launch. Dropped after hipModuleLaunchKernel returns.
     let _null_stream_guard = super::stream::null_stream_sync(stream);
-    let sort_downsweep_args = if creategrid_safe_validator_enabled()
+    let sort_downsweep_args = if (creategrid_safe_validator_enabled()
+        || creategrid_snapshot_log_start().is_some())
         && name.contains("RadixSortDownsweepKernel")
         && !extra.is_null()
         && stream.0.is_null()
     {
         unsafe { read_sort_downsweep_launch_args(extra) }
+    } else {
+        None
+    };
+    let createcell_snapshot_args = if createcell_snapshot_log_start().is_some()
+        && creategrid_snapshot_log_start().is_some()
+        && name.contains("CreateCellIndices")
+    {
+        unsafe { read_createcell_snapshot_args(kernel_params, extra) }
     } else {
         None
     };
@@ -6304,6 +7984,30 @@ pub(crate) fn launch_kernel(
                 args.keys_out,
                 args.vals_out,
             );
+            let capture_begin_bit = sort_replay_capture_begin_bit();
+            let creategrid_call_n = CREATEGRID_LOG_CALL_N.load(std::sync::atomic::Ordering::Relaxed);
+            let start_call = creategrid_snapshot_log_start();
+            if should_queue_sort_replay_capture(
+                args.begin_bit,
+                creategrid_call_n,
+                start_call,
+                capture_begin_bit,
+            ) {
+                queue_sort_downsweep_replay_capture_prelaunch(
+                    args,
+                    stream,
+                    grid_dim_x,
+                    block_dim_x,
+                    block_dim_y,
+                    block_dim_z,
+                    shared_mem_bytes,
+                );
+            }
+        }
+    }
+    if let Some(slot_index) = iofx_actor_range_slot {
+        unsafe {
+            capture_iofx_actor_range_pre(slot_index, stream);
         }
     }
 
@@ -6382,27 +8086,89 @@ pub(crate) fn launch_kernel(
         Err(code) if code == hipErrorCode_t::LaunchFailure => hipError_t::ErrorLaunchOutOfResources,
         other => other,
     };
-    if let Some(args) = sort_downsweep_args.filter(|_| result.is_ok()) {
+    if let Some(slot_index) = iofx_actor_range_slot.filter(|_| result.is_ok()) {
         unsafe {
-            capture_sort_downsweep_safe(
-                args.begin_bit,
-                args.n_items,
-                args.keys_in,
-                args.keys_out,
-                args.vals_in,
-                args.vals_out,
-                args.spine_ptr,
-                Some(args.grid_share),
-                grid_dim_x,
-                block_dim_x,
-                block_dim_y,
-                block_dim_z,
-                shared_mem_bytes,
-                args.first,
-                args.last,
-                args.overwrite,
-                stream,
-            );
+            capture_iofx_actor_range_post(slot_index, stream);
+        }
+    }
+    if let Some(args) = createcell_snapshot_args.filter(|_| result.is_ok()) {
+        if let Some(start_call) = createcell_snapshot_log_start() {
+            let call_n =
+                CREATECELL_SNAPSHOT_LOG_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if call_n >= start_call {
+                unsafe {
+                    queue_createcell_snapshot_direct(
+                        call_n,
+                        args.n_items,
+                        args.hash_out,
+                        stream,
+                        grid_dim_x,
+                        grid_dim_y,
+                        grid_dim_z,
+                        block_dim_x,
+                        block_dim_y,
+                        block_dim_z,
+                        shared_mem_bytes,
+                    );
+                }
+            }
+        }
+    }
+    if let Some(args) = sort_downsweep_args.filter(|_| result.is_ok()) {
+        let creategrid_call_n = CREATEGRID_LOG_CALL_N.load(std::sync::atomic::Ordering::Relaxed);
+        let start_call = creategrid_snapshot_log_start();
+        let should_capture_replay = should_queue_sort_replay_capture(
+            args.begin_bit,
+            creategrid_call_n,
+            start_call,
+            sort_replay_capture_begin_bit(),
+        );
+        if start_call.is_some_and(|start| creategrid_call_n >= start) {
+            unsafe {
+                queue_sort_downsweep_snapshot(
+                    args.begin_bit,
+                    args.n_items,
+                    args.keys_in,
+                    args.keys_out,
+                    args.first,
+                    args.last,
+                    args.overwrite,
+                    stream,
+                    grid_dim_x,
+                    block_dim_x,
+                    block_dim_y,
+                    block_dim_z,
+                    shared_mem_bytes,
+                );
+                if should_capture_replay {
+                    queue_sort_downsweep_replay_capture_postlaunch(args, stream);
+                }
+            }
+        }
+    }
+    if creategrid_safe_validator_enabled() {
+        if let Some(args) = sort_downsweep_args.filter(|_| result.is_ok()) {
+            unsafe {
+                capture_sort_downsweep_safe(
+                    args.begin_bit,
+                    args.n_items,
+                    args.keys_in,
+                    args.keys_out,
+                    args.vals_in,
+                    args.vals_out,
+                    args.spine_ptr,
+                    Some(args.grid_share),
+                    grid_dim_x,
+                    block_dim_x,
+                    block_dim_y,
+                    block_dim_z,
+                    shared_mem_bytes,
+                    args.first,
+                    args.last,
+                    args.overwrite,
+                    stream,
+                );
+            }
         }
     }
     // Spine readback removed — hipMemcpyDtoH triggers ProfilingSignal race.
@@ -7648,6 +9414,16 @@ mod tests {
     }
 
     #[test]
+    fn summarize_key_domain_detects_bad_values_without_sort_requirements() {
+        let summary = summarize_key_domain(&[42, 7, -1, 20_000_001]).unwrap();
+        assert_eq!(summary.min_key, -1);
+        assert_eq!(summary.max_key, 20_000_001);
+        assert_eq!(summary.negative_count, 1);
+        assert_eq!(summary.huge_count, 1);
+        assert_eq!(summary.first_bad_value, Some((2, -1)));
+    }
+
+    #[test]
     fn restore_signed_radix_residue_clears_xor_stuck_negatives() {
         let corrupted = [10, 11, 0x8000_000cu32 as i32, 13];
         let restored = restore_signed_radix_residue(&corrupted);
@@ -7729,6 +9505,31 @@ mod tests {
     }
 
     #[test]
+    fn good_sort_replay_baseline_capture_accepts_clean_late_4688_family() {
+        let summary_out = SortedKeySummary {
+            min_key: 40,
+            max_key: 1_591_577,
+            violations: 56,
+            negative_count: 0,
+            huge_count: 0,
+            first_violation: Some(2477),
+            first_bad_value: None,
+        };
+        let vals_summary = SortValueSummary {
+            negative_count: 0,
+            extra_count: 0,
+            missing_count: 0,
+            first_negative: None,
+            first_extra: None,
+            first_missing: None,
+        };
+        assert_eq!(
+            classify_good_sort_replay_capture(16, 4688, 1, 1, summary_out, Some(vals_summary)),
+            Some(GoodSortReplayCaptureKind::LateBit16N4688Clean)
+        );
+    }
+
+    #[test]
     fn good_sort_replay_baseline_capture_rejects_zero_fill_and_wrong_flags() {
         let clean_out = SortedKeySummary {
             min_key: 0,
@@ -7764,6 +9565,10 @@ mod tests {
             None
         );
         assert_eq!(
+            classify_good_sort_replay_capture(16, 4688, 1, 0, clean_out, Some(clean_vals)),
+            None
+        );
+        assert_eq!(
             classify_good_sort_replay_capture(4, 8109, 0, 0, clean_out, Some(clean_vals)),
             None
         );
@@ -7771,6 +9576,78 @@ mod tests {
             classify_good_sort_replay_capture(0, 877, 0, 0, clean_out, Some(clean_vals)),
             None
         );
+    }
+
+    #[test]
+    fn creategrid_sort_touch_log_start_parser_handles_disable_enable_and_offsets() {
+        assert_eq!(creategrid_sort_touch_log_start_from_value(None), None);
+        assert_eq!(creategrid_sort_touch_log_start_from_value(Some("")), None);
+        assert_eq!(creategrid_sort_touch_log_start_from_value(Some("0")), None);
+        assert_eq!(
+            creategrid_sort_touch_log_start_from_value(Some("1")),
+            Some(0)
+        );
+        assert_eq!(
+            creategrid_sort_touch_log_start_from_value(Some("70")),
+            Some(70)
+        );
+        assert_eq!(
+            creategrid_sort_touch_log_start_from_value(Some("not-a-number")),
+            None
+        );
+    }
+
+    #[test]
+    fn creategrid_snapshot_log_start_parser_reuses_touch_threshold_rules() {
+        assert_eq!(
+            creategrid_sort_touch_log_start_from_value(Some("12")),
+            Some(12)
+        );
+        assert_eq!(
+            creategrid_sort_touch_log_start_from_value(Some(" 5 ")),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn sort_replay_capture_begin_bit_parser_defaults_to_zero() {
+        assert_eq!(
+            std::env::var("ZLUDA_SORT_REPLAY_CAPTURE_BIT").ok(),
+            None,
+            "unit tests assume no capture-bit env override is set"
+        );
+        assert_eq!(sort_replay_capture_begin_bit(), 0);
+    }
+
+    #[test]
+    fn sort_replay_capture_gate_uses_configured_begin_bit() {
+        assert!(should_queue_sort_replay_capture(4, 10, Some(10), 4));
+        assert!(!should_queue_sort_replay_capture(0, 10, Some(10), 4));
+        assert!(!should_queue_sort_replay_capture(4, 9, Some(10), 4));
+        assert!(!should_queue_sort_replay_capture(4, 10, None, 4));
+    }
+
+    #[test]
+    fn read_createcell_snapshot_args_reads_n_and_hash_output_from_extra_buffer() {
+        let n_items = 8_827u32;
+        let hash_out = 0x1234_5678_9abc_def0u64;
+        let mut raw = [0u8; 48];
+        raw[0..4].copy_from_slice(&n_items.to_ne_bytes());
+        raw[24..32].copy_from_slice(&hash_out.to_ne_bytes());
+        let mut raw_len = raw.len();
+        let mut extra = [
+            0x1usize as *mut std::ffi::c_void,
+            raw.as_mut_ptr().cast(),
+            0x2usize as *mut std::ffi::c_void,
+            (&mut raw_len as *mut usize).cast(),
+            std::ptr::null_mut(),
+        ];
+
+        let args =
+            unsafe { read_createcell_snapshot_args(std::ptr::null_mut(), extra.as_mut_ptr()) }
+                .expect("CreateCellIndices args should decode");
+        assert_eq!(args.n_items, n_items as usize);
+        assert_eq!(args.hash_out, hash_out);
     }
 
     #[test]
@@ -8187,6 +10064,13 @@ mod tests {
             capture.capture_text
         );
         assert!(
+            capture
+                .capture_text
+                .contains("DEST_BLOCK_RUNS key_mismatch=1 runs=[1..2] value_mismatch=1 runs=[1..2] neg=1 runs=[1..2]"),
+            "capture should summarize mismatch and negative-key runs inside the destination block: {}",
+            capture.capture_text
+        );
+        assert!(
             capture.capture_text.contains("![1]"),
             "capture should mark the mismatching output slot: {}",
             capture.capture_text
@@ -8279,6 +10163,18 @@ mod tests {
                 .contains("ACTUAL_SOURCE_BLOCK block=0 range=[0..2)"),
             "capture should include the foreign source block when the replay crosses blocks: {}",
             capture.capture_text
+        );
+    }
+
+    #[test]
+    fn contiguous_index_runs_groups_striped_ranges() {
+        assert_eq!(
+            contiguous_index_runs(&[2477, 2478, 2479, 2541, 2542, 2605]),
+            vec![(2477, 2480), (2541, 2543), (2605, 2606)]
+        );
+        assert_eq!(
+            format_index_runs(&[2477, 2478, 2479, 2541, 2542, 2605]),
+            "[2477..2480, 2541..2543, 2605..2606]"
         );
     }
 
@@ -8443,6 +10339,39 @@ mod tests {
     }
 
     #[test]
+    fn locate_creategrid_sort_buffer_hit_tracks_in_range_offsets() {
+        let sorted_keys = 0x3000_u64;
+        let n = 64usize;
+        assert_eq!(
+            locate_creategrid_sort_buffer_hit(sorted_keys, n, sorted_keys),
+            Some(CreateGridSortBufferHit {
+                role: CreateGridSortBufferRole::CreateGridInput,
+                byte_offset: 0,
+            })
+        );
+        assert_eq!(
+            locate_creategrid_sort_buffer_hit(sorted_keys, n, sorted_keys + 0x1c),
+            Some(CreateGridSortBufferHit {
+                role: CreateGridSortBufferRole::CreateGridInput,
+                byte_offset: 0x1c,
+            })
+        );
+        let copy_src = sorted_keys + (n * 4) as u64;
+        assert_eq!(
+            locate_creategrid_sort_buffer_hit(sorted_keys, n, copy_src + 0x20),
+            Some(CreateGridSortBufferHit {
+                role: CreateGridSortBufferRole::CopySource,
+                byte_offset: 0x20,
+            })
+        );
+        assert_eq!(
+            locate_creategrid_sort_buffer_hit(sorted_keys, n, copy_src + (n * 4) as u64),
+            None,
+            "the range end must stay exclusive"
+        );
+    }
+
+    #[test]
     fn scan_launch_extra_for_creategrid_sort_refs_finds_both_roles() {
         let sorted_keys = 0x4000_u64;
         let n = 64usize;
@@ -8455,14 +10384,16 @@ mod tests {
             refs,
             vec![
                 CreateGridSortTouchArg {
-                    extra_offset: 8,
+                    location: CreateGridSortTouchArgLocation::ExtraOffset(8),
                     buffer: sorted_keys,
                     role: CreateGridSortBufferRole::CreateGridInput,
+                    byte_offset: 0,
                 },
                 CreateGridSortTouchArg {
-                    extra_offset: 24,
+                    location: CreateGridSortTouchArgLocation::ExtraOffset(24),
                     buffer: copy_src,
                     role: CreateGridSortBufferRole::CopySource,
+                    byte_offset: 0,
                 },
             ]
         );
@@ -8473,9 +10404,435 @@ mod tests {
         let sorted_keys = 0x5000_u64;
         let n = 32usize;
         let mut extra = vec![0u8; 32];
-        extra[0..8].copy_from_slice(&(sorted_keys + 4).to_le_bytes());
-        extra[8..16].copy_from_slice(&(sorted_keys + 8).to_le_bytes());
+        extra[0..8].copy_from_slice(&(sorted_keys - 8).to_le_bytes());
+        extra[8..16].copy_from_slice(&(sorted_keys + (n * 8) as u64).to_le_bytes());
         assert!(scan_launch_extra_for_creategrid_sort_refs(sorted_keys, n, &extra).is_empty());
+    }
+
+    #[test]
+    fn scan_launch_extra_for_creategrid_sort_refs_reports_in_range_offsets() {
+        let sorted_keys = 0x6000_u64;
+        let n = 32usize;
+        let copy_src = sorted_keys + (n * 4) as u64;
+        let mut extra = vec![0u8; 40];
+        extra[0..8].copy_from_slice(&(sorted_keys + 0x10).to_le_bytes());
+        extra[16..24].copy_from_slice(&(copy_src + 0x24).to_le_bytes());
+        let refs = scan_launch_extra_for_creategrid_sort_refs(sorted_keys, n, &extra);
+        assert_eq!(
+            refs,
+            vec![
+                CreateGridSortTouchArg {
+                    location: CreateGridSortTouchArgLocation::ExtraOffset(0),
+                    buffer: sorted_keys + 0x10,
+                    role: CreateGridSortBufferRole::CreateGridInput,
+                    byte_offset: 0x10,
+                },
+                CreateGridSortTouchArg {
+                    location: CreateGridSortTouchArgLocation::ExtraOffset(16),
+                    buffer: copy_src + 0x24,
+                    role: CreateGridSortBufferRole::CopySource,
+                    byte_offset: 0x24,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_launch_kernel_params_for_creategrid_sort_refs_finds_pointer_args() {
+        let sorted_keys = 0x7000_u64;
+        let n = 32usize;
+        let copy_src = sorted_keys + (n * 4) as u64;
+        let n_items = n as u32;
+        let scalar = 17u32;
+        let input_ptr = sorted_keys + 0x18;
+        let copy_ptr = copy_src + 0x20;
+        let tail = 99u32;
+        let mut kernel_params = [
+            (&n_items as *const u32).cast_mut().cast(),
+            (&scalar as *const u32).cast_mut().cast(),
+            (&input_ptr as *const u64).cast_mut().cast(),
+            (&copy_ptr as *const u64).cast_mut().cast(),
+            (&tail as *const u32).cast_mut().cast(),
+            std::ptr::null_mut(),
+        ];
+        let refs = unsafe {
+            scan_launch_kernel_params_for_creategrid_sort_refs(
+                sorted_keys,
+                n,
+                kernel_params.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            refs,
+            vec![
+                CreateGridSortTouchArg {
+                    location: CreateGridSortTouchArgLocation::KernelParamIndex(2),
+                    buffer: input_ptr,
+                    role: CreateGridSortBufferRole::CreateGridInput,
+                    byte_offset: 0x18,
+                },
+                CreateGridSortTouchArg {
+                    location: CreateGridSortTouchArgLocation::KernelParamIndex(3),
+                    buffer: copy_ptr,
+                    role: CreateGridSortBufferRole::CopySource,
+                    byte_offset: 0x20,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn format_creategrid_sort_touch_refs_formats_offsets_and_roles() {
+        let refs = vec![
+            CreateGridSortTouchArg {
+                location: CreateGridSortTouchArgLocation::ExtraOffset(8),
+                buffer: 0x7000,
+                role: CreateGridSortBufferRole::CreateGridInput,
+                byte_offset: 0,
+            },
+            CreateGridSortTouchArg {
+                location: CreateGridSortTouchArgLocation::KernelParamIndex(3),
+                buffer: 0x7120,
+                role: CreateGridSortBufferRole::CopySource,
+                byte_offset: 0x20,
+            },
+        ];
+        assert_eq!(
+            format_creategrid_sort_touch_refs(&refs),
+            "extra+8=0x7000(creategrid_input), arg3=0x7120(copy_src+0x20)"
+        );
+    }
+
+    #[test]
+    fn creategrid_snapshot_restores_signed_radix_residue() {
+        let restored = restore_signed_radix_residue(&[4, -2147483600, 12]);
+        assert_eq!(restored, vec![4, 48, 12]);
+    }
+
+    #[test]
+    fn classify_tfs_kernel_covers_recent_dynamic_grid_crash_family() {
+        assert_eq!(
+            classify_tfs_kernel("TurbulenceFS_dynamicGridClearKernel"),
+            Some(TFS_KERNEL_ID_CLEAR)
+        );
+        assert_eq!(
+            classify_tfs_kernel("TurbulenceFS_dynamicGridMigrateKernel"),
+            Some(TFS_KERNEL_ID_MIGRATE)
+        );
+        assert_eq!(
+            classify_tfs_kernel("TurbulenceFS_dynamicGridParticleDensityAtomicToTexKernel"),
+            Some(TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX)
+        );
+        assert_eq!(
+            classify_tfs_kernel("TurbulenceFS_dynamicGridParticleDensitySmoothYKernel"),
+            Some(TFS_KERNEL_ID_PARTICLE_DENSITY_SMOOTH)
+        );
+        assert_eq!(
+            classify_tfs_kernel("TurbulenceFS_fieldSamplerPointsKernel_templ$0"),
+            Some(TFS_KERNEL_ID_FIELD_SAMPLER_POINTS)
+        );
+        assert_eq!(
+            classify_tfs_kernel("TurbulenceFS_dynamicGridMGRestrictKernel3"),
+            Some(TFS_KERNEL_ID_OTHER)
+        );
+        assert_eq!(
+            classify_tfs_kernel("CreateParticleShapesIncremental_MultiStage_1"),
+            Some(TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS1)
+        );
+        assert_eq!(
+            classify_tfs_kernel("CreateParticleShapesIncremental_MultiStage_2_Batched"),
+            Some(TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED)
+        );
+        assert_eq!(
+            classify_tfs_kernel("InitCollDataAndApplyConstraints"),
+            Some(TFS_KERNEL_ID_INIT_COLL_DATA_AND_APPLY_CONSTRAINTS)
+        );
+        assert_eq!(
+            classify_tfs_kernel("FinalizeCollision"),
+            Some(TFS_KERNEL_ID_FINALIZE_COLLISION)
+        );
+        assert_eq!(
+            classify_tfs_kernel("ParticleCollisionStaticBox"),
+            Some(TFS_KERNEL_ID_PARTICLE_COLLISION_STATIC_BOX)
+        );
+        assert_eq!(
+            classify_tfs_kernel("IOFX_actorRangeKernel"),
+            Some(TFS_KERNEL_ID_IOFX_ACTOR_RANGE)
+        );
+    }
+
+    #[test]
+    fn dump_kernel_args_raw_keeps_late_kernel_params_after_null_holes() {
+        let arg1 = 0x1122_3344_5566_7788_u64;
+        let arg3 = 0x99aa_bbcc_ddee_ff00_u64;
+        let mut kernel_params = [
+            std::ptr::null_mut(),
+            (&arg1 as *const u64).cast_mut().cast(),
+            std::ptr::null_mut(),
+            (&arg3 as *const u64).cast_mut().cast(),
+        ];
+        let mut dumped = [0u8; 32];
+        let written = unsafe {
+            dump_kernel_args_raw(
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+                dumped.as_mut_ptr(),
+                dumped.len(),
+            )
+        };
+        assert_eq!(written, dumped.len());
+        assert_eq!(&dumped[0..8], &[0u8; 8]);
+        assert_eq!(&dumped[8..16], &arg1.to_le_bytes());
+        assert_eq!(&dumped[16..24], &[0u8; 8]);
+        assert_eq!(&dumped[24..32], &arg3.to_le_bytes());
+    }
+
+    #[test]
+    fn dump_kernel_args_raw_falls_back_to_kernel_params_when_extra_is_not_flat_buffer() {
+        let arg0 = 0x0123_4567_89ab_cdef_u64;
+        let arg1 = 0xfedc_ba98_7654_3210_u64;
+        let bogus_extra: [*mut std::ffi::c_void; 5] = [std::ptr::null_mut(); 5];
+        let mut kernel_params = [
+            (&arg0 as *const u64).cast_mut().cast(),
+            (&arg1 as *const u64).cast_mut().cast(),
+        ];
+        let mut dumped = [0u8; 16];
+        let written = unsafe {
+            dump_kernel_args_raw(
+                kernel_params.as_mut_ptr(),
+                bogus_extra.as_ptr().cast_mut(),
+                dumped.as_mut_ptr(),
+                dumped.len(),
+            )
+        };
+        assert_eq!(written, dumped.len());
+        assert_eq!(&dumped[0..8], &arg0.to_le_bytes());
+        assert_eq!(&dumped[8..16], &arg1.to_le_bytes());
+    }
+
+    #[test]
+    fn dump_kernel_param_ptrs_records_entry_addresses_without_dereferencing() {
+        let mut kernel_params = [
+            0x1111usize as *mut std::ffi::c_void,
+            std::ptr::null_mut(),
+            0x3333usize as *mut std::ffi::c_void,
+            0x4444usize as *mut std::ffi::c_void,
+        ];
+        let mut dumped = [0u8; 32];
+        let written = unsafe {
+            dump_kernel_param_ptrs(
+                kernel_params.as_mut_ptr(),
+                dumped.as_mut_ptr(),
+                dumped.len(),
+            )
+        };
+        assert_eq!(written, dumped.len());
+        assert_eq!(&dumped[0..8], &(0x1111u64).to_le_bytes());
+        assert_eq!(&dumped[8..16], &(0u64).to_le_bytes());
+        assert_eq!(&dumped[16..24], &(0x3333u64).to_le_bytes());
+        assert_eq!(&dumped[24..32], &(0x4444u64).to_le_bytes());
+    }
+
+    #[test]
+    fn summarize_launch_arg_encoding_reports_extra_and_kernel_param_shapes() {
+        let bogus_extra: [*mut std::ffi::c_void; 5] = [
+            0x10usize as *mut std::ffi::c_void,
+            0x20usize as *mut std::ffi::c_void,
+            0x30usize as *mut std::ffi::c_void,
+            0x40usize as *mut std::ffi::c_void,
+            std::ptr::null_mut(),
+        ];
+        let summary = unsafe {
+            summarize_launch_arg_encoding(0x1234usize as *mut _, bogus_extra.as_ptr().cast_mut())
+        };
+        assert!(summary.contains("extra_null=false"));
+        assert!(summary.contains("extra_flat=false"));
+        assert!(summary.contains("kernel_params_null=false"));
+        assert!(summary.contains("extra=[0:0x10, 1:0x20, 2:0x30, 3:0x40, 4:0x0]"));
+    }
+
+    #[test]
+    fn encode_launch_arg_meta_tracks_extra_markers_and_nullness() {
+        let flat_extra: [*mut std::ffi::c_void; 5] = [
+            0x1usize as *mut std::ffi::c_void,
+            0x20usize as *mut std::ffi::c_void,
+            0x2usize as *mut std::ffi::c_void,
+            0x40usize as *mut std::ffi::c_void,
+            std::ptr::null_mut(),
+        ];
+        let meta = unsafe {
+            encode_launch_arg_meta(0x1234usize as *mut _, flat_extra.as_ptr().cast_mut())
+        };
+        assert_eq!(meta[0], 0, "extra should be marked present");
+        assert_eq!(meta[1], 0, "kernel_params should be marked present");
+        assert_eq!(meta[2], 1, "extra[0] should match flat-buffer marker");
+        assert_eq!(meta[3], 1, "extra[2] should match size marker");
+        assert_eq!(meta[4], 0, "extra[1] should be non-null");
+        assert_eq!(meta[5], 0, "extra[3] should be non-null");
+
+        let null_meta =
+            unsafe { encode_launch_arg_meta(std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert_eq!(null_meta[0], 1);
+        assert_eq!(null_meta[1], 1);
+    }
+
+    #[test]
+    fn read_iofx_actor_range_args_reads_flat_buffer_layout() {
+        let mut raw = [0u8; 72];
+        raw[12..16].copy_from_slice(&6214u32.to_le_bytes());
+        raw[24..32].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        raw[40..48].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+        raw[48..56].copy_from_slice(&0x9999_aaaa_bbbb_ccccu64.to_le_bytes());
+        raw[56..64].copy_from_slice(&0xdddd_eeee_ffff_0001u64.to_le_bytes());
+        raw[64..72].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+        let raw_len = raw.len();
+        let mut raw_len_storage = raw_len;
+        let extra = [
+            0x1usize as *mut std::ffi::c_void,
+            raw.as_mut_ptr().cast(),
+            0x2usize as *mut std::ffi::c_void,
+            (&mut raw_len_storage as *mut usize).cast(),
+            std::ptr::null_mut(),
+        ];
+        let args =
+            unsafe { read_iofx_actor_range_args(std::ptr::null_mut(), extra.as_ptr().cast_mut()) }
+                .expect("actorRange args should decode");
+        assert_eq!(
+            args,
+            IofxActorRangeArgs {
+                count: 6214,
+                input_ptr_324: 0x1111_2222_3333_4444,
+                output_ptr_326: 0x5555_6666_7777_8888,
+                output_ptr_327: 0x9999_aaaa_bbbb_cccc,
+                output_ptr_328: 0xdddd_eeee_ffff_0001,
+                input_ptr_329: 0x1234_5678_9abc_def0,
+            }
+        );
+    }
+
+    #[test]
+    fn read_iofx_actor_range_args_rejects_zero_or_oversized_layouts() {
+        let mut raw = [0u8; 72];
+        raw[12..16].copy_from_slice(&((IOFX_ACTOR_RANGE_MAX_COUNT + 1) as u32).to_le_bytes());
+        raw[24..32].copy_from_slice(&0x1111u64.to_le_bytes());
+        raw[40..48].copy_from_slice(&0x2222u64.to_le_bytes());
+        raw[48..56].copy_from_slice(&0x3333u64.to_le_bytes());
+        raw[56..64].copy_from_slice(&0x4444u64.to_le_bytes());
+        raw[64..72].copy_from_slice(&0x5555u64.to_le_bytes());
+        let raw_len = raw.len();
+        let mut raw_len_storage = raw_len;
+        let extra = [
+            0x1usize as *mut std::ffi::c_void,
+            raw.as_mut_ptr().cast(),
+            0x2usize as *mut std::ffi::c_void,
+            (&mut raw_len_storage as *mut usize).cast(),
+            std::ptr::null_mut(),
+        ];
+        assert!(unsafe {
+            read_iofx_actor_range_args(std::ptr::null_mut(), extra.as_ptr().cast_mut())
+        }
+        .is_none());
+
+        raw[12..16].copy_from_slice(&16u32.to_le_bytes());
+        raw[24..32].copy_from_slice(&0u64.to_le_bytes());
+        assert!(unsafe {
+            read_iofx_actor_range_args(std::ptr::null_mut(), extra.as_ptr().cast_mut())
+        }
+        .is_none());
+    }
+
+    #[test]
+    fn iofx_actor_range_capture_slot_layout_includes_output_regions() {
+        assert_eq!(
+            IOFX_ACTOR_RANGE_INPUT_329_OFF,
+            IOFX_ACTOR_RANGE_INPUT_324_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES
+        );
+        assert_eq!(
+            IOFX_ACTOR_RANGE_OUTPUT_326_OFF,
+            IOFX_ACTOR_RANGE_INPUT_329_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES
+        );
+        assert_eq!(
+            IOFX_ACTOR_RANGE_OUTPUT_327_OFF,
+            IOFX_ACTOR_RANGE_OUTPUT_326_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES
+        );
+        assert_eq!(
+            IOFX_ACTOR_RANGE_OUTPUT_328_OFF,
+            IOFX_ACTOR_RANGE_OUTPUT_327_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES
+        );
+        assert_eq!(
+            IOFX_ACTOR_RANGE_PRE_OUTPUT_326_OFF,
+            IOFX_ACTOR_RANGE_OUTPUT_328_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES
+        );
+        assert_eq!(
+            IOFX_ACTOR_RANGE_PRE_OUTPUT_327_OFF,
+            IOFX_ACTOR_RANGE_PRE_OUTPUT_326_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES
+        );
+        assert_eq!(
+            IOFX_ACTOR_RANGE_PRE_OUTPUT_328_OFF,
+            IOFX_ACTOR_RANGE_PRE_OUTPUT_327_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES
+        );
+        assert_eq!(
+            std::mem::size_of::<IofxActorRangeCaptureSlot>(),
+            IOFX_ACTOR_RANGE_PRE_OUTPUT_328_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn iofx_actor_range_output_copy_bytes_uses_smallest_positive_pointer_gap() {
+        assert_eq!(
+            iofx_actor_range_output_copy_bytes(0x1000, 0x1800, 0x2000, 0x3000),
+            0x800
+        );
+    }
+
+    #[test]
+    fn iofx_actor_range_output_copy_bytes_falls_back_to_input_span_for_separate_buffers() {
+        assert_eq!(
+            iofx_actor_range_output_copy_bytes(0x1000, 0x5000, 0x9000, 0x3000),
+            0x3000
+        );
+    }
+
+    #[test]
+    fn should_skip_tfs_raw_arg_dump_for_known_kernel_params_only_crash_edge_kernels() {
+        assert!(should_skip_tfs_raw_arg_dump(
+            "CreateParticleShapesIncremental_MultiStage_1"
+        ));
+        assert!(should_skip_tfs_raw_arg_dump(
+            "CreateParticleShapesIncremental_MultiStage_2_Batched"
+        ));
+        assert!(should_skip_tfs_raw_arg_dump(
+            "InitCollDataAndApplyConstraints"
+        ));
+        assert!(should_skip_tfs_raw_arg_dump("FinalizeCollision"));
+        assert!(should_skip_tfs_raw_arg_dump("ParticleCollisionStaticBox"));
+        assert!(!should_skip_tfs_raw_arg_dump(
+            "TurbulenceFS_dynamicGridClearKernel"
+        ));
+    }
+
+    #[test]
+    fn should_capture_ms2b_only_for_large_stage2_batched_launches() {
+        assert!(!should_capture_ms2b(
+            "CreateParticleShapesIncremental_MultiStage_2_Batched",
+            1
+        ));
+        assert!(!should_capture_ms2b(
+            "CreateParticleShapesIncremental_MultiStage_2_Batched",
+            2
+        ));
+        assert!(should_capture_ms2b(
+            "CreateParticleShapesIncremental_MultiStage_2_Batched",
+            3
+        ));
+        assert!(!should_capture_ms2b(
+            "CreateParticleShapesIncremental_MultiStage_1",
+            3
+        ));
+        assert!(!should_capture_ms2b(
+            "TurbulenceFS_dynamicGridClearKernel",
+            3
+        ));
     }
 
     fn pack_u16_stride4(values: &[u16]) -> Vec<u8> {
@@ -8554,6 +10911,12 @@ mod tests {
     fn format_sorted_key_window_centers_on_first_bad_value() {
         let summary = summarize_sorted_keys(&[10, 11, 12, -1, 14, 15]).unwrap();
         let window = format_sorted_key_window(&[10, 11, 12, -1, 14, 15], &summary, "OUT").unwrap();
+        assert!(window.contains("OUT[3]=-1"));
+    }
+
+    #[test]
+    fn format_key_window_around_centers_on_requested_index() {
+        let window = format_key_window_around(&[10, 11, 12, -1, 14, 15], 3, "OUT").unwrap();
         assert!(window.contains("OUT[3]=-1"));
     }
 }

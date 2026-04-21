@@ -260,7 +260,7 @@ fn run_statements<'input>(
                         })
                     ]
                 }
-                // Pre-sm_70 shfl (no .sync, no membermask) — convert to ShflSync with mask=0xFFFFFFFF
+                // Pre-sm_70 shfl (no .sync, no membermask) — use the current active mask.
                 // Handled here (not in run_instruction) because it expands to multiple statements
                 Statement::Instruction(ptx_parser::Instruction::Shfl {
                     data,
@@ -283,12 +283,14 @@ fn run_statements<'input>(
                         ptx_parser::ShuffleMode::BFly => "bfly",
                         ptx_parser::ShuffleMode::Idx => "idx",
                     };
-                    let mut result: SmallVec<[_; 3]> =
-                        smallvec![Statement::Constant(ConstantDefinition {
-                            dst: membermask,
-                            typ: ast::ScalarType::U32,
-                            value: ast::ImmediateValue::U64(0xFFFFFFFF),
-                        }),];
+                    let mut result: SmallVec<[_; 3]> = smallvec![Statement::Instruction(to_call(
+                        resolver,
+                        fn_declarations,
+                        "activemask".into(),
+                        ast::Instruction::Activemask {
+                            arguments: ast::ActivemaskArgs { dst: membermask },
+                        },
+                    )?),];
                     if let Some(dst_pred) = dst_pred {
                         // With predicate output: use _pred variant that returns v2.u32
                         let packed_var = resolver.register_unnamed(Some((

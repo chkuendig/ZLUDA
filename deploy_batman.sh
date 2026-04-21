@@ -35,6 +35,9 @@ STEAM_CLI="${STEAM_CLI:-steam}"
 APP_ID="${STEAM_APPID:-208650}"
 WINDOW_NAME="${BATMAN_WINDOW_NAME:-Batman}"
 LOG_FILE="${BATMAN_LOG_FILE:-/tmp/zluda_tex.log}"
+TITLE_PROMPT_KEY="${BATMAN_TITLE_PROMPT_KEY:-Return}"
+TITLE_PROMPT_RETRY_KEY="${BATMAN_TITLE_PROMPT_RETRY_KEY:-Return}"
+ATTRACT_ESCAPE_KEY="${BATMAN_ATTRACT_ESCAPE_KEY:-Escape}"
 GAME_PROCESS_PATTERN="BatmanAK.exe -nologo"
 DO_BUILD=1
 DO_LAUNCH=1
@@ -48,13 +51,18 @@ WATCH_TIMEOUT=28800
 WATCH_INTERVAL=10
 
 GAME_TIMEOUT=240
-BENCHMARK_START_TIMEOUT=240
+BENCHMARK_START_TIMEOUT=360
 BENCHMARK_MONITOR_TIMEOUT=900
 INITIAL_MENU_SETTLE=30
 TITLE_PROMPT_ADVANCE_DELAY=2
-SAVE_SLOT_ADVANCE_DELAY=10
+SAVE_SLOT_SELECT_DELAY=10
+OPTIONS_MENU_SETTLE_DELAY=2
+BENCHMARK_MENU_SETTLE_DELAY="${BATMAN_BENCHMARK_MENU_SETTLE_DELAY:-0}"
 FOCUS_SETTLE_DELAY=0.2
-BENCHMARK_RETRY_AFTER_SECONDS=20
+# The benchmark can sit on a long loading screen before the first CUDA launches
+# appear in the log. Retrying too early just kicks the UI again while the load
+# is still in progress, so keep the default retry comfortably past that handoff.
+BENCHMARK_RETRY_AFTER_SECONDS="${BATMAN_BENCHMARK_RETRY_AFTER_SECONDS:-180}"
 
 X_DISPLAY="${DISPLAY-}"
 X_AUTHORITY="${XAUTHORITY-}"
@@ -135,9 +143,33 @@ WINE_UNIX_DIR="$PROTON_LIB64_DIR/wine/x86_64-unix"
 PROTONFIX_SRC="$REPO_DIR/protonfixes/gamefixes-steam/208650.py"
 PROTONFIX_DST="$COMPAT_TOOL_DIR/protonfixes/gamefixes-steam/208650.py"
 PROTONFIX_PKG_DST="$COMPAT_TOOL_DIR/protonfixes/protonfixes/gamefixes-steam/208650.py"
+PROTONFIX_ENV_DST="${PROTONFIX_DST%.py}.env"
+PROTONFIX_PKG_ENV_DST="${PROTONFIX_PKG_DST%.py}.env"
 COMPUTE_CACHE_DB="${HOME}/.cache/zluda/ComputeCache/zluda.db"
 ZLUDA_CARGO_SCRIPT="$REPO_DIR/scripts/zluda-cargo.sh"
 BATMAN_DUMP_CLEANUP_SCRIPT="$REPO_DIR/scripts/cleanup-batman-dumps.sh"
+BATMAN_PROTONFIX_OVERRIDE_VARS=(
+    ZLUDA_LAUNCH_MUTEX
+    ZLUDA_LOG_ALL
+    ZLUDA_LOG_LAUNCHES
+    ZLUDA_VALIDATE_SORT
+    ZLUDA_VALIDATE_SORT_SAFE
+    ZLUDA_TRACE_SORT_COPY
+    ZLUDA_CREATEGRID_TOUCH_LOG
+    ZLUDA_CREATEGRID_SNAPSHOT_LOG
+    ZLUDA_CREATECELL_SNAPSHOT_LOG
+    ZLUDA_SORT_REPLAY_CAPTURE_BIT
+    ZLUDA_MS4_CAPTURE
+    ZLUDA_TFS_CAPTURE
+    ZLUDA_IOFX_CAPTURE
+    ZLUDA_COUNTER_SNAPSHOT
+    ZLUDA_SORT_ZERO_INPUT_SLACK
+    ZLUDA_NULL_STREAM_STRICT
+    PROTON_LOG
+    DXVK_LOG_LEVEL
+    WINEDEBUG
+    AMD_LOG_LEVEL
+)
 
 status() {
     echo "[batman] $*" >&2
@@ -175,6 +207,26 @@ install_if_changed() {
         return
     fi
     install -D -m "$mode" "$src" "$dst"
+}
+
+write_batman_protonfix_overrides() {
+    local dst="$1"
+    local tmp
+    local wrote=0
+    tmp="$(mktemp)"
+    : > "$tmp"
+    for var in "${BATMAN_PROTONFIX_OVERRIDE_VARS[@]}"; do
+        if [[ ${!var+x} ]]; then
+            printf '%s=%s\n' "$var" "${!var}" >> "$tmp"
+            wrote=1
+        fi
+    done
+    if (( wrote )); then
+        install -D -m 644 "$tmp" "$dst"
+    else
+        rm -f "$dst"
+    fi
+    rm -f "$tmp"
 }
 
 log_cursor() {
@@ -226,46 +278,159 @@ game_running() {
     ps -eo cmd | grep -F "$GAME_PROCESS_PATTERN" | grep -v grep >/dev/null
 }
 
+list_game_pids() {
+    ps -eo pid=,cmd= | grep -F "$GAME_PROCESS_PATTERN" | grep -v grep | awk '{print $1}'
+}
+
+terminate_game_pid() {
+    local pid="$1"
+    local attempts=0
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+        return 0
+    fi
+    kill "$pid" >/dev/null 2>&1 || true
+    for ((attempts = 1; attempts <= 10; attempts++)); do
+        if ! kill -0 "$pid" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    status "BatmanAK.exe pid ${pid} ignored TERM; sending KILL"
+    kill -9 "$pid" >/dev/null 2>&1 || true
+    for ((attempts = 1; attempts <= 5; attempts++)); do
+        if ! kill -0 "$pid" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "Error: failed to stop stale BatmanAK.exe pid ${pid}" >&2
+    return 1
+}
+
+clear_stale_game_processes() {
+    local pids=()
+    local pid=""
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        pids+=("$pid")
+    done < <(list_game_pids)
+    if [[ "${#pids[@]}" -eq 0 ]]; then
+        return 0
+    fi
+    status "stopping stale BatmanAK.exe pids: ${pids[*]}"
+    for pid in "${pids[@]}"; do
+        terminate_game_pid "$pid"
+    done
+}
+
 discover_x_session() {
+    usable_xauthority_file() {
+        local auth="$1"
+        [[ -n "$auth" && -f "$auth" && -r "$auth" ]]
+    }
+
+    x_display_socket_ready() {
+        local disp="$1"
+        local display_num="${disp#:}"
+        [[ "$display_num" =~ ^[0-9]+$ ]] || return 1
+        [[ -S "/tmp/.X11-unix/X${display_num}" ]]
+    }
+
+    probe_x_session() {
+        local disp="$1"
+        local auth="${2-}"
+        x_display_socket_ready "$disp" || return 1
+        if ! command -v xdotool >/dev/null 2>&1; then
+            return 0
+        fi
+        if usable_xauthority_file "$auth"; then
+            DISPLAY="$disp" XAUTHORITY="$auth" xdotool getdisplaygeometry >/dev/null 2>&1
+        else
+            env -u XAUTHORITY DISPLAY="$disp" xdotool getdisplaygeometry >/dev/null 2>&1
+        fi
+    }
+
+    use_x_session() {
+        local disp="$1"
+        local auth="${2-}"
+        local source="$3"
+        X_DISPLAY="$disp"
+        export DISPLAY="$X_DISPLAY"
+        if usable_xauthority_file "$auth"; then
+            X_AUTHORITY="$auth"
+            export XAUTHORITY="$X_AUTHORITY"
+            status "${source} DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY"
+        else
+            X_AUTHORITY=""
+            unset XAUTHORITY || true
+            status "${source} DISPLAY=$DISPLAY (no readable XAUTHORITY)"
+        fi
+        return 0
+    }
+
     local pid=""
     local disp=""
     local auth=""
-    if [[ -n "$X_DISPLAY" && -n "$X_AUTHORITY" && -r "$X_AUTHORITY" ]]; then
-        export DISPLAY="$X_DISPLAY"
-        export XAUTHORITY="$X_AUTHORITY"
+    if [[ -n "$X_DISPLAY" ]] && probe_x_session "$X_DISPLAY" "$X_AUTHORITY"; then
+        use_x_session "$X_DISPLAY" "$X_AUTHORITY" "using requested X session"
         return 0
     fi
     while read -r pid _; do
         [[ -r "/proc/$pid/environ" ]] || continue
         disp="$(tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^DISPLAY=//p' | head -n 1)"
         auth="$(tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^XAUTHORITY=//p' | head -n 1)"
-        if [[ -n "$disp" && -n "$auth" && -r "$auth" && -S "/tmp/.X11-unix/X${disp#:}" ]]; then
-            X_DISPLAY="$disp"
-            X_AUTHORITY="$auth"
-            export DISPLAY="$X_DISPLAY"
-            export XAUTHORITY="$X_AUTHORITY"
-            status "using X session DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY"
+        if [[ -n "$disp" ]] && probe_x_session "$disp" "$auth"; then
+            use_x_session "$disp" "$auth" "using discovered X session"
             return 0
         fi
-    done < <(ps -eo pid,cmd | grep -E 'kwin_x11|plasmashell|startplasma-x11' | grep -v grep)
+    done < <(ps -eo pid,cmd | grep -E 'kwin_x11|plasmashell|startplasma-x11|gamescope|Xwayland|Xorg' | grep -v grep)
 
     shopt -s nullglob
-    local fallback_auth=(/run/user/"$(id -u)"/xauth_*)
+    local fallback_auth=(/run/user/"$(id -u)"/xauth_* "$HOME/.Xauthority")
+    local fallback_socket=""
     shopt -u nullglob
-    if [[ -S /tmp/.X11-unix/X0 && ${#fallback_auth[@]} -gt 0 ]]; then
-        X_DISPLAY=":0"
-        X_AUTHORITY="${fallback_auth[0]}"
-        export DISPLAY="$X_DISPLAY"
-        export XAUTHORITY="$X_AUTHORITY"
-        status "using fallback X session DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY"
-        return 0
-    fi
+    for fallback_socket in /tmp/.X11-unix/X*; do
+        [[ -S "$fallback_socket" ]] || continue
+        disp=":${fallback_socket##*X}"
+        for auth in "${fallback_auth[@]}"; do
+            if probe_x_session "$disp" "$auth"; then
+                use_x_session "$disp" "$auth" "using fallback X session"
+                return 0
+            fi
+        done
+        if probe_x_session "$disp" ""; then
+            use_x_session "$disp" "" "using fallback X session"
+            return 0
+        fi
+    done
     echo "Error: could not discover a usable X session for xdotool" >&2
     return 1
 }
 
 find_game_window() {
-    xdotool search --onlyvisible --name "$WINDOW_NAME" 2>/dev/null | head -n 1 || true
+    local wid=""
+    local best_wid=""
+    local geom=""
+    local width=""
+    local height=""
+    local area=0
+    local best_area=-1
+    while read -r wid; do
+        [[ -n "$wid" ]] || continue
+        geom="$(xdotool getwindowgeometry --shell "$wid" 2>/dev/null || true)"
+        width="$(awk -F= '/^WIDTH=/{print $2}' <<<"$geom")"
+        height="$(awk -F= '/^HEIGHT=/{print $2}' <<<"$geom")"
+        if [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]]; then
+            area=$((width * height))
+            if (( area > best_area )); then
+                best_area=$area
+                best_wid="$wid"
+            fi
+        fi
+    done < <(xdotool search --onlyvisible --name "$WINDOW_NAME" 2>/dev/null || true)
+    if [[ -n "$best_wid" ]]; then
+        printf '%s\n' "$best_wid"
+    fi
 }
 
 focus_window() {
@@ -274,17 +439,53 @@ focus_window() {
     sleep "$FOCUS_SETTLE_DELAY"
 }
 
+wait_for_game_window() {
+    local timeout="${1:-60}"
+    local attempts=$((timeout / 2))
+    local wid=""
+    local last_wid=""
+    local stable_count=0
+    for ((i = 1; i <= attempts; i++)); do
+        wid="$(find_game_window)"
+        if [[ -n "$wid" ]]; then
+            if [[ "$wid" == "$last_wid" ]]; then
+                stable_count=$((stable_count + 1))
+            else
+                last_wid="$wid"
+                stable_count=1
+            fi
+            if (( stable_count >= 2 )); then
+                focus_window "$wid"
+                return 0
+            fi
+        else
+            last_wid=""
+            stable_count=0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 send_key() {
     local key="$1"
     local delay="$2"
-    local wid=""
-    wid="$(find_game_window)"
-    if [[ -n "$wid" ]]; then
+    local active_name=""
+    active_name="$(xdotool getactivewindow getwindowname 2>/dev/null || true)"
+    if [[ "$active_name" != *"$WINDOW_NAME"* ]]; then
+        local wid=""
+        if ! wait_for_game_window 10; then
+            echo "Error: Batman window not visible before sending key '$key'" >&2
+            return 1
+        fi
+        wid="$(find_game_window)"
+        if [[ -z "$wid" ]]; then
+            echo "Error: Batman window disappeared before sending key '$key'" >&2
+            return 1
+        fi
         focus_window "$wid"
-        xdotool key --clearmodifiers --window "$wid" "$key"
-    else
-        xdotool key --clearmodifiers "$key"
     fi
+    xdotool key --clearmodifiers "$key"
     sleep "$delay"
 }
 
@@ -305,6 +506,8 @@ deploy_protonfixes() {
     status "deploying Batman protonfixes"
     install_if_changed 644 "$PROTONFIX_SRC" "$PROTONFIX_DST"
     install_if_changed 644 "$PROTONFIX_SRC" "$PROTONFIX_PKG_DST"
+    write_batman_protonfix_overrides "$PROTONFIX_ENV_DST"
+    write_batman_protonfix_overrides "$PROTONFIX_PKG_ENV_DST"
     find "$COMPAT_TOOL_DIR/protonfixes" -type d -name '__pycache__' -prune -exec rm -rf {} +
 }
 
@@ -319,6 +522,7 @@ clean_batman_dumps() {
 }
 
 launch_game() {
+    clear_stale_game_processes
     discover_x_session
     status "launching app ${APP_ID} via Steam CLI"
     "$STEAM_CLI" -applaunch "$APP_ID" >/tmp/batman_steam_launch.log 2>&1 &
@@ -351,24 +555,46 @@ run_benchmark_menu_sequence() {
     send_key Up 2
     send_key Up 2
     send_key Return 2
+    if (( OPTIONS_MENU_SETTLE_DELAY > 0 )); then
+        status "waiting ${OPTIONS_MENU_SETTLE_DELAY}s for options menu"
+        sleep "$OPTIONS_MENU_SETTLE_DELAY"
+    fi
     send_key Up 2
     send_key Return 0
 }
 
-start_benchmark() {
-    status "starting benchmark sequence"
-    status "waiting ${INITIAL_MENU_SETTLE}s before first input"
-    sleep "$INITIAL_MENU_SETTLE"
+run_full_benchmark_sequence() {
+    local title_prompt_key="${1:-$TITLE_PROMPT_KEY}"
     status "advancing past title prompt"
-    send_key Return "$TITLE_PROMPT_ADVANCE_DELAY"
-    status "selecting default save slot"
-    send_key Return "$SAVE_SLOT_ADVANCE_DELAY"
+    send_key "$title_prompt_key" "$TITLE_PROMPT_ADVANCE_DELAY"
+    status "accepting highlighted default profile"
+    send_key Return "$SAVE_SLOT_SELECT_DELAY"
+    if (( BENCHMARK_MENU_SETTLE_DELAY > 0 )); then
+        status "waiting ${BENCHMARK_MENU_SETTLE_DELAY}s for main menu"
+        sleep "$BENCHMARK_MENU_SETTLE_DELAY"
+    fi
     run_benchmark_menu_sequence
 }
 
+start_benchmark() {
+    status "starting benchmark sequence"
+    if wait_for_game_window 60; then
+        status "Batman window detected; waiting ${INITIAL_MENU_SETTLE}s before first input"
+    else
+        status "Batman window not visible yet; waiting ${INITIAL_MENU_SETTLE}s before first input"
+    fi
+    sleep "$INITIAL_MENU_SETTLE"
+    run_full_benchmark_sequence
+}
+
 retry_benchmark_sequence() {
-    status "benchmark still idle; retrying benchmark sequence once"
-    run_benchmark_menu_sequence
+    status "benchmark still idle; retrying full benchmark sequence once"
+    if [[ -n "$TITLE_PROMPT_RETRY_KEY" && "$TITLE_PROMPT_RETRY_KEY" != "$TITLE_PROMPT_KEY" ]]; then
+        status "retrying title prompt with alternate key ${TITLE_PROMPT_RETRY_KEY}"
+        run_full_benchmark_sequence "$TITLE_PROMPT_RETRY_KEY"
+    else
+        run_full_benchmark_sequence
+    fi
 }
 
 wait_for_benchmark_start() {
