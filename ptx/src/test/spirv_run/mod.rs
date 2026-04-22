@@ -959,6 +959,8 @@ fn shfl_segmented_min_halfwarp_boundary_amdgpu() -> Result<(), Box<dyn error::Er
 
 
 
+
+
 #[cfg(feature = "has_rocm")]
 #[test]
 fn shfl_block_prefix_carry_amdgpu() -> Result<(), Box<dyn error::Error>> {
@@ -4533,6 +4535,10 @@ fn select_sort_replay_sample_index_prefers_isolated_mismatch_for_distinct_output
 
     assert_eq!(select_sort_replay_sample_index(&capture, Some(0)), Some(0));
 }
+
+
+
+
 
 
 
