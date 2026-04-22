@@ -1,10 +1,12 @@
 use super::read_test_file;
 use crate::pass;
 use cuda_types::cuda::CUstream;
-use hip_runtime_sys::hipError_t;
-use std::collections::HashMap;
+use hip_runtime_sys::{
+    hipArray_Format, hipError_t, HIPaddress_mode, HIPfilter_mode, HIP_TEXTURE_DESC,
+};
 use pretty_assertions;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::error;
@@ -930,6 +932,29 @@ test_ptx_warp!(
 
 #[cfg(feature = "has_rocm")]
 #[test]
+fn shfl_segmented_min_halfwarp_boundary_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("shfl_segmented_min_halfwarp_boundary.ptx");
+    let mut expected = vec![0u32; 64];
+    for out in &mut expected[32..48] {
+        *out = 16;
+    }
+    test_hip_assert(
+        "shfl_segmented_min_halfwarp_boundary",
+        &ptx,
+        None::<&[u8]>,
+        &expected,
+        64,
+    )
+}
+
+
+
+
+
+
+
+#[cfg(feature = "has_rocm")]
+#[test]
 fn shfl_block_prefix_carry_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ptx = read_test_file!("shfl_block_prefix_carry.ptx");
     let expected: Vec<u32> = (1..=128u32).collect();
@@ -1816,9 +1841,7 @@ fn compile_fixture_artifacts(
         attributes_ir,
         metadata,
         Some(&|data, file_name| {
-            artifacts
-                .borrow_mut()
-                .insert(file_name, data.clone());
+            artifacts.borrow_mut().insert(file_name, data.clone());
         }),
     )?;
     Ok(artifacts.into_inner())
@@ -1894,9 +1917,8 @@ fn dump_alias_followup_linked_ll() -> Result<(), Box<dyn error::Error>> {
     let fixed_ptx = read_test_file!("lds_u16_u32_alias_fixed_words_test.ptx");
     let fixed_ll = compile_fixture_linked_ll(fixed_ptx)?;
     fs::write("/tmp/alias_fixed_words.linked.ll", &fixed_ll)?;
-    let fixed_body =
-        defined_function_body(&fixed_ll, "lds_u16_u32_alias_fixed_words_test")
-            .ok_or_else(|| "missing fixed-word fixture body".to_string())?;
+    let fixed_body = defined_function_body(&fixed_ll, "lds_u16_u32_alias_fixed_words_test")
+        .ok_or_else(|| "missing fixed-word fixture body".to_string())?;
     assert!(fixed_body.contains("load i16"));
     assert!(fixed_body.contains("store i16"));
     assert!(fixed_body.contains("load i32"));
@@ -1916,7 +1938,8 @@ fn dump_alias_followup_linked_ll() -> Result<(), Box<dyn error::Error>> {
 #[test]
 #[ignore = "diagnostic: dumps backend asm for the fixed-word and three-lane alias probes"]
 fn dump_alias_followup_asm() -> Result<(), Box<dyn error::Error>> {
-    let fixed = compile_fixture_artifacts(read_test_file!("lds_u16_u32_alias_fixed_words_test.ptx"))?;
+    let fixed =
+        compile_fixture_artifacts(read_test_file!("lds_u16_u32_alias_fixed_words_test.ptx"))?;
     fs::write(
         "/tmp/alias_fixed_words.asm",
         fixed
@@ -1924,8 +1947,9 @@ fn dump_alias_followup_asm() -> Result<(), Box<dyn error::Error>> {
             .ok_or_else(|| "missing fixed-word asm".to_string())?,
     )?;
 
-    let three_lane =
-        compile_fixture_artifacts(read_test_file!("lds_u16_u32_alias_three_lane_reread_test.ptx"))?;
+    let three_lane = compile_fixture_artifacts(read_test_file!(
+        "lds_u16_u32_alias_three_lane_reread_test.ptx"
+    ))?;
     fs::write(
         "/tmp/alias_three_lane.asm",
         three_lane
@@ -3957,6 +3981,98 @@ fn patch_iofx_actor_range_raw_args(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+fn first_iofx_bbox_buffer_word_mismatch(
+    expected: &[u8],
+    actual: &[u8],
+) -> Option<(usize, u32, u32)> {
+    expected
+        .chunks_exact(mem::size_of::<u32>())
+        .zip(actual.chunks_exact(mem::size_of::<u32>()))
+        .enumerate()
+        .find_map(|(word_idx, (expected, actual))| {
+            let expected = u32::from_le_bytes(expected.try_into().unwrap());
+            let actual = u32::from_le_bytes(actual.try_into().unwrap());
+            (expected != actual).then_some((word_idx, expected, actual))
+        })
+}
+
+
+
+fn find_iofx_bbox_record(buffer: &[u8], needle: [u32; 4]) -> Option<usize> {
+    buffer
+        .chunks_exact(16)
+        .enumerate()
+        .find_map(|(record_idx, chunk)| {
+            let record = [
+                u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
+                u32::from_le_bytes(chunk[4..8].try_into().unwrap()),
+                u32::from_le_bytes(chunk[8..12].try_into().unwrap()),
+                u32::from_le_bytes(chunk[12..16].try_into().unwrap()),
+            ];
+            (record == needle).then_some(record_idx)
+        })
+}
+
 #[test]
 fn parse_sort_replay_capture_reads_expected_layout() -> Result<(), Box<dyn error::Error>> {
     let mut bytes = Vec::new();
@@ -4162,6 +4278,24 @@ fn patch_iofx_actor_range_raw_args_rewrites_only_pointer_fields(
     assert_eq!(raw_args[95], 0xa5);
     Ok(())
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -4415,6 +4549,19 @@ fn select_sort_replay_sample_index_prefers_isolated_mismatch_for_distinct_output
 
 
 
+
+
+
+fn default_iofx_bbox_ptx_path() -> Option<String> {
+    [
+        "/tmp/zluda_ptx_056.ptx",
+        "/tmp/zluda_ptx_dump/module_56.ptx",
+        "/tmp/zluda_ptx_dump/module_18.ptx",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).exists())
+    .map(str::to_string)
+}
 
 fn default_iofx_actor_range_ptx_path() -> Option<String> {
     [
