@@ -953,6 +953,12 @@ fn shfl_segmented_min_halfwarp_boundary_amdgpu() -> Result<(), Box<dyn error::Er
 
 
 
+
+
+
+
+
+
 #[cfg(feature = "has_rocm")]
 #[test]
 fn shfl_block_prefix_carry_amdgpu() -> Result<(), Box<dyn error::Error>> {
