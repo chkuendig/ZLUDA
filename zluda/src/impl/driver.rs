@@ -301,6 +301,16 @@ fn install_fault_signal_handler() {
             c"/tmp/iofx_actor_range_captures.bin".as_ptr(),
         );
 
+        let iofx_bbox_host_ptr =
+            super::function::IOFX_BBOX_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let iofx_bbox_total_bytes = super::function::IOFX_BBOX_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            iofx_bbox_host_ptr,
+            iofx_bbox_total_bytes,
+            c"/tmp/iofx_bbox_captures.bin".as_ptr(),
+        );
+
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -344,6 +354,13 @@ fn install_fault_signal_handler() {
                     f,
                     "*** IOFX actorRange capture dumped to /tmp/iofx_actor_range_captures.bin ({} bytes)\n",
                     iofx_total_bytes
+                );
+            }
+            if iofx_bbox_host_ptr != 0 && iofx_bbox_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** IOFX bbox capture dumped to /tmp/iofx_bbox_captures.bin ({} bytes)\n",
+                    iofx_bbox_total_bytes
                 );
             }
             if let Ok(guard) = KERNEL_RING.lock() {

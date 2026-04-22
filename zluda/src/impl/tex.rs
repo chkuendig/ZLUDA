@@ -10,6 +10,7 @@ pub(crate) unsafe fn sync_synthetic_texref(tex_ref: *mut textureReference) {
     }
     let tex_obj = (*tex_ref).textureObject;
     if tex_obj.is_null() {
+        super::module::set_synthetic_texref_linear_binding(tex_ref, None);
         return;
     }
     if let Some(device_global) = super::module::get_synthetic_texref_global(tex_ref) {
@@ -23,6 +24,44 @@ pub(crate) unsafe fn sync_synthetic_texref(tex_ref: *mut textureReference) {
             mem::size_of::<hipTextureObject_t>(),
         );
     }
+    let mut res_desc: hipResourceDesc = mem::zeroed();
+    let mut tex_desc: hipTextureDesc = mem::zeroed();
+    let binding = if hipGetTextureObjectResourceDesc(&mut res_desc, tex_obj).is_ok()
+        && hipGetTextureObjectTextureDesc(&mut tex_desc, tex_obj).is_ok()
+        && res_desc.resType == hipResourceType::hipResourceTypeLinear
+        && !unsafe { res_desc.res.linear.devPtr }.is_null()
+        && unsafe { res_desc.res.linear.sizeInBytes } != 0
+    {
+        from_channel_format_desc(unsafe { res_desc.res.linear.desc })
+            .ok()
+            .map(
+                |(format, num_channels)| super::module::SyntheticTexRefLinearBinding {
+                    src_ptr: hipDeviceptr_t(unsafe { res_desc.res.linear.devPtr }),
+                    size_in_bytes: unsafe { res_desc.res.linear.sizeInBytes },
+                    format,
+                    num_channels,
+                    texture_desc: HIP_TEXTURE_DESC {
+                        addressMode: [
+                            HIPaddress_mode(tex_desc.addressMode[0].0),
+                            HIPaddress_mode(tex_desc.addressMode[1].0),
+                            HIPaddress_mode(tex_desc.addressMode[2].0),
+                        ],
+                        filterMode: HIPfilter_mode(tex_desc.filterMode.0),
+                        flags: 0,
+                        maxAnisotropy: tex_desc.maxAnisotropy,
+                        mipmapFilterMode: HIPfilter_mode(tex_desc.mipmapFilterMode.0),
+                        mipmapLevelBias: tex_desc.mipmapLevelBias,
+                        minMipmapLevelClamp: tex_desc.minMipmapLevelClamp,
+                        maxMipmapLevelClamp: tex_desc.maxMipmapLevelClamp,
+                        borderColor: tex_desc.borderColor,
+                        reserved: [0; 12],
+                    },
+                },
+            )
+    } else {
+        None
+    };
+    super::module::set_synthetic_texref_linear_binding(tex_ref, binding);
 }
 
 fn as_tex_ref(texref: CUtexref) -> *mut textureReference {

@@ -6661,6 +6661,15 @@ pub(crate) static TFS_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
 const IOFX_CAPTURE_SLOTS: usize = 16;
 const IOFX_ACTOR_RANGE_MAX_COUNT: usize = 8192;
 const IOFX_ACTOR_RANGE_INPUT_BYTES: usize = IOFX_ACTOR_RANGE_MAX_COUNT * 4;
+const IOFX_BBOX_POINTER_COUNT: usize = 8;
+// The bbox texture path samples float4 positions by actor index. Late Batman
+// launches use indices well past the first 4096 records, so 64 KiB can truncate
+// the captured texref prefix and make offline replay fault on a harness artifact.
+const IOFX_BBOX_TEXREF_BYTES: usize = 1024 * 1024;
+// The texture-path bbox launches also walk param_4 / param_5 index arrays up to
+// param_2 elements. Current large captures reach ~50k items, so 32 KiB still
+// clips those u32 windows and only the smaller `(1,0)` launches replay fully.
+const IOFX_BBOX_BUFFER_BYTES: usize = 256 * 1024;
 
 #[repr(C)]
 struct IofxActorRangeCaptureSlot {
@@ -6736,6 +6745,97 @@ struct IofxActorRangeArgs {
     input_ptr_329: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IofxBboxTexrefCaptureDesc {
+    address_mode: [u32; 3],
+    filter_mode: u32,
+    flags: u32,
+    max_anisotropy: u32,
+    mipmap_filter_mode: u32,
+    mipmap_level_bias: f32,
+    min_mipmap_level_clamp: f32,
+    max_mipmap_level_clamp: f32,
+    border_color: [f32; 4],
+}
+
+impl Default for IofxBboxTexrefCaptureDesc {
+    fn default() -> Self {
+        Self {
+            address_mode: [0; 3],
+            filter_mode: 0,
+            flags: 0,
+            max_anisotropy: 0,
+            mipmap_filter_mode: 0,
+            mipmap_level_bias: 0.0,
+            min_mipmap_level_clamp: 0.0,
+            max_mipmap_level_clamp: 0.0,
+            border_color: [0.0; 4],
+        }
+    }
+}
+
+#[repr(C)]
+struct IofxBboxCaptureSlot {
+    magic: u64,                                 // 0: "IOFXBBCP"
+    launch_n: u64,                              // 8
+    timestamp_ms: u64,                          // 16
+    grid_x: u32,                                // 24
+    block_x: u32,                               // 28
+    shared_mem_bytes: u32,                      // 32
+    raw_args_len: u32,                          // 36
+    param_2: u32,                               // 40
+    param_3: u32,                               // 44
+    param_12: u32,                              // 48
+    param_13: u32,                              // 52
+    arg_meta: [u8; 8],                          // 56
+    texref_src_ptr: u64,                        // 64
+    texref_capture_bytes: u32,                  // 72
+    texref_format: u32,                         // 76
+    texref_num_channels: u32,                   // 80
+    texref_desc: IofxBboxTexrefCaptureDesc,     // 84
+    _pad0: [u8; 4],                             // 140
+    ptr_params: [u64; IOFX_BBOX_POINTER_COUNT], // 144
+    raw_args: [u8; TFS_RAW_ARGS_BYTES],         // 208
+    pre_ptr_buffers: [u8; IOFX_BBOX_POINTER_COUNT * IOFX_BBOX_BUFFER_BYTES],
+    post_ptr_buffers: [u8; IOFX_BBOX_POINTER_COUNT * IOFX_BBOX_BUFFER_BYTES],
+    texref_buffer: [u8; IOFX_BBOX_TEXREF_BYTES],
+}
+
+const IOFX_BBOX_CAPTURE_MAGIC: u64 = 0x494f4658_42424350; // "IOFXBBCP"
+const IOFX_BBOX_SLOT_SIZE: usize = std::mem::size_of::<IofxBboxCaptureSlot>();
+const IOFX_BBOX_RAW_ARGS_OFF: usize = 208;
+const IOFX_BBOX_PRE_PTRS_OFF: usize = IOFX_BBOX_RAW_ARGS_OFF + TFS_RAW_ARGS_BYTES;
+const IOFX_BBOX_POST_PTRS_OFF: usize =
+    IOFX_BBOX_PRE_PTRS_OFF + IOFX_BBOX_POINTER_COUNT * IOFX_BBOX_BUFFER_BYTES;
+const IOFX_BBOX_TEXREF_OFF: usize =
+    IOFX_BBOX_POST_PTRS_OFF + IOFX_BBOX_POINTER_COUNT * IOFX_BBOX_BUFFER_BYTES;
+const IOFX_BBOX_CAPTURE_TOTAL_SIZE: usize = IOFX_BBOX_SLOT_SIZE * IOFX_CAPTURE_SLOTS;
+
+struct IofxBboxCaptureState {
+    host_ptr: *mut u8,
+    dev_ptr: *mut std::ffi::c_void,
+    launch_counter: u64,
+}
+unsafe impl Send for IofxBboxCaptureState {}
+unsafe impl Sync for IofxBboxCaptureState {}
+
+static IOFX_BBOX_CAPTURE: Mutex<Option<IofxBboxCaptureState>> = Mutex::new(None);
+
+pub(crate) static IOFX_BBOX_CAPTURE_HOST_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static IOFX_BBOX_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IofxBboxArgs {
+    param_2: u32,
+    param_3: u32,
+    ptr_params: [u64; IOFX_BBOX_POINTER_COUNT],
+    param_12: u32,
+    param_13: u32,
+}
+
 fn tfs_capture_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_TFS_CAPTURE").map_or(false, |v| v == "1"))
@@ -6744,6 +6844,11 @@ fn tfs_capture_enabled() -> bool {
 fn iofx_actor_range_capture_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_IOFX_CAPTURE").map_or(false, |v| v == "1"))
+}
+
+fn iofx_bbox_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_IOFX_BBOX_CAPTURE").map_or(false, |v| v == "1"))
 }
 
 unsafe fn iofx_actor_range_capture_init(state: &mut Option<IofxActorRangeCaptureState>) {
@@ -6800,6 +6905,60 @@ unsafe fn iofx_actor_range_capture_init(state: &mut Option<IofxActorRangeCapture
     });
 }
 
+unsafe fn iofx_bbox_capture_init(state: &mut Option<IofxBboxCaptureState>) {
+    if state.is_some() {
+        return;
+    }
+    let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let alloc_result = unsafe {
+        hipHostMalloc(
+            &mut host_ptr,
+            IOFX_BBOX_CAPTURE_TOTAL_SIZE,
+            hipHostMallocMapped,
+        )
+    };
+    if alloc_result.is_err() || host_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] IOFX bbox capture: hipHostMalloc({}) failed: {:?}",
+            IOFX_BBOX_CAPTURE_TOTAL_SIZE, alloc_result
+        ));
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, IOFX_BBOX_CAPTURE_TOTAL_SIZE);
+    }
+    let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
+    if map_result.is_err() || dev_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] IOFX bbox capture: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] IOFX bbox capture: {} slots × {} KB = {} KB pinned; host=0x{:x} dev=0x{:x}",
+        IOFX_CAPTURE_SLOTS,
+        IOFX_BBOX_SLOT_SIZE / 1024,
+        IOFX_BBOX_CAPTURE_TOTAL_SIZE / 1024,
+        host_ptr as usize,
+        dev_ptr as usize,
+    ));
+    IOFX_BBOX_CAPTURE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::SeqCst);
+    IOFX_BBOX_CAPTURE_TOTAL_BYTES.store(
+        IOFX_BBOX_CAPTURE_TOTAL_SIZE,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    *state = Some(IofxBboxCaptureState {
+        host_ptr: host_ptr as *mut u8,
+        dev_ptr,
+        launch_counter: 0,
+    });
+}
+
 unsafe fn read_iofx_actor_range_args(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
@@ -6827,6 +6986,36 @@ unsafe fn read_iofx_actor_range_args(
         output_ptr_327,
         output_ptr_328,
         input_ptr_329,
+    })
+}
+
+unsafe fn read_iofx_bbox_args(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> Option<IofxBboxArgs> {
+    let param_2: u32 = unsafe { read_kernel_arg(kernel_params, extra, 12, 2) }?;
+    let param_3: u32 = unsafe { read_kernel_arg(kernel_params, extra, 16, 3) }?;
+    let ptr_params = [
+        unsafe { read_kernel_arg(kernel_params, extra, 24, 4) }?,
+        unsafe { read_kernel_arg(kernel_params, extra, 32, 5) }?,
+        unsafe { read_kernel_arg(kernel_params, extra, 40, 6) }.unwrap_or(0),
+        unsafe { read_kernel_arg(kernel_params, extra, 48, 7) }?,
+        unsafe { read_kernel_arg(kernel_params, extra, 56, 8) }?,
+        unsafe { read_kernel_arg(kernel_params, extra, 64, 9) }?,
+        unsafe { read_kernel_arg(kernel_params, extra, 72, 10) }?,
+        unsafe { read_kernel_arg(kernel_params, extra, 80, 11) }?,
+    ];
+    let param_12: u32 = unsafe { read_kernel_arg(kernel_params, extra, 88, 12) }?;
+    let param_13: u32 = unsafe { read_kernel_arg(kernel_params, extra, 92, 13) }?;
+    if ptr_params.iter().all(|&ptr| ptr == 0) {
+        return None;
+    }
+    Some(IofxBboxArgs {
+        param_2,
+        param_3,
+        ptr_params,
+        param_12,
+        param_13,
     })
 }
 
@@ -6975,6 +7164,109 @@ unsafe fn capture_iofx_actor_range_outputs(
             stream,
         );
     }
+}
+
+unsafe fn capture_iofx_bbox_inputs(
+    module: hipModule_t,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    grid_x: u32,
+    block_x: u32,
+    shared_mem_bytes: u32,
+) -> Option<usize> {
+    if !iofx_bbox_capture_enabled() {
+        return None;
+    }
+    let args = match unsafe { read_iofx_bbox_args(kernel_params, extra) } {
+        Some(args) => args,
+        None => return None,
+    };
+
+    let mut guard = match IOFX_BBOX_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    unsafe { iofx_bbox_capture_init(&mut guard) };
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let this_launch = state.launch_counter;
+    state.launch_counter += 1;
+    let slot_index = (this_launch as usize) % IOFX_CAPTURE_SLOTS;
+    let slot_host =
+        state.host_ptr.add(slot_index * IOFX_BBOX_SLOT_SIZE) as *mut IofxBboxCaptureSlot;
+    std::ptr::write_bytes(slot_host as *mut u8, 0, IOFX_BBOX_SLOT_SIZE);
+    (*slot_host).magic = IOFX_BBOX_CAPTURE_MAGIC;
+    (*slot_host).launch_n = this_launch;
+    (*slot_host).timestamp_ms = crate::elapsed_ms();
+    (*slot_host).grid_x = grid_x;
+    (*slot_host).block_x = block_x;
+    (*slot_host).shared_mem_bytes = shared_mem_bytes;
+    (*slot_host).param_2 = args.param_2;
+    (*slot_host).param_3 = args.param_3;
+    (*slot_host).param_12 = args.param_12;
+    (*slot_host).param_13 = args.param_13;
+    (*slot_host).arg_meta = encode_launch_arg_meta(kernel_params, extra);
+    (*slot_host).ptr_params = args.ptr_params;
+    unsafe { populate_iofx_bbox_texref_capture(slot_host, module) };
+    let raw_dst = (*slot_host).raw_args.as_mut_ptr();
+    (*slot_host).raw_args_len =
+        dump_kernel_args_raw(kernel_params, extra, raw_dst, TFS_RAW_ARGS_BYTES) as u32;
+    Some(slot_index)
+}
+
+unsafe fn capture_iofx_bbox_ptr_regions(slot_index: usize, stream: hipStream_t, prelaunch: bool) {
+    if !iofx_bbox_capture_enabled() {
+        return;
+    }
+
+    let guard = match IOFX_BBOX_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let slot_host =
+        state.host_ptr.add(slot_index * IOFX_BBOX_SLOT_SIZE) as *const IofxBboxCaptureSlot;
+    let slot_dev_base = (state.dev_ptr as usize + slot_index * IOFX_BBOX_SLOT_SIZE) as *mut u8;
+    let base_off = if prelaunch {
+        IOFX_BBOX_PRE_PTRS_OFF
+    } else {
+        IOFX_BBOX_POST_PTRS_OFF
+    };
+    for (idx, src_ptr) in (*slot_host).ptr_params.iter().copied().enumerate() {
+        if src_ptr == 0 {
+            continue;
+        }
+        let dst_off = base_off + idx * IOFX_BBOX_BUFFER_BYTES;
+        let _ = hipMemcpyDtoDAsync(
+            hipDeviceptr_t(slot_dev_base.add(dst_off) as _),
+            hipDeviceptr_t(src_ptr as _),
+            IOFX_BBOX_BUFFER_BYTES,
+            stream,
+        );
+    }
+    if prelaunch && (*slot_host).texref_src_ptr != 0 && (*slot_host).texref_capture_bytes != 0 {
+        let _ = hipMemcpyDtoDAsync(
+            hipDeviceptr_t(slot_dev_base.add(IOFX_BBOX_TEXREF_OFF) as _),
+            hipDeviceptr_t((*slot_host).texref_src_ptr as _),
+            (*slot_host).texref_capture_bytes as usize,
+            stream,
+        );
+    }
+}
+
+unsafe fn capture_iofx_bbox_pre(slot_index: usize, stream: hipStream_t) {
+    unsafe { capture_iofx_bbox_ptr_regions(slot_index, stream, true) };
+}
+
+unsafe fn capture_iofx_bbox_post(slot_index: usize, stream: hipStream_t) {
+    unsafe { capture_iofx_bbox_ptr_regions(slot_index, stream, false) };
 }
 
 unsafe fn capture_iofx_actor_range_pre(slot_index: usize, stream: hipStream_t) {
@@ -7260,7 +7552,42 @@ fn lookup_name(f: hipFunction_t) -> String {
 
 pub(crate) struct Function {
     pub(crate) base: hipFunction_t,
+    pub(crate) module: hipModule_t,
     pub(crate) sm_version: u32,
+}
+
+fn iofx_bbox_texref_desc_from_hip(desc: &HIP_TEXTURE_DESC) -> IofxBboxTexrefCaptureDesc {
+    IofxBboxTexrefCaptureDesc {
+        address_mode: [
+            desc.addressMode[0].0,
+            desc.addressMode[1].0,
+            desc.addressMode[2].0,
+        ],
+        filter_mode: desc.filterMode.0,
+        flags: desc.flags,
+        max_anisotropy: desc.maxAnisotropy,
+        mipmap_filter_mode: desc.mipmapFilterMode.0,
+        mipmap_level_bias: desc.mipmapLevelBias,
+        min_mipmap_level_clamp: desc.minMipmapLevelClamp,
+        max_mipmap_level_clamp: desc.maxMipmapLevelClamp,
+        border_color: desc.borderColor,
+    }
+}
+
+unsafe fn populate_iofx_bbox_texref_capture(
+    slot_host: *mut IofxBboxCaptureSlot,
+    module: hipModule_t,
+) {
+    let Some(binding) =
+        super::module::get_texref_linear_binding(module, "IOFX_texRefBBoxPositions")
+    else {
+        return;
+    };
+    (*slot_host).texref_src_ptr = binding.src_ptr.0 as u64;
+    (*slot_host).texref_capture_bytes = binding.size_in_bytes.min(IOFX_BBOX_TEXREF_BYTES) as u32;
+    (*slot_host).texref_format = binding.format.0;
+    (*slot_host).texref_num_channels = binding.num_channels;
+    (*slot_host).texref_desc = iofx_bbox_texref_desc_from_hip(&binding.texture_desc);
 }
 
 impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, CUfunction, E>
@@ -7786,6 +8113,20 @@ pub(crate) fn launch_kernel(
     } else {
         None
     };
+    let iofx_bbox_slot = if name == "IOFX_bboxKernel" {
+        unsafe {
+            capture_iofx_bbox_inputs(
+                f.module,
+                kernel_params,
+                extra,
+                grid_dim_x,
+                block_dim_x,
+                shared_mem_bytes,
+            )
+        }
+    } else {
+        None
+    };
     if creategrid_safe_validator_enabled() {
         unsafe {
             maybe_capture_creategrid_sort_buffer_touch(
@@ -7985,7 +8326,8 @@ pub(crate) fn launch_kernel(
                 args.vals_out,
             );
             let capture_begin_bit = sort_replay_capture_begin_bit();
-            let creategrid_call_n = CREATEGRID_LOG_CALL_N.load(std::sync::atomic::Ordering::Relaxed);
+            let creategrid_call_n =
+                CREATEGRID_LOG_CALL_N.load(std::sync::atomic::Ordering::Relaxed);
             let start_call = creategrid_snapshot_log_start();
             if should_queue_sort_replay_capture(
                 args.begin_bit,
@@ -8008,6 +8350,11 @@ pub(crate) fn launch_kernel(
     if let Some(slot_index) = iofx_actor_range_slot {
         unsafe {
             capture_iofx_actor_range_pre(slot_index, stream);
+        }
+    }
+    if let Some(slot_index) = iofx_bbox_slot {
+        unsafe {
+            capture_iofx_bbox_pre(slot_index, stream);
         }
     }
 
@@ -8089,6 +8436,11 @@ pub(crate) fn launch_kernel(
     if let Some(slot_index) = iofx_actor_range_slot.filter(|_| result.is_ok()) {
         unsafe {
             capture_iofx_actor_range_post(slot_index, stream);
+        }
+    }
+    if let Some(slot_index) = iofx_bbox_slot.filter(|_| result.is_ok()) {
+        unsafe {
+            capture_iofx_bbox_post(slot_index, stream);
         }
     }
     if let Some(args) = createcell_snapshot_args.filter(|_| result.is_ok()) {
@@ -10739,6 +11091,133 @@ mod tests {
             read_iofx_actor_range_args(std::ptr::null_mut(), extra.as_ptr().cast_mut())
         }
         .is_none());
+    }
+
+    #[test]
+    fn read_iofx_bbox_args_reads_flat_buffer_layout() {
+        let mut raw = [0u8; 96];
+        raw[12..16].copy_from_slice(&17u32.to_le_bytes());
+        raw[16..20].copy_from_slice(&23u32.to_le_bytes());
+        raw[24..32].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        raw[32..40].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+        raw[40..48].copy_from_slice(&0x9999_aaaa_bbbb_ccccu64.to_le_bytes());
+        raw[48..56].copy_from_slice(&0xdddd_eeee_ffff_0001u64.to_le_bytes());
+        raw[56..64].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+        raw[64..72].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+        raw[72..80].copy_from_slice(&0xfedc_ba98_7654_3210u64.to_le_bytes());
+        raw[80..88].copy_from_slice(&0x0bad_f00d_dead_beefu64.to_le_bytes());
+        raw[88..92].copy_from_slice(&31u32.to_le_bytes());
+        raw[92..96].copy_from_slice(&37u32.to_le_bytes());
+        let raw_len = raw.len();
+        let mut raw_len_storage = raw_len;
+        let extra = [
+            0x1usize as *mut std::ffi::c_void,
+            raw.as_mut_ptr().cast(),
+            0x2usize as *mut std::ffi::c_void,
+            (&mut raw_len_storage as *mut usize).cast(),
+            std::ptr::null_mut(),
+        ];
+        let args = unsafe { read_iofx_bbox_args(std::ptr::null_mut(), extra.as_ptr().cast_mut()) }
+            .expect("bbox args should decode");
+        assert_eq!(
+            args,
+            IofxBboxArgs {
+                param_2: 17,
+                param_3: 23,
+                ptr_params: [
+                    0x1111_2222_3333_4444,
+                    0x5555_6666_7777_8888,
+                    0x9999_aaaa_bbbb_cccc,
+                    0xdddd_eeee_ffff_0001,
+                    0x1234_5678_9abc_def0,
+                    0x0123_4567_89ab_cdef,
+                    0xfedc_ba98_7654_3210,
+                    0x0bad_f00d_dead_beef,
+                ],
+                param_12: 31,
+                param_13: 37,
+            }
+        );
+    }
+
+    #[test]
+    fn read_iofx_bbox_args_rejects_all_zero_pointer_layouts() {
+        let mut raw = [0u8; 96];
+        raw[12..16].copy_from_slice(&17u32.to_le_bytes());
+        raw[16..20].copy_from_slice(&23u32.to_le_bytes());
+        raw[88..92].copy_from_slice(&31u32.to_le_bytes());
+        raw[92..96].copy_from_slice(&37u32.to_le_bytes());
+        let raw_len = raw.len();
+        let mut raw_len_storage = raw_len;
+        let extra = [
+            0x1usize as *mut std::ffi::c_void,
+            raw.as_mut_ptr().cast(),
+            0x2usize as *mut std::ffi::c_void,
+            (&mut raw_len_storage as *mut usize).cast(),
+            std::ptr::null_mut(),
+        ];
+        assert!(
+            unsafe { read_iofx_bbox_args(std::ptr::null_mut(), extra.as_ptr().cast_mut()) }
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn read_iofx_bbox_args_allows_unused_param_6_to_be_missing_from_kernel_params() {
+        let param_2 = 17u32;
+        let param_3 = 23u32;
+        let param_4 = 0x1111_2222_3333_4444u64;
+        let param_5 = 0x5555_6666_7777_8888u64;
+        let param_7 = 0x9999_aaaa_bbbb_ccccu64;
+        let param_8 = 0xdddd_eeee_ffff_0001u64;
+        let param_9 = 0x1234_5678_9abc_def0u64;
+        let param_10 = 0x0123_4567_89ab_cdefu64;
+        let param_11 = 0xfedc_ba98_7654_3210u64;
+        let param_12 = 31u32;
+        let param_13 = 37u32;
+        let mut kernel_params = [std::ptr::null_mut(); 14];
+        kernel_params[2] = (&param_2 as *const u32).cast_mut().cast();
+        kernel_params[3] = (&param_3 as *const u32).cast_mut().cast();
+        kernel_params[4] = (&param_4 as *const u64).cast_mut().cast();
+        kernel_params[5] = (&param_5 as *const u64).cast_mut().cast();
+        kernel_params[7] = (&param_7 as *const u64).cast_mut().cast();
+        kernel_params[8] = (&param_8 as *const u64).cast_mut().cast();
+        kernel_params[9] = (&param_9 as *const u64).cast_mut().cast();
+        kernel_params[10] = (&param_10 as *const u64).cast_mut().cast();
+        kernel_params[11] = (&param_11 as *const u64).cast_mut().cast();
+        kernel_params[12] = (&param_12 as *const u32).cast_mut().cast();
+        kernel_params[13] = (&param_13 as *const u32).cast_mut().cast();
+
+        let args = unsafe { read_iofx_bbox_args(kernel_params.as_mut_ptr(), std::ptr::null_mut()) }
+            .expect("bbox args should decode with null param_6");
+        assert_eq!(args.param_2, param_2);
+        assert_eq!(args.param_3, param_3);
+        assert_eq!(args.ptr_params[0], param_4);
+        assert_eq!(args.ptr_params[1], param_5);
+        assert_eq!(args.ptr_params[2], 0);
+        assert_eq!(args.ptr_params[3], param_7);
+        assert_eq!(args.ptr_params[4], param_8);
+        assert_eq!(args.ptr_params[5], param_9);
+        assert_eq!(args.ptr_params[6], param_10);
+        assert_eq!(args.ptr_params[7], param_11);
+        assert_eq!(args.param_12, param_12);
+        assert_eq!(args.param_13, param_13);
+    }
+
+    #[test]
+    fn iofx_bbox_capture_slot_layout_includes_pre_and_post_regions() {
+        assert_eq!(
+            IOFX_BBOX_PRE_PTRS_OFF,
+            IOFX_BBOX_RAW_ARGS_OFF + TFS_RAW_ARGS_BYTES
+        );
+        assert_eq!(
+            IOFX_BBOX_POST_PTRS_OFF,
+            IOFX_BBOX_PRE_PTRS_OFF + IOFX_BBOX_POINTER_COUNT * IOFX_BBOX_BUFFER_BYTES
+        );
+        assert_eq!(
+            std::mem::size_of::<IofxBboxCaptureSlot>(),
+            IOFX_BBOX_TEXREF_OFF + IOFX_BBOX_TEXREF_BYTES
+        );
     }
 
     #[test]

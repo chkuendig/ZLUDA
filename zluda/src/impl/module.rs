@@ -17,6 +17,22 @@ use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 
 /// Work around an AMDGPU divergence bug in PhysX IOFX_bbox{,Sync}Kernel.
 ///
+/// ============================================================
+/// WORKAROUND for an AMDGPU LLVM backend miscompilation.
+/// Upstream fix would live in: llvm/lib/Target/AMDGPU/
+///   (most likely MachineUniformityAnalysis / AMDGPUAnnotateUniformValues:
+///    a value conditionally written only by tid=0 is wrongly classified as
+///    uniform, gets SGPR-allocated, and the tid=0 store becomes visible to
+///    every lane in the wave.)
+/// Revisit this patch if we land a proper LLVM fix — at that point this
+/// PTX-level guard becomes redundant and should be removed so unaffected
+/// kernels aren't forced through the extra branch.
+/// Related tree artifacts:
+///   - ptx/experiments/bbox/README.md (bisection record)
+///   - ext/llvm-project branch zluda-physx-pr145902
+///   - ~/.claude/plans/can-tou-peppy-milner.md (investigation plan)
+/// ============================================================
+///
 /// The kernel's tail-phase "per-warp cross-warp merge" section contains a
 /// `setp.eq.s64 %pN, %rdN, 0; @%pN bra BB_EXIT;` guard that is semantically
 /// supposed to let only tid=0 fall through (other lanes have
