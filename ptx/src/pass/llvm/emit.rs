@@ -373,6 +373,24 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             unsafe { LLVMSetExternallyInitialized(global, 1) };
             unsafe { LLVMSetAlignment(global, std::mem::size_of::<usize>() as u32) };
             self.preserved_globals.push(global);
+        } else if matches!(
+            var.info.state_space,
+            ast::StateSpace::Shared | ast::StateSpace::SharedCluster | ast::StateSpace::SharedCta
+        ) {
+            // Internal-linkage shared globals need an initializer per LLVM's
+            // verifier. LDS storage is undefined at workgroup start on AMDGPU,
+            // so `undef` is the correct semantic — it lets the backend allocate
+            // the slot without pretending we know its contents. Dynamic
+            // shared memory (zero-length array, kept External) doesn't get
+            // an initializer.
+            let is_dynamic_shared = matches!(
+                &var.info.v_type,
+                ast::Type::Array(_, _, dims) if dims.iter().any(|&d| d == 0)
+            );
+            if !is_dynamic_shared {
+                let ty = get_type(self.context, &var.info.v_type)?;
+                unsafe { LLVMSetInitializer(global, LLVMGetUndef(ty)) };
+            }
         } else if var.info.state_space == ast::StateSpace::Global {
             // Other global variables without explicit initializers need a zero initializer
             let ty = get_type(self.context, &var.info.v_type)?;
@@ -511,22 +529,38 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             ),
             ast::StateSpace::Shared
             | ast::StateSpace::SharedCluster
-            | ast::StateSpace::SharedCta
-                if var_info.array_init.is_empty() =>
-            {
-                (
-                    LLVMLinkage::LLVMExternalLinkage,
-                    LLVMVisibility::LLVMDefaultVisibility,
-                    false,
-                )
+            | ast::StateSpace::SharedCta => {
+                // Dynamic shared memory (`.extern .shared .b8 sdata[];`,
+                // zero-length array) keeps External linkage because its size
+                // is fixed at launch time by hipModuleLaunchKernel's
+                // shared_mem_bytes; the AMDGPU backend treats any
+                // external addrspace(3) global as the dynamic-shared base.
+                //
+                // STATIC `.shared` arrays with a declared size get Internal
+                // linkage so the AMDGPU LDS allocator places each at its
+                // own non-overlapping offset. Observed bug on IOFX_bboxKernel:
+                // with External linkage for everything, sWarpLastActorID (132B)
+                // was at LDS offset 0 and sWarpLastBounds (792B) at LDS
+                // offset 24, so sWarpLastBounds writes clobbered
+                // sWarpLastActorID[6..32].
+                let is_dynamic_shared = matches!(
+                    &var_info.v_type,
+                    ast::Type::Array(_, _, dims) if dims.iter().any(|&d| d == 0)
+                );
+                if is_dynamic_shared {
+                    (
+                        LLVMLinkage::LLVMExternalLinkage,
+                        LLVMVisibility::LLVMDefaultVisibility,
+                        false,
+                    )
+                } else {
+                    (
+                        LLVMLinkage::LLVMInternalLinkage,
+                        LLVMVisibility::LLVMDefaultVisibility,
+                        false,
+                    )
+                }
             }
-            ast::StateSpace::Shared
-            | ast::StateSpace::SharedCluster
-            | ast::StateSpace::SharedCta => (
-                LLVMLinkage::LLVMPrivateLinkage,
-                LLVMVisibility::LLVMHiddenVisibility,
-                false,
-            ),
             _ => return Err(error_unreachable()),
         };
         unsafe {
