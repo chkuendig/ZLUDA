@@ -15,22 +15,264 @@ use std::{
 };
 use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 
+/// Work around an AMDGPU divergence bug in PhysX IOFX_bbox{,Sync}Kernel.
+///
+/// The kernel's tail-phase "per-warp cross-warp merge" section contains a
+/// `setp.eq.s64 %pN, %rdN, 0; @%pN bra BB_EXIT;` guard that is semantically
+/// supposed to let only tid=0 fall through (other lanes have
+/// rd=0 set at BB10_175 / equivalent and should branch to BB_EXIT).
+///
+/// On gfx1030 under LLVM's AMDGPU divergence analysis, the guard misfires
+/// and some non-tid=0 lanes pass through. Those lanes then execute
+/// `st.global.v4.f32 [%rdX]` with computed `rdX` pointers that are bogus
+/// for those lanes, triggering a page-fault-worth-27GB-past-param_7 crash.
+/// Three different PTX-level edits all fix it (explicit tid==0 guard,
+/// re-zero rd before guard, swap guard to tid==0); the narrowest correct
+/// fix is to leave the existing rd==0 guard in place and ADD a tid==0
+/// guard right after it, so only a lane that is BOTH tid==0 AND has
+/// rd != 0 falls through.
+///
+/// Detection: find every `setp.eq.s64 %pN, %rdM, 0;\n@%pN bra TARGET;`
+/// that immediately follows a `BBLABEL:` line, within a `.visible .entry
+/// IOFX_bbox*` function body. Insert the additional tid==0 guard after
+/// the existing branch.
+///
+/// Narrow by entry-name prefix `IOFX_bbox` to avoid touching unrelated
+/// kernels. Tracked and verified: applies cleanly to IOFX_bboxKernel
+/// (BB10_184, rd305 guard, target BB10_186) and IOFX_bboxSyncKernel
+/// (BB9_146, rd540 guard, target BB9_148).
+pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
+    if !ptx.contains("IOFX_bbox") {
+        return None;
+    }
+    // The regex would be ideal here but ptx_parser is the only regex-y dep
+    // in the module chain. Do it by line scan instead.
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut out = String::with_capacity(ptx.len() + 1024);
+    let mut i = 0;
+    let mut in_bbox_kernel = false;
+    let mut brace_depth: i32 = 0;
+    let mut patch_count = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        out.push_str(line);
+        out.push('\n');
+        let trimmed = line.trim_start();
+        // Enter/leave IOFX_bbox* kernel. Kernel bodies are delimited by `{ ... }`
+        // at file scope.
+        if trimmed.starts_with(".visible .entry IOFX_bbox")
+            || trimmed.starts_with(".entry IOFX_bbox")
+        {
+            in_bbox_kernel = true;
+            brace_depth = 0;
+        }
+        if in_bbox_kernel {
+            for c in line.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_bbox_kernel = false;
+                        break;
+                    }
+                }
+            }
+        }
+        // Detect the specific pattern inside an IOFX_bbox* kernel:
+        //   ^BB<N>_<M>:\n
+        //   ^setp.eq.s64\s+%p<X>, %rd<Y>, 0;\n
+        //   ^@%p<X>\s+bra\s+BB<A>_<B>;\n
+        if in_bbox_kernel
+            && brace_depth >= 1
+            && is_bb_label(trimmed)
+            && i + 2 < lines.len()
+        {
+            let setp_line = lines[i + 1].trim_start();
+            let bra_line = lines[i + 2].trim_start();
+            if let Some((pred_a, target_label)) = match_setp_eq_s64_zero_pair(setp_line, bra_line) {
+                // Emit setp + bra as-is, then insert the additional tid==0 guard.
+                out.push_str(lines[i + 1]);
+                out.push('\n');
+                out.push_str(lines[i + 2]);
+                out.push('\n');
+                out.push_str("// ZLUDA IOFX_bbox fix: AMDGPU divergence guard\n");
+                out.push_str("{\n");
+                out.push_str(".reg .pred %p_zluda_bbox_lane0;\n");
+                out.push_str(".reg .s32 %r_zluda_bbox_tid;\n");
+                out.push_str("mov.u32 %r_zluda_bbox_tid, %tid.x;\n");
+                out.push_str("setp.ne.s32 %p_zluda_bbox_lane0, %r_zluda_bbox_tid, 0;\n");
+                out.push_str(&format!(
+                    "@%p_zluda_bbox_lane0 bra {};\n",
+                    target_label
+                ));
+                out.push_str("}\n");
+                let _ = pred_a;
+                i += 3;
+                patch_count += 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if patch_count == 0 {
+        None
+    } else {
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] patch_iofx_bbox_tail_merge: applied {} guard(s)",
+            patch_count
+        ));
+        Some(out)
+    }
+}
+
+fn is_bb_label(s: &str) -> bool {
+    // Matches "BB<digits>_<digits>:" with optional leading `$`, followed by nothing else.
+    let s = s.trim_end();
+    if !s.ends_with(':') {
+        return false;
+    }
+    let name = &s[..s.len() - 1];
+    if !name.starts_with("BB") {
+        return false;
+    }
+    let rest = &name[2..];
+    let mut parts = rest.split('_');
+    let first = parts.next().unwrap_or("");
+    let second = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        return false;
+    }
+    !first.is_empty()
+        && !second.is_empty()
+        && first.chars().all(|c| c.is_ascii_digit())
+        && second.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Parses:
+///   `setp.eq.s64<ws>%p<digits>, %rd<digits>, 0;`
+///   `@%p<same_digits> bra BB<digits>_<digits>;`
+/// Returns (predicate_name_without_%, target_label) on match.
+fn match_setp_eq_s64_zero_pair(setp_line: &str, bra_line: &str) -> Option<(String, String)> {
+    let setp = setp_line.trim_end();
+    // Expect prefix "setp.eq.s64" (possibly with tab/space separator).
+    let rest = setp.strip_prefix("setp.eq.s64")?;
+    let rest = rest.trim_start();
+    // "%pNN, %rdMM, 0;"
+    let mut parts = rest.splitn(3, ',');
+    let p_tok = parts.next()?.trim();
+    let rd_tok = parts.next()?.trim();
+    let zero_tok = parts.next()?.trim();
+    if !p_tok.starts_with("%p") {
+        return None;
+    }
+    let pred_name = &p_tok[1..]; // "pNN" (without the leading %)
+    if !rd_tok.starts_with("%rd") {
+        return None;
+    }
+    if !zero_tok.starts_with("0;") && zero_tok != "0" {
+        return None;
+    }
+    // bra line must be `@%pNN bra BBX_Y;`.
+    let bra = bra_line.trim_end();
+    let bra_rest = bra.strip_prefix("@%")?;
+    let bra_rest = bra_rest.strip_prefix(pred_name)?;
+    let bra_rest = bra_rest.trim_start();
+    let bra_rest = bra_rest.strip_prefix("bra")?;
+    let target = bra_rest.trim().trim_end_matches(';').trim();
+    if !target.starts_with("BB") {
+        return None;
+    }
+    Some((pred_name.to_string(), target.to_string()))
+}
+
 /// Global map from synthetic texture reference pointers to their device global variable addresses.
 /// When .texref variables are compiled as .global .u64 in PTX, hipModuleGetTexRef can't find them.
 /// We create synthetic textureReference structs and track which device global they correspond to.
 /// After a texture object is created (via hipTexRefSetArray), we copy the handle to the device global
 /// so the kernel can read it at runtime.
-static SYNTHETIC_TEXREFS: std::sync::LazyLock<Mutex<HashMap<usize, hipDeviceptr_t>>> =
+static SYNTHETIC_TEXREFS: std::sync::LazyLock<Mutex<HashMap<usize, SyntheticTexRefState>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static TEXREFS_BY_MODULE_AND_NAME: std::sync::LazyLock<Mutex<HashMap<(usize, String), usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Copy)]
+pub(crate) struct SyntheticTexRefLinearBinding {
+    pub(crate) src_ptr: hipDeviceptr_t,
+    pub(crate) size_in_bytes: usize,
+    pub(crate) format: hipArray_Format,
+    pub(crate) num_channels: u32,
+    pub(crate) texture_desc: HIP_TEXTURE_DESC,
+}
+
+#[derive(Clone, Copy)]
+struct SyntheticTexRefState {
+    device_global: hipDeviceptr_t,
+    linear_binding: Option<SyntheticTexRefLinearBinding>,
+}
 
 /// Check if a texture reference is synthetic and get its device global address
 pub(crate) fn get_synthetic_texref_global(
     tex_ref: *const textureReference,
 ) -> Option<hipDeviceptr_t> {
+    SYNTHETIC_TEXREFS.lock().ok().and_then(|map| {
+        map.get(&(tex_ref as usize))
+            .and_then(|state| (!state.device_global.0.is_null()).then_some(state.device_global))
+    })
+}
+
+pub(crate) fn set_synthetic_texref_linear_binding(
+    tex_ref: *const textureReference,
+    binding: Option<SyntheticTexRefLinearBinding>,
+) {
+    let Ok(mut map) = SYNTHETIC_TEXREFS.lock() else {
+        return;
+    };
+    let Some(state) = map.get_mut(&(tex_ref as usize)) else {
+        return;
+    };
+    state.linear_binding = binding;
+}
+
+pub(crate) fn get_synthetic_texref_linear_binding_for_global(
+    device_global: hipDeviceptr_t,
+) -> Option<SyntheticTexRefLinearBinding> {
+    SYNTHETIC_TEXREFS.lock().ok().and_then(|map| {
+        map.values()
+            .find(|state| state.device_global.0 == device_global.0)
+            .and_then(|state| state.linear_binding)
+    })
+}
+
+fn register_texref(
+    module: hipModule_t,
+    name: &str,
+    tex_ref: *mut textureReference,
+    device_global: Option<hipDeviceptr_t>,
+) {
+    if let Ok(mut map) = SYNTHETIC_TEXREFS.lock() {
+        map.entry(tex_ref as usize).or_insert(SyntheticTexRefState {
+            device_global: device_global.unwrap_or(hipDeviceptr_t(std::ptr::null_mut())),
+            linear_binding: None,
+        });
+    }
+    if let Ok(mut map) = TEXREFS_BY_MODULE_AND_NAME.lock() {
+        map.insert((module.0 as usize, name.to_string()), tex_ref as usize);
+    }
+}
+
+pub(crate) fn get_texref_linear_binding(
+    module: hipModule_t,
+    name: &str,
+) -> Option<SyntheticTexRefLinearBinding> {
+    let tex_ref = TEXREFS_BY_MODULE_AND_NAME
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&(module.0 as usize, name.to_string())).copied())?;
     SYNTHETIC_TEXREFS
         .lock()
         .ok()
-        .and_then(|map| map.get(&(tex_ref as usize)).copied())
+        .and_then(|map| map.get(&tex_ref).and_then(|state| state.linear_binding))
 }
 
 pub(crate) struct Module {
@@ -57,6 +299,7 @@ impl ModuleMutable {
                 unsafe { hipModuleGetFunction(&mut func_handle, module, entry.key().as_ptr()) }?;
                 let func = Box::new(Function {
                     base: func_handle,
+                    module,
                     sm_version,
                 });
                 &*entry.insert(func)
@@ -113,7 +356,10 @@ fn get_best_ptx_and_compile(
                         module_count,
                         ptx.len()
                     ));
-                    ptx_modules.push(Cow::Borrowed(ptx));
+                    match patch_iofx_bbox_tail_merge(ptx) {
+                        Some(patched) => ptx_modules.push(Cow::Owned(patched)),
+                        None => ptx_modules.push(Cow::Borrowed(ptx)),
+                    }
                 }
                 Ok(CodeModuleRef::File(file)) => {
                     let kind = if file.header.kind == FatbinFileHeader::HEADER_KIND_PTX {
@@ -150,7 +396,11 @@ fn get_best_ptx_and_compile(
                                             let _ = f.write_all(text.as_bytes());
                                         }
                                     }
-                                    ptx_modules.push(text);
+                                    let patched = patch_iofx_bbox_tail_merge(&text);
+                                    match patched {
+                                        Some(p) => ptx_modules.push(Cow::Owned(p)),
+                                        None => ptx_modules.push(text),
+                                    }
                                 }
                                 None => {
                                     super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: cow_bytes_to_str FAILED (not valid UTF-8)", module_count));
@@ -669,6 +919,7 @@ pub(crate) fn get_tex_ref(
                 "[ZLUDA] cuModuleGetTexRef('{}') -> {:p}",
                 name_str, tex_ref
             ));
+            register_texref(hmod.base, &name_str, tex_ref, None);
             *p_tex_ref = tex_ref as CUtexref;
             Ok(())
         }
@@ -695,9 +946,7 @@ pub(crate) fn get_tex_ref(
                 let tex_ref_ptr =
                     &synth_ref.tex_ref as *const textureReference as *mut textureReference;
                 // Register in global map so tex.rs can find the device global
-                if let Ok(mut map) = SYNTHETIC_TEXREFS.lock() {
-                    map.insert(tex_ref_ptr as usize, dptr);
-                }
+                register_texref(hmod.base, &name_str, tex_ref_ptr, Some(dptr));
                 // Leak the Box — the texture reference lives as long as the module
                 Box::leak(synth_ref);
                 *p_tex_ref = tex_ref_ptr as CUtexref;
@@ -757,7 +1006,13 @@ pub(crate) fn get_surf_ref(
                 let tex_ref_ptr =
                     &synth_ref.tex_ref as *const textureReference as *mut textureReference;
                 if let Ok(mut map) = SYNTHETIC_TEXREFS.lock() {
-                    map.insert(tex_ref_ptr as usize, dptr);
+                    map.insert(
+                        tex_ref_ptr as usize,
+                        SyntheticTexRefState {
+                            device_global: dptr,
+                            linear_binding: None,
+                        },
+                    );
                 }
                 Box::leak(synth_ref);
                 *p_surf_ref = tex_ref_ptr as cuda_types::cuda::CUsurfref;
@@ -780,6 +1035,142 @@ pub(crate) fn get_loading_mode(mode: &mut cuda_types::cuda::CUmoduleLoadingMode)
 
 pub(crate) fn load_fat_binary(module: &mut CUmodule, image: &std::ffi::c_void) -> CUresult {
     load_data(module, image)
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    #[test]
+    fn patch_skips_non_bbox_ptx() {
+        let ptx = "// not a bbox kernel\n.visible .entry foo() { ret; }\n";
+        assert!(patch_iofx_bbox_tail_merge(ptx).is_none());
+    }
+
+    #[test]
+    fn patch_inserts_guard_for_bboxkernel_pattern() {
+        let ptx = r#"
+.visible .entry IOFX_bboxKernel() {
+.reg .pred %p<200>;
+.reg .s32 %r<800>;
+.reg .s64 %rd<400>;
+BB10_184:
+setp.eq.s64	%p122, %rd305, 0;
+@%p122 bra BB10_186;
+
+ld.global.v4.f32 %f1, [%rd304];
+BB10_186:
+ret;
+}
+"#;
+        let patched = patch_iofx_bbox_tail_merge(ptx).expect("should patch");
+        assert!(
+            patched.contains("ZLUDA IOFX_bbox fix"),
+            "patched PTX missing fix marker:\n{}",
+            patched
+        );
+        // Confirm original guard preserved AND new tid-0 guard added.
+        assert!(patched.contains("setp.eq.s64\t%p122, %rd305, 0;"));
+        assert!(patched.contains("@%p122 bra BB10_186;"));
+        assert!(patched.contains("setp.ne.s32 %p_zluda_bbox_lane0, %r_zluda_bbox_tid, 0;"));
+        assert!(patched.contains("@%p_zluda_bbox_lane0 bra BB10_186;"));
+    }
+
+    #[test]
+    fn patch_handles_bboxsync_different_register_numbers() {
+        // Same structural pattern, different register numbers (matching the
+        // actual IOFX_bboxSyncKernel from Batman AK).
+        let ptx = r#"
+.visible .entry IOFX_bboxSyncKernel() {
+.reg .pred %p<200>;
+.reg .s32 %r<800>;
+.reg .s64 %rd<600>;
+BB9_146:
+setp.eq.s64	%p103, %rd540, 0;
+@%p103 bra BB9_148;
+
+ld.global.v4.f32 %f1, [%rd539];
+BB9_148:
+ret;
+}
+"#;
+        let patched = patch_iofx_bbox_tail_merge(ptx).expect("should patch");
+        assert!(patched.contains("@%p_zluda_bbox_lane0 bra BB9_148;"));
+        // Original predicate/register preserved.
+        assert!(patched.contains("setp.eq.s64\t%p103, %rd540, 0;"));
+    }
+
+    #[test]
+    fn patch_skips_same_pattern_outside_bbox_kernels() {
+        // Same structural pattern but inside a kernel that doesn't start with
+        // IOFX_bbox — must NOT patch. (This is the pattern we use for null
+        // pointer checks; over-patching would break unrelated kernels.)
+        let ptx = r#"
+.visible .entry something_else() {
+.reg .pred %p<200>;
+.reg .s64 %rd<400>;
+BB1_1:
+setp.eq.s64	%p1, %rd1, 0;
+@%p1 bra BB1_2;
+BB1_2:
+ret;
+}
+"#;
+        // Must return None because kernel name doesn't contain "IOFX_bbox".
+        assert!(patch_iofx_bbox_tail_merge(ptx).is_none());
+    }
+
+    #[test]
+    fn patch_handles_multiple_occurrences_in_same_kernel() {
+        // If the compiler emitted more than one of these guards, patch each.
+        let ptx = r#"
+.visible .entry IOFX_bboxKernel() {
+BB1_1:
+setp.eq.s64	%p1, %rd1, 0;
+@%p1 bra BB1_2;
+BB1_2:
+setp.eq.s64	%p2, %rd2, 0;
+@%p2 bra BB1_3;
+BB1_3:
+ret;
+}
+"#;
+        let patched = patch_iofx_bbox_tail_merge(ptx).expect("should patch");
+        let insertions = patched.matches("ZLUDA IOFX_bbox fix").count();
+        assert_eq!(insertions, 2, "expected 2 patches, got:\n{}", patched);
+        assert!(patched.contains("@%p_zluda_bbox_lane0 bra BB1_2;"));
+        assert!(patched.contains("@%p_zluda_bbox_lane0 bra BB1_3;"));
+    }
+
+    #[test]
+    #[ignore = "writes /tmp/module_56_zluda_patched.ptx from /tmp/zluda_ptx_dump/module_56.ptx"]
+    fn patch_produce_patched_module_56() {
+        let src = std::fs::read_to_string("/tmp/zluda_ptx_dump/module_56.ptx").unwrap();
+        let patched = patch_iofx_bbox_tail_merge(&src)
+            .expect("expected module_56.ptx to match the bbox pattern");
+        std::fs::write("/tmp/module_56_zluda_patched.ptx", &patched).unwrap();
+        eprintln!(
+            "wrote {} bytes (was {} bytes) to /tmp/module_56_zluda_patched.ptx",
+            patched.len(),
+            src.len()
+        );
+    }
+
+    #[test]
+    fn patch_leaves_unrelated_bb_labels_alone() {
+        // A BBLabel with no matching setp/bra pair following must not be touched.
+        let ptx = r#"
+.visible .entry IOFX_bboxKernel() {
+BB1_1:
+setp.ne.s64	%p1, %rd1, 0;
+@%p1 bra BB1_2;
+BB1_2:
+ret;
+}
+"#;
+        // setp.ne not setp.eq → not the pattern → no patch → None.
+        assert!(patch_iofx_bbox_tail_merge(ptx).is_none());
+    }
 }
 
 #[cfg(test)]
