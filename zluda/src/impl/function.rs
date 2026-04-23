@@ -7474,17 +7474,38 @@ unsafe fn capture_cub_downsweep_pre(slot_index: usize, stream: hipStream_t) {
     };
     let slot_dev_base =
         unsafe { (state.dev_ptr as *mut u8).add(slot_index * CUB_DOWNSWEEP_SLOT_SIZE) };
+    // Read n_items + grid from the captured raw_args to size each DtoD to
+    // the actual live allocation. Reading PAST a small spine (~8 KB) with
+    // a flat 128 KB DtoD silently fails (leaving the dest zero) and can
+    // disturb unrelated allocations. Compute:
+    //   key/value buffers (idx 0..=3): n_items * sizeof(i32)
+    //   spine (idx 4):                 grid_x * num_bins * sizeof(i32)
+    // With num_bins bounded by 32 (RADIX_BITS=5 max). If n_items is 0 or
+    // suspicious, fall back to CUB_DOWNSWEEP_BUFFER_BYTES for keys/values
+    // so the kernel arg parsing quirks of different CUB versions don't
+    // silently disable the capture.
+    let raw_args = unsafe { (*slot_host).raw_args.as_ptr() };
+    let n_items = unsafe { std::ptr::read_unaligned(raw_args.add(40) as *const u32) };
+    let grid_x = unsafe { (*slot_host).grid_x };
+    let key_value_bytes = if n_items > 0 && (n_items as usize) * 4 <= CUB_DOWNSWEEP_BUFFER_BYTES {
+        (n_items as usize) * 4
+    } else {
+        CUB_DOWNSWEEP_BUFFER_BYTES
+    };
+    let spine_bytes_est = (grid_x as usize).saturating_mul(32 * 4);
+    let spine_bytes = spine_bytes_est.max(64).min(CUB_DOWNSWEEP_BUFFER_BYTES);
     for idx in 0..CUB_DOWNSWEEP_POINTER_COUNT {
         let src_ptr = unsafe { (*slot_host).ptr_params[idx] };
         if src_ptr == 0 {
             continue;
         }
+        let n_bytes = if idx == 4 { spine_bytes } else { key_value_bytes };
         let dst_off = CUB_DOWNSWEEP_PRE_PTRS_OFF + idx * CUB_DOWNSWEEP_BUFFER_BYTES;
         unsafe {
             let _ = hipMemcpyDtoDAsync(
                 hipDeviceptr_t(slot_dev_base.add(dst_off) as _),
                 hipDeviceptr_t(src_ptr as _),
-                CUB_DOWNSWEEP_BUFFER_BYTES,
+                n_bytes,
                 stream,
             );
         }
