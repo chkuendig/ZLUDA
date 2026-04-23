@@ -7269,6 +7269,228 @@ unsafe fn capture_iofx_bbox_post(slot_index: usize, stream: hipStream_t) {
     unsafe { capture_iofx_bbox_ptr_regions(slot_index, stream, false) };
 }
 
+// ============================================================================
+// CUB RadixSort Downsweep capture. Mirrors the IOFX_BBOX capture pattern:
+// pinned-mapped host buffer, ring of slots, D2D-async snapshots on the
+// kernel's own stream (safe vs. the ProfilingSignal race that specifically
+// affects post-launch D2H — see `feedback_no_d2d_from_launch_kernel.md` and
+// the NOTE below `capture_iofx_bbox_ptr_regions`).
+//
+// Gated by ZLUDA_DOWNSWEEP_CAPTURE=1. The kernel takes 5 pointer params
+// (verified from a live capture on 2026-04-23):
+//   0: d_keys_in, 1: d_keys_out, 2: d_values_in, 3: d_values_out, 4: d_spine
+// We snapshot CUB_DOWNSWEEP_BUFFER_BYTES (128 KB) from each, plus the 88-byte
+// extra-args buffer. Output file: /tmp/cub_downsweep_captures.bin.
+// ============================================================================
+
+const CUB_DOWNSWEEP_POINTER_COUNT: usize = 5;
+const CUB_DOWNSWEEP_BUFFER_BYTES: usize = 128 * 1024;
+const CUB_DOWNSWEEP_RAW_ARGS_BYTES: usize = 128;
+const CUB_DOWNSWEEP_CAPTURE_MAGIC: u64 = 0x43554244_4f574e53; // "CUBDOWNS"
+
+#[repr(C)]
+struct CubDownsweepCaptureSlot {
+    magic: u64,                                                              // 0
+    launch_n: u64,                                                           // 8
+    timestamp_ms: u64,                                                       // 16
+    grid_x: u32,                                                             // 24
+    grid_y: u32,                                                             // 28
+    grid_z: u32,                                                             // 32
+    block_x: u32,                                                            // 36
+    block_y: u32,                                                            // 40
+    block_z: u32,                                                            // 44
+    shared_mem_bytes: u32,                                                   // 48
+    raw_args_len: u32,                                                       // 52
+    ptr_params: [u64; CUB_DOWNSWEEP_POINTER_COUNT],                          // 56..96
+    buffer_bytes_per_ptr: u32,                                               // 96
+    _pad0: [u8; 4],                                                          // 100
+    raw_args: [u8; CUB_DOWNSWEEP_RAW_ARGS_BYTES],                            // 104..232
+    _pad1: [u8; 24],                                                         // 232..256
+    pre_ptr_buffers: [u8; CUB_DOWNSWEEP_POINTER_COUNT * CUB_DOWNSWEEP_BUFFER_BYTES],
+}
+
+const CUB_DOWNSWEEP_SLOT_SIZE: usize = std::mem::size_of::<CubDownsweepCaptureSlot>();
+const CUB_DOWNSWEEP_PRE_PTRS_OFF: usize = 256;
+const CUB_DOWNSWEEP_CAPTURE_TOTAL_SIZE: usize = CUB_DOWNSWEEP_SLOT_SIZE * IOFX_CAPTURE_SLOTS;
+
+struct CubDownsweepCaptureState {
+    host_ptr: *mut u8,
+    dev_ptr: *mut std::ffi::c_void,
+    launch_counter: u64,
+}
+unsafe impl Send for CubDownsweepCaptureState {}
+unsafe impl Sync for CubDownsweepCaptureState {}
+
+static CUB_DOWNSWEEP_CAPTURE: Mutex<Option<CubDownsweepCaptureState>> = Mutex::new(None);
+
+pub(crate) static CUB_DOWNSWEEP_CAPTURE_HOST_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static CUB_DOWNSWEEP_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn cub_downsweep_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZLUDA_DOWNSWEEP_CAPTURE").map_or(false, |v| v == "1")
+    })
+}
+
+unsafe fn cub_downsweep_capture_init(state: &mut Option<CubDownsweepCaptureState>) {
+    if state.is_some() {
+        return;
+    }
+    let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let alloc_result = unsafe {
+        hipHostMalloc(
+            &mut host_ptr,
+            CUB_DOWNSWEEP_CAPTURE_TOTAL_SIZE,
+            hipHostMallocMapped,
+        )
+    };
+    if alloc_result.is_err() || host_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] CUB downsweep capture: hipHostMalloc({}) failed: {:?}",
+            CUB_DOWNSWEEP_CAPTURE_TOTAL_SIZE, alloc_result
+        ));
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, CUB_DOWNSWEEP_CAPTURE_TOTAL_SIZE);
+    }
+    let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
+    if map_result.is_err() || dev_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] CUB downsweep capture: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] CUB downsweep capture: {} slots × {} KB = {} KB pinned; host=0x{:x} dev=0x{:x}",
+        IOFX_CAPTURE_SLOTS,
+        CUB_DOWNSWEEP_SLOT_SIZE / 1024,
+        CUB_DOWNSWEEP_CAPTURE_TOTAL_SIZE / 1024,
+        host_ptr as usize,
+        dev_ptr as usize,
+    ));
+    CUB_DOWNSWEEP_CAPTURE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::SeqCst);
+    CUB_DOWNSWEEP_CAPTURE_TOTAL_BYTES.store(
+        CUB_DOWNSWEEP_CAPTURE_TOTAL_SIZE,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    *state = Some(CubDownsweepCaptureState {
+        host_ptr: host_ptr as *mut u8,
+        dev_ptr,
+        launch_counter: 0,
+    });
+}
+
+unsafe fn capture_cub_downsweep_inputs(
+    extra: *mut *mut ::core::ffi::c_void,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
+    shared_mem_bytes: u32,
+) -> Option<usize> {
+    if !cub_downsweep_capture_enabled() {
+        return None;
+    }
+    if extra.is_null() {
+        return None;
+    }
+    let extra_arr = unsafe { std::slice::from_raw_parts(extra, 5) };
+    if extra_arr[0] != (0x1usize as *mut _) || extra_arr[1].is_null() {
+        return None;
+    }
+    let buf = extra_arr[1] as *const u8;
+    let mut ptrs = [0u64; CUB_DOWNSWEEP_POINTER_COUNT];
+    for i in 0..CUB_DOWNSWEEP_POINTER_COUNT {
+        ptrs[i] = unsafe { std::ptr::read_unaligned(buf.add(i * 8) as *const u64) };
+    }
+
+    let mut guard = match CUB_DOWNSWEEP_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    unsafe { cub_downsweep_capture_init(&mut guard) };
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let this_launch = state.launch_counter;
+    state.launch_counter += 1;
+    let slot_index = (this_launch as usize) % IOFX_CAPTURE_SLOTS;
+    let slot_host = unsafe {
+        state
+            .host_ptr
+            .add(slot_index * CUB_DOWNSWEEP_SLOT_SIZE) as *mut CubDownsweepCaptureSlot
+    };
+    unsafe {
+        std::ptr::write_bytes(slot_host as *mut u8, 0, CUB_DOWNSWEEP_SLOT_SIZE);
+        (*slot_host).magic = CUB_DOWNSWEEP_CAPTURE_MAGIC;
+        (*slot_host).launch_n = this_launch;
+        (*slot_host).timestamp_ms = crate::elapsed_ms();
+        (*slot_host).grid_x = grid_x;
+        (*slot_host).grid_y = grid_y;
+        (*slot_host).grid_z = grid_z;
+        (*slot_host).block_x = block_x;
+        (*slot_host).block_y = block_y;
+        (*slot_host).block_z = block_z;
+        (*slot_host).shared_mem_bytes = shared_mem_bytes;
+        (*slot_host).ptr_params = ptrs;
+        (*slot_host).buffer_bytes_per_ptr = CUB_DOWNSWEEP_BUFFER_BYTES as u32;
+        // Raw args buffer is 88 bytes from the extra; copy and pad to 128.
+        let dst = (*slot_host).raw_args.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(buf, dst, 88);
+        (*slot_host).raw_args_len = 88;
+    }
+    Some(slot_index)
+}
+
+unsafe fn capture_cub_downsweep_pre(slot_index: usize, stream: hipStream_t) {
+    if !cub_downsweep_capture_enabled() {
+        return;
+    }
+    let guard = match CUB_DOWNSWEEP_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+    let slot_host = unsafe {
+        state
+            .host_ptr
+            .add(slot_index * CUB_DOWNSWEEP_SLOT_SIZE) as *const CubDownsweepCaptureSlot
+    };
+    let slot_dev_base =
+        unsafe { (state.dev_ptr as *mut u8).add(slot_index * CUB_DOWNSWEEP_SLOT_SIZE) };
+    for idx in 0..CUB_DOWNSWEEP_POINTER_COUNT {
+        let src_ptr = unsafe { (*slot_host).ptr_params[idx] };
+        if src_ptr == 0 {
+            continue;
+        }
+        let dst_off = CUB_DOWNSWEEP_PRE_PTRS_OFF + idx * CUB_DOWNSWEEP_BUFFER_BYTES;
+        unsafe {
+            let _ = hipMemcpyDtoDAsync(
+                hipDeviceptr_t(slot_dev_base.add(dst_off) as _),
+                hipDeviceptr_t(src_ptr as _),
+                CUB_DOWNSWEEP_BUFFER_BYTES,
+                stream,
+            );
+        }
+    }
+}
+
 unsafe fn capture_iofx_actor_range_pre(slot_index: usize, stream: hipStream_t) {
     unsafe { capture_iofx_actor_range_outputs(slot_index, stream, true) };
 }
@@ -7940,10 +8162,12 @@ pub(crate) fn launch_kernel(
                 } else {
                     "US"
                 };
-                // params 0..4 are u64 pointers (Downsweep: d_keys_a, d_keys_b,
-                // d_spine, d_values_a, d_values_b; Upsweep: d_keys, d_spine,
-                // d_values). Upsweep's buffer is shorter but offsets 0..40
-                // still hold pointers for both.
+                // params 0..4 are u64 pointers. Verified from the capture infra:
+                // Downsweep = (d_keys_in, d_keys_out, d_values_in, d_values_out,
+                // d_spine). Upsweep is (d_keys, d_spine, d_values) — its buffer
+                // is shorter but offsets 0..40 still hold pointers so reading
+                // 5 is safe; ptrs[3..5] for Upsweep are unused/padding bytes
+                // from the shared struct and should be treated as garbage.
                 let ptrs: [u64; 5] = [
                     std::ptr::read_unaligned(buf.add(0)  as *const u64),
                     std::ptr::read_unaligned(buf.add(8)  as *const u64),
@@ -8128,6 +8352,22 @@ pub(crate) fn launch_kernel(
                 extra,
                 grid_dim_x,
                 block_dim_x,
+                shared_mem_bytes,
+            )
+        }
+    } else {
+        None
+    };
+    let cub_downsweep_slot = if name.contains("RadixSortDownsweepKernel") {
+        unsafe {
+            capture_cub_downsweep_inputs(
+                extra,
+                grid_dim_x,
+                grid_dim_y,
+                grid_dim_z,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z,
                 shared_mem_bytes,
             )
         }
@@ -8362,6 +8602,11 @@ pub(crate) fn launch_kernel(
     if let Some(slot_index) = iofx_bbox_slot {
         unsafe {
             capture_iofx_bbox_pre(slot_index, stream);
+        }
+    }
+    if let Some(slot_index) = cub_downsweep_slot {
+        unsafe {
+            capture_cub_downsweep_pre(slot_index, stream);
         }
     }
 

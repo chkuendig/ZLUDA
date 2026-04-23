@@ -311,6 +311,16 @@ fn install_fault_signal_handler() {
             c"/tmp/iofx_bbox_captures.bin".as_ptr(),
         );
 
+        let cub_downsweep_host_ptr = super::function::CUB_DOWNSWEEP_CAPTURE_HOST_PTR
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let cub_downsweep_total_bytes = super::function::CUB_DOWNSWEEP_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            cub_downsweep_host_ptr,
+            cub_downsweep_total_bytes,
+            c"/tmp/cub_downsweep_captures.bin".as_ptr(),
+        );
+
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -361,6 +371,13 @@ fn install_fault_signal_handler() {
                     f,
                     "*** IOFX bbox capture dumped to /tmp/iofx_bbox_captures.bin ({} bytes)\n",
                     iofx_bbox_total_bytes
+                );
+            }
+            if cub_downsweep_host_ptr != 0 && cub_downsweep_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** CUB downsweep capture dumped to /tmp/cub_downsweep_captures.bin ({} bytes)\n",
+                    cub_downsweep_total_bytes
                 );
             }
             if let Ok(guard) = KERNEL_RING.lock() {
