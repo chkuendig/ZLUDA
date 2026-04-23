@@ -78,7 +78,10 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
     if env_off {
         return None;
     }
-    if !ptx.contains("IOFX_bbox") {
+    // 2026-04-23 (4593cb2e): also covers IOFX_actorRangeKernel (2 stride=4
+    // sites with same BB10_188 structural shape; PTX scanner confirmed
+    // no false-positive matches in non-IOFX kernels).
+    if !ptx.contains("IOFX_bbox") && !ptx.contains("IOFX_actorRange") {
         return None;
     }
     // The regex would be ideal here but ptx_parser is the only regex-y dep
@@ -101,6 +104,8 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
         // at file scope.
         if trimmed.starts_with(".visible .entry IOFX_bbox")
             || trimmed.starts_with(".entry IOFX_bbox")
+            || trimmed.starts_with(".visible .entry IOFX_actorRange")
+            || trimmed.starts_with(".entry IOFX_actorRange")
         {
             in_bbox_kernel = true;
             brace_depth = 0;
@@ -247,9 +252,11 @@ fn match_setp_eq_s32_minus_one_pair(setp_line: &str, bra_line: &str) -> Option<(
     Some((r_tok.to_string(), target.to_string()))
 }
 
-/// Matches `mul.wide.u32 %rd<N>, <reg>, 16;` where <reg> is the given register
-/// identifier (e.g. "%r94"). The destination is irrelevant — we only care that
-/// <reg> is the left-hand multiplicand being scaled by 16.
+/// Matches `mul.wide.u32 %rd<N>, <reg>, <stride>;` where <reg> is the given
+/// register identifier (e.g. "%r94") and <stride> is an element size we
+/// consider a per-lane scatter (4 = u32/i32, 8 = u64/i64/ptr, 16 = float4/
+/// 4xi32 vector). Any of these, paired with an uninitialized-LDS read that
+/// survives a -1 guard, produces a wild pointer on AMDGPU.
 fn is_mul_wide_u32_by_reg_times_16(line: &str, reg: &str) -> bool {
     let line = line.trim_end();
     let rest = match line.strip_prefix("mul.wide.u32") {
@@ -269,7 +276,7 @@ fn is_mul_wide_u32_by_reg_times_16(line: &str, reg: &str) -> bool {
         Some(s) => s.trim().trim_end_matches(';').trim(),
         None => return false,
     };
-    src1 == reg && src2 == "16"
+    src1 == reg && matches!(src2, "4" | "8" | "16")
 }
 
 fn is_bb_label(s: &str) -> bool {
@@ -2354,6 +2361,60 @@ ret;
 }
 "#;
         // No mul.wide.u32 ..., 16 in sight → no patch for this pattern.
+        assert!(patch_iofx_bbox_tail_merge(ptx).is_none());
+    }
+
+    #[test]
+    fn patch_covers_iofx_actor_range_kernel_stride_4() {
+        // IOFX_actorRangeKernel has the same class of pattern as
+        // IOFX_bboxKernel's BB10_188: `ld.shared.u32 %r, addr;
+        // setp.eq.s32 %p, %r, -1; @%p bra X; ... mul.wide.u32 _, %r, 4;
+        // st.global.u32 [...]`. On AMDGPU the shared-memory read returns
+        // garbage for some lanes; the -1 guard doesn't catch them; the
+        // u32-stride scatter produces wild pointers.
+        let ptx = r#"
+.visible .entry IOFX_actorRangeKernel() {
+.reg .pred %p<20>;
+.reg .s32 %r<50>;
+.reg .s64 %rd<50>;
+BB6_18:
+ld.shared.u32 %r17, [%rd4+4];
+setp.eq.s32	%p9, %r17, -1;
+@%p9 bra BB6_21;
+
+mul.wide.u32 %rd35, %r17, 4;
+add.s64 %rd36, %rd34, %rd35;
+st.global.u32 [%rd36], %r18;
+BB6_21:
+ret;
+}
+"#;
+        let patched = patch_iofx_bbox_tail_merge(ptx).expect("should patch");
+        assert!(
+            patched.contains("@%p_zluda_bbox_lane0_0 bra BB6_21;"),
+            "missing tid==0 guard for actorRange pattern:\n{}",
+            patched
+        );
+        assert!(patched.contains("setp.eq.s32\t%p9, %r17, -1;"));
+    }
+
+    #[test]
+    fn patch_skips_non_iofx_kernels_even_with_bbox_pattern() {
+        // A kernel that's not IOFX_bbox* or IOFX_actorRange* must be untouched
+        // even if it has the full pattern.
+        let ptx = r#"
+.visible .entry _Z7SomeFooPv() {
+.reg .pred %p<10>;
+.reg .s32 %r<20>;
+.reg .s64 %rd<20>;
+BB1_1:
+setp.eq.s32	%p1, %r1, -1;
+@%p1 bra BB1_2;
+mul.wide.u32 %rd2, %r1, 4;
+BB1_2:
+ret;
+}
+"#;
         assert!(patch_iofx_bbox_tail_merge(ptx).is_none());
     }
 
