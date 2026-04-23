@@ -7923,45 +7923,52 @@ pub(crate) fn launch_kernel(
             shared_mem_bytes
         ));
     }
-    // Capture CUB RadixSort kernel args (Downsweep + Upsweep) including GridEvenShare.
-    // Pure CPU reads from the extra buffer — no GPU ops, no ProfilingSignal risk.
-    // Logs once per unique (kernel, begin_bit) pair so we get one line per pass.
+    // Capture CUB RadixSort kernel args (Downsweep + Upsweep) including
+    // GridEvenShare and the 5 pointer params. Pure CPU reads from the extra
+    // buffer — no GPU ops, no ProfilingSignal risk. Every launch logs (was
+    // previously gated to a single sort's worth of passes, which was hiding
+    // the crashing Downsweep's state).
     if (name.contains("RadixSortDownsweepKernel") || name.contains("RadixSortUpsweepKernel"))
         && !extra.is_null()
     {
-        static SORT_CAPTURE_DONE: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !SORT_CAPTURE_DONE.load(std::sync::atomic::Ordering::Relaxed) {
-            unsafe {
-                let extra_arr = std::slice::from_raw_parts(extra, 5);
-                if extra_arr[0] == (0x1usize as *mut _) && !extra_arr[1].is_null() {
-                    let buf = extra_arr[1] as *const u8;
-                    // Read all bytes 0-87 of the extra buffer
-                    let raw: Vec<u8> = (0..88).map(|i| *buf.add(i)).collect();
-                    let kernel_type = if name.contains("Downsweep") {
-                        "DS"
-                    } else {
-                        "US"
-                    };
-                    let n_items = std::ptr::read_unaligned(buf.add(40) as *const u32);
-                    let begin_bit = std::ptr::read_unaligned(buf.add(44) as *const u32);
-                    let is_first = *buf.add(48);
-                    let is_last = *buf.add(49);
-                    let overwrite = *buf.add(50);
-                    // GridEvenShare at bytes 52-87 (36 bytes)
-                    let ges_raw: Vec<u8> = (52..88).map(|i| *buf.add(i)).collect();
-                    let ges_i32: Vec<i32> = (0..9)
-                        .map(|i| std::ptr::read_unaligned(buf.add(52 + i * 4) as *const i32))
-                        .collect();
-                    super::driver::zluda_log_err(&format!(
-                        "SORT_ARGS {} n={} bit={} first={} last={} ow={} GES={:?} grid={} stream={:?}",
-                        kernel_type, n_items, begin_bit, is_first, is_last, overwrite,
-                        ges_i32, grid_dim_x, stream));
-                    // Mark done after capturing all passes (last Downsweep = bit>=16)
-                    if name.contains("Downsweep") && begin_bit >= 16 {
-                        SORT_CAPTURE_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
+        unsafe {
+            let extra_arr = std::slice::from_raw_parts(extra, 5);
+            if extra_arr[0] == (0x1usize as *mut _) && !extra_arr[1].is_null() {
+                let buf = extra_arr[1] as *const u8;
+                let kernel_type = if name.contains("Downsweep") {
+                    "DS"
+                } else {
+                    "US"
+                };
+                // params 0..4 are u64 pointers (Downsweep: d_keys_a, d_keys_b,
+                // d_spine, d_values_a, d_values_b; Upsweep: d_keys, d_spine,
+                // d_values). Upsweep's buffer is shorter but offsets 0..40
+                // still hold pointers for both.
+                let ptrs: [u64; 5] = [
+                    std::ptr::read_unaligned(buf.add(0)  as *const u64),
+                    std::ptr::read_unaligned(buf.add(8)  as *const u64),
+                    std::ptr::read_unaligned(buf.add(16) as *const u64),
+                    std::ptr::read_unaligned(buf.add(24) as *const u64),
+                    std::ptr::read_unaligned(buf.add(32) as *const u64),
+                ];
+                let n_items = std::ptr::read_unaligned(buf.add(40) as *const u32);
+                let begin_bit = std::ptr::read_unaligned(buf.add(44) as *const u32);
+                let is_first = *buf.add(48);
+                let is_last = *buf.add(49);
+                let overwrite = *buf.add(50);
+                let ges_i32: Vec<i32> = (0..9)
+                    .map(|i| std::ptr::read_unaligned(buf.add(52 + i * 4) as *const i32))
+                    .collect();
+                // Per-call sequence counter so we can align this with the
+                // kernel-launch history dump at crash time.
+                static SORT_SEQ: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let seq = SORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::driver::zluda_log_err(&format!(
+                    "SORT_ARGS#{} {} n={} bit={} first={} last={} ow={} GES={:?} grid={} stream={:?} ptrs=[0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
+                    seq, kernel_type, n_items, begin_bit, is_first, is_last, overwrite,
+                    ges_i32, grid_dim_x, stream,
+                    ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4]));
             }
         }
     }
