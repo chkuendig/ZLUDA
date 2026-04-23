@@ -69,6 +69,9 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
     let mut in_bbox_kernel = false;
     let mut brace_depth: i32 = 0;
     let mut patch_count = 0usize;
+    // Counter for synthesized predicate/register names so multiple guards in
+    // the same kernel don't collide on the same identifier.
+    let mut guard_uid: usize = 0;
     while i < lines.len() {
         let line = lines[i];
         out.push_str(line);
@@ -95,7 +98,7 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
                 }
             }
         }
-        // Detect the specific pattern inside an IOFX_bbox* kernel:
+        // Pattern A — BB10_184 style (guard a tid=0 store via rd305==0 check):
         //   ^BB<N>_<M>:\n
         //   ^setp.eq.s64\s+%p<X>, %rd<Y>, 0;\n
         //   ^@%p<X>\s+bra\s+BB<A>_<B>;\n
@@ -112,21 +115,59 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
                 out.push('\n');
                 out.push_str(lines[i + 2]);
                 out.push('\n');
-                out.push_str("// ZLUDA IOFX_bbox fix: AMDGPU divergence guard\n");
-                out.push_str("{\n");
-                out.push_str(".reg .pred %p_zluda_bbox_lane0;\n");
-                out.push_str(".reg .s32 %r_zluda_bbox_tid;\n");
-                out.push_str("mov.u32 %r_zluda_bbox_tid, %tid.x;\n");
-                out.push_str("setp.ne.s32 %p_zluda_bbox_lane0, %r_zluda_bbox_tid, 0;\n");
-                out.push_str(&format!(
-                    "@%p_zluda_bbox_lane0 bra {};\n",
-                    target_label
-                ));
-                out.push_str("}\n");
+                emit_lane0_guard(&mut out, &target_label, guard_uid);
+                guard_uid += 1;
                 let _ = pred_a;
                 i += 3;
                 patch_count += 1;
                 continue;
+            }
+        }
+        // Pattern B — BB10_188 / BB9_202 style: `setp.eq.s32 %pX, %rY, -1; @%pX bra TARGET;`
+        // where %rY is loaded from uninitialized sWarpFirstActorID LDS and used
+        // shortly after as `mul.wide.u32 %rdZ, %rY, 16;` to compute a per-lane
+        // global store pointer. Non-tid=0 lanes on AMDGPU have garbage rY; NV
+        // happens to have 0/-1 which is either benign-race or filtered by the
+        // -1 guard. Adding a tid==0 guard after the -1 check prevents the wild
+        // stores.
+        if in_bbox_kernel
+            && brace_depth >= 1
+            && i + 1 < lines.len()
+        {
+            let setp_line = lines[i].trim_start();
+            let bra_line = lines[i + 1].trim_start();
+            if let Some((reg_name, target_label)) =
+                match_setp_eq_s32_minus_one_pair(setp_line, bra_line)
+            {
+                // Confirmation: within the next 20 lines, the same %rY must be
+                // used as `mul.wide.u32 %rd?, %rY, 16;`. This anchors the patch
+                // to the wild-pointer computation and avoids touching unrelated
+                // `-1` checks (e.g., r91/r797 initialization reads).
+                let mut uses_in_mul_wide = false;
+                let look_end = (i + 22).min(lines.len());
+                for j in (i + 2)..look_end {
+                    let l = lines[j].trim_start();
+                    if is_bb_label(l) {
+                        break;
+                    }
+                    if is_mul_wide_u32_by_reg_times_16(l, &reg_name) {
+                        uses_in_mul_wide = true;
+                        break;
+                    }
+                }
+                if uses_in_mul_wide {
+                    // NOTE: we've already pushed lines[i] (the setp) via the
+                    // loop-top push. Now push lines[i+1] (the bra), then
+                    // insert the tid==0 guard that also branches to
+                    // `target_label`.
+                    out.push_str(lines[i + 1]);
+                    out.push('\n');
+                    emit_lane0_guard(&mut out, &target_label, guard_uid);
+                    guard_uid += 1;
+                    i += 2;
+                    patch_count += 1;
+                    continue;
+                }
             }
         }
         i += 1;
@@ -140,6 +181,85 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
         ));
         Some(out)
     }
+}
+
+fn emit_lane0_guard(out: &mut String, target_label: &str, uid: usize) {
+    out.push_str("// ZLUDA IOFX_bbox fix: AMDGPU divergence guard\n");
+    out.push_str("{\n");
+    out.push_str(&format!(".reg .pred %p_zluda_bbox_lane0_{};\n", uid));
+    out.push_str(&format!(".reg .s32 %r_zluda_bbox_tid_{};\n", uid));
+    out.push_str(&format!("mov.u32 %r_zluda_bbox_tid_{}, %tid.x;\n", uid));
+    out.push_str(&format!(
+        "setp.ne.s32 %p_zluda_bbox_lane0_{}, %r_zluda_bbox_tid_{}, 0;\n",
+        uid, uid
+    ));
+    out.push_str(&format!(
+        "@%p_zluda_bbox_lane0_{} bra {};\n",
+        uid, target_label
+    ));
+    out.push_str("}\n");
+}
+
+/// Parses:
+///   `setp.eq.s32<ws>%p<digits>, %r<digits>, -1;`
+///   `@%p<same_digits> bra BB<digits>_<digits>;`
+/// Returns (register_name_with_%, target_label) on match.
+fn match_setp_eq_s32_minus_one_pair(
+    setp_line: &str,
+    bra_line: &str,
+) -> Option<(String, String)> {
+    let setp = setp_line.trim_end();
+    let rest = setp.strip_prefix("setp.eq.s32")?;
+    let rest = rest.trim_start();
+    let mut parts = rest.splitn(3, ',');
+    let p_tok = parts.next()?.trim();
+    let r_tok = parts.next()?.trim();
+    let minus_tok = parts.next()?.trim();
+    if !p_tok.starts_with("%p") {
+        return None;
+    }
+    let pred_name = &p_tok[1..];
+    if !r_tok.starts_with("%r") || r_tok.starts_with("%rd") {
+        return None;
+    }
+    if !(minus_tok.starts_with("-1;") || minus_tok == "-1") {
+        return None;
+    }
+    let bra = bra_line.trim_end();
+    let bra_rest = bra.strip_prefix("@%")?;
+    let bra_rest = bra_rest.strip_prefix(pred_name)?;
+    let bra_rest = bra_rest.trim_start();
+    let bra_rest = bra_rest.strip_prefix("bra")?;
+    let target = bra_rest.trim().trim_end_matches(';').trim();
+    if !target.starts_with("BB") {
+        return None;
+    }
+    Some((r_tok.to_string(), target.to_string()))
+}
+
+/// Matches `mul.wide.u32 %rd<N>, <reg>, 16;` where <reg> is the given register
+/// identifier (e.g. "%r94"). The destination is irrelevant — we only care that
+/// <reg> is the left-hand multiplicand being scaled by 16.
+fn is_mul_wide_u32_by_reg_times_16(line: &str, reg: &str) -> bool {
+    let line = line.trim_end();
+    let rest = match line.strip_prefix("mul.wide.u32") {
+        Some(r) => r.trim_start(),
+        None => return false,
+    };
+    let mut parts = rest.splitn(3, ',');
+    let _dest = match parts.next() {
+        Some(s) => s.trim(),
+        None => return false,
+    };
+    let src1 = match parts.next() {
+        Some(s) => s.trim(),
+        None => return false,
+    };
+    let src2 = match parts.next() {
+        Some(s) => s.trim().trim_end_matches(';').trim(),
+        None => return false,
+    };
+    src1 == reg && src2 == "16"
 }
 
 fn is_bb_label(s: &str) -> bool {
@@ -1088,8 +1208,8 @@ ret;
         // Confirm original guard preserved AND new tid-0 guard added.
         assert!(patched.contains("setp.eq.s64\t%p122, %rd305, 0;"));
         assert!(patched.contains("@%p122 bra BB10_186;"));
-        assert!(patched.contains("setp.ne.s32 %p_zluda_bbox_lane0, %r_zluda_bbox_tid, 0;"));
-        assert!(patched.contains("@%p_zluda_bbox_lane0 bra BB10_186;"));
+        assert!(patched.contains("setp.ne.s32 %p_zluda_bbox_lane0_0, %r_zluda_bbox_tid_0, 0;"));
+        assert!(patched.contains("@%p_zluda_bbox_lane0_0 bra BB10_186;"));
     }
 
     #[test]
@@ -1111,9 +1231,125 @@ ret;
 }
 "#;
         let patched = patch_iofx_bbox_tail_merge(ptx).expect("should patch");
-        assert!(patched.contains("@%p_zluda_bbox_lane0 bra BB9_148;"));
+        assert!(patched.contains("@%p_zluda_bbox_lane0_0 bra BB9_148;"));
         // Original predicate/register preserved.
         assert!(patched.contains("setp.eq.s64\t%p103, %rd540, 0;"));
+    }
+
+    #[test]
+    fn patch_inserts_guard_for_bb10_188_r94_pattern() {
+        // BB10_188-style pattern: a `setp.eq.s32 %pX, %rY, -1; @%pX bra TARGET;`
+        // followed shortly by `mul.wide.u32 %rd?, %rY, 16;` — the per-lane
+        // wild-pointer compute. A tid==0 guard must be inserted after @%pX bra.
+        let ptx = r#"
+.visible .entry IOFX_bboxKernel() {
+.reg .pred %p<200>;
+.reg .s32 %r<800>;
+.reg .s64 %rd<400>;
+BB10_188:
+setp.eq.s32	%p124, %r94, -1;
+@%p124 bra BB10_195;
+
+@%p117 bra BB10_191;
+
+mul.wide.u32 %rd290, %r94, 16;
+add.s64 %rd307, %rd3, %rd290;
+BB10_195:
+ret;
+}
+"#;
+        let patched = patch_iofx_bbox_tail_merge(ptx).expect("should patch");
+        assert!(
+            patched.contains("@%p_zluda_bbox_lane0_0 bra BB10_195;"),
+            "missing tid==0 guard branch to BB10_195:\n{}",
+            patched
+        );
+        // Original -1 guard preserved.
+        assert!(patched.contains("setp.eq.s32\t%p124, %r94, -1;"));
+        assert!(patched.contains("@%p124 bra BB10_195;"));
+    }
+
+    #[test]
+    fn patch_inserts_guard_for_bb9_202_sync_pattern() {
+        // BB9_202-style pattern in IOFX_bboxSyncKernel: load -> setp -1 -> bra
+        // -> mul.wide.u32 %r, 16.
+        let ptx = r#"
+.visible .entry IOFX_bboxSyncKernel() {
+.reg .pred %p<200>;
+.reg .s32 %r<800>;
+.reg .s64 %rd<600>;
+BB9_202:
+ld.volatile.shared.u32 %r89, [%rd9];
+setp.eq.s32	%p132, %r89, -1;
+@%p132 bra BB9_204;
+
+mul.wide.u32 %rd532, %r89, 16;
+add.s64 %rd533, %rd530, %rd532;
+BB9_204:
+ret;
+}
+"#;
+        let patched = patch_iofx_bbox_tail_merge(ptx).expect("should patch");
+        assert!(
+            patched.contains("@%p_zluda_bbox_lane0_0 bra BB9_204;"),
+            "missing tid==0 guard branch to BB9_204:\n{}",
+            patched
+        );
+    }
+
+    #[test]
+    fn patch_skips_minus_one_pattern_without_mul_wide() {
+        // A setp.eq.s32 ..., -1 pattern that is NOT followed by
+        // `mul.wide.u32 %rY, 16` within the BB must not be patched
+        // (common case: a check on a uniformly-loaded shared value that
+        // does not produce a per-lane store pointer).
+        let ptx = r#"
+.visible .entry IOFX_bboxKernel() {
+.reg .pred %p<200>;
+.reg .s32 %r<800>;
+BB10_10:
+setp.eq.s32	%p1, %r1, -1;
+@%p1 bra BB10_11;
+
+mov.u32 %r2, 42;
+BB10_11:
+ret;
+}
+"#;
+        // No mul.wide.u32 ..., 16 in sight → no patch for this pattern.
+        assert!(patch_iofx_bbox_tail_merge(ptx).is_none());
+    }
+
+    #[test]
+    fn patch_both_bb184_and_bb188_patterns_together() {
+        // Both patterns in the same kernel should produce two guards.
+        let ptx = r#"
+.visible .entry IOFX_bboxKernel() {
+.reg .pred %p<200>;
+.reg .s32 %r<800>;
+.reg .s64 %rd<400>;
+BB10_184:
+setp.eq.s64	%p122, %rd305, 0;
+@%p122 bra BB10_186;
+
+BB10_188:
+setp.eq.s32	%p124, %r94, -1;
+@%p124 bra BB10_195;
+
+mul.wide.u32 %rd290, %r94, 16;
+BB10_195:
+ret;
+}
+"#;
+        let patched = patch_iofx_bbox_tail_merge(ptx).expect("should patch");
+        assert_eq!(
+            patched.matches("ZLUDA IOFX_bbox fix").count(),
+            2,
+            "expected 2 guards, got:\n{}",
+            patched
+        );
+        assert!(patched.contains("@%p_zluda_bbox_lane0_0 bra BB10_186;"));
+        assert!(patched.contains("@%p_zluda_bbox_lane0_1 bra BB10_195;"));
     }
 
     #[test]
@@ -1154,8 +1390,8 @@ ret;
         let patched = patch_iofx_bbox_tail_merge(ptx).expect("should patch");
         let insertions = patched.matches("ZLUDA IOFX_bbox fix").count();
         assert_eq!(insertions, 2, "expected 2 patches, got:\n{}", patched);
-        assert!(patched.contains("@%p_zluda_bbox_lane0 bra BB1_2;"));
-        assert!(patched.contains("@%p_zluda_bbox_lane0 bra BB1_3;"));
+        assert!(patched.contains("@%p_zluda_bbox_lane0_0 bra BB1_2;"));
+        assert!(patched.contains("@%p_zluda_bbox_lane0_1 bra BB1_3;"));
     }
 
     #[test]
