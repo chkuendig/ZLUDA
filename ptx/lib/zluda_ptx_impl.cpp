@@ -310,13 +310,11 @@ extern "C"
     // intrinsics, it is always 31 for idx, bfly, and down, and 0 for up. This is used for the
     // bounds check.
 #define SHFL_SYNC_IMPL(mode, calculate_index, CMP)                                                                                              \
-    ShflSyncResult FUNC(shfl_sync_##mode##_b32_pred)(uint32_t input, int32_t delta, uint32_t opts, uint32_t membermask)                        \
+    ShflSyncResult FUNC(shfl_sync_##mode##_b32_pred)(uint32_t input, int32_t delta, uint32_t opts, uint32_t membermask __attribute__((unused))) \
     {                                                                                                                                           \
         int32_t section_mask = (opts >> 8) & 0b11111;                                                                                           \
         int32_t warp_end = opts & 0b11111;                                                                                                      \
         int32_t self = (int32_t)FUNC_CALL(sreg_laneid)();                                                                                       \
-        uint32_t active_mask = FUNC_CALL(activemask)();                                                                                         \
-        uint32_t participants = membermask & active_mask;                                                                                       \
         int32_t subsection = section_mask & self;                                                                                               \
         int32_t subsection_end = subsection | (~section_mask & warp_end);                                                                       \
         int32_t idx = calculate_index;                                                                                                          \
@@ -324,11 +322,6 @@ extern "C"
         if (out_of_bounds)                                                                                                                      \
         {                                                                                                                                       \
             idx = self;                                                                                                                         \
-        }                                                                                                                                       \
-        if (((participants >> idx) & 1U) == 0)                                                                                                  \
-        {                                                                                                                                       \
-            idx = self;                                                                                                                         \
-            out_of_bounds = true;                                                                                                               \
         }                                                                                                                                       \
         int32_t output = __builtin_amdgcn_ds_bpermute(idx << 2, (int32_t)input);                                                                \
         return {(uint32_t)output, uint32_t(!out_of_bounds)};                                                                                    \
