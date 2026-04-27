@@ -55,18 +55,32 @@ use hip_runtime_sys::{
 
 #[must_use]
 pub(crate) fn get_non_broken_format(format: hipArray_Format) -> (u32, hipArray_Format) {
-    // PASSTHROUGH TEST (2026-04-11): earlier runs showed that current ROCm
-    // accepts HALF format at `hipTexRefSetFormat` (res=Ok(())), and the legacy
-    // `cuTexRef` path has no `HIP_RESOURCE_VIEW_DESC` equivalent to invert
-    // the substitution. If `hipArrayCreate` also accepts these formats, the
-    // whole substitution machinery is unnecessary and actively breaks
-    // TurbulenceFS HALF4 texref sampling. Revert this to the match below if
-    // `hipArrayCreate(HALF)` fails:
+    // 2026-04-27: re-enabled the lsh substitution. The prior passthrough
+    // (commit 90f30cee) was tested only by crash-distance, BEFORE the
+    // LLVM PR #161638 backport. With that backport the game runs ~140x
+    // further and we can SEE rendering — the user reports volumetric
+    // fog/smoke does NOT render. Lshqqytiger v3.9.6 (the v3 reference
+    // fork known to work for Batman) STILL has this substitution active.
     //
-    //     F::HIP_AD_FORMAT_HALF => (2, F::HIP_AD_FORMAT_UNSIGNED_INT16),
-    //     F::HIP_AD_FORMAT_SIGNED_INT16 => (1, F::HIP_AD_FORMAT_UNSIGNED_INT16),
-    //     F::HIP_AD_FORMAT_SIGNED_INT8 => (1, F::HIP_AD_FORMAT_UNSIGNED_INT8),
-    (0, format)
+    // Without substitution: HIP samples HALF4 textures, but ROCm's
+    // sampler appears to read raw UINT16 bits without HALF→FLOAT
+    // conversion — empty velocity field, no smoke.
+    //
+    // With substitution: array stored as UNSIGNED_INT16, and
+    // cuTexObjectCreate synthesizes a HIP_RESOURCE_VIEW_DESC saying
+    // "interpret as FLOAT_4X16" so the sampler converts correctly.
+    //
+    // Caveat: the legacy `cuTexRef` path has no HIP_RESOURCE_VIEW_DESC
+    // equivalent. If PhysX uses cuTexRef for some reads, those will
+    // break. Empirically Batman uses cuTexObject for the TFS velocity
+    // grids, so this is net-positive.
+    use hipArray_Format as F;
+    match format {
+        F::HIP_AD_FORMAT_HALF => (2, F::HIP_AD_FORMAT_UNSIGNED_INT16),
+        F::HIP_AD_FORMAT_SIGNED_INT16 => (1, F::HIP_AD_FORMAT_UNSIGNED_INT16),
+        F::HIP_AD_FORMAT_SIGNED_INT8 => (1, F::HIP_AD_FORMAT_UNSIGNED_INT8),
+        f => (0, f),
+    }
 }
 
 /// Inverse: given a hack_flag and the (possibly already-transformed) format,
