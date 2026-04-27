@@ -141,18 +141,27 @@ pub(crate) unsafe fn ref_set_array(h_tex_ref: CUtexref, h_array: CUarray, flags:
     // Get array descriptor to know the format and channel count
     let mut desc: HIP_ARRAY_DESCRIPTOR = mem::zeroed();
     hipArrayGetDescriptor(&mut desc, h_array as hipArray_t)?;
+    // 2026-04-27: lsh-style inverse-format. If the array was created with the
+    // HALF/SIGNED_INT substitution (stored as UNSIGNED_INT*), tell the texref
+    // the ORIGINAL format so the HIP sampler converts bytes correctly. Without
+    // this, the sampler returns raw bits as garbage floats — the missing-fog
+    // regression for TurbulenceFS HALF4 velocity textures.
+    // See lshqqytiger/ZLUDA v3.9.6 zluda/src/impl/texref.rs::set_array.
+    let original_format = super::hipfix::broken_format_for_array(h_array as hipArray_t)
+        .0
+        .unwrap_or(desc.Format);
     if texref_log_enabled() {
         let hack = super::hipfix::get_array_hack(h_array as hipArray_t);
         super::driver::zluda_log_err(&format!(
-            "TEXREF_SET_ARRAY tex={:p} array={:p} stored_fmt={} ch={} flags={} hack={:?}",
-            tex_ref, h_array, desc.Format.0, desc.NumChannels, flags, hack
+            "TEXREF_SET_ARRAY tex={:p} array={:p} stored_fmt={} bound_fmt={} ch={} flags={} hack={:?}",
+            tex_ref, h_array, desc.Format.0, original_format.0, desc.NumChannels, flags, hack
         ));
     }
-    let set_fmt_res = hipTexRefSetFormat(tex_ref, desc.Format, desc.NumChannels as i32);
+    let set_fmt_res = hipTexRefSetFormat(tex_ref, original_format, desc.NumChannels as i32);
     if set_fmt_res.is_err() && texref_log_enabled() {
         super::driver::zluda_log_err(&format!(
             "TEXREF_SET_ARRAY hipTexRefSetFormat FAILED tex={:p} fmt={} ch={}",
-            tex_ref, desc.Format.0, desc.NumChannels
+            tex_ref, original_format.0, desc.NumChannels
         ));
     }
     set_fmt_res?;
