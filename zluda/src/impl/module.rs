@@ -500,7 +500,10 @@ fn get_best_ptx_and_compile(
                         module_count,
                         ptx.len()
                     ));
-                    ptx_modules.push(Cow::Borrowed(ptx));
+                    match patch_iofx_bbox_tail_merge(ptx) {
+                        Some(patched) => ptx_modules.push(Cow::Owned(patched)),
+                        None => ptx_modules.push(Cow::Borrowed(ptx)),
+                    }
                 }
                 Ok(CodeModuleRef::File(file)) => {
                     let kind = if file.header.kind == FatbinFileHeader::HEADER_KIND_PTX {
@@ -537,7 +540,11 @@ fn get_best_ptx_and_compile(
                                             let _ = f.write_all(text.as_bytes());
                                         }
                                     }
-                                    ptx_modules.push(text);
+                                    let patched = patch_iofx_bbox_tail_merge(&text);
+                                    match patched {
+                                        Some(p) => ptx_modules.push(Cow::Owned(p)),
+                                        None => ptx_modules.push(text),
+                                    }
                                 }
                                 None => {
                                     super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: cow_bytes_to_str FAILED (not valid UTF-8)", module_count));
