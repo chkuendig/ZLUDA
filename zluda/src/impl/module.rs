@@ -19,17 +19,30 @@ use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 ///
 /// ============================================================
 /// WORKAROUND for an AMDGPU LLVM backend miscompilation.
-/// Upstream fix would live in: llvm/lib/Target/AMDGPU/
-///   (most likely MachineUniformityAnalysis / AMDGPUAnnotateUniformValues:
-///    a value conditionally written only by tid=0 is wrongly classified as
-///    uniform, gets SGPR-allocated, and the tid=0 store becomes visible to
-///    every lane in the wave.)
-/// Revisit this patch if we land a proper LLVM fix — at that point this
-/// PTX-level guard becomes redundant and should be removed so unaffected
-/// kernels aren't forced through the extra branch.
+/// A value conditionally written only by tid=0 is wrongly classified as
+/// uniform, gets SGPR-allocated, and the tid=0 store becomes visible to
+/// every lane in the wave.
+///
+/// CANDIDATE upstream fixes (merged in llvm/llvm-project main, NOT yet
+/// in our LLVM tree — cherry-pick stalled 2026-04-28 due to substantial
+/// conflicts in rocm-rel-6.4 base):
+///   - PR #180509 (f8416c8643534) "Replace DivergentValues with
+///     UniformValues for conservative divergence queries" — inverts the
+///     analysis to default to divergent when not proven uniform. Highest
+///     leverage candidate.
+///   - PR #174938 (da94edf535e7) + #174117 — "Jump over reducible cycles
+///     when locating join blocks" — companion to already-cherry-picked
+///     #139667.
+/// Already cherry-picked but byte-identical IR for our case (refuted):
+///   - PR #139667 (6421248c) "Fixed control-div early stop"
+///
+/// REMOVAL PLAN: when LLVM rebases past PR #180509 + #174938, retest
+/// with patch DELETED + multi-run protocol (≥3 runs). If smoke renders
+/// + game stability holds, delete the patch entirely.
+///
 /// Related tree artifacts:
 ///   - ptx/experiments/bbox/README.md (bisection record)
-///   - ext/llvm-project branch zluda-physx-pr145902
+///   - ext/llvm-project branch zluda-physx-pr145902 (different bug)
 ///   - ~/.claude/plans/can-tou-peppy-milner.md (investigation plan)
 /// ============================================================
 ///
