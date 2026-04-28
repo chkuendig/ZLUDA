@@ -58,6 +58,14 @@ use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 /// (BB10_184, rd305 guard, target BB10_186) and IOFX_bboxSyncKernel
 /// (BB9_146, rd540 guard, target BB9_148).
 pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
+    // 2026-04-28: env-gated for retirement testing on zluda-physx-clean.
+    // Set ZLUDA_IOFX_BBOX_GUARD=0 to disable. If smoke + game stability
+    // unaffected, the patch can be deleted entirely.
+    let env_off = std::env::var("ZLUDA_IOFX_BBOX_GUARD")
+        .map_or(false, |v| v == "0");
+    if env_off {
+        return None;
+    }
     if !ptx.contains("IOFX_bbox") {
         return None;
     }
@@ -492,10 +500,7 @@ fn get_best_ptx_and_compile(
                         module_count,
                         ptx.len()
                     ));
-                    match patch_iofx_bbox_tail_merge(ptx) {
-                        Some(patched) => ptx_modules.push(Cow::Owned(patched)),
-                        None => ptx_modules.push(Cow::Borrowed(ptx)),
-                    }
+                    ptx_modules.push(Cow::Borrowed(ptx));
                 }
                 Ok(CodeModuleRef::File(file)) => {
                     let kind = if file.header.kind == FatbinFileHeader::HEADER_KIND_PTX {
@@ -532,11 +537,7 @@ fn get_best_ptx_and_compile(
                                             let _ = f.write_all(text.as_bytes());
                                         }
                                     }
-                                    let patched = patch_iofx_bbox_tail_merge(&text);
-                                    match patched {
-                                        Some(p) => ptx_modules.push(Cow::Owned(p)),
-                                        None => ptx_modules.push(text),
-                                    }
+                                    ptx_modules.push(text);
                                 }
                                 None => {
                                     super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: cow_bytes_to_str FAILED (not valid UTF-8)", module_count));
