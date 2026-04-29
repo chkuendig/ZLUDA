@@ -423,6 +423,111 @@ pub fn patch_iofx_actor_range_membar(ptx: &str) -> Option<String> {
     }
 }
 
+/// 2026-04-29 Phase 3g defensive workaround for IOFX_actorRangeKernel
+/// wild-scatter. Phase 3e localized this kernel as the dominant fault
+/// producer (100/274 = 37% of all GPU page faults). The IOFX-specific
+/// capture (ZLUDA_IOFX_CAPTURE) showed input_329 contains values with
+/// bit 31 set (e.g. 0x800001B9 = `0x80000000 | 441` for count=443) —
+/// leftover from an upstream IOFX_newRadixSortStepKernel TwiddleOut
+/// step that didn't fully untwiddle on AMDGPU.
+///
+/// When IOFX_actorRangeKernel reads these values via
+/// `mul.wide.u32 %rdN, %rR, 4` (zero-extends to u64 then multiplies
+/// by 4), a value with bit 31 produces an offset of ~8.6 GB, which
+/// added to the output base lands at a wild VA outside any allocation
+/// → TCP page fault → SIGABRT. This matches our 100 captured fault
+/// VAs (page-aligned, ~10 GB above heap, exact bit pattern of `r17*4`
+/// where r17 has bit 31 set).
+///
+/// Defensive fix: insert `and.b32 %rR, %rR, 0x7FFFFFFF;` before every
+/// `mul.wide.u32 %rdN, %rR, 4;` inside IOFX_actorRangeKernel. This
+/// clears the leftover-twiddle bit while leaving the low 31 bits
+/// (the actual index) intact. The kernel's existing `-1` sentinel
+/// check (`setp.eq.s32 %p, %rR, -1`) runs BEFORE the multiply on the
+/// branch path that uses %rR, so the mask doesn't break sentinel
+/// detection (we only mask AFTER any equality compare and BEFORE the
+/// multiply).
+///
+/// Env-gate: `ZLUDA_IOFX_ACTOR_MASK_BIT31=1` (default ON in protonfix).
+pub fn patch_iofx_actor_range_mask_bit31(ptx: &str) -> Option<String> {
+    let env_off = std::env::var("ZLUDA_IOFX_ACTOR_MASK_BIT31")
+        .map_or(false, |v| v == "0");
+    if env_off {
+        return None;
+    }
+    if !ptx.contains("IOFX_actorRangeKernel") {
+        return None;
+    }
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut out = String::with_capacity(ptx.len() + 256);
+    let mut in_kernel = false;
+    let mut brace_depth: i32 = 0;
+    let mut patched = 0usize;
+    // Parse out the source register from `mul.wide.u32 %rdN, %rM, 4;`. The PTX
+    // emitter is consistent enough that simple split-on-whitespace works.
+    fn extract_mul_wide_u32_by_4_src(line: &str) -> Option<&str> {
+        let s = line.trim();
+        let s = s.strip_prefix("mul.wide.u32")?;
+        // Expect: "  %rdN, %rM, 4;"
+        let mut parts = s.split(',').map(|p| p.trim());
+        let _dst = parts.next()?; // %rdN
+        let src = parts.next()?;  // %rM
+        let imm = parts.next()?;  // "4;" or "4 ;"
+        let imm = imm.trim_end_matches(';').trim();
+        if imm != "4" {
+            return None;
+        }
+        // Source must be a 32-bit register reference (%rN with N digits).
+        if !src.starts_with("%r") || src.starts_with("%rd") {
+            return None;
+        }
+        Some(src)
+    }
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(".visible .entry IOFX_actorRangeKernel")
+            || trimmed.starts_with(".entry IOFX_actorRangeKernel")
+        {
+            in_kernel = true;
+            brace_depth = 0;
+        }
+        if in_kernel {
+            for c in line.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_kernel = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if in_kernel && brace_depth >= 1 {
+            if let Some(src) = extract_mul_wide_u32_by_4_src(line) {
+                out.push_str("// ZLUDA IOFX_actorRange mask-bit31 defensive\n");
+                out.push_str(&format!("and.b32 {0}, {0}, 0x7FFFFFFF;\n", src));
+                patched += 1;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+    if patched == 0 {
+        None
+    } else {
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] patch_iofx_actor_range_mask_bit31: inserted {} bit31 masks",
+            patched
+        ));
+        Some(out)
+    }
+}
+
 /// Broader version of patch_iofx_actor_range_membar that applies to ALL
 /// kernels whose name matches PhysX/FleX/TFS/IOFX prefixes. The narrow
 /// patch only helped a single kernel; the bug class likely exists in
@@ -686,10 +791,15 @@ fn get_best_ptx_and_compile(
                             Some(p) => Cow::Owned(p),
                             None => after_bbox,
                         };
-                    let final_ptx: Cow<str> =
-                        match patch_broad_membar_before_bar_sync(after_actor.as_ref()) {
+                    let after_mask: Cow<str> =
+                        match patch_iofx_actor_range_mask_bit31(after_actor.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_actor,
+                        };
+                    let final_ptx: Cow<str> =
+                        match patch_broad_membar_before_bar_sync(after_mask.as_ref()) {
+                            Some(p) => Cow::Owned(p),
+                            None => after_mask,
                         };
                     ptx_modules.push(final_ptx);
                 }
@@ -738,12 +848,19 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => after_bbox,
                                         };
-                                    let final_ptx: Cow<str> =
-                                        match patch_broad_membar_before_bar_sync(
+                                    let after_mask: Cow<str> =
+                                        match patch_iofx_actor_range_mask_bit31(
                                             after_actor.as_ref(),
                                         ) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_actor,
+                                        };
+                                    let final_ptx: Cow<str> =
+                                        match patch_broad_membar_before_bar_sync(
+                                            after_mask.as_ref(),
+                                        ) {
+                                            Some(p) => Cow::Owned(p),
+                                            None => after_mask,
                                         };
                                     ptx_modules.push(final_ptx);
                                 }
