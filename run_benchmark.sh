@@ -191,6 +191,7 @@ archive_run() {
     shopt -s nullglob
     for f in /tmp/ms4_captures.bin /tmp/ms2b_captures.bin /tmp/tfs_captures.bin \
              /tmp/iofx_bbox_captures.bin /tmp/iofx_captures.bin \
+             /tmp/iofx_actor_range_captures.bin /tmp/cub_downsweep_captures.bin \
              /tmp/zluda_sort_replay_capture_*.bin; do
         [[ -f "$f" ]] || continue
         cp -a "$f" "$ARCHIVE_DIR/" 2>/dev/null || true
