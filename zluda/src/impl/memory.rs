@@ -20,6 +20,72 @@ pub(crate) static ALLOC_MAX: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SMALL_HOST_ALLOCS: std::sync::Mutex<Vec<(usize, usize, usize)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Tracker for the specific 1040000-byte cuMemHostAlloc'd buffers we believe
+/// PhysX/FleX use as actor lists. Plan Phase 3a Path 1b: log first 32 bytes
+/// at allocation time and periodically thereafter, then diff PASS vs FAIL
+/// to identify the buffer whose first slot stays NULL on the failing path.
+/// Each entry is just `host_ptr` (the size==1040000 invariant identifies
+/// the buffer; use the index in this vec as a stable label across log
+/// messages). Gated by `ZLUDA_HOSTBUF_SAMPLE=1`.
+pub(crate) static HOSTBUF_TRACKER: std::sync::Mutex<Vec<usize>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn hostbuf_sample_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_HOSTBUF_SAMPLE").map_or(false, |v| v == "1"))
+}
+
+unsafe fn track_hostbuf(host: *mut ::core::ffi::c_void, size: usize) {
+    if !hostbuf_sample_enabled() || size != 1040000 {
+        return;
+    }
+    if let Ok(mut t) = HOSTBUF_TRACKER.lock() {
+        let idx = t.len();
+        let p = host as *const u64;
+        let v0 = p.read_unaligned();
+        let v1 = p.add(1).read_unaligned();
+        let v2 = p.add(2).read_unaligned();
+        let v3 = p.add(3).read_unaligned();
+        super::driver::zluda_log_err(&format!(
+            "[HOSTBUF_TRACK #{:02}] ptr=0x{:x} q0=0x{:016x} q1=0x{:016x} q2=0x{:016x} q3=0x{:016x}",
+            idx, host as usize, v0, v1, v2, v3
+        ));
+        t.push(host as usize);
+    }
+}
+
+fn untrack_hostbuf(host: *mut ::core::ffi::c_void) {
+    if !hostbuf_sample_enabled() {
+        return;
+    }
+    if let Ok(mut t) = HOSTBUF_TRACKER.lock() {
+        t.retain(|p| *p != host as usize);
+    }
+}
+
+/// Snapshot all tracked 1040000 buffers' first 32 bytes. Call from rare
+/// events (alloc completion, every Nth kernel launch). The output line is
+/// one per call, with all buffers' q0 values inline so a single grep finds
+/// the timeline. q0 alone usually suffices because PhysX iterates `array[0]`
+/// as a pointer; q1..q3 provided for context.
+pub(crate) unsafe fn sample_hostbufs(reason: &str) {
+    if !hostbuf_sample_enabled() {
+        return;
+    }
+    if let Ok(t) = HOSTBUF_TRACKER.lock() {
+        if t.is_empty() {
+            return;
+        }
+        let mut s = String::with_capacity(t.len() * 32 + 32);
+        s.push_str(&format!("[HOSTBUF_SAMPLE {}] ", reason));
+        for (i, &p) in t.iter().enumerate() {
+            let q0 = (p as *const u64).read_unaligned();
+            s.push_str(&format!("#{:02}=0x{:016x} ", i, q0));
+        }
+        super::driver::zluda_log_err(&s);
+    }
+}
+
 fn track_host_alloc(host: *mut ::core::ffi::c_void, dev: *mut ::core::ffi::c_void, size: usize) {
     if size == 0 {
         return;
@@ -46,6 +112,58 @@ pub(crate) fn update_alloc_range(addr: u64, size: u64) {
 fn vram_log_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_VRAM_LOG").map_or(false, |v| v == "1"))
+}
+
+/// Check whether DtoH-copy diagnostics are enabled (`ZLUDA_DTOH_LOG=1`).
+/// When ON, logs every cuMemcpyDtoH{,Async} with dst/src/size and the
+/// first up-to-16 dwords of the destination buffer AFTER the copy
+/// completes. For Mode-B-SIGSEGV investigation: PhysX reads back small
+/// scalars/structs from GPU; this surfaces the value (count, range,
+/// status flag) that drives downstream CPU-side allocation/iteration.
+fn dtoh_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_DTOH_LOG").map_or(false, |v| v == "1"))
+}
+
+/// Format up to 16 dwords (64 bytes) at byte offset `off` from `dst_host`.
+/// Caller must guarantee the slice is mapped + readable.
+unsafe fn format_dwords_at(dst_host: *const u8, off: usize, n_bytes: usize) -> String {
+    let n_dwords = n_bytes / 4;
+    let mut s = String::with_capacity(n_dwords * 9);
+    for i in 0..n_dwords {
+        let v = (dst_host.add(off) as *const u32).add(i).read_unaligned();
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(&format!("{:08x}", v));
+    }
+    s
+}
+
+/// Format dwords for DtoH logging.
+///
+/// - Small buffers (≤ 256 bytes): one window at offset 0, up to 16 dwords.
+/// - Big buffers (> 256 bytes): four 16-byte windows at offsets 0,
+///   1/4·size, 1/2·size, 3/4·size — disambiguates "all-zero" from
+///   "zero-prefix only with data later in the buffer".
+unsafe fn format_dtoh_dwords(dst_host: *const u8, byte_count: usize) -> String {
+    if byte_count <= 256 {
+        let n = byte_count.min(64);
+        let dwords = format_dwords_at(dst_host, 0, n);
+        return format!("[{}]", dwords);
+    }
+    // Big buffer: 4 sample windows × 16 bytes (4 dwords) each
+    let q1 = (byte_count / 4) & !0x3;       // align to 4
+    let q2 = (byte_count / 2) & !0x3;
+    let q3 = (3 * byte_count / 4) & !0x3;
+    let w0 = format_dwords_at(dst_host, 0, 16);
+    let w1 = format_dwords_at(dst_host, q1, 16);
+    let w2 = format_dwords_at(dst_host, q2, 16);
+    let w3 = format_dwords_at(dst_host, q3, 16);
+    format!(
+        "[@0:{} @{:#x}:{} @{:#x}:{} @{:#x}:{}]",
+        w0, q1, w1, q2, w2, q3, w3
+    )
 }
 
 /// Read current VRAM usage from sysfs. Returns bytes used, or 0 on error
@@ -146,7 +264,15 @@ pub(crate) fn copy_dto_h_v2(
     src_device: hipDeviceptr_t,
     byte_count: usize,
 ) -> hipError_t {
-    unsafe { hipMemcpyDtoH(dst_host, src_device, byte_count) }
+    let result = unsafe { hipMemcpyDtoH(dst_host, src_device, byte_count) };
+    if result.is_ok() && dtoh_log_enabled() {
+        let dwords = unsafe { format_dtoh_dwords(dst_host as *const u8, byte_count) };
+        super::driver::zluda_log(&format!(
+            "[DTOH/sync] dst={:p} src={:p} size={} bytes={}",
+            dst_host, src_device.0, byte_count, dwords
+        ));
+    }
+    result
 }
 
 pub(crate) fn copy_hto_d_v2(
@@ -154,6 +280,13 @@ pub(crate) fn copy_hto_d_v2(
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
 ) -> hipError_t {
+    if dtoh_log_enabled() {
+        let dwords = unsafe { format_dtoh_dwords(src_host as *const u8, byte_count) };
+        super::driver::zluda_log(&format!(
+            "[HTOD/sync] dst={:p} src={:p} size={} bytes={}",
+            dst_device.0, src_host, byte_count, dwords
+        ));
+    }
     // Log gParams writes (496 bytes) — validate texture handles and device pointers
     if byte_count == 496 {
         let data = src_host as *const u64;
@@ -235,14 +368,22 @@ pub(crate) fn copy_dto_h_v2_ptds(
     src_device: hipDeviceptr_t,
     byte_count: usize,
 ) -> hipError_t {
-    unsafe {
+    let result = unsafe {
         hipMemcpy_spt(
             dst_host.cast(),
             src_device.0.cast(),
             byte_count,
             hipMemcpyKind::hipMemcpyDeviceToHost,
         )
+    };
+    if result.is_ok() && dtoh_log_enabled() {
+        let dwords = unsafe { format_dtoh_dwords(dst_host as *const u8, byte_count) };
+        super::driver::zluda_log(&format!(
+            "[DTOH/ptds] dst={:p} src={:p} size={} bytes={}",
+            dst_host, src_device.0, byte_count, dwords
+        ));
     }
+    result
 }
 
 pub(crate) fn get_address_range_v2(
@@ -253,7 +394,26 @@ pub(crate) fn get_address_range_v2(
     unsafe { hipMemGetAddressRange(pbase, psize, dptr) }
 }
 
+/// Log a cuMemset* call when ZLUDA_DTOH_LOG=1. Used to track which device
+/// pointers get initialized via memset (vs HtoD or kernel writes).
+fn log_memset(kind: &str, dst: u64, value: u64, n: usize) {
+    if dtoh_log_enabled() {
+        super::driver::zluda_log(&format!(
+            "[MEMSET/{}] dst=0x{:x} value=0x{:x} n={} bytes={}",
+            kind, dst, value, n,
+            // Approximate total bytes: D8=n, D16=n*2, D32=n*4
+            match kind {
+                "d8" | "d8a" => n,
+                "d16" | "d16a" => n * 2,
+                "d32" | "d32a" => n * 4,
+                _ => n,
+            }
+        ));
+    }
+}
+
 pub(crate) fn set_d8_v2(dst: hipDeviceptr_t, value: ::core::ffi::c_uchar, n: usize) -> hipError_t {
+    log_memset("d8", dst.0 as u64, value as u64, n);
     unsafe { hipMemsetD8(dst, value, n) }
 }
 
@@ -263,6 +423,7 @@ pub(crate) fn set_d8_async(
     n: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    log_memset("d8a", dst.0 as u64, value as u64, n);
     let _guard = super::stream::null_stream_sync(stream);
     unsafe { hipMemsetD8Async(dst, value, n, stream) }
 }
@@ -272,6 +433,7 @@ pub(crate) fn set_d16_v2(
     value: ::core::ffi::c_ushort,
     n: usize,
 ) -> hipError_t {
+    log_memset("d16", dst.0 as u64, value as u64, n);
     unsafe { hipMemsetD16(dst, value, n) }
 }
 
@@ -281,11 +443,13 @@ pub(crate) fn set_d16_async(
     n: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    log_memset("d16a", dst.0 as u64, value as u64, n);
     let _guard = super::stream::null_stream_sync(stream);
     unsafe { hipMemsetD16Async(dst, value, n, stream) }
 }
 
 pub(crate) fn set_d32_v2(dst: hipDeviceptr_t, value: ::core::ffi::c_uint, n: usize) -> hipError_t {
+    log_memset("d32", dst.0 as u64, value as u64, n);
     unsafe { hipMemsetD32(dst, value as _, n) }
 }
 
@@ -295,6 +459,7 @@ pub(crate) fn set_d32_async(
     n: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    log_memset("d32a", dst.0 as u64, value as u64, n);
     let _guard = super::stream::null_stream_sync(stream);
     unsafe { hipMemsetD32Async(dst, value as _, n, stream) }
 }
@@ -326,6 +491,7 @@ pub(crate) fn get_info_v2(free: *mut usize, total: *mut usize) -> hipError_t {
 pub(crate) unsafe fn free_host(ptr: *mut ::core::ffi::c_void) -> CUresult {
     let hip_result = hipFreeHost(ptr);
     untrack_host_alloc(ptr);
+    untrack_hostbuf(ptr);
     remove_allocation(ptr)?;
     Ok(hip_result?)
 }
@@ -366,6 +532,8 @@ pub(crate) unsafe fn host_alloc(
         *pp == dev_ptr
     ));
     track_host_alloc(*pp, dev_ptr, bytesize);
+    track_hostbuf(*pp, bytesize);
+    sample_hostbufs("post_alloc");
     add_allocation(*pp, bytesize, context)?;
     Ok(())
 }
@@ -381,6 +549,12 @@ pub(crate) unsafe fn host_get_device_pointer_v2(
 
     // HIP equivalent of cuMemHostGetDevicePointer_v2
     hipHostGetDevicePointer(std::ptr::from_mut(pdptr).cast(), p, flags)?;
+    if dtoh_log_enabled() {
+        super::driver::zluda_log(&format!(
+            "[HOSTGETDEV] host=0x{:x} -> dev=0x{:x} flags=0x{:x}",
+            p as usize, pdptr.0 as usize, flags
+        ));
+    }
     Ok(())
 }
 
@@ -421,6 +595,13 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    if dtoh_log_enabled() {
+        let dwords = unsafe { format_dtoh_dwords(src_host as *const u8, byte_count) };
+        super::driver::zluda_log(&format!(
+            "[HTOD/async] dst={:p} src={:p} size={} stream={:p} bytes={}",
+            dst_device.0, src_host, byte_count, stream.0, dwords
+        ));
+    }
     // Log gParams writes (496 bytes = Flex solver params) — validate texture handles
     if byte_count == 496 {
         let data = src_host as *const u64;
@@ -483,7 +664,19 @@ pub(crate) unsafe fn copy_dto_h_async_v2(
     stream: hipStream_t,
 ) -> hipError_t {
     let _guard = super::stream::null_stream_sync(stream);
-    hipMemcpyDtoHAsync(dst_host, src_device, byte_count, stream)
+    let result = hipMemcpyDtoHAsync(dst_host, src_device, byte_count, stream);
+    if result.is_ok() && dtoh_log_enabled() {
+        // The async copy may not have completed by the time the call
+        // returns. Sync the stream so the host buffer reflects what the
+        // GPU actually wrote — otherwise we'd log stale pre-copy bytes.
+        let _ = hipStreamSynchronize(stream);
+        let dwords = format_dtoh_dwords(dst_host as *const u8, byte_count);
+        super::driver::zluda_log(&format!(
+            "[DTOH/async] dst={:p} src={:p} size={} stream={:p} bytes={}",
+            dst_host, src_device.0, byte_count, stream.0, dwords
+        ));
+    }
+    result
 }
 
 pub(crate) unsafe fn copy_dto_d_v2(

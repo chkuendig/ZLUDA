@@ -8166,6 +8166,146 @@ pub(crate) fn launch_kernel(
             shared_mem_bytes
         ));
     }
+
+    // Phase 3a Path 1b: periodically sample first-qword of each tracked
+    // 1040000-byte cuMemHostAlloc'd buffer. We only fire every Nth launch
+    // to avoid log explosion (game does ~400k launches per benchmark cycle).
+    if super::memory::hostbuf_sample_enabled() {
+        static LAUNCH_TICK: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let n = LAUNCH_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Sample every 1000th launch — at typical launch rate that's ~1 sample/sec.
+        if n % 1000 == 0 {
+            unsafe {
+                super::memory::sample_hostbufs(&format!("launch_tick={}", n));
+            }
+        }
+    }
+
+    // Generic kernel-arg pointer logger — gated by ZLUDA_KARG_LOG=1. One-shot
+    // per kernel name (logs only the first launch for each distinct kernel)
+    // to avoid log explosion. For each arg index 0..16 we deref the
+    // kernel_params slot, read the first 8 bytes, and report any value that
+    // falls within the ZLUDA-tracked ALLOC range — those are likely device
+    // pointers. Goal: cross-reference DtoH source pointers with kernel args
+    // to see whether always-zero DtoH'd buffers are ever bound to a kernel.
+    static KARG_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let karg_log = *KARG_LOG
+        .get_or_init(|| std::env::var("ZLUDA_KARG_LOG").map_or(false, |v| v == "1"));
+    if karg_log {
+        static KARG_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let seen_set =
+            KARG_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let is_first = {
+            let mut s = seen_set.lock().unwrap_or_else(|e| e.into_inner());
+            s.insert(name.to_string())
+        };
+        if is_first {
+            let alloc_min = super::memory::ALLOC_MIN.load(std::sync::atomic::Ordering::Relaxed);
+            let alloc_max = super::memory::ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
+            let mut all_args: Vec<String> = Vec::new();
+            // Plausible user-space pointer range on x86_64 Linux. Anything
+            // outside is either NULL/small-int packing or wild read past
+            // the kernel_params array end. Use this to early-bail instead
+            // of trusting the unbounded `read_kernel_arg` walk.
+            const PTR_LO: u64 = 0x1000;
+            const PTR_HI: u64 = 0x0000_8000_0000_0000;
+            let plausible_ptr = |p: u64| p >= PTR_LO && p < PTR_HI;
+            // Walk up to 12 indices (enough for every PhysX kernel we've
+            // seen — max observed is ~10). Two safety layers:
+            // 1. For kparams: each kernel_params[i] entry must itself be
+            //    a plausible user-space pointer before we dereference it.
+            //    Past-the-array reads usually return non-NULL garbage that
+            //    fails this check, avoiding the wild deref that previously
+            //    SIGSEGV'd in alloc::dealloc.
+            // 2. For extra: byte layout is bounded by the buffer header,
+            //    so read_kernel_arg's offset arithmetic is safe up to the
+            //    declared size. Cap at 12 anyway for symmetry.
+            for i in 0..12usize {
+                if !kernel_params.is_null() {
+                    // Pre-check the slot pointer is plausible before deref.
+                    let slot_ptr = unsafe { *kernel_params.add(i) } as u64;
+                    if slot_ptr == 0 {
+                        all_args.push(format!("p{}=null", i));
+                        break;
+                    }
+                    if !plausible_ptr(slot_ptr) {
+                        all_args.push(format!("p{}=oob(0x{:x})", i, slot_ptr));
+                        break;
+                    }
+                }
+                let val: Option<u64> =
+                    unsafe { read_kernel_arg::<u64>(kernel_params, extra, i * 8, i) };
+                match val {
+                    Some(v) => {
+                        let kind = if alloc_min <= alloc_max && v >= alloc_min && v <= alloc_max {
+                            "DEV"
+                        } else {
+                            "val"
+                        };
+                        all_args.push(format!("{}{}=0x{:x}", kind, i, v));
+                    }
+                    None => {
+                        all_args.push(format!("p{}=null", i));
+                        break;
+                    }
+                }
+            }
+            let kp_kind = if !kernel_params.is_null() {
+                "kparams"
+            } else if !extra.is_null() {
+                "extra"
+            } else {
+                "none"
+            };
+            super::driver::zluda_log_err(&format!(
+                "[KARG] '{}' first-launch via={} grid=[{},{},{}] block=[{},{},{}] args=[{}]",
+                name,
+                kp_kind,
+                grid_dim_x,
+                grid_dim_y,
+                grid_dim_z,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z,
+                all_args.join(" ")
+            ));
+        }
+    }
+    // Capture every MemCopyAsync / MemCopyBatchedAsync launch's packed
+    // 32-byte struct param. PhysX uses these kernels as INTERNAL D2D copies
+    // instead of cuMemcpyDtoD — so they don't appear in our cuMem* logs.
+    // Layout (from MemCopyAsync PTX byte-level decode):
+    //   bytes  0..7  = field0 (size or count)
+    //   bytes  8..15 = ptr_a (likely src or dst)
+    //   bytes 16..23 = ptr_b (likely the other end)
+    //   bytes 24..31 = type/flags (32-bit `setp.eq.s32 r,3` check at offset 24)
+    // Cross-reference logged ptr_a/ptr_b against DtoH-zero buffers to find
+    // the FleX initial-data path.
+    if (name == "MemCopyAsync" || name == "MemCopyBatchedAsync") && !kernel_params.is_null() {
+        unsafe {
+            // kernel_params[2] -> &param_2 (the 32-byte struct)
+            let p2_ptr = *kernel_params.add(2);
+            if !p2_ptr.is_null() {
+                let buf = p2_ptr as *const u8;
+                let f0 = std::ptr::read_unaligned(buf.add(0) as *const u64);
+                let pa = std::ptr::read_unaligned(buf.add(8) as *const u64);
+                let pb = std::ptr::read_unaligned(buf.add(16) as *const u64);
+                let ty = std::ptr::read_unaligned(buf.add(24) as *const u64);
+                let p0 = read_kernel_arg::<u64>(kernel_params, extra, 0, 0).unwrap_or(0);
+                let p1 = read_kernel_arg::<u64>(kernel_params, extra, 8, 1).unwrap_or(0);
+                static MC_SEQ: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let seq = MC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::driver::zluda_log_err(&format!(
+                    "MEMCPY_ARGS#{} {} grid=[{},{},{}] p0=0x{:x} p1=0x{:x} f0=0x{:x} pa=0x{:x} pb=0x{:x} ty=0x{:x}",
+                    seq, name, grid_dim_x, grid_dim_y, grid_dim_z, p0, p1, f0, pa, pb, ty
+                ));
+            }
+        }
+    }
+
     // Capture CUB RadixSort kernel args (Downsweep + Upsweep) including
     // GridEvenShare and the 5 pointer params. Pure CPU reads from the extra
     // buffer — no GPU ops, no ProfilingSignal risk. Every launch logs (was

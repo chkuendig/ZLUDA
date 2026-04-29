@@ -640,26 +640,83 @@ wait_for_benchmark_start() {
 monitor_benchmark_outcome() {
     local log_start="$1"
     local attempts=$((BENCHMARK_MONITOR_TIMEOUT / 5))
+    # 2026-04-28 Phase 3a: kernel-quiescence detection + auto re-entry test.
+    # If we've seen lots of kernels and growth has stalled, assume the
+    # benchmark completed. Take a screenshot, send Esc + Enter to re-trigger
+    # the benchmark menu (back → re-enter), then keep monitoring. If a
+    # second "completion" or a crash happens, we have a 2-cycle data point.
+    # Set ZLUDA_AUTO_REENTRY=0 to disable.
+    local auto_reentry="${ZLUDA_AUTO_REENTRY:-1}"
+    local prev_kernels=0
+    local stall_count=0
+    local STALL_THRESHOLD=8           # 8 × 5s = 40s of no kernel growth
+    local KERNELS_FOR_COMPLETE=200000 # only consider "completed" if we saw lots
+    local reentry_done=0
     status "monitoring benchmark outcome"
     for ((i = 1; i <= attempts; i++)); do
         local crash_line=""
         crash_line="$(latest_new_log_match "$log_start" '\\*\\*\\* SIGABRT|GPU fault likely|\\*\\*\\* SIGSEGV' || true)"
         if [[ -n "$crash_line" ]]; then
-            status "crash detected: ${crash_line}"
+            local phase="initial"
+            (( reentry_done == 1 )) && phase="reentry"
+            status "crash detected (${phase}): ${crash_line}"
             return 2
         fi
         if ! game_running; then
             status "BatmanAK.exe exited without an explicit crash marker"
             return 0
         fi
+
+        # Kernel-quiescence + auto re-entry logic.
+        # Idle benchmark menu still ticks ~800 kernels/s (MemCopyBatchedAsync +
+        # MS_2 alternating). Real mid-benchmark is many thousands per second.
+        # We declare "quiescent" if growth in the 5s tick is below a threshold.
+        if (( auto_reentry == 1 )) && (( reentry_done == 0 )); then
+            local kernels=""
+            kernels="$(count_new_log_matches "$log_start" 'cuLaunchKernel')"
+            if (( kernels >= KERNELS_FOR_COMPLETE )); then
+                local delta=$((kernels - prev_kernels))
+                # Idle adds <5000/5s; mid-benchmark adds tens of thousands.
+                if (( delta < 5000 )); then
+                    stall_count=$((stall_count + 1))
+                else
+                    stall_count=0
+                fi
+                if (( stall_count >= STALL_THRESHOLD )); then
+                    status "kernel quiescence at cuLaunchKernel=${kernels} for ${STALL_THRESHOLD}×5s — assuming benchmark completed"
+                    # We don't have access to take_screenshot here (defined in
+                    # run_benchmark.sh); print a marker line that the wrapping
+                    # archiver picks up as a "first benchmark completed" event.
+                    status "ATTEMPTING RE-ENTRY: sending Escape, then Enter"
+                    discover_x_session >/dev/null 2>&1 || true
+                    if command -v xdotool >/dev/null 2>&1; then
+                        local wid=""
+                        wid="$(find_game_window)" || true
+                        [[ -n "$wid" ]] && focus_window "$wid" >/dev/null 2>&1 || true
+                        xdotool key --clearmodifiers Escape >/dev/null 2>&1 || true
+                        sleep 3
+                        xdotool key --clearmodifiers Return >/dev/null 2>&1 || true
+                        sleep 1
+                        xdotool key --clearmodifiers Return >/dev/null 2>&1 || true
+                    fi
+                    reentry_done=1
+                    status "RE-ENTRY SENT — continuing monitor"
+                    stall_count=0
+                fi
+            fi
+            prev_kernels=$kernels
+        fi
+
         if (( i % 12 == 0 )); then
             local kernels=""
             kernels="$(count_new_log_matches "$log_start" 'cuLaunchKernel')"
-            status "benchmark still running (cuLaunchKernel=${kernels})"
+            local phase="initial"
+            (( reentry_done == 1 )) && phase="reentry"
+            status "benchmark still running [${phase}] (cuLaunchKernel=${kernels})"
         fi
         sleep 5
     done
-    status "monitor timeout reached; benchmark still appears to be running"
+    status "monitor timeout reached; benchmark still appears to be running (reentry_done=${reentry_done})"
 }
 
 latest_capture_with_prefix() {

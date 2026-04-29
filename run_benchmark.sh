@@ -210,11 +210,77 @@ archive_run() {
             last_ts="$(grep -oE '\[[0-9]+ms\]' "$ARCHIVE_DIR/zluda_tex.log" | tail -n1 | tr -d '[]ms')"
             [[ -n "$last_ts" ]] && echo "last_log_ms:   $last_ts"
         fi
+
+        # Phase 1a (2026-04-28): run-sequence + outcome classification.
+        # Counts of session boundaries and benchmark starts in the tex log.
+        # A "benchmark started" line is emitted by deploy_batman.sh when
+        # cuLaunchKernel ≥ KERNEL_START_THRESHOLD. If we see >1, the user
+        # (or harness) re-entered the benchmark within the same Batman
+        # session — relevant for the A vs B disambiguation.
+        local n_zluda_init n_bench_started n_apply_forces
+        n_zluda_init=$(grep -c '=== ZLUDA init' "$ARCHIVE_DIR/zluda_tex.log" 2>/dev/null || echo 0)
+        # No ZLUDA-side marker for benchmark re-entry; instead, count
+        # "Title prompt advanced" / explicit harness markers if present.
+        # As a proxy, count clusters of cuLaunchKernel'CreateParticleShapesIncremental_MultiStage_1'
+        # which fire at every benchmark scene init.
+        n_bench_started=$(grep -c "cuLaunchKernel 'CreateParticleShapesIncremental_MultiStage_1'" "$ARCHIVE_DIR/zluda_tex.log" 2>/dev/null || echo 0)
+        n_apply_forces=$(grep -c "cuLaunchKernel 'TurbulenceFS_dynamicGridApplyForcesKernel'" "$ARCHIVE_DIR/zluda_tex.log" 2>/dev/null || echo 0)
+        echo "zluda_init_count: $n_zluda_init"
+        echo "ms1_kernel_count: $n_bench_started"
+        echo "apply_forces:     $n_apply_forces"
+
+        # Crash detection + signature classification.
+        local crash_kind="none"
         if grep -qE '\*\*\* SIGABRT|GPU fault likely|\*\*\* SIGSEGV' "$ARCHIVE_DIR/zluda_tex.log" 2>/dev/null; then
-            echo "crash:         yes"
+            if grep -qE '\*\*\* SIGABRT' "$ARCHIVE_DIR/zluda_tex.log"; then
+                crash_kind="SIGABRT"
+            elif grep -qE '\*\*\* SIGSEGV' "$ARCHIVE_DIR/zluda_tex.log"; then
+                crash_kind="SIGSEGV"
+            else
+                crash_kind="signal"
+            fi
+            echo "crash:         yes ($crash_kind)"
             grep -E '\*\*\* SIGABRT|GPU fault likely|\*\*\* SIGSEGV' "$ARCHIVE_DIR/zluda_tex.log" | head -3
+
+            # Outcome heuristic — Phase 1a:
+            # - benchmark_count=0  → pre_bench_crash (died during init/menu)
+            # - benchmark_count=1  → mid_or_initial   (one benchmark run, then crash — could be mid-run OR re-entry crash before second MS1)
+            # - benchmark_count>=2 → reentry_crash   (multi-bench session, crash after re-entry)
+            local outcome
+            if (( n_bench_started == 0 )); then
+                outcome="pre_benchmark_crash"
+            elif (( n_bench_started >= 2 )); then
+                outcome="post_reentry_crash"
+            elif (( n_apply_forces > 100 )); then
+                outcome="mid_run_crash_after_AF"
+            else
+                outcome="early_run_crash"
+            fi
+            echo "outcome:       $outcome"
         else
             echo "crash:         no"
+            # No crash detected. Check whether benchmark completed normally
+            # by looking at the last log timestamp gap and kernel activity.
+            # If last_log_ms > 600000 (10 min) and no crash, very likely
+            # the benchmark completed and the harness timed out monitoring.
+            local last_ms_int
+            last_ms_int=$(grep -oE '\[[0-9]+ms\]' "$ARCHIVE_DIR/zluda_tex.log" 2>/dev/null | tail -n1 | tr -d '[]ms')
+            if [[ -n "$last_ms_int" && "$last_ms_int" -gt 600000 ]]; then
+                echo "outcome:       completed_or_idle"
+            else
+                echo "outcome:       early_exit"
+            fi
+        fi
+
+        # Latest BatmanAK coredump (matched by recency, not pid).
+        local latest_core
+        latest_core=$(coredumpctl list --since "today" 2>/dev/null | grep -i BatmanAK | tail -1 | awk '{print $5}')
+        if [[ -n "$latest_core" ]]; then
+            echo "latest_core_pid: $latest_core"
+            # Resolve crash library (PhysX / HIP / zluda Rust / other).
+            local crash_lib
+            crash_lib=$(coredumpctl info "$latest_core" 2>/dev/null | grep -oE 'libamdhip64\.so|PhysX3_x64\.dll|libnvcuda\.so|libc\.so|wine_stack_fix' | head -1)
+            [[ -n "$crash_lib" ]] && echo "crash_library: $crash_lib"
         fi
     } > "$ARCHIVE_DIR/SUMMARY.txt"
     log "archive complete: $ARCHIVE_DIR"

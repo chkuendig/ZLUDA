@@ -343,6 +343,170 @@ fn match_setp_eq_s64_zero_pair(setp_line: &str, bra_line: &str) -> Option<(Strin
     Some((pred_name.to_string(), target.to_string()))
 }
 
+/// 2026-04-28 Phase 3a probe — A/B test for the LLVM-codegen LDS-publish
+/// hypothesis on IOFX_actorRangeKernel.
+///
+/// IOFX_actorRangeKernel does:
+///   - All threads write `st.shared.u32 [sdata + tid*4], r40`
+///   - Thread 0 ALSO writes `st.shared.u32 [sdata + ntid*4], r42`
+///     (extra slots at the end, for the "boundary" actor of the chunk)
+///   - bar.sync 0
+///   - All threads ld.shared from those slots, including the ones thread 0 wrote
+///
+/// Hypothesis: thread 0's writes to the "end" LDS slots may not propagate
+/// to other lanes/warps across the bar.sync on AMDGPU under specific
+/// conditions, despite the explicit s_waitcnt+s_barrier sequence emitted
+/// by our bar_sync wrapper. This kernel was the LAST kernel before crashes
+/// in Phase 2 run 1 (Mode A SIGABRT with TCP fault) and is upstream of
+/// the data PhysX iterates in Mode B SIGSEGV crashes.
+///
+/// This patch inserts `membar.cta;` immediately before EVERY `bar.sync 0;`
+/// inside IOFX_actorRangeKernel. PTX `membar.cta` lowers to a CTA-scope
+/// fence on AMDGPU. If this fixes the crash distribution, we've found that
+/// PR #161638's fix is incomplete for some access pattern. If it doesn't,
+/// we know to look elsewhere.
+///
+/// Env-gate `ZLUDA_IOFX_ACTOR_MEMBAR=1` (default OFF).
+pub fn patch_iofx_actor_range_membar(ptx: &str) -> Option<String> {
+    let env_on = std::env::var("ZLUDA_IOFX_ACTOR_MEMBAR").map_or(false, |v| v == "1");
+    if !env_on {
+        return None;
+    }
+    if !ptx.contains("IOFX_actorRangeKernel") {
+        return None;
+    }
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut out = String::with_capacity(ptx.len() + 256);
+    let mut in_kernel = false;
+    let mut brace_depth: i32 = 0;
+    let mut patched = 0usize;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(".visible .entry IOFX_actorRangeKernel")
+            || trimmed.starts_with(".entry IOFX_actorRangeKernel")
+        {
+            in_kernel = true;
+            brace_depth = 0;
+        }
+        if in_kernel {
+            for c in line.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_kernel = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if in_kernel && brace_depth >= 1 && trimmed == "bar.sync 0;" {
+            out.push_str("// ZLUDA IOFX_actorRange membar A/B probe\n");
+            out.push_str("membar.cta;\n");
+            patched += 1;
+        }
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+    if patched == 0 {
+        None
+    } else {
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] patch_iofx_actor_range_membar: inserted {} membar.cta",
+            patched
+        ));
+        Some(out)
+    }
+}
+
+/// Broader version of patch_iofx_actor_range_membar that applies to ALL
+/// kernels whose name matches PhysX/FleX/TFS/IOFX prefixes. The narrow
+/// patch only helped a single kernel; the bug class likely exists in
+/// many kernels with thread-0-only stores + bar.sync visibility patterns.
+///
+/// Skip CUB / cub-prefixed kernels (`_ZN3cub`) — those have their own
+/// micro-optimized barrier patterns we don't want to perturb. PR #161638
+/// fixed the relevant CUB issue.
+///
+/// Env-gate `ZLUDA_BROAD_MEMBAR=1` (default OFF — opt-in workaround).
+pub fn patch_broad_membar_before_bar_sync(ptx: &str) -> Option<String> {
+    let env_on = std::env::var("ZLUDA_BROAD_MEMBAR").map_or(false, |v| v == "1");
+    if !env_on {
+        return None;
+    }
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut out = String::with_capacity(ptx.len() + 1024);
+    let mut in_kernel = false;
+    let mut current_name = String::new();
+    let mut brace_depth: i32 = 0;
+    let mut patched_kernels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut total_patches = 0usize;
+    for line in &lines {
+        let trimmed = line.trim_start();
+        // Detect kernel entry start
+        if let Some(name) = trimmed
+            .strip_prefix(".visible .entry ")
+            .or_else(|| trimmed.strip_prefix(".entry "))
+        {
+            // Extract name up to '('
+            let nm = name.split('(').next().unwrap_or(name).trim().to_string();
+            current_name = nm;
+            // Apply to PhysX/FleX/TFS/IOFX/MS_* kernels; skip CUB and the
+            // dummy stub functions cudaMalloc/cudaFuncGetAttributes/etc.
+            let cn = current_name.as_str();
+            in_kernel = !cn.starts_with("_ZN3cub")
+                && !cn.starts_with("cuda")
+                && (cn.starts_with("IOFX_")
+                    || cn.starts_with("TurbulenceFS_")
+                    || cn.starts_with("ParticleIOS_")
+                    || cn.starts_with("FieldSampler_")
+                    || cn.starts_with("CreateParticleShapesIncremental_")
+                    || cn.starts_with("InitParticleShapes")
+                    || cn.starts_with("InitCollData")
+                    || cn.starts_with("FinalizeCollision")
+                    || cn.starts_with("ParticleCollisionStaticBox")
+                    || cn.starts_with("MemCopy")
+                    || cn.starts_with("_Z")); // FleX C++ mangled
+            brace_depth = 0;
+        }
+        if in_kernel {
+            for c in line.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_kernel = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if in_kernel && brace_depth >= 1 && trimmed == "bar.sync 0;" {
+            out.push_str("// ZLUDA broad membar workaround\n");
+            out.push_str("membar.cta;\n");
+            patched_kernels.insert(current_name.clone());
+            total_patches += 1;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if total_patches == 0 {
+        None
+    } else {
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] patch_broad_membar_before_bar_sync: inserted {} membar.cta across {} kernels",
+            total_patches,
+            patched_kernels.len()
+        ));
+        Some(out)
+    }
+}
+
 /// Global map from synthetic texture reference pointers to their device global variable addresses.
 /// When .texref variables are compiled as .global .u64 in PTX, hipModuleGetTexRef can't find them.
 /// We create synthetic textureReference structs and track which device global they correspond to.
@@ -513,10 +677,21 @@ fn get_best_ptx_and_compile(
                         module_count,
                         ptx.len()
                     ));
-                    match patch_iofx_bbox_tail_merge(ptx) {
-                        Some(patched) => ptx_modules.push(Cow::Owned(patched)),
-                        None => ptx_modules.push(Cow::Borrowed(ptx)),
-                    }
+                    let after_bbox: Cow<str> = match patch_iofx_bbox_tail_merge(ptx) {
+                        Some(patched) => Cow::Owned(patched),
+                        None => Cow::Borrowed(ptx),
+                    };
+                    let after_actor: Cow<str> =
+                        match patch_iofx_actor_range_membar(after_bbox.as_ref()) {
+                            Some(p) => Cow::Owned(p),
+                            None => after_bbox,
+                        };
+                    let final_ptx: Cow<str> =
+                        match patch_broad_membar_before_bar_sync(after_actor.as_ref()) {
+                            Some(p) => Cow::Owned(p),
+                            None => after_actor,
+                        };
+                    ptx_modules.push(final_ptx);
                 }
                 Ok(CodeModuleRef::File(file)) => {
                     let kind = if file.header.kind == FatbinFileHeader::HEADER_KIND_PTX {
@@ -553,11 +728,24 @@ fn get_best_ptx_and_compile(
                                             let _ = f.write_all(text.as_bytes());
                                         }
                                     }
-                                    let patched = patch_iofx_bbox_tail_merge(&text);
-                                    match patched {
-                                        Some(p) => ptx_modules.push(Cow::Owned(p)),
-                                        None => ptx_modules.push(text),
-                                    }
+                                    let after_bbox: Cow<str> =
+                                        match patch_iofx_bbox_tail_merge(&text) {
+                                            Some(p) => Cow::Owned(p),
+                                            None => text,
+                                        };
+                                    let after_actor: Cow<str> =
+                                        match patch_iofx_actor_range_membar(after_bbox.as_ref()) {
+                                            Some(p) => Cow::Owned(p),
+                                            None => after_bbox,
+                                        };
+                                    let final_ptx: Cow<str> =
+                                        match patch_broad_membar_before_bar_sync(
+                                            after_actor.as_ref(),
+                                        ) {
+                                            Some(p) => Cow::Owned(p),
+                                            None => after_actor,
+                                        };
+                                    ptx_modules.push(final_ptx);
                                 }
                                 None => {
                                     super::driver::zluda_log(&format!("[ZLUDA]   module[{}]: cow_bytes_to_str FAILED (not valid UTF-8)", module_count));
