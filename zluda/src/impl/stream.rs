@@ -81,6 +81,25 @@ pub(crate) fn null_stream_sync(stream: hipStream_t) -> NullStreamGuard {
 pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
     super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize({:?})", stream));
     let result = unsafe { hipStreamSynchronize(stream) };
+    // 2026-04-29 Phase 3g: HDP flush hypothesis test. Mode B SIGSEGVs continue
+    // even after our LDS-visibility patches eliminated all GPU page faults.
+    // Hypothesis: the GPU writes to host-pinned (zero-copy) memory complete
+    // on the GPU side, but the writes sit in the HDP write buffer and aren't
+    // visible to a subsequent CPU read. NVIDIA cuStreamSynchronize implicitly
+    // ensures host visibility; HIP hipStreamSynchronize on AMDGPU may not
+    // include HDP flush semantics. Forcing a hipDeviceSynchronize after the
+    // stream sync acts as an HDP flush via the driver's full-device wait
+    // path. Heavy-handed (~adds latency to every sync) but a clean test of
+    // the hypothesis. Env-gate ZLUDA_HDP_FLUSH_ON_SYNC=1 (default ON).
+    static HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let hdp_flush = *HDP_FLUSH
+        .get_or_init(|| std::env::var("ZLUDA_HDP_FLUSH_ON_SYNC").map_or(true, |v| v != "0"));
+    if hdp_flush {
+        let _ = unsafe { hipDeviceSynchronize() };
+        // Also issue a CPU-side memory fence to invalidate any stale CPU
+        // caches that might be holding pre-write values.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
     super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize -> {:?}", result));
     result
 }
