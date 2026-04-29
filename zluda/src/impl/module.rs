@@ -423,41 +423,65 @@ pub fn patch_iofx_actor_range_membar(ptx: &str) -> Option<String> {
     }
 }
 
-/// 2026-04-29: convert `ld.shared.u32` → `ld.volatile.shared.u32` inside
-/// IOFX_actorRangeKernel and other PhysX/FleX kernels with the cross-wave
-/// LDS visibility class. The membar.cta + s_waitcnt fixes target HW-level
-/// visibility but we're still seeing inconsistent results (~50% of runs
-/// still produce wild scatter from this kernel).
+/// 2026-04-29: convert `ld.shared.<T>` → `ld.volatile.shared.<T>` across
+/// PhysX/FleX/TFS/IOFX/ParticleIOS kernels affected by the cross-wave LDS
+/// visibility class. The membar.cta + s_waitcnt fixes target HW-level
+/// visibility but inconsistent results show silicon-level intermittence —
+/// adding the volatile qualifier defeats any compiler-level CSE / dead-load
+/// elimination that might otherwise hoist a stale read past a barrier.
 ///
-/// `volatile` qualifier on PTX shared loads: the compiler treats each load
-/// as a fresh fetch with no CSE / dead-load elimination. On AMDGPU, this
-/// is lowered to a `ds_read` with no caching attribute. Combined with the
-/// existing membar/waitcnt, this might defeat any compiler-level LDS-load
-/// hoisting that defeats our fence guarantees.
+/// First applied IOFX-only (5/5 runs zero IOFX wild-scatter, but Mode B
+/// SIGSEGVs continued from TFS/ParticleIOS family kernels with the same
+/// LDS visibility class). Broadened to match the same kernel prefixes
+/// as patch_broad_membar_before_bar_sync.
 ///
-/// Env-gate: `ZLUDA_IOFX_VOLATILE_LDS=1` (default ON in protonfix).
-pub fn patch_iofx_actor_range_volatile_lds(ptx: &str) -> Option<String> {
-    let env_off = std::env::var("ZLUDA_IOFX_VOLATILE_LDS")
+/// Skip CUB / cuda::* — those are not our suspect class.
+///
+/// Env-gate: `ZLUDA_BROAD_VOLATILE_LDS=1` (default ON in protonfix).
+pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
+    let env_off = std::env::var("ZLUDA_BROAD_VOLATILE_LDS")
         .map_or(false, |v| v == "0");
     if env_off {
-        return None;
-    }
-    if !ptx.contains("IOFX_actorRangeKernel") {
         return None;
     }
     let lines: Vec<&str> = ptx.lines().collect();
     let mut out = String::with_capacity(ptx.len() + 256);
     let mut in_kernel = false;
     let mut brace_depth: i32 = 0;
-    let mut patched = 0usize;
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
+    let mut total_patches = 0usize;
+    let mut patched_kernels: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut current_name = String::new();
+    for line in &lines {
         let trimmed = line.trim_start();
-        if trimmed.starts_with(".visible .entry IOFX_actorRangeKernel")
-            || trimmed.starts_with(".entry IOFX_actorRangeKernel")
-        {
-            in_kernel = true;
+        if trimmed.starts_with(".visible .entry ") || trimmed.starts_with(".entry ") {
+            let after = if let Some(rest) = trimmed.strip_prefix(".visible .entry ") {
+                rest
+            } else if let Some(rest) = trimmed.strip_prefix(".entry ") {
+                rest
+            } else {
+                ""
+            };
+            let cn = after
+                .trim_start()
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_string();
+            current_name = cn.clone();
+            in_kernel = !cn.starts_with("_ZN3cub")
+                && !cn.starts_with("cuda")
+                && (cn.starts_with("IOFX_")
+                    || cn.starts_with("TurbulenceFS_")
+                    || cn.starts_with("ParticleIOS_")
+                    || cn.starts_with("FieldSampler_")
+                    || cn.starts_with("CreateParticleShapesIncremental_")
+                    || cn.starts_with("InitParticleShapes")
+                    || cn.starts_with("InitCollData")
+                    || cn.starts_with("FinalizeCollision")
+                    || cn.starts_with("ParticleCollisionStaticBox")
+                    || cn.starts_with("MemCopy")
+                    || cn.starts_with("_Z")); // FleX C++ mangled
             brace_depth = 0;
         }
         if in_kernel {
@@ -482,21 +506,21 @@ pub fn patch_iofx_actor_range_volatile_lds(ptx: &str) -> Option<String> {
                 let prefix = &line[..leading_ws_len];
                 let rest = &body["ld.shared.".len()..];
                 out.push_str(&format!("{}ld.volatile.shared.{}\n", prefix, rest));
-                patched += 1;
-                i += 1;
+                patched_kernels.insert(current_name.clone());
+                total_patches += 1;
                 continue;
             }
         }
         out.push_str(line);
         out.push('\n');
-        i += 1;
     }
-    if patched == 0 {
+    if total_patches == 0 {
         None
     } else {
         super::driver::zluda_log(&format!(
-            "[ZLUDA] patch_iofx_actor_range_volatile_lds: converted {} ld.shared → ld.volatile.shared",
-            patched
+            "[ZLUDA] patch_broad_volatile_lds: converted {} ld.shared → ld.volatile.shared across {} kernels",
+            total_patches,
+            patched_kernels.len()
         ));
         Some(out)
     }
@@ -766,7 +790,7 @@ fn get_best_ptx_and_compile(
                             None => after_bbox,
                         };
                     let after_volatile: Cow<str> =
-                        match patch_iofx_actor_range_volatile_lds(after_actor.as_ref()) {
+                        match patch_broad_volatile_lds(after_actor.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_actor,
                         };
@@ -823,7 +847,7 @@ fn get_best_ptx_and_compile(
                                             None => after_bbox,
                                         };
                                     let after_volatile: Cow<str> =
-                                        match patch_iofx_actor_range_volatile_lds(
+                                        match patch_broad_volatile_lds(
                                             after_actor.as_ref(),
                                         ) {
                                             Some(p) => Cow::Owned(p),
