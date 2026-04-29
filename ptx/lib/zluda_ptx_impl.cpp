@@ -278,6 +278,16 @@ extern "C"
 
     void FUNC(bar_sync)(uint32_t)
     {
+        // gfx10.x's FeatureBackOffBarrier omits the implicit s_waitcnt
+        // before s_barrier (per LLVM D120544). The fence below should
+        // produce the waitcnt, but SIMemoryLegalizer occasionally
+        // optimises it away — only ~half of compiled s_barrier sites
+        // end up with a preceding s_waitcnt. Required for CUB BlockScan
+        // and any cross-wave LDS visibility (PhysX/FleX/TFS use this).
+        // Inline-asm form survives DCE; prior `__builtin_amdgcn_s_waitcnt(0)`
+        // was silently dropped by zoc's LLVMLinkModules2 pipeline.
+        // See project_bar_sync_waitcnt_dropped_by_linker_2026_04_27.md.
+        asm volatile("s_waitcnt 0\n" ::: "memory");
         __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "workgroup");
         __builtin_amdgcn_s_barrier();
     }
