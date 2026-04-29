@@ -423,6 +423,85 @@ pub fn patch_iofx_actor_range_membar(ptx: &str) -> Option<String> {
     }
 }
 
+/// 2026-04-29: convert `ld.shared.u32` → `ld.volatile.shared.u32` inside
+/// IOFX_actorRangeKernel and other PhysX/FleX kernels with the cross-wave
+/// LDS visibility class. The membar.cta + s_waitcnt fixes target HW-level
+/// visibility but we're still seeing inconsistent results (~50% of runs
+/// still produce wild scatter from this kernel).
+///
+/// `volatile` qualifier on PTX shared loads: the compiler treats each load
+/// as a fresh fetch with no CSE / dead-load elimination. On AMDGPU, this
+/// is lowered to a `ds_read` with no caching attribute. Combined with the
+/// existing membar/waitcnt, this might defeat any compiler-level LDS-load
+/// hoisting that defeats our fence guarantees.
+///
+/// Env-gate: `ZLUDA_IOFX_VOLATILE_LDS=1` (default ON in protonfix).
+pub fn patch_iofx_actor_range_volatile_lds(ptx: &str) -> Option<String> {
+    let env_off = std::env::var("ZLUDA_IOFX_VOLATILE_LDS")
+        .map_or(false, |v| v == "0");
+    if env_off {
+        return None;
+    }
+    if !ptx.contains("IOFX_actorRangeKernel") {
+        return None;
+    }
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut out = String::with_capacity(ptx.len() + 256);
+    let mut in_kernel = false;
+    let mut brace_depth: i32 = 0;
+    let mut patched = 0usize;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(".visible .entry IOFX_actorRangeKernel")
+            || trimmed.starts_with(".entry IOFX_actorRangeKernel")
+        {
+            in_kernel = true;
+            brace_depth = 0;
+        }
+        if in_kernel {
+            for c in line.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_kernel = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if in_kernel && brace_depth >= 1 {
+            // Match a leading `ld.shared.<type>` (no existing volatile/acquire
+            // qualifier). Convert to `ld.volatile.shared.<type>`.
+            let leading_ws_len = line.len() - line.trim_start().len();
+            let body = &line[leading_ws_len..];
+            if body.starts_with("ld.shared.") {
+                let prefix = &line[..leading_ws_len];
+                let rest = &body["ld.shared.".len()..];
+                out.push_str(&format!("{}ld.volatile.shared.{}\n", prefix, rest));
+                patched += 1;
+                i += 1;
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+    if patched == 0 {
+        None
+    } else {
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] patch_iofx_actor_range_volatile_lds: converted {} ld.shared → ld.volatile.shared",
+            patched
+        ));
+        Some(out)
+    }
+}
+
 /// Broader version of patch_iofx_actor_range_membar that applies to ALL
 /// kernels whose name matches PhysX/FleX/TFS/IOFX prefixes. The narrow
 /// patch only helped a single kernel; the bug class likely exists in
@@ -686,10 +765,15 @@ fn get_best_ptx_and_compile(
                             Some(p) => Cow::Owned(p),
                             None => after_bbox,
                         };
-                    let final_ptx: Cow<str> =
-                        match patch_broad_membar_before_bar_sync(after_actor.as_ref()) {
+                    let after_volatile: Cow<str> =
+                        match patch_iofx_actor_range_volatile_lds(after_actor.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_actor,
+                        };
+                    let final_ptx: Cow<str> =
+                        match patch_broad_membar_before_bar_sync(after_volatile.as_ref()) {
+                            Some(p) => Cow::Owned(p),
+                            None => after_volatile,
                         };
                     ptx_modules.push(final_ptx);
                 }
@@ -738,12 +822,19 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => after_bbox,
                                         };
-                                    let final_ptx: Cow<str> =
-                                        match patch_broad_membar_before_bar_sync(
+                                    let after_volatile: Cow<str> =
+                                        match patch_iofx_actor_range_volatile_lds(
                                             after_actor.as_ref(),
                                         ) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_actor,
+                                        };
+                                    let final_ptx: Cow<str> =
+                                        match patch_broad_membar_before_bar_sync(
+                                            after_volatile.as_ref(),
+                                        ) {
+                                            Some(p) => Cow::Owned(p),
+                                            None => after_volatile,
                                         };
                                     ptx_modules.push(final_ptx);
                                 }
