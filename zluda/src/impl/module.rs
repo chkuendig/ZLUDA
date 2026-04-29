@@ -500,6 +500,11 @@ pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
         if in_kernel && brace_depth >= 1 {
             // Match a leading `ld.shared.<type>` (no existing volatile/acquire
             // qualifier). Convert to `ld.volatile.shared.<type>`.
+            //
+            // 2026-04-29: tried adding `st.shared` → `st.volatile.shared` too,
+            // but that REGRESSED IOFX_actorRangeKernel back to Mode A SIGABRT
+            // wild scatter. Atomic store semantics on AMDGPU appear to break
+            // something at this layer. Keeping load-only as the working state.
             let leading_ws_len = line.len() - line.trim_start().len();
             let body = &line[leading_ws_len..];
             if body.starts_with("ld.shared.") {
