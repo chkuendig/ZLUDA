@@ -895,7 +895,7 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
                 let msg = format!(
                     "[ZLUDA] FATAL: ROCm version mismatch! Compiled with {}.{}, runtime is {}.{}. \
                      GPU code compiled with one version cannot be loaded by another. \
-                     Update Proton ROCm libs: cd proton-ge-custom/rocm && ./fetch-rocm.sh",
+                     Update Proton ROCm libs: cd proton-ge-custom && ./scripts/fetch-rocm.sh",
                     compiled_major, compiled_minor, rt_major, rt_minor
                 );
                 zluda_log(&msg);

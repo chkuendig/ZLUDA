@@ -10,7 +10,7 @@ use hip_runtime_sys::*;
 // to never trigger physics simulation steps. We previously worked around this
 // on 6.4 by substituting a wall-clock delta when hip_ms < 1.0. That workaround
 // was REMOVED on 2026-04-09 because we're now pinned to ROCm 6.2.4
-// (proton-ge-custom rocm/fetch-rocm.sh, see commit 26273fe0 and the comment in
+// (proton-ge-custom scripts/fetch-rocm.sh, see commit 26273fe0 and the comment in
 // that script). On 6.2 the workaround was CLOBBERING valid sub-ms values with
 // stale wall-clock deltas — e.g. a 74 µs operation between two events would
 // be returned as 2959 ms (the elapsed wall-clock since the previous call),
