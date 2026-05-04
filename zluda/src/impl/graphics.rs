@@ -193,45 +193,32 @@ pub(crate) unsafe fn resource_get_mapped_mipmapped_array(
 }
 
 // -- D3D11 interop --
-// Under Wine/Proton, D3D11 resources are DXVK Vulkan resources.
-// True interop requires Vulkan → HIP memory sharing which is complex.
-// For now, create a dummy resource so PhysX doesn't crash at registration time.
-// The actual data sharing won't work — this is a known limitation.
-
-/// Internal dummy D3D11 resource.
-#[repr(C)]
-struct D3D11GraphicsResource {
-    hip_resource: hipGraphicsResource_t,
-    device_ptr: hipDeviceptr_t,
-    device_ptr_size: usize,
-}
-
-const D3D11_DUMMY_SIZE: usize = 256 * 1024; // 256 KB
+// Under Wine/Proton, D3D11 resources are DXVK Vulkan resources. True interop
+// requires Vulkan→HIP external-memory import (VK_KHR_external_memory_fd +
+// hipImportExternalMemory), which is not yet implemented.
+//
+// Until the real implementation lands we return NOT_SUPPORTED. The previous
+// version of this function silently allocated a 256 KB hipMalloc buffer and
+// returned it as if registration had succeeded — that masked the real error
+// and let the application read garbage. Returning NOT_SUPPORTED here lets the
+// PE-side wrapper (nvidia-libs/.../nvcuda.c::wine_cuGraphicsD3D11RegisterResource)
+// log P0 introspection of the resource type before this point so we can scope
+// the eventual implementation correctly.
 
 #[no_mangle]
 pub unsafe extern "system" fn cuGraphicsD3D11RegisterResource(
     p_cuda_resource: *mut CUgraphicsResource,
-    _d3d_resource: *mut ::core::ffi::c_void,
-    _flags: u32,
+    d3d_resource: *mut ::core::ffi::c_void,
+    flags: u32,
 ) -> CUresult {
-    super::driver::zluda_log_err("[ZLUDA] cuGraphicsD3D11RegisterResource (dummy stub)");
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] cuGraphicsD3D11RegisterResource(d3d={:p}, flags={}) — not yet implemented (returning NOT_SUPPORTED)",
+        d3d_resource, flags
+    ));
     if p_cuda_resource.is_null() {
         return Err(CUerror::INVALID_VALUE);
     }
-    // Allocate a dummy device buffer
-    let mut dev_ptr: *mut ::core::ffi::c_void = ptr::null_mut();
-    if let Err(e) = hipMalloc(&mut dev_ptr, D3D11_DUMMY_SIZE) {
-        super::driver::zluda_log_err(&format!("[ZLUDA] D3D11 interop: hipMalloc failed: {:?}", e));
-        return Err(CUerror::UNKNOWN);
-    }
-    let _ = hipMemsetD8(hipDeviceptr_t(dev_ptr), 0, D3D11_DUMMY_SIZE);
-    let resource = Box::new(D3D11GraphicsResource {
-        hip_resource: ptr::null_mut(),
-        device_ptr: hipDeviceptr_t(dev_ptr),
-        device_ptr_size: D3D11_DUMMY_SIZE,
-    });
-    *p_cuda_resource = Box::into_raw(resource) as CUgraphicsResource;
-    Ok(())
+    Err(CUerror::NOT_SUPPORTED)
 }
 
 #[no_mangle]
