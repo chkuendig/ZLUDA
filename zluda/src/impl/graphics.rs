@@ -164,14 +164,13 @@ pub(crate) unsafe fn unmap_resources_ptsz(
 
 /// cuGraphicsSubResourceGetMappedArray
 ///
-/// D3D11 resources route to this function when an app prefers an array-style
-/// hipArray_t over a raw device pointer. We don't yet have a D3D11
-/// implementation — Batman is observed to use `cuGraphicsResourceGetMappedPointer_v2`
-/// (the linear path), so this is unimplemented. Any other workload that hits
-/// this path will land here with a D3D11 resource and we'd otherwise pass the
-/// pointer to HIP as a `hipGraphicsResource_t`, which would dereference our
-/// `Box<D3D11ResourceState>` as if it were a HIP-internal struct → crash.
-/// Panic loudly in dev builds; return NOT_SUPPORTED otherwise.
+/// Returns a hipArray view of the mapped resource's contents. Batman's PhysX
+/// path uses this for D3D11 textures (NOT GetMappedPointer_v2 as a stale
+/// comment in this file used to claim — fixed 2026-05-05). For D3D11
+/// resources we route to `d3d11_interop::get_mapped_array`, which lazily
+/// allocates a hipArray and refreshes its contents from our imported linear
+/// buffer on each call. For non-D3D11 (GL) resources we pass through to
+/// HIP's native `hipGraphicsSubResourceGetMappedArray`.
 pub(crate) unsafe fn sub_resource_get_mapped_array(
     p_array: &mut CUarray,
     resource: CUgraphicsResource,
@@ -183,16 +182,9 @@ pub(crate) unsafe fn sub_resource_get_mapped_array(
         resource
     ));
     if super::d3d11_interop::is_d3d11_resource(resource) {
-        let msg = format!(
-            "[ZLUDA] cuGraphicsSubResourceGetMappedArray: D3D11 path not implemented \
-             (resource={:p}, array_index={}, mip_level={}). Batman uses \
-             GetMappedPointer_v2; if you hit this with another workload, the array \
-             path needs hipExternalMemoryGetMappedMipmappedArray wiring.",
-            resource, array_index, mip_level
-        );
-        super::driver::zluda_log_err(&msg);
-        debug_assert!(false, "{}", msg);
-        return Err(CUerror::NOT_SUPPORTED);
+        let arr = super::d3d11_interop::get_mapped_array(resource, array_index, mip_level)?;
+        *p_array = arr as CUarray;
+        return Ok(());
     }
     hip_to_cuda(hipGraphicsSubResourceGetMappedArray(
         p_array as *mut CUarray as *mut hipArray_t,

@@ -67,6 +67,15 @@ pub struct D3D11ResourceState {
     pub size: u64,
     /// Original descriptor — kept for diagnostics + future Map/Unmap.
     pub desc: ZludaD3D11ImportedDesc,
+    /// hipArray allocated for cuGraphicsSubResourceGetMappedArray. Batman's
+    /// PhysX path uses the array variant (not GetMappedPointer_v2), so we
+    /// allocate a real hipArray and copy our linear imported buffer's
+    /// contents into it on each Map. ROCm 6.2.4 doesn't export
+    /// hipExternalMemoryGetMappedMipmappedArray (verified via nm), so we
+    /// can't share the array's memory directly with the import — we copy
+    /// linear→tiled inside the GPU on each Map. Allocated lazily on first
+    /// SubResource call so non-array consumers don't pay the alloc cost.
+    pub hip_array: Mutex<hipArray_t>,
 }
 
 // SAFETY: hipExternalMemory_t and *mut c_void are raw HIP-owned pointers; we
@@ -212,6 +221,7 @@ pub unsafe extern "system" fn zluda_d3d11_register_imported(
         dev_ptr,
         size: desc.size,
         desc,
+        hip_array: Mutex::new(std::ptr::null_mut()),
     });
     let cuda_res = Box::into_raw(state) as CUgraphicsResource;
 
@@ -246,6 +256,127 @@ pub unsafe fn get_mapped_pointer(
     *p_dev_ptr = hipDeviceptr_t(state.dev_ptr);
     *p_size = state.size as usize;
     Ok(())
+}
+
+/// Allocate (lazily, once) a hipArray dimensioned to match the D3D11
+/// texture descriptor and return its handle. Subsequent calls return the
+/// cached handle. Format is fixed at R32G32B32A32_FLOAT (the only format
+/// the P0 probe observed). Caller must hold no lock on `state.hip_array`
+/// — this function takes its own mutex.
+unsafe fn ensure_hip_array(state: &D3D11ResourceState) -> Result<hipArray_t, CUerror> {
+    let mut guard = state.hip_array.lock().map_err(|_| CUerror::UNKNOWN)?;
+    if !guard.is_null() {
+        return Ok(*guard);
+    }
+    /* R32G32B32A32_FLOAT — 4×32-bit float channels. */
+    let mut fmt: hipChannelFormatDesc = std::mem::zeroed();
+    fmt.x = 32; fmt.y = 32; fmt.z = 32; fmt.w = 32;
+    fmt.f = hipChannelFormatKind::hipChannelFormatKindFloat;
+    let mut arr: hipArray_t = std::ptr::null_mut();
+    if let Err(e) = hipMallocArray(
+        &mut arr,
+        &fmt,
+        state.desc.width as usize,
+        state.desc.height as usize,
+        hipArrayDefault,
+    ) {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] D3D11 ensure_hip_array hipMallocArray failed: {:?} ({}x{})",
+            e, state.desc.width, state.desc.height
+        ));
+        return Err(CUerror::OUT_OF_MEMORY);
+    }
+    *guard = arr;
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] D3D11 ensure_hip_array allocated {}x{} R32G32B32A32_FLOAT array={:p}",
+        state.desc.width, state.desc.height, arr
+    ));
+    Ok(arr)
+}
+
+/// Refresh the hipArray contents from the imported linear buffer. Called
+/// from get_mapped_array (right before the application reads via texture
+/// object) so the array contains the current frame's data. Uses 2D copy
+/// with explicit pitch.
+///
+/// Env-gated `ZLUDA_D3D11_ARRAY_REFRESH=0` skips the copy entirely
+/// (returns OK without touching the array). Used for an A/B test:
+/// hipMemcpy2DToArray on every Map appears to interact badly with
+/// DXVK's submit thread on iter46–iter51 (CUB-RadixSort dmesg page
+/// faults, ~10/run). Skipping means PhysX gets an empty hipArray —
+/// not correct, but lets us verify whether the CUB regression class
+/// is caused by this specific copy.
+unsafe fn refresh_array_from_buffer(state: &D3D11ResourceState) -> Result<(), CUerror> {
+    let arr = ensure_hip_array(state)?;
+    if std::env::var("ZLUDA_D3D11_ARRAY_REFRESH")
+        .ok()
+        .as_deref() == Some("0")
+    {
+        return Ok(());
+    }
+    let row_bytes = (state.desc.width as usize).saturating_mul(16); /* R32G32B32A32_FLOAT */
+    if let Err(e) = hipMemcpy2DToArray(
+        arr,
+        0,
+        0,
+        state.dev_ptr,
+        state.desc.pitch as usize,
+        row_bytes,
+        state.desc.height as usize,
+        hipMemcpyKind::hipMemcpyDeviceToDevice,
+    ) {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] D3D11 refresh_array_from_buffer hipMemcpy2DToArray failed: {:?}",
+            e
+        ));
+        return Err(CUerror::UNKNOWN);
+    }
+    Ok(())
+}
+
+/// Implementation of cuGraphicsSubResourceGetMappedArray for D3D11 resources.
+/// Returns a hipArray whose contents reflect the imported buffer at the time
+/// of the call. ROCm 6.2.4 doesn't export hipExternalMemoryGetMappedMipmappedArray
+/// so we can't share array memory with our import directly; we copy
+/// buffer→array on each call instead. The cost is one GPU-side 2D memcpy
+/// (~few hundred µs for the 256x254 textures Batman uses).
+///
+/// Env `ZLUDA_D3D11_SUBRESOURCE=0` reverts to NOT_SUPPORTED on this path,
+/// causing PhysX to fall back to its non-D3D11 buffer allocations. Used for
+/// A/B testing whether the SubResource hipArray path is itself a regression
+/// against the historical TFS-late ~6% baseline. iter46–iter54 (with
+/// SubResource active) showed CUB-RadixSort early crashes with 10+ dmesg
+/// page faults; iter17b–iter40 (with SubResource returning NOT_SUPPORTED)
+/// showed TFS-late ~6% rate. Toggling via env lets us isolate which
+/// behaviour we want to ship.
+pub unsafe fn get_mapped_array(
+    cuda_res: CUgraphicsResource,
+    array_index: u32,
+    mip_level: u32,
+) -> Result<hipArray_t, CUerror> {
+    if std::env::var("ZLUDA_D3D11_SUBRESOURCE")
+        .ok()
+        .as_deref() == Some("0")
+    {
+        return Err(CUerror::NOT_SUPPORTED);
+    }
+    let state = match state_for(cuda_res) {
+        Some(s) => s,
+        None => return Err(CUerror::INVALID_VALUE),
+    };
+    if array_index != 0 || mip_level != 0 {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] D3D11 get_mapped_array: array_index={} mip_level={} unsupported (only 0/0)",
+            array_index, mip_level
+        ));
+        return Err(CUerror::NOT_SUPPORTED);
+    }
+    refresh_array_from_buffer(state)?;
+    let arr = state.hip_array.lock().map(|g| *g).unwrap_or(std::ptr::null_mut());
+    if arr.is_null() {
+        return Err(CUerror::UNKNOWN);
+    }
+    Ok(arr)
 }
 
 /// Implementation of cuGraphicsMapResources for D3D11 resources.
@@ -300,6 +431,13 @@ pub unsafe fn unregister(cuda_res: CUgraphicsResource) -> CUresult {
         return Err(CUerror::INVALID_VALUE);
     }
     let state = Box::from_raw(cuda_res as *mut D3D11ResourceState);
+    /* Free the hipArray if we allocated one (lazy SubResource path). */
+    if let Ok(guard) = state.hip_array.lock() {
+        let arr = *guard;
+        if !arr.is_null() {
+            let _ = hipFreeArray(arr);
+        }
+    }
     let _ = hipDestroyExternalMemory(state.ext_mem);
     super::driver::zluda_log_err(&format!(
         "[ZLUDA] cuGraphicsUnregisterResource: D3D11 freed (was {:p}, {}x{})",
