@@ -250,41 +250,31 @@ pub unsafe fn get_mapped_pointer(
 
 /// Implementation of cuGraphicsMapResources for D3D11 resources.
 ///
-/// First-iteration stub: just hipDeviceSynchronize() so any outstanding HIP
-/// work touching the imported memory completes before we hand control back.
-/// PROPER implementation must additionally use DXVK's IDXGIVkInteropDevice
-/// LockSubmissionQueue / FlushRenderingCommands / submit a blit from the
-/// real DXVK image into our LINEAR import / wait on a fence — see plan
-/// step 5d. A loud warning is logged so we know if Batman cares about
-/// staleness in this iteration.
+/// The actual DXVK→imported-memory blit happens on the PE side in
+/// nvcuda.c::wine_cuGraphicsMapResources, BEFORE the call reaches us
+/// (CopySurfaceToExternalBuffer through IDXGIVkInteropDevice2). By the
+/// time we get here the imported VkBuffer holds the current D3D11 image
+/// pixels, so we just need to hipDeviceSynchronize so any outstanding
+/// HIP work touching that memory completes before the kernel runs.
 pub unsafe fn map_resources(cuda_res: CUgraphicsResource) -> CUresult {
     let state = match state_for(cuda_res) {
         Some(s) => s,
         None => return Err(CUerror::INVALID_VALUE),
     };
-    super::driver::zluda_log_err(&format!(
-        "[ZLUDA] cuGraphicsMapResources: D3D11 stub (no DXVK→staging blit yet) \
-         resource={:p} dev_ptr={:p} {}x{}",
-        cuda_res, state.dev_ptr, state.desc.width, state.desc.height
-    ));
+    let _ = state; // borrow to avoid 'unused' warning when not logging
     let _ = hipDeviceSynchronize();
     Ok(())
 }
 
 /// Implementation of cuGraphicsUnmapResources for D3D11 resources.
-/// Symmetric stub to map_resources — a full impl would optionally blit our
-/// staging back into the DXVK image when the binding had write semantics.
-/// Batman's observed bind=SRV|RTV implies one-way DXVK→CUDA so write-back
-/// is unnecessary; we just sync.
+/// One-way DXVK→CUDA flow (Batman's resources bind SRV|RTV; PhysX never
+/// writes back), so no reverse blit is needed. Just sync to ensure any
+/// HIP reads of the imported memory complete before the application
+/// resumes Vulkan work on the source image.
 pub unsafe fn unmap_resources(cuda_res: CUgraphicsResource) -> CUresult {
-    let state = match state_for(cuda_res) {
-        Some(s) => s,
-        None => return Err(CUerror::INVALID_VALUE),
-    };
-    super::driver::zluda_log_err(&format!(
-        "[ZLUDA] cuGraphicsUnmapResources: D3D11 stub resource={:p} dev_ptr={:p}",
-        cuda_res, state.dev_ptr
-    ));
+    if state_for(cuda_res).is_none() {
+        return Err(CUerror::INVALID_VALUE);
+    }
     let _ = hipDeviceSynchronize();
     Ok(())
 }
