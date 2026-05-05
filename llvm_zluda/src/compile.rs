@@ -125,7 +125,26 @@ pub fn compile(
 
     let triple = c"amdgcn-amd-amdhsa";
     let cpu = std::ffi::CString::new(gcn_arch).map_err(|_| ("invalid gcn_arch").to_string())?;
-    let features = c"-wavefrontsize64,+cumode";
+    /* Disable FeatureBackOffBarrier when ZLUDA_DISABLE_BACK_OFF_BARRIER=1.
+     * The feature (added by upstream D120544) lets gfx10.x hardware omit
+     * the implicit s_waitcnt before s_barrier — fine for graphics
+     * workloads that emit explicit fences but breaks CUDA's implicit
+     * `bar.sync 0` LDS-commit semantic. We compensate via an explicit
+     * `s_waitcnt(0)` in `__zluda_ptx_impl_bar_sync` (commit 579bcc05),
+     * but that's only invoked from PTX-translated `bar.sync`, not from
+     * any other LDS-fence path the LLVM codegen might emit. Disabling
+     * the optimisation entirely makes the codegen always emit the wait,
+     * which should make residual TFS/IOFX races go away if they're
+     * caused by some non-bar.sync LDS visibility gap. */
+    let features_static: &CStr = if std::env::var("ZLUDA_DISABLE_BACK_OFF_BARRIER")
+        .ok()
+        .as_deref() == Some("1")
+    {
+        c"-wavefrontsize64,+cumode,-back-off-barrier"
+    } else {
+        c"-wavefrontsize64,+cumode"
+    };
+    let features = features_static;
 
     let mut target = unsafe { std::mem::zeroed() };
     let mut err = std::ptr::null_mut();
