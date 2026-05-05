@@ -438,6 +438,18 @@ pub fn patch_iofx_actor_range_membar(ptx: &str) -> Option<String> {
 /// Skip CUB / cuda::* — those are not our suspect class.
 ///
 /// Env-gate: `ZLUDA_BROAD_VOLATILE_LDS=1` (default ON in protonfix).
+///
+/// Originally kernel-name-targeted (PhysX/TFS/IOFX/FleX prefixes, skip
+/// `_ZN3cub`). After 2026-05-05's SubResource interop landing made PhysX
+/// exercise CUB Radix Sort with larger inputs, CUB kernels started
+/// crashing — the same memory-model bug class the prefix-list workaround
+/// was masking elsewhere. Broadened to apply to ALL kernels: per user
+/// direction, prefer one generic memory-model fix over many per-kernel
+/// patches. The opt-out for `_ZN3cub` and `cuda::*` is dropped.
+///
+/// Risk: makes legitimate CUB scan/sort code slower on workloads that
+/// don't trigger the AMDGPU race. For our hardware (gfx1033) and goal
+/// (gameplay correctness over benchmark perf), correctness wins.
 pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
     let env_off = std::env::var("ZLUDA_BROAD_VOLATILE_LDS")
         .map_or(false, |v| v == "0");
@@ -469,19 +481,9 @@ pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
                 .unwrap_or("")
                 .to_string();
             current_name = cn.clone();
-            in_kernel = !cn.starts_with("_ZN3cub")
-                && !cn.starts_with("cuda")
-                && (cn.starts_with("IOFX_")
-                    || cn.starts_with("TurbulenceFS_")
-                    || cn.starts_with("ParticleIOS_")
-                    || cn.starts_with("FieldSampler_")
-                    || cn.starts_with("CreateParticleShapesIncremental_")
-                    || cn.starts_with("InitParticleShapes")
-                    || cn.starts_with("InitCollData")
-                    || cn.starts_with("FinalizeCollision")
-                    || cn.starts_with("ParticleCollisionStaticBox")
-                    || cn.starts_with("MemCopy")
-                    || cn.starts_with("_Z")); // FleX C++ mangled
+            /* Apply to ALL kernels — we want one generic fix, not per-kernel
+             * exclusions. See doc comment above for the rationale. */
+            in_kernel = true;
             brace_depth = 0;
         }
         if in_kernel {
@@ -563,22 +565,14 @@ pub fn patch_broad_membar_before_bar_sync(ptx: &str) -> Option<String> {
             // Extract name up to '('
             let nm = name.split('(').next().unwrap_or(name).trim().to_string();
             current_name = nm;
-            // Apply to PhysX/FleX/TFS/IOFX/MS_* kernels; skip CUB and the
-            // dummy stub functions cudaMalloc/cudaFuncGetAttributes/etc.
-            let cn = current_name.as_str();
-            in_kernel = !cn.starts_with("_ZN3cub")
-                && !cn.starts_with("cuda")
-                && (cn.starts_with("IOFX_")
-                    || cn.starts_with("TurbulenceFS_")
-                    || cn.starts_with("ParticleIOS_")
-                    || cn.starts_with("FieldSampler_")
-                    || cn.starts_with("CreateParticleShapesIncremental_")
-                    || cn.starts_with("InitParticleShapes")
-                    || cn.starts_with("InitCollData")
-                    || cn.starts_with("FinalizeCollision")
-                    || cn.starts_with("ParticleCollisionStaticBox")
-                    || cn.starts_with("MemCopy")
-                    || cn.starts_with("_Z")); // FleX C++ mangled
+            /* Apply to ALL kernels, including CUB. Per user direction
+             * 2026-05-05: prefer generic memory-model fixes over per-
+             * kernel exclusions. The historical CUB-skip was based on
+             * "CUB doesn't crash" which only held when PhysX wasn't
+             * exercising it via D3D11 textures; the SubResource interop
+             * landing exposed CUB to the same memory-model bug class. */
+            let _ = current_name; // borrow to silence dead-code lint
+            in_kernel = true;
             brace_depth = 0;
         }
         if in_kernel {
