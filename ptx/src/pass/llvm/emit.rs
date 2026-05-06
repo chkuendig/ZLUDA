@@ -894,14 +894,12 @@ impl<'a> MethodEmitContext<'a> {
         let src = self.resolver.value(arguments.src)?;
         let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
         apply_qualifier(load, data.qualifier)?;
-        // ZLUDA codegen fix (2026-05-06): force volatile=true on ld.shared
-        // loads. AMDGPU's CSE/MachineLICM/GVN can hoist non-volatile shared
-        // loads across barriers, breaking cross-wave LDS visibility (the
-        // FeatureBackOffBarrier issue). NVPTX docs document ld.volatile as
-        // the standard codegen for shared synchronization patterns. This
-        // replaces the per-kernel `patch_broad_volatile_lds` PTX rewrite
-        // with a universal codegen-layer fix. See plan
-        // resilient-sprouting-pie.md Phase 2.1.
+        // Phase 2.1 (2026-05-06): force LLVM `load volatile` for ld.shared.
+        // Prevents CSE/MachineLICM from coalescing or hoisting LDS reads
+        // across barriers. Verified not the smoke regression cause —
+        // smoke regression is the D3D11 SubResource hipArray path
+        // (commit 70683673), gated off by default via
+        // ZLUDA_D3D11_SUBRESOURCE=0.
         if data.state_space == ast::StateSpace::Shared {
             unsafe { LLVMSetVolatile(load, 1) };
         }
