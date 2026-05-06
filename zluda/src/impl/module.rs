@@ -609,6 +609,86 @@ pub fn patch_broad_membar_before_bar_sync(ptx: &str) -> Option<String> {
     }
 }
 
+/// Reader-side acquire fence for the cross-warp LDS handshake in
+/// `RadixSortScanKernel`. Symmetric companion to
+/// `patch_broad_membar_before_bar_sync` (which inserts membar.cta BEFORE
+/// bar.sync = release semantics): this inserts membar.cta AFTER each
+/// bar.sync 0 in RadixSortScanKernel = acquire semantics. Without it,
+/// post-barrier reads can use stale cached LDS values from before the
+/// barrier.
+///
+/// Phase 8 (2026-04-27) in-game evidence: warp 0 lane 2 stores correct
+/// exclusive-prefix to LDS, thread 32 in warp 1 reads back its own
+/// pre-barrier `thread_partial` — `bar.sync 0` fails to publish writes
+/// cross-wave. Originally probed in commit 8daf62f8, gated default off
+/// when CUB Scan was no longer the primary blocker. Re-enabled
+/// 2026-05-05 because CUB Downsweep (which consumes Scan's output) is
+/// now the dominant residual failure (9/22 = 41%).
+///
+/// PTX `membar.cta` lowers to LLVM `fence(SEQ_CST, workgroup)`, which on
+/// AMDGPU CU-mode (with PR #161638 backport) emits at minimum
+/// `s_waitcnt lgkmcnt(0)` after `s_barrier`, giving reader threads a
+/// fresh acquire of LDS state.
+///
+/// Default ON. Set `ZLUDA_SCAN_READER_ACQUIRE=0` to disable.
+pub fn patch_scan_kernel_reader_acquire(ptx: &str) -> Option<String> {
+    let env_off = std::env::var("ZLUDA_SCAN_READER_ACQUIRE")
+        .map_or(false, |v| v == "0");
+    if env_off {
+        return None;
+    }
+    if !ptx.contains("RadixSortScanKernel") {
+        return None;
+    }
+
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut out = String::with_capacity(ptx.len() + 256);
+    let mut in_scan = false;
+    let mut brace_depth: i32 = 0;
+    let mut applied = 0usize;
+
+    for line in &lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(".visible .entry ") || trimmed.starts_with(".entry ") {
+            in_scan = trimmed.contains("RadixSortScanKernel");
+            brace_depth = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+        if in_scan && brace_depth >= 1 {
+            let stripped = trimmed.trim_end_matches(|c: char| c.is_whitespace());
+            if stripped == "bar.sync 0;" {
+                out.push_str("// ZLUDA scan reader-acquire fence\n");
+                out.push_str("membar.cta;\n");
+                applied += 1;
+            }
+        }
+        if in_scan {
+            for c in line.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_scan = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if applied == 0 {
+        return None;
+    }
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] patch_scan_kernel_reader_acquire: injected membar.cta after {} bar.sync 0 site(s) in RadixSortScanKernel",
+        applied
+    ));
+    Some(out)
+}
+
+
 /// Global map from synthetic texture reference pointers to their device global variable addresses.
 /// When .texref variables are compiled as .global .u64 in PTX, hipModuleGetTexRef can't find them.
 /// We create synthetic textureReference structs and track which device global they correspond to.
@@ -793,10 +873,15 @@ fn get_best_ptx_and_compile(
                             Some(p) => Cow::Owned(p),
                             None => after_actor,
                         };
-                    let final_ptx: Cow<str> =
+                    let after_membar: Cow<str> =
                         match patch_broad_membar_before_bar_sync(after_volatile.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_volatile,
+                        };
+                    let final_ptx: Cow<str> =
+                        match patch_scan_kernel_reader_acquire(after_membar.as_ref()) {
+                            Some(p) => Cow::Owned(p),
+                            None => after_membar,
                         };
                     ptx_modules.push(final_ptx);
                 }
@@ -852,12 +937,19 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => after_actor,
                                         };
-                                    let final_ptx: Cow<str> =
+                                    let after_membar: Cow<str> =
                                         match patch_broad_membar_before_bar_sync(
                                             after_volatile.as_ref(),
                                         ) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_volatile,
+                                        };
+                                    let final_ptx: Cow<str> =
+                                        match patch_scan_kernel_reader_acquire(
+                                            after_membar.as_ref(),
+                                        ) {
+                                            Some(p) => Cow::Owned(p),
+                                            None => after_membar,
                                         };
                                     ptx_modules.push(final_ptx);
                                 }

@@ -290,6 +290,10 @@ extern "C"
         asm volatile("s_waitcnt 0\n" ::: "memory");
         __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "workgroup");
         __builtin_amdgcn_s_barrier();
+        // Option B post-barrier s_waitcnt(0) was tested 2026-05-05
+        // (iter93-iter97) and REFUTED — 3/5 IOFX_actorRange crashes
+        // vs baseline 13%, P=1.4%. The post-barrier waitcnt forced
+        // strict ordering that some kernel algorithms don't expect.
     }
 
     int32_t __ockl_wgred_and_i32(int32_t) __device__;

@@ -894,6 +894,17 @@ impl<'a> MethodEmitContext<'a> {
         let src = self.resolver.value(arguments.src)?;
         let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
         apply_qualifier(load, data.qualifier)?;
+        // ZLUDA codegen fix (2026-05-06): force volatile=true on ld.shared
+        // loads. AMDGPU's CSE/MachineLICM/GVN can hoist non-volatile shared
+        // loads across barriers, breaking cross-wave LDS visibility (the
+        // FeatureBackOffBarrier issue). NVPTX docs document ld.volatile as
+        // the standard codegen for shared synchronization patterns. This
+        // replaces the per-kernel `patch_broad_volatile_lds` PTX rewrite
+        // with a universal codegen-layer fix. See plan
+        // resilient-sprouting-pie.md Phase 2.1.
+        if data.state_space == ast::StateSpace::Shared {
+            unsafe { LLVMSetVolatile(load, 1) };
+        }
         unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
         if needs_cast {
             self.resolver.with_result(arguments.dst, |dst| unsafe {
@@ -1361,6 +1372,13 @@ impl<'a> MethodEmitContext<'a> {
         // future use if we find a way to identify scatter-write patterns specifically.
         let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
         apply_qualifier(store, data.qualifier)?;
+        // Phase 2.1b (volatile on st.shared) was REVERTED 2026-05-06:
+        // user reported particle/smoke effects disappeared from Batman
+        // benchmark. Volatile stores at codegen level cause TFS (smoke
+        // simulation) to compute wrong output. Same regression class
+        // as the prior PTX-level st.volatile.shared attempt (commit
+        // 56ffc0fd which regressed IOFX_actorRange to SIGABRT). Keep
+        // volatile=true ONLY on loads (Phase 2.1, in emit_ld).
         unsafe {
             LLVMSetAlignment(store, data.typ.layout().align() as u32);
         }
