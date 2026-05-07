@@ -294,26 +294,32 @@ unsafe fn ensure_hip_array(state: &D3D11ResourceState) -> Result<hipArray_t, CUe
     Ok(arr)
 }
 
-/// Refresh the hipArray contents from the imported linear buffer. Called
-/// from get_mapped_array (right before the application reads via texture
-/// object) so the array contains the current frame's data. Uses 2D copy
-/// with explicit pitch.
+/// Refresh the hipArray contents from the imported linear buffer.
 ///
-/// Env-gated `ZLUDA_D3D11_ARRAY_REFRESH=0` skips the copy entirely
-/// (returns OK without touching the array). Used for an A/B test:
-/// hipMemcpy2DToArray on every Map appears to interact badly with
-/// DXVK's submit thread on iter46–iter51 (CUB-RadixSort dmesg page
-/// faults, ~10/run). Skipping means PhysX gets an empty hipArray —
-/// not correct, but lets us verify whether the CUB regression class
-/// is caused by this specific copy.
+/// **2026-05-06 — DEFAULT NO-OP per F1.** Offline analysis of
+/// `run_20260505_094523_d3d11_iter42` proved PhysX never binds these
+/// hipArrays to any texref / tex object / surf object / memcpy. The
+/// per-frame `hipMemcpy2DToArray` calls do work for nothing — and on
+/// the NULL stream they serialize against PhysX's
+/// `MemCopyBatchedAsync` scheduling, which we believe is what breaks
+/// the smoke effect timing (smoke renders correctly with this off).
+///
+/// We still allocate the hipArray (`ensure_hip_array`) so callers
+/// get a non-null handle from `cuGraphicsSubResourceGetMappedArray`,
+/// but the contents are uninitialized — PhysX doesn't read them.
+///
+/// Env-gated escape hatch: `ZLUDA_D3D11_ARRAY_REFRESH=1` re-enables
+/// the historical buffer→array copy in case any caller ever does
+/// read the array. Default is OFF for the reason above.
 unsafe fn refresh_array_from_buffer(state: &D3D11ResourceState) -> Result<(), CUerror> {
-    let arr = ensure_hip_array(state)?;
+    let _arr = ensure_hip_array(state)?;
     if std::env::var("ZLUDA_D3D11_ARRAY_REFRESH")
         .ok()
-        .as_deref() == Some("0")
+        .as_deref() != Some("1")
     {
         return Ok(());
     }
+    let arr = _arr;
     let row_bytes = (state.desc.width as usize).saturating_mul(16); /* R32G32B32A32_FLOAT */
     if let Err(e) = hipMemcpy2DToArray(
         arr,
