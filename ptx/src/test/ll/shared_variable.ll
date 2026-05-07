@@ -1,4 +1,4 @@
-@shared_mem1 = external addrspace(3) global [128 x i8], align 4
+@shared_mem1 = internal addrspace(3) global [128 x i8] undef, align 4
 
 define amdgpu_kernel void @shared_variable(ptr addrspace(4) byref(i64) %"41", ptr addrspace(4) byref(i64) %"42") #0 {
   %"43" = alloca i64, align 8, addrspace(5)
@@ -22,7 +22,7 @@ define amdgpu_kernel void @shared_variable(ptr addrspace(4) byref(i64) %"41", pt
   store i64 %5, ptr addrspace(5) %"45", align 8
   %6 = load i64, ptr addrspace(5) %"45", align 8
   store i64 %6, ptr addrspace(3) @shared_mem1, align 8
-  %7 = load i64, ptr addrspace(3) @shared_mem1, align 8
+  %7 = load volatile i64, ptr addrspace(3) @shared_mem1, align 8
   store i64 %7, ptr addrspace(5) %"46", align 8
   %8 = load i64, ptr addrspace(5) %"44", align 8
   %9 = load i64, ptr addrspace(5) %"46", align 8

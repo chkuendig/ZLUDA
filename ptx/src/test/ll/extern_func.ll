@@ -22,7 +22,7 @@ define amdgpu_kernel void @extern_func(ptr addrspace(4) byref(i64) %"53", ptr ad
   %"70" = inttoptr i64 %4 to ptr addrspace(1)
   %5 = load i64, ptr addrspace(1) %"70", align 8
   store i64 %5, ptr addrspace(5) %"57", align 8
-  %"64" = getelementptr inbounds i8, ptr addrspace(5) %"63", i64 0
+  %"64" = getelementptr inbounds i8, ptr addrspace(5) %"63", i32 0
   %6 = load i64, ptr addrspace(5) %"57", align 8
   store i64 %6, ptr addrspace(5) %"64", align 8
   %7 = load i64, ptr addrspace(5) %"63", align 8

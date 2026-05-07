@@ -1,3 +1,5 @@
+declare hidden i32 @__zluda_ptx_impl_activemask() #0
+
 declare hidden i32 @__zluda_ptx_impl_shfl_sync_idx_b32(i32, i32, i32, i32) #0
 
 declare hidden <2 x i32> @__zluda_ptx_impl_shfl_sync_up_b32_pred(i32, i32, i32, i32) #0
@@ -52,10 +54,11 @@ define amdgpu_kernel void @shfl_scan_idx_lower_half_active_w16(ptr addrspace(4) 
 
 "25":                                             ; preds = %"23"
   %10 = load i32, ptr addrspace(5) %"81", align 4
-  %"153" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_up_b32_pred(i32 %10, i32 1, i32 4096, i32 -1)
-  %"141" = extractelement <2 x i32> %"153", i8 0
-  %"154" = extractelement <2 x i32> %"153", i8 1
-  %11 = trunc i32 %"154" to i1
+  %"152" = call i32 @__zluda_ptx_impl_activemask()
+  %"155" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_up_b32_pred(i32 %10, i32 1, i32 4096, i32 %"152")
+  %"141" = extractelement <2 x i32> %"155", i8 0
+  %"156" = extractelement <2 x i32> %"155", i8 1
+  %11 = trunc i32 %"156" to i1
   store i32 %"141", ptr addrspace(5) %"82", align 4
   store i1 %11, ptr addrspace(5) %"85", align 1
   %12 = load i1, ptr addrspace(5) %"85", align 1
@@ -70,10 +73,11 @@ define amdgpu_kernel void @shfl_scan_idx_lower_half_active_w16(ptr addrspace(4) 
 
 "27":                                             ; preds = %"26", %"25"
   %15 = load i32, ptr addrspace(5) %"81", align 4
-  %"162" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_up_b32_pred(i32 %15, i32 2, i32 4096, i32 -1)
-  %"143" = extractelement <2 x i32> %"162", i8 0
-  %"163" = extractelement <2 x i32> %"162", i8 1
-  %16 = trunc i32 %"163" to i1
+  %"163" = call i32 @__zluda_ptx_impl_activemask()
+  %"164" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_up_b32_pred(i32 %15, i32 2, i32 4096, i32 %"163")
+  %"143" = extractelement <2 x i32> %"164", i8 0
+  %"165" = extractelement <2 x i32> %"164", i8 1
+  %16 = trunc i32 %"165" to i1
   store i32 %"143", ptr addrspace(5) %"82", align 4
   store i1 %16, ptr addrspace(5) %"85", align 1
   %17 = load i1, ptr addrspace(5) %"85", align 1
@@ -88,10 +92,11 @@ define amdgpu_kernel void @shfl_scan_idx_lower_half_active_w16(ptr addrspace(4) 
 
 "29":                                             ; preds = %"28", %"27"
   %20 = load i32, ptr addrspace(5) %"81", align 4
-  %"165" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_up_b32_pred(i32 %20, i32 4, i32 4096, i32 -1)
-  %"145" = extractelement <2 x i32> %"165", i8 0
-  %"166" = extractelement <2 x i32> %"165", i8 1
-  %21 = trunc i32 %"166" to i1
+  %"166" = call i32 @__zluda_ptx_impl_activemask()
+  %"167" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_up_b32_pred(i32 %20, i32 4, i32 4096, i32 %"166")
+  %"145" = extractelement <2 x i32> %"167", i8 0
+  %"168" = extractelement <2 x i32> %"167", i8 1
+  %21 = trunc i32 %"168" to i1
   store i32 %"145", ptr addrspace(5) %"82", align 4
   store i1 %21, ptr addrspace(5) %"85", align 1
   %22 = load i1, ptr addrspace(5) %"85", align 1
@@ -106,10 +111,11 @@ define amdgpu_kernel void @shfl_scan_idx_lower_half_active_w16(ptr addrspace(4) 
 
 "31":                                             ; preds = %"30", %"29"
   %25 = load i32, ptr addrspace(5) %"81", align 4
-  %"168" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_up_b32_pred(i32 %25, i32 8, i32 4096, i32 -1)
-  %"147" = extractelement <2 x i32> %"168", i8 0
-  %"169" = extractelement <2 x i32> %"168", i8 1
-  %26 = trunc i32 %"169" to i1
+  %"169" = call i32 @__zluda_ptx_impl_activemask()
+  %"170" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_up_b32_pred(i32 %25, i32 8, i32 4096, i32 %"169")
+  %"147" = extractelement <2 x i32> %"170", i8 0
+  %"171" = extractelement <2 x i32> %"170", i8 1
+  %26 = trunc i32 %"171" to i1
   store i32 %"147", ptr addrspace(5) %"82", align 4
   store i1 %26, ptr addrspace(5) %"85", align 1
   %27 = load i1, ptr addrspace(5) %"85", align 1
@@ -124,7 +130,8 @@ define amdgpu_kernel void @shfl_scan_idx_lower_half_active_w16(ptr addrspace(4) 
 
 "33":                                             ; preds = %"32", %"31"
   %30 = load i32, ptr addrspace(5) %"81", align 4
-  %"149" = call i32 @__zluda_ptx_impl_shfl_sync_idx_b32(i32 %30, i32 15, i32 4127, i32 -1)
+  %"172" = call i32 @__zluda_ptx_impl_activemask()
+  %"149" = call i32 @__zluda_ptx_impl_shfl_sync_idx_b32(i32 %30, i32 15, i32 4127, i32 %"172")
   store i32 %"149", ptr addrspace(5) %"82", align 4
   %31 = load i32, ptr addrspace(5) %"81", align 4
   %32 = load i32, ptr addrspace(5) %"82", align 4

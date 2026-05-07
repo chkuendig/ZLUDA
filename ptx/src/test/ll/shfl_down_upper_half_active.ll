@@ -1,3 +1,5 @@
+declare hidden i32 @__zluda_ptx_impl_activemask() #0
+
 declare hidden <2 x i32> @__zluda_ptx_impl_shfl_sync_down_b32_pred(i32, i32, i32, i32) #0
 
 declare hidden i32 @__zluda_ptx_impl_sreg_tid(i8) #0
@@ -45,10 +47,11 @@ define amdgpu_kernel void @shfl_down_upper_half_active(ptr addrspace(4) byref(i6
 
 "23":                                             ; preds = %"21"
   %9 = load i32, ptr addrspace(5) %"63", align 4
-  %"98" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_down_b32_pred(i32 %9, i32 1, i32 31, i32 -1)
-  %"94" = extractelement <2 x i32> %"98", i8 0
-  %"99" = extractelement <2 x i32> %"98", i8 1
-  %10 = trunc i32 %"99" to i1
+  %"97" = call i32 @__zluda_ptx_impl_activemask()
+  %"100" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_down_b32_pred(i32 %9, i32 1, i32 31, i32 %"97")
+  %"94" = extractelement <2 x i32> %"100", i8 0
+  %"101" = extractelement <2 x i32> %"100", i8 1
+  %10 = trunc i32 %"101" to i1
   store i32 %"94", ptr addrspace(5) %"65", align 4
   store i1 %10, ptr addrspace(5) %"67", align 1
   %11 = load i1, ptr addrspace(5) %"67", align 1

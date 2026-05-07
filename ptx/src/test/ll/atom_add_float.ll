@@ -1,4 +1,4 @@
-@shared_mem = external addrspace(3) global [1024 x i8], align 4
+@shared_mem = internal addrspace(3) global [1024 x i8] undef, align 4
 
 define amdgpu_kernel void @atom_add_float(ptr addrspace(4) byref(i64) %"45", ptr addrspace(4) byref(i64) %"46") #0 {
   %"47" = alloca i64, align 8, addrspace(5)
@@ -30,7 +30,7 @@ define amdgpu_kernel void @atom_add_float(ptr addrspace(4) byref(i64) %"45", ptr
   %9 = load float, ptr addrspace(5) %"50", align 4
   %10 = atomicrmw fadd ptr addrspace(3) @shared_mem, float %9 syncscope("agent-one-as") acq_rel, align 4
   store float %10, ptr addrspace(5) %"49", align 4
-  %11 = load float, ptr addrspace(3) @shared_mem, align 4
+  %11 = load volatile float, ptr addrspace(3) @shared_mem, align 4
   store float %11, ptr addrspace(5) %"50", align 4
   %12 = load i64, ptr addrspace(5) %"48", align 8
   %13 = load float, ptr addrspace(5) %"49", align 4

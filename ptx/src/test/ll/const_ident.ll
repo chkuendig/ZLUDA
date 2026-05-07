@@ -31,28 +31,26 @@ define amdgpu_kernel void @const_ident(ptr addrspace(4) byref(i64) %"55", ptr ad
   store i64 %5, ptr addrspace(5) %"62", align 8
   %6 = load i64, ptr addrspace(5) %"59", align 8
   %7 = load i64, ptr addrspace(5) %"61", align 8
-  %8 = xor i64 %6, %7
-  %"71" = freeze i64 %8
+  %"71" = xor i64 %6, %7
   store i64 %"71", ptr addrspace(5) %"63", align 8
-  %9 = load i64, ptr addrspace(5) %"60", align 8
-  %10 = load i64, ptr addrspace(5) %"62", align 8
-  %11 = xor i64 %9, %10
-  %"74" = freeze i64 %11
+  %8 = load i64, ptr addrspace(5) %"60", align 8
+  %9 = load i64, ptr addrspace(5) %"62", align 8
+  %"74" = xor i64 %8, %9
   store i64 %"74", ptr addrspace(5) %"64", align 8
+  %10 = load i64, ptr addrspace(5) %"58", align 8
+  %11 = load i64, ptr addrspace(5) %"63", align 8
+  %"91" = inttoptr i64 %10 to ptr
+  store i64 %11, ptr %"91", align 8
   %12 = load i64, ptr addrspace(5) %"58", align 8
-  %13 = load i64, ptr addrspace(5) %"63", align 8
-  %"91" = inttoptr i64 %12 to ptr
-  store i64 %13, ptr %"91", align 8
-  %14 = load i64, ptr addrspace(5) %"58", align 8
-  %"93" = inttoptr i64 %14 to ptr
+  %"93" = inttoptr i64 %12 to ptr
   %"51" = getelementptr inbounds i8, ptr %"93", i64 8
-  %15 = load i64, ptr addrspace(5) %"64", align 8
-  store i64 %15, ptr %"51", align 8
-  %16 = load i64, ptr addrspace(5) %"58", align 8
-  %"95" = inttoptr i64 %16 to ptr
+  %13 = load i64, ptr addrspace(5) %"64", align 8
+  store i64 %13, ptr %"51", align 8
+  %14 = load i64, ptr addrspace(5) %"58", align 8
+  %"95" = inttoptr i64 %14 to ptr
   %"53" = getelementptr inbounds i8, ptr %"95", i64 8
-  %17 = load i64, ptr addrspace(5) %"64", align 8
-  store i64 %17, ptr %"53", align 8
+  %15 = load i64, ptr addrspace(5) %"64", align 8
+  store i64 %15, ptr %"53", align 8
   fence seq_cst
   ret void
 }

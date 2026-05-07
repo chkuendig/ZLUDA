@@ -1,4 +1,4 @@
-@shared_buf = external addrspace(3) global [64 x i8], align 4
+@shared_buf = internal addrspace(3) global [64 x i8] undef, align 4
 
 define amdgpu_kernel void @shared_ptr_offset(ptr addrspace(4) byref(i64) %"43", ptr addrspace(4) byref(i64) %"44") #0 {
   %"45" = alloca i64, align 8, addrspace(5)
@@ -34,7 +34,7 @@ define amdgpu_kernel void @shared_ptr_offset(ptr addrspace(4) byref(i64) %"43", 
   %10 = load i64, ptr addrspace(5) %"48", align 8
   %11 = trunc i64 %10 to i32
   %"68" = inttoptr i32 %11 to ptr addrspace(3)
-  %12 = load i64, ptr addrspace(3) %"68", align 8
+  %12 = load volatile i64, ptr addrspace(3) %"68", align 8
   store i64 %12, ptr addrspace(5) %"49", align 8
   %13 = load i64, ptr addrspace(5) %"46", align 8
   %14 = load i64, ptr addrspace(5) %"49", align 8

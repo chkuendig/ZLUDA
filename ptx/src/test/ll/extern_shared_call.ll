@@ -8,7 +8,7 @@ define hidden void @incr_shared_2_global() #0 {
   br label %"42"
 
 "42":                                             ; preds = %1
-  %2 = load i64, ptr addrspace(3) @shared_mem, align 8
+  %2 = load volatile i64, ptr addrspace(3) @shared_mem, align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
   %3 = load i64, ptr addrspace(5) %"45", align 8
   %"47" = add i64 %3, 2
@@ -44,7 +44,7 @@ define amdgpu_kernel void @extern_shared_call(ptr addrspace(4) byref(i64) %"50",
   br label %"44"
 
 "44":                                             ; preds = %"43"
-  %7 = load i64, ptr addrspace(3) @shared_mem, align 8
+  %7 = load volatile i64, ptr addrspace(3) @shared_mem, align 8
   store i64 %7, ptr addrspace(5) %"54", align 8
   %8 = load i64, ptr addrspace(5) %"53", align 8
   %9 = load i64, ptr addrspace(5) %"54", align 8

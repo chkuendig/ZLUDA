@@ -25,13 +25,12 @@ define amdgpu_kernel void @xor(ptr addrspace(4) byref(i64) %"42", ptr addrspace(
   store i32 %7, ptr addrspace(5) %"47", align 4
   %8 = load i32, ptr addrspace(5) %"46", align 4
   %9 = load i32, ptr addrspace(5) %"47", align 4
-  %10 = xor i32 %8, %9
-  %"54" = freeze i32 %10
+  %"54" = xor i32 %8, %9
   store i32 %"54", ptr addrspace(5) %"46", align 4
-  %11 = load i64, ptr addrspace(5) %"45", align 8
-  %12 = load i32, ptr addrspace(5) %"46", align 4
-  %"61" = inttoptr i64 %11 to ptr
-  store i32 %12, ptr %"61", align 4
+  %10 = load i64, ptr addrspace(5) %"45", align 8
+  %11 = load i32, ptr addrspace(5) %"46", align 4
+  %"61" = inttoptr i64 %10 to ptr
+  store i32 %11, ptr %"61", align 4
   fence seq_cst
   ret void
 }
