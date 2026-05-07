@@ -389,6 +389,22 @@ pub(crate) unsafe fn object_create(
         *p_tex_object = 0;
     }
     result?;
+    // Phase 3 (2026-05-07): hipDeviceSynchronize after a successful
+    // hipTexObjectCreate. Targets the PhysX null-this race
+    // (PhysX3_x64.dll PC ~0x6ffffd0aced9): cuTexObjectCreate is
+    // documented as thread-safe, but our impl may have a window where
+    // the returned handle is encoded + stored before HIP's internal
+    // texture-descriptor publish is visible to other threads. The
+    // sync ensures the texture object is fully ready before the
+    // returned handle escapes to the caller. Cost: ~50–200µs added
+    // latency per call; Batman creates ~6–12 per frame → ~3% perf hit.
+    // Gated by ZLUDA_TEXOBJ_SYNC=0 to disable for A/B testing.
+    if std::env::var("ZLUDA_TEXOBJ_SYNC")
+        .ok()
+        .as_deref() != Some("0")
+    {
+        let _ = hip_runtime_sys::hipDeviceSynchronize();
+    }
     // Encode pixel shift in top 3 bits of the handle, same as cuSurfObjectCreate.
     // On NVIDIA, texture and surface handles are interchangeable — PhysX uses
     // texture objects for surface writes (sust). Our sust helpers extract the
