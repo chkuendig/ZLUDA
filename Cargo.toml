@@ -7,6 +7,7 @@ members = [
     "cuda_check",
     "cuda_macros",
     "cuda_types",
+    "d3d11_interop_hsa_test",
     "dark_api",
     "detours-sys",
     "ext/highs-sys",
