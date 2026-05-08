@@ -291,6 +291,36 @@ unsafe fn ensure_hip_array(state: &D3D11ResourceState) -> Result<hipArray_t, CUe
         "[ZLUDA] D3D11 ensure_hip_array allocated {}x{} R32G32B32A32_FLOAT array={:p}",
         state.desc.width, state.desc.height, arr
     ));
+    // Phase A.1 canary (2026-05-08): when ZLUDA_D3D11_CANARY=1, fill the
+    // newly-allocated hipArray with a known 0xDEADBEEF u32 pattern. We
+    // read it back in get_mapped_array; if any word changed, something
+    // (likely APEX's surf2Dwrite kernel) wrote to it. Confirms or refutes
+    // hypothesis H1 in resilient-sprouting-pie.md Phase A.1.
+    if std::env::var("ZLUDA_D3D11_CANARY").ok().as_deref() == Some("1") {
+        let w = state.desc.width as usize;
+        let h = state.desc.height as usize;
+        let row_bytes = w.saturating_mul(16); // R32G32B32A32_FLOAT
+        let n_u32 = w.saturating_mul(h).saturating_mul(4);
+        let canary: Vec<u32> = vec![0xDEADBEEFu32; n_u32];
+        // 2D copy because hipArrays are 2D-tiled internally; hipMemcpyHtoA
+        // returned hipErrorInvalidValue for the 2D case.
+        match hipMemcpy2DToArray(
+            arr, 0, 0,
+            canary.as_ptr() as *const std::ffi::c_void,
+            row_bytes,
+            row_bytes,
+            h,
+            hipMemcpyKind::hipMemcpyHostToDevice,
+        ) {
+            Ok(()) => super::driver::zluda_log_err(&format!(
+                "[ZLUDA] D3D11 canary filled 0xDEADBEEF arr={:p} {}x{}",
+                arr, w, h
+            )),
+            Err(e) => super::driver::zluda_log_err(&format!(
+                "[ZLUDA] D3D11 canary fill failed: {:?}", e
+            )),
+        }
+    }
     Ok(arr)
 }
 
@@ -381,6 +411,18 @@ pub unsafe fn get_mapped_array(
     let arr = state.hip_array.lock().map(|g| *g).unwrap_or(std::ptr::null_mut());
     if arr.is_null() {
         return Err(CUerror::UNKNOWN);
+    }
+    // Phase A.1 canary (2026-05-08): read back first 16 u32s; flag if
+    // anything diverges from 0xDEADBEEF (a kernel wrote to our array).
+    if std::env::var("ZLUDA_D3D11_CANARY").ok().as_deref() == Some("1") {
+        let mut buf = [0u32; 16];
+        if hipMemcpyAtoH(buf.as_mut_ptr() as *mut std::ffi::c_void, arr, 0, 64).is_ok() {
+            let changed = buf.iter().any(|&w| w != 0xDEADBEEFu32);
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] D3D11 canary readback arr={:p} changed={} cuda_res={:p} buf=[{:08x} {:08x} {:08x} {:08x}]",
+                arr, changed, cuda_res, buf[0], buf[1], buf[2], buf[3]
+            ));
+        }
     }
     Ok(arr)
 }
