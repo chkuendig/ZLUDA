@@ -75,6 +75,22 @@ pub(crate) unsafe fn get_descriptor_v2(
     p_array_descriptor: &mut CUDA_ARRAY_DESCRIPTOR,
     h_array: CUarray,
 ) -> CUresult {
+    // Path-(b) D3D11 interop: synthesize a descriptor for D3D11
+    // sentinel arrays — hipArrayGetDescriptor would return InvalidContext.
+    // We only support R32G32B32A32_FLOAT for these (per
+    // d3d11_interop::ensure_hip_array).
+    if let Some((w, h, _pix)) =
+        super::d3d11_interop::d3d11_array_descriptor(h_array as hipArray_t)
+    {
+        let mut desc: HIP_ARRAY_DESCRIPTOR = mem::zeroed();
+        desc.Width = w as usize;
+        desc.Height = h as usize;
+        desc.Format = hipArray_Format::HIP_AD_FORMAT_FLOAT;
+        desc.NumChannels = 4;
+        *p_array_descriptor =
+            *((&desc) as *const HIP_ARRAY_DESCRIPTOR as *const CUDA_ARRAY_DESCRIPTOR);
+        return Ok(());
+    }
     let mut desc: HIP_ARRAY_DESCRIPTOR = mem::zeroed();
     hipArrayGetDescriptor(&mut desc, h_array as hipArray_t)?;
     *p_array_descriptor = *((&desc) as *const HIP_ARRAY_DESCRIPTOR as *const CUDA_ARRAY_DESCRIPTOR);
@@ -135,6 +151,27 @@ pub(crate) unsafe fn _3d_get_descriptor_v2(
     p_array_descriptor: &mut CUDA_ARRAY3D_DESCRIPTOR,
     h_array: CUarray,
 ) -> CUresult {
+    // Path-(b) D3D11 interop: synthesize 3D descriptor for D3D11
+    // sentinel arrays. Our arrays are 2D; depth=0 / NumChannels=4
+    // / format=FLOAT signals "2D" to APEX.
+    // Without this, hipArray3DGetDescriptor returns InvalidContext
+    // and APEX abandons the array — which is what observed
+    // 2026-05-09 v3 run (3 ERR cuArray3DGetDescriptor_v2 immediately
+    // after cuGraphicsSubResourceGetMappedArray returns our sentinel).
+    if let Some((w, h, _pix)) =
+        super::d3d11_interop::d3d11_array_descriptor(h_array as hipArray_t)
+    {
+        let mut desc: HIP_ARRAY3D_DESCRIPTOR = mem::zeroed();
+        desc.Width = w as usize;
+        desc.Height = h as usize;
+        desc.Depth = 0;
+        desc.Format = hipArray_Format::HIP_AD_FORMAT_FLOAT;
+        desc.NumChannels = 4;
+        desc.Flags = 0;
+        *p_array_descriptor =
+            *((&desc) as *const HIP_ARRAY3D_DESCRIPTOR as *const CUDA_ARRAY3D_DESCRIPTOR);
+        return Ok(());
+    }
     let mut desc: HIP_ARRAY3D_DESCRIPTOR = mem::zeroed();
     hipArray3DGetDescriptor(&mut desc, h_array as hipArray_t)?;
     *p_array_descriptor =

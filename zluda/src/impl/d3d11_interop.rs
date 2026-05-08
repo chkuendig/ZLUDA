@@ -18,9 +18,185 @@
 
 use cuda_types::cuda::*;
 use hip_runtime_sys::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::os::raw::c_int;
 use std::sync::{LazyLock, Mutex};
+
+// ---------------------------------------------------------------------------
+// HSA bindings — minimal, just what we need for path-(b) interop bypass.
+//
+// Validated end-to-end by zluda/d3d11_interop_hsa_test crate (Phase
+// A.HSA.0–5 on 2026-05-08): hsa_ext_image_create_with_layout on a
+// HIP-imported dev_ptr returns a valid gfx10 T# at image.handle, which
+// can be cast to hipSurfaceObject_t and used by kernel surf2Dwrite to
+// write through to the original buffer.
+// ---------------------------------------------------------------------------
+
+#[allow(non_camel_case_types)]
+type hsa_status_t = u32;
+const HSA_STATUS_SUCCESS: hsa_status_t = 0;
+const HSA_STATUS_INFO_BREAK: hsa_status_t = 0x4001; // info codes are in 0x4xxx range; using 0x100 worked but be precise
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HsaAgent {
+    handle: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct HsaExtImage {
+    handle: u64,
+}
+
+const HSA_EXT_IMAGE_GEOMETRY_2D: u32 = 1;
+const HSA_EXT_IMAGE_CHANNEL_TYPE_FLOAT: u32 = 15;
+const HSA_EXT_IMAGE_CHANNEL_ORDER_RGBA: u32 = 8;
+const HSA_ACCESS_PERMISSION_RW: u32 = 3;
+const HSA_EXT_IMAGE_DATA_LAYOUT_LINEAR: u32 = 0x1;
+const HSA_AGENT_INFO_DEVICE: u32 = 17;
+const HSA_DEVICE_TYPE_GPU: u32 = 1;
+
+#[repr(C)]
+struct HsaExtImageFormat {
+    channel_type: u32,
+    channel_order: u32,
+}
+
+#[repr(C)]
+struct HsaExtImageDescriptor {
+    geometry: u32,
+    width: usize,
+    height: usize,
+    depth: usize,
+    array_size: usize,
+    format: HsaExtImageFormat,
+}
+
+#[link(name = "hsa-runtime64")]
+extern "C" {
+    fn hsa_init() -> hsa_status_t;
+    fn hsa_iterate_agents(
+        cb: extern "C" fn(HsaAgent, *mut c_void) -> hsa_status_t,
+        data: *mut c_void,
+    ) -> hsa_status_t;
+    fn hsa_agent_get_info(
+        agent: HsaAgent,
+        attribute: u32,
+        value: *mut c_void,
+    ) -> hsa_status_t;
+    fn hsa_ext_image_create_with_layout(
+        agent: HsaAgent,
+        descriptor: *const HsaExtImageDescriptor,
+        image_data: *const c_void,
+        access: u32,
+        layout: u32,
+        row_pitch: usize,
+        slice_pitch: usize,
+        image: *mut HsaExtImage,
+    ) -> hsa_status_t;
+    fn hsa_ext_image_destroy(agent: HsaAgent, image: HsaExtImage) -> hsa_status_t;
+}
+
+extern "C" fn hsa_find_gpu_cb(agent: HsaAgent, data: *mut c_void) -> hsa_status_t {
+    unsafe {
+        let mut device_type: u32 = 0;
+        if hsa_agent_get_info(
+            agent,
+            HSA_AGENT_INFO_DEVICE,
+            &mut device_type as *mut _ as *mut c_void,
+        ) != HSA_STATUS_SUCCESS
+        {
+            return HSA_STATUS_SUCCESS;
+        }
+        if device_type == HSA_DEVICE_TYPE_GPU {
+            *(data as *mut HsaAgent) = agent;
+            return HSA_STATUS_INFO_BREAK;
+        }
+        HSA_STATUS_SUCCESS
+    }
+}
+
+/// Cached GPU agent (initialised on first ensure_hip_array call).
+static HSA_GPU_AGENT: LazyLock<Mutex<Option<HsaAgent>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+unsafe fn get_gpu_agent() -> Option<HsaAgent> {
+    let mut g = HSA_GPU_AGENT.lock().ok()?;
+    if let Some(a) = *g {
+        return Some(a);
+    }
+    let _ = hsa_init();
+    let mut a = HsaAgent { handle: 0 };
+    let _ = hsa_iterate_agents(hsa_find_gpu_cb, &mut a as *mut _ as *mut c_void);
+    if a.handle == 0 {
+        super::driver::zluda_log_err("[ZLUDA] D3D11 HSA: no GPU agent found");
+        return None;
+    }
+    *g = Some(a);
+    Some(a)
+}
+
+/// Sentinel struct used as our hipArray_t for D3D11-imported memory.
+/// Heap-allocated; its address is what we return from
+/// `cuGraphicsSubResourceGetMappedArray`. surf::object_create looks
+/// the address up in `D3D11_ARRAY_TABLE` to recognise our synthesis.
+///
+/// Layout doesn't have to match HIP's hipArray — we never let HIP
+/// dereference it. Only our own intercepts touch it.
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct D3D11FabricatedArray {
+    /// Magic to make accidental bad casts more diagnosable.
+    pub magic: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_size: u32, // bytes per pixel
+    /// HSA image whose .handle is the gfx10 T# pointing at the
+    /// imported buffer's GPU virtual address.
+    pub hsa_image_handle: u64,
+}
+
+const D3D11_FAB_MAGIC: u64 = 0xD3D11_5AB_0000_0001u64;
+
+/// arr_ptr → image so surf::object_create can synthesize. Lifetime:
+/// entries live as long as the cuda_res is registered; cleared in
+/// `unregister`.
+pub(crate) static D3D11_ARRAY_TABLE: LazyLock<Mutex<HashMap<usize, HsaImageRef>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Stored alongside the sentinel array pointer so unregister can free.
+pub(crate) struct HsaImageRef {
+    pub agent: HsaAgent,
+    pub image: HsaExtImage,
+    /// Strong owner of the heap-allocated D3D11FabricatedArray.
+    /// Cleared on unregister; the Box is freed here.
+    pub _sentinel_owner: Box<D3D11FabricatedArray>,
+}
+// Manual Send/Sync: HSA agent + image handles are device handles
+// safe to share; the boxed sentinel is also Send (raw u64s + u32s).
+unsafe impl Send for HsaImageRef {}
+unsafe impl Sync for HsaImageRef {}
+
+/// Look up whether a hipArray_t was synthesized by the D3D11 path.
+/// Returns the HSA image handle if so, None otherwise.
+pub(crate) fn d3d11_array_to_hsa_image(arr: hipArray_t) -> Option<u64> {
+    let key = arr as usize;
+    let table = D3D11_ARRAY_TABLE.lock().ok()?;
+    table.get(&key).map(|e| e.image.handle)
+}
+
+/// Look up whether a hipArray_t is one of ours (for descriptor
+/// synthesis in tex/surf paths).
+pub(crate) fn d3d11_array_descriptor(arr: hipArray_t) -> Option<(u32, u32, u32)> {
+    let key = arr as usize;
+    let table = D3D11_ARRAY_TABLE.lock().ok()?;
+    let entry = table.get(&key)?;
+    // We currently only register R32G32B32A32_FLOAT 2D; pixel_size = 16.
+    let sentinel = &*entry._sentinel_owner;
+    Some((sentinel.width, sentinel.height, sentinel.pixel_size))
+}
 
 /// Descriptor handed to us by the PE-side wine_cuGraphicsD3D11RegisterResource
 /// after it has set up the dma_buf via Vulkan. Layout MUST match the C struct
@@ -263,110 +439,104 @@ pub unsafe fn get_mapped_pointer(
 /// cached handle. Format is fixed at R32G32B32A32_FLOAT (the only format
 /// the P0 probe observed). Caller must hold no lock on `state.hip_array`
 /// — this function takes its own mutex.
+/// Path-(b) implementation: synthesize a hipArray that aliases the
+/// imported D3D11 memory via HSA. Validated end-to-end by the
+/// `d3d11_interop_hsa_test` crate (Phase A.HSA.0–5, 2026-05-08):
+/// kernel surf2Dwrite via the resulting surface object writes through
+/// to the original buffer.
+///
+/// Returns a sentinel `hipArray_t` whose pointer is registered in
+/// `D3D11_ARRAY_TABLE`. ZLUDA's surf::object_create / texref paths
+/// look up the sentinel and bypass `hipCreateSurfaceObject` (which
+/// SIGSEGVs on non-cl_mem `data` pointers) by returning the HSA
+/// image's T# pointer directly.
 unsafe fn ensure_hip_array(state: &D3D11ResourceState) -> Result<hipArray_t, CUerror> {
     let mut guard = state.hip_array.lock().map_err(|_| CUerror::UNKNOWN)?;
     if !guard.is_null() {
         return Ok(*guard);
     }
-    /* R32G32B32A32_FLOAT — 4×32-bit float channels. */
-    let mut fmt: hipChannelFormatDesc = std::mem::zeroed();
-    fmt.x = 32; fmt.y = 32; fmt.z = 32; fmt.w = 32;
-    fmt.f = hipChannelFormatKind::hipChannelFormatKindFloat;
-    let mut arr: hipArray_t = std::ptr::null_mut();
-    if let Err(e) = hipMallocArray(
-        &mut arr,
-        &fmt,
-        state.desc.width as usize,
-        state.desc.height as usize,
-        hipArrayDefault,
-    ) {
-        super::driver::zluda_log_err(&format!(
-            "[ZLUDA] D3D11 ensure_hip_array hipMallocArray failed: {:?} ({}x{})",
-            e, state.desc.width, state.desc.height
-        ));
-        return Err(CUerror::OUT_OF_MEMORY);
-    }
-    *guard = arr;
-    super::driver::zluda_log_err(&format!(
-        "[ZLUDA] D3D11 ensure_hip_array allocated {}x{} R32G32B32A32_FLOAT array={:p}",
-        state.desc.width, state.desc.height, arr
-    ));
-    // Phase A.1 canary (2026-05-08): when ZLUDA_D3D11_CANARY=1, fill the
-    // newly-allocated hipArray with a known 0xDEADBEEF u32 pattern. We
-    // read it back in get_mapped_array; if any word changed, something
-    // (likely APEX's surf2Dwrite kernel) wrote to it. Confirms or refutes
-    // hypothesis H1 in resilient-sprouting-pie.md Phase A.1.
-    if std::env::var("ZLUDA_D3D11_CANARY").ok().as_deref() == Some("1") {
-        let w = state.desc.width as usize;
-        let h = state.desc.height as usize;
-        let row_bytes = w.saturating_mul(16); // R32G32B32A32_FLOAT
-        let n_u32 = w.saturating_mul(h).saturating_mul(4);
-        let canary: Vec<u32> = vec![0xDEADBEEFu32; n_u32];
-        // 2D copy because hipArrays are 2D-tiled internally; hipMemcpyHtoA
-        // returned hipErrorInvalidValue for the 2D case.
-        match hipMemcpy2DToArray(
-            arr, 0, 0,
-            canary.as_ptr() as *const std::ffi::c_void,
-            row_bytes,
-            row_bytes,
-            h,
-            hipMemcpyKind::hipMemcpyHostToDevice,
-        ) {
-            Ok(()) => super::driver::zluda_log_err(&format!(
-                "[ZLUDA] D3D11 canary filled 0xDEADBEEF arr={:p} {}x{}",
-                arr, w, h
-            )),
-            Err(e) => super::driver::zluda_log_err(&format!(
-                "[ZLUDA] D3D11 canary fill failed: {:?}", e
-            )),
-        }
-    }
-    Ok(arr)
-}
 
-/// Refresh the hipArray contents from the imported linear buffer.
-///
-/// **2026-05-06 — DEFAULT NO-OP per F1.** Offline analysis of
-/// `run_20260505_094523_d3d11_iter42` proved PhysX never binds these
-/// hipArrays to any texref / tex object / surf object / memcpy. The
-/// per-frame `hipMemcpy2DToArray` calls do work for nothing — and on
-/// the NULL stream they serialize against PhysX's
-/// `MemCopyBatchedAsync` scheduling, which we believe is what breaks
-/// the smoke effect timing (smoke renders correctly with this off).
-///
-/// We still allocate the hipArray (`ensure_hip_array`) so callers
-/// get a non-null handle from `cuGraphicsSubResourceGetMappedArray`,
-/// but the contents are uninitialized — PhysX doesn't read them.
-///
-/// Env-gated escape hatch: `ZLUDA_D3D11_ARRAY_REFRESH=1` re-enables
-/// the historical buffer→array copy in case any caller ever does
-/// read the array. Default is OFF for the reason above.
-unsafe fn refresh_array_from_buffer(state: &D3D11ResourceState) -> Result<(), CUerror> {
-    let _arr = ensure_hip_array(state)?;
-    if std::env::var("ZLUDA_D3D11_ARRAY_REFRESH")
-        .ok()
-        .as_deref() != Some("1")
-    {
-        return Ok(());
-    }
-    let arr = _arr;
-    let row_bytes = (state.desc.width as usize).saturating_mul(16); /* R32G32B32A32_FLOAT */
-    if let Err(e) = hipMemcpy2DToArray(
-        arr,
+    let agent = match get_gpu_agent() {
+        Some(a) => a,
+        None => return Err(CUerror::UNKNOWN),
+    };
+
+    // R32G32B32A32_FLOAT 2D image bound to the imported dev_ptr.
+    let row_pitch = (state.desc.width as usize).saturating_mul(16);
+    let descriptor = HsaExtImageDescriptor {
+        geometry: HSA_EXT_IMAGE_GEOMETRY_2D,
+        width: state.desc.width as usize,
+        height: state.desc.height as usize,
+        depth: 0,
+        array_size: 0,
+        format: HsaExtImageFormat {
+            channel_type: HSA_EXT_IMAGE_CHANNEL_TYPE_FLOAT,
+            channel_order: HSA_EXT_IMAGE_CHANNEL_ORDER_RGBA,
+        },
+    };
+    let mut image: HsaExtImage = HsaExtImage { handle: 0 };
+    let st = hsa_ext_image_create_with_layout(
+        agent,
+        &descriptor,
+        state.dev_ptr as *const c_void,
+        HSA_ACCESS_PERMISSION_RW,
+        HSA_EXT_IMAGE_DATA_LAYOUT_LINEAR,
+        row_pitch,
         0,
-        0,
-        state.dev_ptr,
-        state.desc.pitch as usize,
-        row_bytes,
-        state.desc.height as usize,
-        hipMemcpyKind::hipMemcpyDeviceToDevice,
-    ) {
+        &mut image,
+    );
+    if st != HSA_STATUS_SUCCESS || image.handle == 0 {
         super::driver::zluda_log_err(&format!(
-            "[ZLUDA] D3D11 refresh_array_from_buffer hipMemcpy2DToArray failed: {:?}",
-            e
+            "[ZLUDA] D3D11 ensure_hip_array hsa_ext_image_create_with_layout failed: 0x{:x} ({}x{})",
+            st, state.desc.width, state.desc.height
         ));
         return Err(CUerror::UNKNOWN);
     }
+
+    // Allocate sentinel; its address is the hipArray_t we return.
+    let sentinel = Box::new(D3D11FabricatedArray {
+        magic: D3D11_FAB_MAGIC,
+        width: state.desc.width,
+        height: state.desc.height,
+        pixel_size: 16, // R32G32B32A32_FLOAT
+        hsa_image_handle: image.handle,
+    });
+    let arr_ptr = (&*sentinel as *const D3D11FabricatedArray) as hipArray_t;
+
+    // Register so surf::object_create can find us.
+    if let Ok(mut tbl) = D3D11_ARRAY_TABLE.lock() {
+        tbl.insert(
+            arr_ptr as usize,
+            HsaImageRef {
+                agent,
+                image,
+                _sentinel_owner: sentinel,
+            },
+        );
+    } else {
+        // Couldn't register; tear down the HSA image.
+        let _ = hsa_ext_image_destroy(agent, image);
+        return Err(CUerror::UNKNOWN);
+    }
+
+    *guard = arr_ptr;
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] D3D11 ensure_hip_array (HSA path) {}x{} R32G32B32A32_FLOAT \
+         arr={:p} hsa_image=0x{:x} dev_ptr={:p}",
+        state.desc.width, state.desc.height, arr_ptr, image.handle, state.dev_ptr
+    ));
+    Ok(arr_ptr)
+}
+
+/// No-op stub. The HSA-backed hipArray sentinel from `ensure_hip_array`
+/// already aliases the imported memory directly — there's nothing to
+/// "refresh" because the kernel will read/write to the same physical
+/// memory the imported buffer points at.
+///
+/// Kept as a function so the `get_mapped_array` call site below doesn't
+/// need to change semantics.
+unsafe fn refresh_array_from_buffer(state: &D3D11ResourceState) -> Result<(), CUerror> {
+    let _ = ensure_hip_array(state)?;
     Ok(())
 }
 
@@ -479,11 +649,21 @@ pub unsafe fn unregister(cuda_res: CUgraphicsResource) -> CUresult {
         return Err(CUerror::INVALID_VALUE);
     }
     let state = Box::from_raw(cuda_res as *mut D3D11ResourceState);
-    /* Free the hipArray if we allocated one (lazy SubResource path). */
+    /* If we allocated an HSA-backed sentinel array, tear it down via
+     * D3D11_ARRAY_TABLE (which owns the HSA image + sentinel struct).
+     * Removing from the table drops the HsaImageRef which destroys
+     * the image and frees the boxed sentinel. */
     if let Ok(guard) = state.hip_array.lock() {
         let arr = *guard;
         if !arr.is_null() {
-            let _ = hipFreeArray(arr);
+            let key = arr as usize;
+            if let Ok(mut tbl) = D3D11_ARRAY_TABLE.lock() {
+                if let Some(entry) = tbl.remove(&key) {
+                    let _ = hsa_ext_image_destroy(entry.agent, entry.image);
+                    // _sentinel_owner Box drops here, freeing the heap
+                    // allocation we used as the hipArray_t.
+                }
+            }
         }
     }
     let _ = hipDestroyExternalMemory(state.ext_mem);

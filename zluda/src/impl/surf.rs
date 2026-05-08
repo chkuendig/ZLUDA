@@ -13,6 +13,49 @@ pub(crate) unsafe fn object_create(
     if desc.resType != hipResourceType::hipResourceTypeArray {
         return Err(CUerror::NOT_SUPPORTED);
     }
+
+    // Path-(b) D3D11 interop bypass: if the input array was synthesized
+    // by `d3d11_interop::ensure_hip_array`, return the HSA image's T#
+    // pointer directly instead of calling hipCreateSurfaceObject (which
+    // SIGSEGVs on our sentinel — clr's as_amd((cl_mem)data) would deref
+    // a non-cl_mem pointer). Validated end-to-end by
+    // d3d11_interop_hsa_test::kernel_writeback_amdgpu (Phase A.HSA.5,
+    // 2026-05-08).
+    let array_in = desc.res.array.array;
+    if let Some(hsa_image_handle) = super::d3d11_interop::d3d11_array_to_hsa_image(array_in) {
+        // Synthesize: T# pointer with ZLUDA's pixel-shift encoding.
+        // R32G32B32A32_FLOAT pixel = 16 bytes; shift = log2(16) = 4.
+        let (_w, _h, pixel_size_bytes) =
+            super::d3d11_interop::d3d11_array_descriptor(array_in)
+                .unwrap_or((0, 0, 16));
+        let shift_bits = if pixel_size_bytes > 0 {
+            (pixel_size_bytes as usize).trailing_zeros() as usize
+        } else {
+            4
+        };
+        // Top bits of hsa_image_handle should be clear (a heap pointer
+        // in the typical 47-bit user range), so the shift encoding fits.
+        let top_reserved_bits =
+            hsa_image_handle >> (u64::BITS - IMAGE_RESERVED_TOP_BITS) as u64;
+        if top_reserved_bits != 0 {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] cuSurfObjectCreate (D3D11 HSA): hsa_handle 0x{:x} \
+                 has non-zero top bits, can't encode shift",
+                hsa_image_handle
+            ));
+            return Err(CUerror::UNKNOWN);
+        }
+        let shift_amount = shift_bits << (usize::BITS - IMAGE_RESERVED_TOP_BITS);
+        let encoded = (hsa_image_handle as usize) | shift_amount;
+        super::driver::zluda_log_err(&format!(
+            "cuSurfObjectCreate (D3D11 HSA): hsa_handle=0x{:x} pixel_size={} \
+             shift={} encoded=0x{:x} array={:?}",
+            hsa_image_handle, pixel_size_bytes, shift_bits, encoded, array_in
+        ));
+        *p_surf_object = encoded as CUsurfObject;
+        return Ok(());
+    }
+
     let mut surf_obj: hipSurfaceObject_t = mem::zeroed();
     hipCreateSurfaceObject(&mut surf_obj, &desc)?;
     // Track surface object address in global alloc range

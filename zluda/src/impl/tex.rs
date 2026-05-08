@@ -138,6 +138,22 @@ pub(crate) unsafe fn ref_set_array(h_tex_ref: CUtexref, h_array: CUarray, flags:
     if (flags & !1u32) != 0 {
         return Err(CUerror::NOT_SUPPORTED);
     }
+    // Path-(b) D3D11 interop bypass: D3D11 sentinel arrays are NOT
+    // valid hipArray pointers — calling hipArrayGetDescriptor on them
+    // returns InvalidContext and hipTexRefSetArray would SIGSEGV
+    // (same root cause as hipCreateSurfaceObject's cl_mem deref).
+    // Log + return NOT_SUPPORTED so callers fall back gracefully.
+    // Currently we only support surface-object writes via the HSA T#
+    // path; texref-based sampler reads from D3D11 arrays would need
+    // a separate sampler-SRD synthesis (deferred).
+    if super::d3d11_interop::d3d11_array_to_hsa_image(h_array as hipArray_t).is_some() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] cuTexRefSetArray on D3D11 sentinel array={:p} — NOT_SUPPORTED \
+             (sampler-SRD synthesis not yet implemented; surface-write path is)",
+            h_array
+        ));
+        return Err(CUerror::NOT_SUPPORTED);
+    }
     // Get array descriptor to know the format and channel count
     let mut desc: HIP_ARRAY_DESCRIPTOR = mem::zeroed();
     hipArrayGetDescriptor(&mut desc, h_array as hipArray_t)?;

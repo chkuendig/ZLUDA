@@ -766,6 +766,22 @@ pub(crate) unsafe fn copy_2d_v2(memcpy: hip_Memcpy2D) -> CUresult {
     Ok(())
 }
 
+pub(crate) unsafe fn copy_2d_async_v2(
+    memcpy: hip_Memcpy2D,
+    stream: hipStream_t,
+) -> CUresult {
+    // 2026-05-09: APEX TurbulenceFS calls cuMemcpy2DAsync_v2 many
+    // times per frame after we returned its hipArray sentinel. We
+    // weren't implementing it; the resulting NOT_SUPPORTED was
+    // (we believe) breaking the smoke data flow. The simple
+    // pass-through to hipMemcpyParam2DAsync should cover linear
+    // copies; if APEX uses our D3D11 sentinel as src/dst, the
+    // downstream HIP would treat its `data` as cl_mem and crash —
+    // we'd need an additional sentinel-aware path then.
+    hipMemcpyParam2DAsync(&memcpy, stream)?;
+    Ok(())
+}
+
 pub(crate) unsafe fn copy_2d_unaligned_v2(memcpy: hip_Memcpy2D) -> CUresult {
     hipDrvMemcpy2DUnaligned(&memcpy)?;
     Ok(())
