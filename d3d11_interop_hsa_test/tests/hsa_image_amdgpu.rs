@@ -243,3 +243,140 @@ fn hsa_image_create_on_hip_imported_amdgpu() {
         );
     }
 }
+
+/// A.HSA.4 — is image.handle a CPU-readable SRD pointer?
+///
+/// AMDGPU image SRDs are 256 bits (8 dwords). On gfx10 the T# layout
+/// has the buffer base address in dwords [0..2]. If image.handle is
+/// CPU-readable, the first dwords should encode our dev_ptr.
+///
+/// If the dereference succeeds AND the bits look like a valid SRD,
+/// we can synthesize hipSurfaceObject_t by writing those 256 bits
+/// at a known location and returning a pointer.
+///
+/// If the dereference faults, image.handle is in GPU-only memory and
+/// we need a different mechanism (HSA likely wraps the SRD in a
+/// host-side proxy; need to ask via HSA APIs).
+#[test]
+fn hsa_image_handle_layout_probe_amdgpu() {
+    let _g = d3d11_interop_hsa_test::serialize();
+    init_hip();
+    let agent = find_gpu();
+
+    const WIDTH: u32 = 256;
+    const HEIGHT: u32 = 254;
+    const ROW_PITCH: usize = (WIDTH as usize) * 16;
+    const N: usize = ROW_PITCH * (HEIGHT as usize);
+
+    unsafe {
+        let mut dev_a: *mut c_void = ptr::null_mut();
+        ok_hip(hipMalloc(&mut dev_a, N));
+
+        let mut fd: c_int = -1;
+        let mut offset: u64 = 0;
+        let st = hsa_amd_portable_export_dmabuf(dev_a, N, &mut fd, &mut offset);
+        assert_eq!(st, HSA_STATUS_SUCCESS);
+
+        let mut hd: hipExternalMemoryHandleDesc = std::mem::zeroed();
+        hd.type_ = hipExternalMemoryHandleType::hipExternalMemoryHandleTypeOpaqueFd;
+        hd.handle.fd = fd;
+        hd.size = N as u64;
+        let mut ext_mem: hipExternalMemory_t = ptr::null_mut();
+        ok_hip(hipImportExternalMemory(&mut ext_mem, &hd));
+
+        let mut bd: hipExternalMemoryBufferDesc = std::mem::zeroed();
+        bd.offset = offset;
+        bd.size = N as u64;
+        let mut dev_b: *mut c_void = ptr::null_mut();
+        ok_hip(hipExternalMemoryGetMappedBuffer(&mut dev_b, ext_mem, &bd));
+
+        let descriptor = HsaExtImageDescriptor {
+            geometry: HSA_EXT_IMAGE_GEOMETRY_2D,
+            width: WIDTH as usize,
+            height: HEIGHT as usize,
+            depth: 0,
+            array_size: 0,
+            format: HsaExtImageFormat {
+                channel_type: HSA_EXT_IMAGE_CHANNEL_TYPE_FLOAT,
+                channel_order: HSA_EXT_IMAGE_CHANNEL_ORDER_RGBA,
+            },
+        };
+
+        let mut image: HsaExtImage = HsaExtImage { handle: 0 };
+        assert_eq!(
+            hsa_ext_image_create_with_layout(
+                agent,
+                &descriptor,
+                dev_b as *const c_void,
+                HSA_ACCESS_PERMISSION_RW,
+                HSA_EXT_IMAGE_DATA_LAYOUT_LINEAR,
+                ROW_PITCH,
+                0,
+                &mut image,
+            ),
+            HSA_STATUS_SUCCESS
+        );
+        assert!(image.handle != 0);
+
+        eprintln!(
+            "[test] image.handle = 0x{:x}, dev_b = 0x{:x}",
+            image.handle, dev_b as usize
+        );
+
+        // Try to dereference image.handle as a pointer to 8 u32s.
+        // If it faults, the test process will crash — but it's already
+        // wrapped under cargo's per-test process boundary by virtue of
+        // each panic killing the test. We use a simple read; the reader
+        // crashes the process if image.handle is GPU-only memory.
+        let srd_ptr = image.handle as *const u32;
+        // Read just the FIRST u32 first to scope the crash to a single
+        // load; then 8 if successful.
+        let first_dword = std::ptr::read_volatile(srd_ptr);
+        eprintln!("[test] image.handle deref [0] = 0x{:08x}", first_dword);
+
+        let mut srd = [0u32; 8];
+        for i in 0..8 {
+            srd[i] = std::ptr::read_volatile(srd_ptr.add(i));
+        }
+        eprintln!(
+            "[test] image SRD bits = [{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}]",
+            srd[0], srd[1], srd[2], srd[3], srd[4], srd[5], srd[6], srd[7]
+        );
+
+        // Sanity check: the SRD's base address should encode dev_b.
+        // On gfx10 T# format the base is stored as `dev_b >> 8` (256-byte
+        // aligned units). Low 32 bits of `dev_b >> 8` go in dword[0];
+        // high 8 bits go in dword[1] bits [7:0] (giving a 40-bit base
+        // pointer in 256-byte units = 48-bit byte address).
+        let base_units = (dev_b as u64) >> 8;
+        let expected_low = base_units as u32;
+        let expected_high = ((base_units >> 32) & 0xFF) as u32;
+        let srd_base_low = srd[0];
+        let srd_base_high = srd[1] & 0xFF;
+        eprintln!(
+            "[test] base in 256B units: 0x{:x}; expected dword[0]=0x{:08x} got=0x{:08x}; expected dword[1] low8=0x{:02x} got=0x{:02x}",
+            base_units, expected_low, srd_base_low, expected_high, srd_base_high
+        );
+        let base_matches =
+            srd_base_low == expected_low && srd_base_high == expected_high;
+        eprintln!(
+            "[test] SRD base addr {} dev_b — {}",
+            if base_matches { "==" } else { "≠" },
+            if base_matches {
+                "image.handle IS the T# of our memory; we can synth surface objects by copying these 8 dwords"
+            } else {
+                "image.handle is opaque or differently encoded; need HSA-internal SRD extraction"
+            }
+        );
+
+        let _ = hsa_ext_image_destroy(agent, image);
+        let _ = hipDestroyExternalMemory(ext_mem);
+        ok_hip(hipFree(dev_a));
+
+        assert!(
+            base_matches,
+            "image.handle does NOT directly contain a T# with our dev_ptr; \
+             see stderr for actual SRD bits"
+        );
+    }
+}
