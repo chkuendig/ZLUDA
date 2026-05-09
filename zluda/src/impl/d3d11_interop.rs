@@ -181,10 +181,14 @@ unsafe impl Sync for HsaImageRef {}
 
 /// Look up whether a hipArray_t was synthesized by the D3D11 path.
 /// Returns the HSA image handle if so, None otherwise.
+/// Returns None if the array is registered but the HSA image
+/// creation was skipped (P1 probe — handle is 0) so callers
+/// distinguish "not ours" from "ours but no SRD".
 pub(crate) fn d3d11_array_to_hsa_image(arr: hipArray_t) -> Option<u64> {
     let key = arr as usize;
     let table = D3D11_ARRAY_TABLE.lock().ok()?;
-    table.get(&key).map(|e| e.image.handle)
+    let h = table.get(&key)?.image.handle;
+    if h == 0 { None } else { Some(h) }
 }
 
 /// Look up whether a hipArray_t is one of ours (for descriptor
@@ -461,36 +465,56 @@ unsafe fn ensure_hip_array(state: &D3D11ResourceState) -> Result<hipArray_t, CUe
         None => return Err(CUerror::UNKNOWN),
     };
 
-    // R32G32B32A32_FLOAT 2D image bound to the imported dev_ptr.
-    let row_pitch = (state.desc.width as usize).saturating_mul(16);
-    let descriptor = HsaExtImageDescriptor {
-        geometry: HSA_EXT_IMAGE_GEOMETRY_2D,
-        width: state.desc.width as usize,
-        height: state.desc.height as usize,
-        depth: 0,
-        array_size: 0,
-        format: HsaExtImageFormat {
-            channel_type: HSA_EXT_IMAGE_CHANNEL_TYPE_FLOAT,
-            channel_order: HSA_EXT_IMAGE_CHANNEL_ORDER_RGBA,
-        },
-    };
+    // P1 probe (2026-05-09): when ZLUDA_D3D11_HSA_SKIP_IMAGE=1, skip
+    // the actual hsa_ext_image_create_with_layout call. We still
+    // register a sentinel in D3D11_ARRAY_TABLE so descriptor queries
+    // and cuMemcpy2DAsync_v2 succeed, but image.handle stays 0 and
+    // surf::object_create will refuse to synthesize.
+    //
+    // This isolates: does just creating the HSA image break IOFX_bboxKernel?
+    // Baseline (no HSA): 4014–5694 IOFX_bbox launches before crash.
+    // v6 (HSA active):   4 IOFX_bbox launches before crash.
+    let skip_image = std::env::var("ZLUDA_D3D11_HSA_SKIP_IMAGE")
+        .ok()
+        .as_deref()
+        == Some("1");
+
     let mut image: HsaExtImage = HsaExtImage { handle: 0 };
-    let st = hsa_ext_image_create_with_layout(
-        agent,
-        &descriptor,
-        state.dev_ptr as *const c_void,
-        HSA_ACCESS_PERMISSION_RW,
-        HSA_EXT_IMAGE_DATA_LAYOUT_LINEAR,
-        row_pitch,
-        0,
-        &mut image,
-    );
-    if st != HSA_STATUS_SUCCESS || image.handle == 0 {
-        super::driver::zluda_log_err(&format!(
-            "[ZLUDA] D3D11 ensure_hip_array hsa_ext_image_create_with_layout failed: 0x{:x} ({}x{})",
-            st, state.desc.width, state.desc.height
-        ));
-        return Err(CUerror::UNKNOWN);
+    if !skip_image {
+        // R32G32B32A32_FLOAT 2D image bound to the imported dev_ptr.
+        let row_pitch = (state.desc.width as usize).saturating_mul(16);
+        let descriptor = HsaExtImageDescriptor {
+            geometry: HSA_EXT_IMAGE_GEOMETRY_2D,
+            width: state.desc.width as usize,
+            height: state.desc.height as usize,
+            depth: 0,
+            array_size: 0,
+            format: HsaExtImageFormat {
+                channel_type: HSA_EXT_IMAGE_CHANNEL_TYPE_FLOAT,
+                channel_order: HSA_EXT_IMAGE_CHANNEL_ORDER_RGBA,
+            },
+        };
+        let st = hsa_ext_image_create_with_layout(
+            agent,
+            &descriptor,
+            state.dev_ptr as *const c_void,
+            HSA_ACCESS_PERMISSION_RW,
+            HSA_EXT_IMAGE_DATA_LAYOUT_LINEAR,
+            row_pitch,
+            0,
+            &mut image,
+        );
+        if st != HSA_STATUS_SUCCESS || image.handle == 0 {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] D3D11 ensure_hip_array hsa_ext_image_create_with_layout failed: 0x{:x} ({}x{})",
+                st, state.desc.width, state.desc.height
+            ));
+            return Err(CUerror::UNKNOWN);
+        }
+    } else {
+        super::driver::zluda_log_err(
+            "[ZLUDA] D3D11 ensure_hip_array — HSA_SKIP_IMAGE=1, no HSA image created",
+        );
     }
 
     // Allocate sentinel; its address is the hipArray_t we return.
@@ -659,7 +683,9 @@ pub unsafe fn unregister(cuda_res: CUgraphicsResource) -> CUresult {
             let key = arr as usize;
             if let Ok(mut tbl) = D3D11_ARRAY_TABLE.lock() {
                 if let Some(entry) = tbl.remove(&key) {
-                    let _ = hsa_ext_image_destroy(entry.agent, entry.image);
+                    if entry.image.handle != 0 {
+                        let _ = hsa_ext_image_destroy(entry.agent, entry.image);
+                    }
                     // _sentinel_owner Box drops here, freeing the heap
                     // allocation we used as the hipArray_t.
                 }
