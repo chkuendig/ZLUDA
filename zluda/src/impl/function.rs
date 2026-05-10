@@ -7710,6 +7710,15 @@ unsafe fn iofx_chain_capture_init(state: &mut Option<IofxChainCaptureState>) {
 
 /// Scan up to N kernel_params slots as u64 ptrs; record up to ptr_count_max
 /// values that look like device pointers (HSA-mapped user-space range).
+///
+/// Heuristic: tightened 2026-05-11 to the 0x7f00_0000_0000 .. 0x7fff_ffff_ffff
+/// window where every HSA-mapped device pointer we have ever captured (across
+/// IOFX_actorRange, IOFX_bbox, CUB downsweep, and the IOFX chain) actually
+/// lives. The earlier looser `v >= 0x10000 && v < 0x8000_0000_0000` heuristic
+/// false-positive'd on scalar args like 0x5b00100000 and 0x100000004; when
+/// the buffer-snapshot path then dereferenced those as DtoD sources, HIP
+/// queue state got wedged and PhysX faulted at IOFX_volumeMigrationKernel
+/// after ~90 launches. The tighter range eliminates the regression.
 unsafe fn iofx_chain_extract_ptrs(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
@@ -7726,10 +7735,7 @@ unsafe fn iofx_chain_extract_ptrs(
             Some(v) => v,
             None => continue,
         };
-        // Heuristic: HSA-mapped device-pointers on the Steam Deck APU sit in
-        // the 0x7f00_0000_0000 .. 0x7fff_ffff_ffff window. Skip null and
-        // small scalars; skip kernel/sentinel values.
-        if v >= 0x10000 && v < 0x0000_8000_0000_0000 {
+        if (v >> 40) == 0x7f {
             ptrs[nr] = v;
             nr += 1;
         }
