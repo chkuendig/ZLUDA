@@ -9044,9 +9044,19 @@ pub(crate) fn launch_kernel(
             }
         }
     }
-    // Track last kernel name for SIGABRT handler
+    // Track last kernel name + timestamp for the SIGABRT handler.
+    // NOTE: we deliberately do NOT extract pointer args generically here —
+    // dump_kernel_args_raw will read past the end of short kernel_params
+    // arrays and crash on the first kernel with N<16 args (verified
+    // 2026-05-10: scanning all launches segfaulted in TurbulenceFS init
+    // after 38 launches). Specific capture intercepts (actor_range, bbox,
+    // downsweep, etc.) already record structured pointer ranges through
+    // their own per-kernel paths.
     if !name.is_empty() {
-        super::driver::set_last_kernel(name.clone());
+        static LAUNCH_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let n = LAUNCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::driver::record_kernel_launch(n, &name, &[], None);
     }
     // Log launch failures with full context for diagnosis
     if result.is_err() {

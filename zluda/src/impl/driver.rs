@@ -186,24 +186,118 @@ pub(crate) fn zluda_log_err(msg: &str) {
     }
 }
 
-/// Ring buffer of last N kernel names — the SIGABRT handler dumps all of them
+/// Ring buffer of last N kernel launches — the SIGABRT handler dumps all of them
 /// so we see the crash context, not just the racy "last" slot. The fault is
 /// asynchronous on Van Gogh APU, so the actually-faulting kernel is usually
 /// NOT the single most recent one.
+///
+/// Each entry records (launch_n, ts_ns, kernel_name, up to 8 ptr ranges) so the
+/// signal handler + post-mortem tooling can correlate a journalctl fault VA
+/// against the buffers any recent kernel might have written. ptr_count==0
+/// means the launch path didn't supply structured args (callers can still pass
+/// the legacy `info: String` summary).
 const KERNEL_RING_SIZE: usize = 32;
+const KERNEL_RING_NAME_BYTES: usize = 96;
+const KERNEL_RING_PTRS: usize = 8;
+
+#[derive(Clone)]
+pub(crate) struct KernelRingEntry {
+    pub launch_n: u64,
+    pub ts_ns: u64,
+    pub name: [u8; KERNEL_RING_NAME_BYTES],
+    pub info: Option<String>,
+    pub ptr_count: u8,
+    pub ptr_ranges: [(u64, u64); KERNEL_RING_PTRS],
+}
+
+impl KernelRingEntry {
+    const fn empty() -> Self {
+        Self {
+            launch_n: 0,
+            ts_ns: 0,
+            name: [0u8; KERNEL_RING_NAME_BYTES],
+            info: None,
+            ptr_count: 0,
+            ptr_ranges: [(0, 0); KERNEL_RING_PTRS],
+        }
+    }
+
+    pub fn name_str(&self) -> &str {
+        let end = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(KERNEL_RING_NAME_BYTES);
+        std::str::from_utf8(&self.name[..end]).unwrap_or("<utf8 err>")
+    }
+}
+
 static KERNEL_RING: std::sync::Mutex<(
-    [Option<String>; KERNEL_RING_SIZE],
+    [KernelRingEntry; KERNEL_RING_SIZE],
     usize, // write index
     u64,   // total push count
-)> = std::sync::Mutex::new(([const { None }; KERNEL_RING_SIZE], 0, 0));
+)> = std::sync::Mutex::new((
+    [const { KernelRingEntry::empty() }; KERNEL_RING_SIZE],
+    0,
+    0,
+));
+
+fn copy_name_into(dst: &mut [u8; KERNEL_RING_NAME_BYTES], src: &str) {
+    let bytes = src.as_bytes();
+    let n = bytes.len().min(KERNEL_RING_NAME_BYTES);
+    dst[..n].copy_from_slice(&bytes[..n]);
+    for b in &mut dst[n..] {
+        *b = 0;
+    }
+}
 
 pub(crate) fn set_last_kernel(info: String) {
     if let Ok(mut guard) = KERNEL_RING.lock() {
         let (ref mut buf, ref mut idx, ref mut total) = *guard;
-        buf[*idx] = Some(info);
+        let entry = &mut buf[*idx];
+        // Reset the structured fields; only the free-form `info` is meaningful
+        // when called via this legacy entry point.
+        *entry = KernelRingEntry::empty();
+        entry.ts_ns = elapsed_ns();
+        entry.info = Some(info);
         *idx = (*idx + 1) % KERNEL_RING_SIZE;
         *total += 1;
     }
+}
+
+/// Structured launch recorder — preferred over `set_last_kernel`. Records the
+/// kernel name, timestamp, and any pointer-arg ranges the caller could extract.
+/// Pass an empty `ranges` slice for callers that can't or won't decode args.
+pub(crate) fn record_kernel_launch(
+    launch_n: u64,
+    name: &str,
+    ranges: &[(u64, u64)],
+    extra_info: Option<String>,
+) {
+    if let Ok(mut guard) = KERNEL_RING.lock() {
+        let (ref mut buf, ref mut idx, ref mut total) = *guard;
+        let entry = &mut buf[*idx];
+        *entry = KernelRingEntry::empty();
+        entry.launch_n = launch_n;
+        entry.ts_ns = elapsed_ns();
+        copy_name_into(&mut entry.name, name);
+        let n = ranges.len().min(KERNEL_RING_PTRS);
+        entry.ptr_count = n as u8;
+        for (i, range) in ranges.iter().take(n).enumerate() {
+            entry.ptr_ranges[i] = *range;
+        }
+        entry.info = extra_info;
+        *idx = (*idx + 1) % KERNEL_RING_SIZE;
+        *total += 1;
+    }
+}
+
+fn elapsed_ns() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = ORIGIN.get_or_init(Instant::now);
+    Instant::now().saturating_duration_since(*origin).as_nanos() as u64
 }
 
 /// SIGABRT/SIGSEGV handler — fires when HSA runtime kills the process on GPU fault.
@@ -400,10 +494,35 @@ fn install_fault_signal_handler() {
                 };
                 for i in 0..count {
                     let slot = (start + i) % KERNEL_RING_SIZE;
-                    if let Some(ref name) = buf[slot] {
-                        let launch_n = total.saturating_sub((count - i) as u64);
-                        let _ = write!(f, "***   #{} {}\n", launch_n, name);
+                    let entry = &buf[slot];
+                    let ring_n = total.saturating_sub((count - i) as u64);
+                    let name = entry.name_str();
+                    if entry.ptr_count == 0 && name.is_empty() {
+                        if let Some(ref info) = entry.info {
+                            let _ = write!(f, "***   #{} {}\n", ring_n, info);
+                        }
+                        continue;
                     }
+                    let _ = write!(
+                        f,
+                        "***   #{} launch_n={} ts_ns={} {}",
+                        ring_n, entry.launch_n, entry.ts_ns, name
+                    );
+                    if entry.ptr_count > 0 {
+                        let _ = write!(f, " ptrs=[");
+                        for k in 0..(entry.ptr_count as usize) {
+                            let (lo, hi) = entry.ptr_ranges[k];
+                            if k > 0 {
+                                let _ = write!(f, " ");
+                            }
+                            let _ = write!(f, "0x{:x}..0x{:x}", lo, hi);
+                        }
+                        let _ = write!(f, "]");
+                    }
+                    if let Some(ref info) = entry.info {
+                        let _ = write!(f, " {}", info);
+                    }
+                    let _ = write!(f, "\n");
                 }
             }
             // Read /proc/self/maps to find what's at common fault regions
