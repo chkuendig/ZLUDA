@@ -859,6 +859,51 @@ impl<'a, E: CudaErrorType> FromCuda<'a, cudnn9::cudnnConvolutionBwdFilterAlgo_t,
     }
 }
 
+impl<'a, E: CudaErrorType> FromCuda<'a, *const cuda_types::cuda::CUDA_MEMCPY3D, E>
+    for hip_runtime_sys::HIP_MEMCPY3D
+{
+    fn from_cuda(format: &'a *const cuda_types::cuda::CUDA_MEMCPY3D) -> Result<Self, E> {
+        let format = unsafe { format.as_ref() }.ok_or(E::INVALID_VALUE)?;
+        Ok(hip_runtime_sys::HIP_MEMCPY3D {
+            srcXInBytes: format.srcXInBytes,
+            srcY: format.srcY,
+            srcZ: format.srcZ,
+            srcLOD: format.srcLOD,
+            srcMemoryType: match format.srcMemoryType {
+                CUmemorytype::CU_MEMORYTYPE_HOST => hipMemoryType::hipMemoryTypeHost,
+                CUmemorytype::CU_MEMORYTYPE_DEVICE => hipMemoryType::hipMemoryTypeDevice,
+                CUmemorytype::CU_MEMORYTYPE_ARRAY => hipMemoryType::hipMemoryTypeArray,
+                CUmemorytype::CU_MEMORYTYPE_UNIFIED => hipMemoryType::hipMemoryTypeUnified,
+                _ => return Err(E::NOT_SUPPORTED),
+            },
+            srcHost: format.srcHost,
+            srcDevice: hipDeviceptr_t(format.srcDevice.0),
+            srcArray: format.srcArray.cast(),
+            srcPitch: format.srcPitch,
+            srcHeight: format.srcHeight,
+            dstXInBytes: format.dstXInBytes,
+            dstY: format.dstY,
+            dstZ: format.dstZ,
+            dstLOD: format.dstLOD,
+            dstMemoryType: match format.dstMemoryType {
+                CUmemorytype::CU_MEMORYTYPE_HOST => hipMemoryType::hipMemoryTypeHost,
+                CUmemorytype::CU_MEMORYTYPE_DEVICE => hipMemoryType::hipMemoryTypeDevice,
+                CUmemorytype::CU_MEMORYTYPE_ARRAY => hipMemoryType::hipMemoryTypeArray,
+                CUmemorytype::CU_MEMORYTYPE_UNIFIED => hipMemoryType::hipMemoryTypeUnified,
+                _ => return Err(E::NOT_SUPPORTED),
+            },
+            dstHost: format.dstHost,
+            dstDevice: hipDeviceptr_t(format.dstDevice.0),
+            dstArray: format.dstArray.cast(),
+            dstPitch: format.dstPitch,
+            dstHeight: format.dstHeight,
+            WidthInBytes: format.WidthInBytes,
+            Height: format.Height,
+            Depth: format.Depth,
+        })
+    }
+}
+
 impl<'a, E: CudaErrorType> FromCuda<'a, *const CUDA_MEMCPY2D_v2, E>
     for hip_runtime_sys::hip_Memcpy2D
 {

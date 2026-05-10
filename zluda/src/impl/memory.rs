@@ -2,7 +2,7 @@ use crate::r#impl::{
     context,
     driver::{self},
 };
-use cuda_types::cuda::{CUerror, CUresult, CUresultConsts};
+use cuda_types::cuda::{CUarray, CUerror, CUresult, CUresultConsts};
 use hip_runtime_sys::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{mem, ptr};
@@ -762,6 +762,8 @@ pub(crate) unsafe fn alloc_pitch_v2(
 }
 
 pub(crate) unsafe fn copy_2d_v2(memcpy: hip_Memcpy2D) -> CUresult {
+    log_memcpy_sentinel_2d("cuMemcpy2D_v2", &memcpy);
+    let memcpy = rewrite_2d_for_sentinel(memcpy);
     hipMemcpyParam2D(&memcpy)?;
     Ok(())
 }
@@ -770,21 +772,402 @@ pub(crate) unsafe fn copy_2d_async_v2(
     memcpy: hip_Memcpy2D,
     stream: hipStream_t,
 ) -> CUresult {
-    // 2026-05-09: APEX TurbulenceFS calls cuMemcpy2DAsync_v2 many
-    // times per frame after we returned its hipArray sentinel. We
-    // weren't implementing it; the resulting NOT_SUPPORTED was
-    // (we believe) breaking the smoke data flow. The simple
-    // pass-through to hipMemcpyParam2DAsync should cover linear
-    // copies; if APEX uses our D3D11 sentinel as src/dst, the
-    // downstream HIP would treat its `data` as cl_mem and crash —
-    // we'd need an additional sentinel-aware path then.
+    // 2026-05-09 Phase E (plan fluttering-waddling-zephyr.md):
+    // APEX TurbulenceFS calls cuMemcpy2DAsync_v2 with our D3D11
+    // sentinel as `dstArray` (confirmed in run_20260509_phaseA_diag).
+    // Without rewriting, HIP dereferences the sentinel as cl_mem
+    // and SIGSEGVs after 4-8 IOFX_bbox launches. The sentinel is
+    // backed by a linear dev_ptr (the imported VkBuffer); route
+    // the copy as device-to-device into/out of that linear buffer
+    // and the kernel's surface object reads the same memory.
+    log_memcpy_sentinel_2d("cuMemcpy2DAsync_v2", &memcpy);
+    let memcpy = rewrite_2d_for_sentinel(memcpy);
     hipMemcpyParam2DAsync(&memcpy, stream)?;
     Ok(())
 }
 
 pub(crate) unsafe fn copy_2d_unaligned_v2(memcpy: hip_Memcpy2D) -> CUresult {
+    log_memcpy_sentinel_2d("cuMemcpy2DUnaligned_v2", &memcpy);
+    let memcpy = rewrite_2d_for_sentinel(memcpy);
     hipDrvMemcpy2DUnaligned(&memcpy)?;
     Ok(())
+}
+
+/// If `srcArray` or `dstArray` is a D3D11 sentinel, replace it with the
+/// underlying linear dev_ptr and switch the corresponding `*MemoryType`
+/// to Device + use the sentinel's stored pitch. APEX-supplied `*Pitch`
+/// is ignored on the sentinel side (CUDA spec says it's ignored when
+/// the corresponding memory type is ARRAY, so APEX may pass garbage).
+unsafe fn rewrite_2d_for_sentinel(mut memcpy: hip_Memcpy2D) -> hip_Memcpy2D {
+    if let Some((dev, _size, pitch)) =
+        super::d3d11_interop::d3d11_array_layout(memcpy.srcArray)
+    {
+        memcpy.srcArray = std::ptr::null_mut();
+        memcpy.srcMemoryType = hipMemoryType::hipMemoryTypeDevice;
+        memcpy.srcDevice = hipDeviceptr_t(dev);
+        memcpy.srcPitch = pitch as usize;
+    }
+    if let Some((dev, _size, pitch)) =
+        super::d3d11_interop::d3d11_array_layout(memcpy.dstArray)
+    {
+        memcpy.dstArray = std::ptr::null_mut();
+        memcpy.dstMemoryType = hipMemoryType::hipMemoryTypeDevice;
+        memcpy.dstDevice = hipDeviceptr_t(dev);
+        memcpy.dstPitch = pitch as usize;
+    }
+    memcpy
+}
+
+// ---------------------------------------------------------------------------
+// D3D11 sentinel memcpy diagnostics (Phase A of d3d11-subresource plan,
+// 2026-05-09). All gated on `ZLUDA_D3D11_MEMCPY_LOG=1`. The goal is to
+// discover which CUarray-taking memcpy variants APEX calls when the
+// SubResource success branch is taken, so we know which intercepts are
+// missing/wrong. Behavior-preserving: stubs route to the HIP equivalent
+// or return NOT_SUPPORTED to match the prior UNIMPL trampoline.
+// ---------------------------------------------------------------------------
+
+fn d3d11_memcpy_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_D3D11_MEMCPY_LOG").map_or(false, |v| v == "1"))
+}
+
+fn log_memcpy_sentinel_array(fn_name: &str, role: &str, arr: hipArray_t, extra: &str) {
+    if !d3d11_memcpy_log_enabled() {
+        return;
+    }
+    let is_sentinel = super::d3d11_interop::is_d3d11_sentinel(arr);
+    if !is_sentinel && arr.is_null() {
+        // Don't log the common null-array case; only the calls that pass
+        // a real hipArray are interesting.
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[D3D11_MEMCPY] {} {}_array={:p} sentinel={} {}",
+        fn_name, role, arr, is_sentinel, extra,
+    ));
+}
+
+unsafe fn log_memcpy_sentinel_2d(fn_name: &str, memcpy: &hip_Memcpy2D) {
+    if !d3d11_memcpy_log_enabled() {
+        return;
+    }
+    let src_sentinel = super::d3d11_interop::is_d3d11_sentinel(memcpy.srcArray);
+    let dst_sentinel = super::d3d11_interop::is_d3d11_sentinel(memcpy.dstArray);
+    if !src_sentinel && !dst_sentinel {
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[D3D11_MEMCPY] {} src_array={:p} src_sentinel={} dst_array={:p} dst_sentinel={} \
+         w={} h={} src_pitch={} dst_pitch={} src_kind={} dst_kind={}",
+        fn_name,
+        memcpy.srcArray,
+        src_sentinel,
+        memcpy.dstArray,
+        dst_sentinel,
+        memcpy.WidthInBytes,
+        memcpy.Height,
+        memcpy.srcPitch,
+        memcpy.dstPitch,
+        memcpy.srcMemoryType.0,
+        memcpy.dstMemoryType.0,
+    ));
+}
+
+unsafe fn log_memcpy_sentinel_3d(fn_name: &str, memcpy: &HIP_MEMCPY3D) {
+    if !d3d11_memcpy_log_enabled() {
+        return;
+    }
+    let src_sentinel = super::d3d11_interop::is_d3d11_sentinel(memcpy.srcArray);
+    let dst_sentinel = super::d3d11_interop::is_d3d11_sentinel(memcpy.dstArray);
+    if !src_sentinel && !dst_sentinel {
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[D3D11_MEMCPY] {} src_array={:p} src_sentinel={} dst_array={:p} dst_sentinel={} \
+         w={} h={} d={} src_pitch={} dst_pitch={} src_kind={} dst_kind={}",
+        fn_name,
+        memcpy.srcArray,
+        src_sentinel,
+        memcpy.dstArray,
+        dst_sentinel,
+        memcpy.WidthInBytes,
+        memcpy.Height,
+        memcpy.Depth,
+        memcpy.srcPitch,
+        memcpy.dstPitch,
+        memcpy.srcMemoryType.0,
+        memcpy.dstMemoryType.0,
+    ));
+}
+
+pub(crate) unsafe fn copy_ato_h_v2(
+    dst_host: *mut ::core::ffi::c_void,
+    src_array: CUarray,
+    src_offset: usize,
+    byte_count: usize,
+) -> CUresult {
+    log_memcpy_sentinel_array(
+        "cuMemcpyAtoH_v2",
+        "src",
+        src_array as hipArray_t,
+        &format!("offset={} bytes={} dst_host={:p}", src_offset, byte_count, dst_host),
+    );
+    if let Some((dev, _, _)) =
+        super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t)
+    {
+        hipMemcpyDtoH(
+            dst_host,
+            hipDeviceptr_t((dev as *mut u8).add(src_offset) as *mut std::ffi::c_void),
+            byte_count,
+        )?;
+        return Ok(());
+    }
+    hipMemcpyAtoH(dst_host, src_array as hipArray_t, src_offset, byte_count)?;
+    Ok(())
+}
+
+pub(crate) unsafe fn copy_ato_h_async_v2(
+    dst_host: *mut ::core::ffi::c_void,
+    src_array: CUarray,
+    src_offset: usize,
+    byte_count: usize,
+    stream: hipStream_t,
+) -> CUresult {
+    log_memcpy_sentinel_array(
+        "cuMemcpyAtoHAsync_v2",
+        "src",
+        src_array as hipArray_t,
+        &format!(
+            "offset={} bytes={} dst_host={:p} stream={:p}",
+            src_offset, byte_count, dst_host, stream.0
+        ),
+    );
+    if let Some((dev, _, _)) =
+        super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t)
+    {
+        hipMemcpyDtoHAsync(
+            dst_host,
+            hipDeviceptr_t((dev as *mut u8).add(src_offset) as *mut std::ffi::c_void),
+            byte_count,
+            stream,
+        )?;
+        return Ok(());
+    }
+    hipMemcpyAtoHAsync(dst_host, src_array as hipArray_t, src_offset, byte_count, stream)?;
+    Ok(())
+}
+
+pub(crate) unsafe fn copy_hto_a_v2(
+    dst_array: CUarray,
+    dst_offset: usize,
+    src_host: *const ::core::ffi::c_void,
+    byte_count: usize,
+) -> CUresult {
+    log_memcpy_sentinel_array(
+        "cuMemcpyHtoA_v2",
+        "dst",
+        dst_array as hipArray_t,
+        &format!("offset={} bytes={} src_host={:p}", dst_offset, byte_count, src_host),
+    );
+    if let Some((dev, _, _)) =
+        super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t)
+    {
+        hipMemcpyHtoD(
+            hipDeviceptr_t((dev as *mut u8).add(dst_offset) as *mut std::ffi::c_void),
+            src_host as *mut std::ffi::c_void,
+            byte_count,
+        )?;
+        return Ok(());
+    }
+    hipMemcpyHtoA(dst_array as hipArray_t, dst_offset, src_host, byte_count)?;
+    Ok(())
+}
+
+pub(crate) unsafe fn copy_hto_a_async_v2(
+    dst_array: CUarray,
+    dst_offset: usize,
+    src_host: *const ::core::ffi::c_void,
+    byte_count: usize,
+    stream: hipStream_t,
+) -> CUresult {
+    log_memcpy_sentinel_array(
+        "cuMemcpyHtoAAsync_v2",
+        "dst",
+        dst_array as hipArray_t,
+        &format!(
+            "offset={} bytes={} src_host={:p} stream={:p}",
+            dst_offset, byte_count, src_host, stream.0
+        ),
+    );
+    if let Some((dev, _, _)) =
+        super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t)
+    {
+        hipMemcpyHtoDAsync(
+            hipDeviceptr_t((dev as *mut u8).add(dst_offset) as *mut std::ffi::c_void),
+            src_host as *mut std::ffi::c_void,
+            byte_count,
+            stream,
+        )?;
+        return Ok(());
+    }
+    hipMemcpyHtoAAsync(dst_array as hipArray_t, dst_offset, src_host, byte_count, stream)?;
+    Ok(())
+}
+
+pub(crate) unsafe fn copy_ato_d_v2(
+    dst_device: hipDeviceptr_t,
+    src_array: CUarray,
+    src_offset: usize,
+    byte_count: usize,
+) -> CUresult {
+    log_memcpy_sentinel_array(
+        "cuMemcpyAtoD_v2",
+        "src",
+        src_array as hipArray_t,
+        &format!(
+            "offset={} bytes={} dst_dev=0x{:x}",
+            src_offset, byte_count, dst_device.0 as usize
+        ),
+    );
+    if let Some((dev, _, _)) =
+        super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t)
+    {
+        hipMemcpyDtoD(
+            dst_device,
+            hipDeviceptr_t((dev as *mut u8).add(src_offset) as *mut std::ffi::c_void),
+            byte_count,
+        )?;
+        return Ok(());
+    }
+    hipMemcpyAtoD(dst_device, src_array as hipArray_t, src_offset, byte_count)?;
+    Ok(())
+}
+
+pub(crate) unsafe fn copy_dto_a_v2(
+    dst_array: CUarray,
+    dst_offset: usize,
+    src_device: hipDeviceptr_t,
+    byte_count: usize,
+) -> CUresult {
+    log_memcpy_sentinel_array(
+        "cuMemcpyDtoA_v2",
+        "dst",
+        dst_array as hipArray_t,
+        &format!(
+            "offset={} bytes={} src_dev=0x{:x}",
+            dst_offset, byte_count, src_device.0 as usize
+        ),
+    );
+    if let Some((dev, _, _)) =
+        super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t)
+    {
+        hipMemcpyDtoD(
+            hipDeviceptr_t((dev as *mut u8).add(dst_offset) as *mut std::ffi::c_void),
+            src_device,
+            byte_count,
+        )?;
+        return Ok(());
+    }
+    hipMemcpyDtoA(dst_array as hipArray_t, dst_offset, src_device, byte_count)?;
+    Ok(())
+}
+
+pub(crate) unsafe fn copy_ato_a_v2(
+    dst_array: CUarray,
+    dst_offset: usize,
+    src_array: CUarray,
+    src_offset: usize,
+    byte_count: usize,
+) -> CUresult {
+    if d3d11_memcpy_log_enabled() {
+        let src_sentinel = super::d3d11_interop::is_d3d11_sentinel(src_array as hipArray_t);
+        let dst_sentinel = super::d3d11_interop::is_d3d11_sentinel(dst_array as hipArray_t);
+        if src_sentinel
+            || dst_sentinel
+            || !(src_array as *const ()).is_null()
+            || !(dst_array as *const ()).is_null()
+        {
+            super::driver::zluda_log_err(&format!(
+                "[D3D11_MEMCPY] cuMemcpyAtoA_v2 src_array={:p} src_sentinel={} dst_array={:p} \
+                 dst_sentinel={} src_offset={} dst_offset={} bytes={}",
+                src_array, src_sentinel, dst_array, dst_sentinel, src_offset, dst_offset, byte_count,
+            ));
+        }
+    }
+    let src_layout = super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t);
+    let dst_layout = super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t);
+    match (src_layout, dst_layout) {
+        (Some((src_dev, _, _)), Some((dst_dev, _, _))) => {
+            hipMemcpyDtoD(
+                hipDeviceptr_t((dst_dev as *mut u8).add(dst_offset) as *mut std::ffi::c_void),
+                hipDeviceptr_t((src_dev as *mut u8).add(src_offset) as *mut std::ffi::c_void),
+                byte_count,
+            )?;
+            return Ok(());
+        }
+        (Some((src_dev, _, _)), None) => {
+            hipMemcpyDtoA(
+                dst_array as hipArray_t,
+                dst_offset,
+                hipDeviceptr_t((src_dev as *mut u8).add(src_offset) as *mut std::ffi::c_void),
+                byte_count,
+            )?;
+            return Ok(());
+        }
+        (None, Some((dst_dev, _, _))) => {
+            hipMemcpyAtoD(
+                hipDeviceptr_t((dst_dev as *mut u8).add(dst_offset) as *mut std::ffi::c_void),
+                src_array as hipArray_t,
+                src_offset,
+                byte_count,
+            )?;
+            return Ok(());
+        }
+        (None, None) => {}
+    }
+    hipMemcpyAtoA(
+        dst_array as hipArray_t,
+        dst_offset,
+        src_array as hipArray_t,
+        src_offset,
+        byte_count,
+    )?;
+    Ok(())
+}
+
+pub(crate) unsafe fn copy_3d_v2(memcpy: HIP_MEMCPY3D) -> CUresult {
+    log_memcpy_sentinel_3d("cuMemcpy3D_v2", &memcpy);
+    let memcpy = rewrite_3d_for_sentinel(memcpy);
+    hipDrvMemcpy3D(&memcpy)?;
+    Ok(())
+}
+
+pub(crate) unsafe fn copy_3d_async_v2(memcpy: HIP_MEMCPY3D, stream: hipStream_t) -> CUresult {
+    log_memcpy_sentinel_3d("cuMemcpy3DAsync_v2", &memcpy);
+    let memcpy = rewrite_3d_for_sentinel(memcpy);
+    hipDrvMemcpy3DAsync(&memcpy, stream)?;
+    Ok(())
+}
+
+unsafe fn rewrite_3d_for_sentinel(mut memcpy: HIP_MEMCPY3D) -> HIP_MEMCPY3D {
+    if let Some((dev, _size, pitch)) =
+        super::d3d11_interop::d3d11_array_layout(memcpy.srcArray)
+    {
+        memcpy.srcArray = std::ptr::null_mut();
+        memcpy.srcMemoryType = hipMemoryType::hipMemoryTypeDevice;
+        memcpy.srcDevice = hipDeviceptr_t(dev);
+        memcpy.srcPitch = pitch as usize;
+    }
+    if let Some((dev, _size, pitch)) =
+        super::d3d11_interop::d3d11_array_layout(memcpy.dstArray)
+    {
+        memcpy.dstArray = std::ptr::null_mut();
+        memcpy.dstMemoryType = hipMemoryType::hipMemoryTypeDevice;
+        memcpy.dstDevice = hipDeviceptr_t(dev);
+        memcpy.dstPitch = pitch as usize;
+    }
+    memcpy
 }
 
 pub(crate) unsafe fn set_d_2d32_v2(
@@ -837,6 +1220,57 @@ mod tests {
             }
 
             hipFree(dev_ptr).unwrap();
+        }
+    }
+
+    /// Phase A diagnostic stubs (plan fluttering-waddling-zephyr.md):
+    /// `is_d3d11_sentinel` must safely return false on null and on a
+    /// random heap pointer that was never registered. The diagnostic
+    /// stubs depend on this for their fast-path no-op behaviour, so a
+    /// false-positive would produce a spurious log line on every call
+    /// — tolerable but worth pinning.
+    #[test]
+    fn d3d11_sentinel_negatives() {
+        use super::super::d3d11_interop::is_d3d11_sentinel;
+        assert!(!is_d3d11_sentinel(std::ptr::null_mut()));
+        // A random heap allocation is not a sentinel.
+        let b = Box::new(0u64);
+        let p = (&*b as *const u64) as hipArray_t;
+        assert!(!is_d3d11_sentinel(p));
+        drop(b);
+    }
+
+    /// `d3d11_memcpy_log_enabled` is gated by `ZLUDA_D3D11_MEMCPY_LOG=1`.
+    /// We can't safely toggle env in a multi-threaded test (the OnceLock
+    /// inside the helper means the FIRST call wins), so we just confirm
+    /// it returns a stable bool and doesn't panic.
+    #[test]
+    fn d3d11_memcpy_log_gating_is_stable() {
+        let a = super::d3d11_memcpy_log_enabled();
+        let b = super::d3d11_memcpy_log_enabled();
+        assert_eq!(a, b);
+    }
+
+    /// `rewrite_2d_for_sentinel` must leave a non-sentinel memcpy
+    /// unchanged. (Phase E.1 of plan fluttering-waddling-zephyr.md.)
+    #[test]
+    fn rewrite_2d_for_sentinel_passthrough_when_not_sentinel() {
+        unsafe {
+            let mut m: hip_Memcpy2D = std::mem::zeroed();
+            m.srcMemoryType = hipMemoryType::hipMemoryTypeDevice;
+            m.srcDevice = hipDeviceptr_t(0x1000 as *mut std::ffi::c_void);
+            m.srcArray = std::ptr::null_mut();
+            m.dstMemoryType = hipMemoryType::hipMemoryTypeArray;
+            m.dstArray = (0xdead_beef_usize) as hipArray_t; // not in table
+            m.dstPitch = 999_999;
+            m.WidthInBytes = 4096;
+            m.Height = 1;
+            let out = super::rewrite_2d_for_sentinel(m);
+            // Neither src nor dst is registered → both sides untouched.
+            assert_eq!(out.srcArray, m.srcArray);
+            assert_eq!(out.dstArray, m.dstArray);
+            assert_eq!(out.dstMemoryType.0, hipMemoryType::hipMemoryTypeArray.0);
+            assert_eq!(out.dstPitch, 999_999);
         }
     }
 }

@@ -173,6 +173,14 @@ pub(crate) struct HsaImageRef {
     /// Strong owner of the heap-allocated D3D11FabricatedArray.
     /// Cleared on unregister; the Box is freed here.
     pub _sentinel_owner: Box<D3D11FabricatedArray>,
+    /// Backing linear device pointer the sentinel was created over —
+    /// `state.dev_ptr` at registration time. Sentinel-aware memcpy
+    /// paths route through this so they hand HIP a real linear address
+    /// instead of dereferencing the sentinel as `cl_mem`. Snapshot
+    /// because state outlives the table entry.
+    pub dev_ptr: *mut c_void,
+    pub size: u64,
+    pub pitch: u32,
 }
 // Manual Send/Sync: HSA agent + image handles are device handles
 // safe to share; the boxed sentinel is also Send (raw u64s + u32s).
@@ -200,6 +208,42 @@ pub(crate) fn d3d11_array_descriptor(arr: hipArray_t) -> Option<(u32, u32, u32)>
     // We currently only register R32G32B32A32_FLOAT 2D; pixel_size = 16.
     let sentinel = &*entry._sentinel_owner;
     Some((sentinel.width, sentinel.height, sentinel.pixel_size))
+}
+
+/// Yes/no probe for callers (memcpy diag stubs) that don't need the
+/// descriptor — just whether `arr` is a D3D11 sentinel we returned from
+/// `cuGraphicsSubResourceGetMappedArray`. Returns false if the table is
+/// poisoned (treat as not-ours; the caller's pass-through path will deal).
+pub(crate) fn is_d3d11_sentinel(arr: hipArray_t) -> bool {
+    if arr.is_null() {
+        return false;
+    }
+    let key = arr as usize;
+    match D3D11_ARRAY_TABLE.lock() {
+        Ok(table) => table.contains_key(&key),
+        Err(_) => false,
+    }
+}
+
+/// Look up the dev_ptr backing a D3D11 sentinel array, if any. The
+/// sentinel-aware memcpy paths route through this so they hand HIP a
+/// real linear device pointer instead of dereferencing the sentinel as
+/// `cl_mem`.
+pub(crate) fn d3d11_array_dev_ptr(arr: hipArray_t) -> Option<*mut c_void> {
+    let key = arr as usize;
+    let table = D3D11_ARRAY_TABLE.lock().ok()?;
+    let entry = table.get(&key)?;
+    Some(entry.dev_ptr)
+}
+
+/// Look up the (dev_ptr, size, pitch) backing a D3D11 sentinel array.
+/// Used by the dump path and by sentinel-aware memcpy that needs the
+/// row pitch to compute byte offsets.
+pub(crate) fn d3d11_array_layout(arr: hipArray_t) -> Option<(*mut c_void, u64, u32)> {
+    let key = arr as usize;
+    let table = D3D11_ARRAY_TABLE.lock().ok()?;
+    let entry = table.get(&key)?;
+    Some((entry.dev_ptr, entry.size, entry.pitch))
 }
 
 /// Descriptor handed to us by the PE-side wine_cuGraphicsD3D11RegisterResource
@@ -535,6 +579,9 @@ unsafe fn ensure_hip_array(state: &D3D11ResourceState) -> Result<hipArray_t, CUe
                 agent,
                 image,
                 _sentinel_owner: sentinel,
+                dev_ptr: state.dev_ptr,
+                size: state.size,
+                pitch: state.desc.pitch,
             },
         );
     } else {
@@ -634,9 +681,109 @@ pub unsafe fn map_resources(cuda_res: CUgraphicsResource) -> CUresult {
         Some(s) => s,
         None => return Err(CUerror::INVALID_VALUE),
     };
-    let _ = state; // borrow to avoid 'unused' warning when not logging
     let _ = hipDeviceSynchronize();
+    maybe_dump_post_blit_dev_ptr(cuda_res, state);
     Ok(())
+}
+
+/// Total dumps written across the run; cap at 8 to bound disk I/O.
+static SUBRESOURCE_DUMP_TOTAL: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+/// Per-resource one-shot guard so each cuda_res gets at most one dump.
+static SUBRESOURCE_DUMP_SEEN: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+const SUBRESOURCE_DUMP_BYTES: usize = 4096;
+const SUBRESOURCE_DUMP_CAP: u32 = 8;
+
+/// After the PE-side DXVK CopySurfaceToExternalBuffer + our
+/// hipDeviceSynchronize, the imported `dev_ptr` should hold the
+/// post-blit pixel data. Dump the first 4 KB to disk + a 4-pixel
+/// preview to the log so we can verify the blit produced sane
+/// R32G32B32A32_FLOAT pixels (vs zeros / garbage). Phase B of plan
+/// fluttering-waddling-zephyr.md (2026-05-09).
+unsafe fn maybe_dump_post_blit_dev_ptr(
+    cuda_res: CUgraphicsResource,
+    state: &D3D11ResourceState,
+) {
+    if std::env::var("ZLUDA_SUBRESOURCE_DUMP").ok().as_deref() != Some("1") {
+        return;
+    }
+    let key = cuda_res as usize;
+    {
+        let mut seen = match SUBRESOURCE_DUMP_SEEN.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if !seen.insert(key) {
+            return;
+        }
+    }
+    let total = SUBRESOURCE_DUMP_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if total >= SUBRESOURCE_DUMP_CAP {
+        return;
+    }
+
+    let bytes = SUBRESOURCE_DUMP_BYTES.min(state.size as usize);
+    if bytes == 0 || state.dev_ptr.is_null() {
+        return;
+    }
+    let mut buf = vec![0u8; bytes];
+    if hipMemcpyDtoH(
+        buf.as_mut_ptr() as *mut std::ffi::c_void,
+        hipDeviceptr_t(state.dev_ptr),
+        bytes,
+    )
+    .is_err()
+    {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] SUBRESOURCE_DUMP cuda_res={:p} hipMemcpyDtoH failed (dev_ptr={:p} size={})",
+            cuda_res, state.dev_ptr, state.size,
+        ));
+        return;
+    }
+
+    // Compute a 4-pixel preview as 4×R32G32B32A32_FLOAT (16 bytes/pixel).
+    // Pixels at offsets 0, pitch, 2*pitch, 3*pitch (first column of first
+    // 4 rows) — most informative if the blit got width vs pitch wrong.
+    let pitch = state.desc.pitch as usize;
+    let preview = |row: usize| -> Option<[f32; 4]> {
+        let off = row * pitch;
+        if off + 16 > bytes {
+            return None;
+        }
+        let r = f32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
+        let g = f32::from_le_bytes(buf[off + 4..off + 8].try_into().ok()?);
+        let b = f32::from_le_bytes(buf[off + 8..off + 12].try_into().ok()?);
+        let a = f32::from_le_bytes(buf[off + 12..off + 16].try_into().ok()?);
+        Some([r, g, b, a])
+    };
+    let p0 = preview(0);
+    let p1 = preview(1);
+    let p2 = preview(2);
+    let p3 = preview(3);
+
+    // Detect "all zeros" — the most likely failure mode.
+    let all_zero = buf.iter().all(|&b| b == 0);
+
+    let path = format!("/tmp/d3d11_blit_dump_{:x}_{}.bin", key, total);
+    match std::fs::File::create(&path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            let _ = f.write_all(&buf);
+        }
+        Err(e) => {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] SUBRESOURCE_DUMP fopen({}) failed: {}",
+                path, e,
+            ));
+        }
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] SUBRESOURCE_DUMP cuda_res={:p} dev_ptr={:p} bytes={} pitch={} \
+         all_zero={} path={} preview_rows=[{:?}, {:?}, {:?}, {:?}]",
+        cuda_res, state.dev_ptr, bytes, pitch, all_zero, path, p0, p1, p2, p3,
+    ));
 }
 
 /// Implementation of cuGraphicsUnmapResources for D3D11 resources.

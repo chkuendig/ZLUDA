@@ -7214,6 +7214,36 @@ unsafe fn capture_iofx_bbox_inputs(
     let raw_dst = (*slot_host).raw_args.as_mut_ptr();
     (*slot_host).raw_args_len =
         dump_kernel_args_raw(kernel_params, extra, raw_dst, TFS_RAW_ARGS_BYTES) as u32;
+    // Phase D of plan fluttering-waddling-zephyr.md (2026-05-09): emit a
+    // one-line summary of launches #0..N so we can compare the inputs
+    // for #1, #2 (work) vs #3 (crashes). We log up to 8 launches —
+    // enough to span the crashing window without exploding logs once
+    // the kernel runs in a steady state.
+    const IOFX_BBOX_LOG_LAUNCH_LIMIT: u64 = 8;
+    if this_launch < IOFX_BBOX_LOG_LAUNCH_LIMIT {
+        let p = &args.ptr_params;
+        super::driver::zluda_log_err(&format!(
+            "[IOFX_BBOX] launch_n={} grid_x={} block_x={} shared={} \
+             p2={} p3={} p12={} p13={} \
+             ptrs=[0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x} 0x{:x}]",
+            this_launch,
+            grid_x,
+            block_x,
+            shared_mem_bytes,
+            args.param_2,
+            args.param_3,
+            args.param_12,
+            args.param_13,
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            p[7],
+        ));
+    }
     Some(slot_index)
 }
 
