@@ -415,6 +415,16 @@ fn install_fault_signal_handler() {
             c"/tmp/cub_downsweep_captures.bin".as_ptr(),
         );
 
+        let iofx_chain_host_ptr = super::function::IOFX_CHAIN_CAPTURE_HOST_PTR
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let iofx_chain_total_bytes = super::function::IOFX_CHAIN_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            iofx_chain_host_ptr,
+            iofx_chain_total_bytes,
+            c"/tmp/iofx_chain_captures.bin".as_ptr(),
+        );
+
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -472,6 +482,13 @@ fn install_fault_signal_handler() {
                     f,
                     "*** CUB downsweep capture dumped to /tmp/cub_downsweep_captures.bin ({} bytes)\n",
                     cub_downsweep_total_bytes
+                );
+            }
+            if iofx_chain_host_ptr != 0 && iofx_chain_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** IOFX chain capture dumped to /tmp/iofx_chain_captures.bin ({} bytes)\n",
+                    iofx_chain_total_bytes
                 );
             }
             if let Ok(guard) = KERNEL_RING.lock() {
@@ -542,6 +559,76 @@ fn install_fault_signal_handler() {
     unsafe {
         libc::signal(libc::SIGABRT, sigabrt_handler as libc::sighandler_t);
         libc::signal(libc::SIGSEGV, sigabrt_handler as libc::sighandler_t);
+        // Also dump capture rings on normal (non-crash) process exit so
+        // clean-bench runs still produce harvestable data.
+        extern "C" fn dump_rings_atexit() {
+            unsafe {
+                unsafe fn dump_ring_safe(ptr_atomic: usize, len_atomic: usize, path: &str) {
+                    if ptr_atomic == 0 || len_atomic == 0 {
+                        return;
+                    }
+                    let slice = std::slice::from_raw_parts(ptr_atomic as *const u8, len_atomic);
+                    let _ = std::fs::write(path, slice);
+                }
+                dump_ring_safe(
+                    super::function::MS4_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::MS4_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/ms4_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::MS2B_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::MS2B_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/ms2b_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::MS3_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::MS3_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/ms3_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::TFS_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::TFS_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/tfs_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::IOFX_ACTOR_RANGE_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::IOFX_ACTOR_RANGE_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/iofx_actor_range_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::IOFX_BBOX_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::IOFX_BBOX_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/iofx_bbox_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::CUB_DOWNSWEEP_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::CUB_DOWNSWEEP_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/cub_downsweep_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::IOFX_CHAIN_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::IOFX_CHAIN_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/iofx_chain_captures.bin",
+                );
+            }
+        }
+        libc::atexit(dump_rings_atexit);
     }
     zluda_log_err("[ZLUDA] Signal handlers installed (SIGABRT+SIGSEGV) for fault capture");
 }

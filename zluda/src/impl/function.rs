@@ -7550,6 +7550,332 @@ unsafe fn capture_iofx_actor_range_post(slot_index: usize, stream: hipStream_t) 
     unsafe { capture_iofx_actor_range_outputs(slot_index, stream, false) };
 }
 
+// ============================================================================
+// IOFX chain capture — IOFX_makeSortKeys_templ$0/$1 + IOFX_remapKernel_templ$0/$1
+//
+// These are the kernels that run immediately before IOFX_actorRangeKernel in
+// a PhysX/APEX frame: makeSortKeys → CUB sort (Upsweep/Scan/Downsweep) →
+// remapKernel → actorRange (×2). The actorRange wild-pointer fault is
+// state-dependent (offline replay clean across 1,200 isolated launches) so
+// the next decisive test is to replay the full chain in order and see
+// whether the fault reproduces.
+//
+// Single shared ring discriminated by kernel_kind. Kernel-name guard at the
+// call site keeps dump_kernel_args_raw safe — both kernels have ≥11 args so
+// reading 16 kernel_params slots stays in-bounds.
+// ============================================================================
+
+const IOFX_CHAIN_POINTER_COUNT: usize = 8;
+// 16 KB per ptr — verified 2026-05-11 that 64 KB × 8 × 2 (= 1 MB/slot, 16 MB
+// ring) consistently broke PhysX init at IOFX_volumeMigrationKernel after
+// ~90 launches across N=3 runs. At 16 KB the slot footprint drops to
+// 16 KB × 8 × 2 = 256 KB/slot, 4 MB ring. We trade off partial input
+// captures for early-init stability — chain replay tests can re-run a
+// single captured frame, the pre/post buffer DtoD is the diagnostic, not
+// the replay payload.
+const IOFX_CHAIN_BUFFER_BYTES: usize = 16 * 1024;
+const IOFX_CHAIN_RAW_ARGS_BYTES: usize = 512;
+const IOFX_CHAIN_NAME_BYTES: usize = 64;
+const IOFX_CHAIN_CAPTURE_MAGIC: u64 = 0x494f4658_4348414e; // "IOFXCHAN"
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IofxChainKind {
+    MakeSortKeysTempl0 = 0,
+    MakeSortKeysTempl1 = 1,
+    RemapTempl0 = 2,
+    RemapTempl1 = 3,
+}
+
+fn classify_iofx_chain_kernel(name: &str) -> Option<IofxChainKind> {
+    if name == "IOFX_makeSortKeys_templ$0" {
+        Some(IofxChainKind::MakeSortKeysTempl0)
+    } else if name == "IOFX_makeSortKeys_templ$1" {
+        Some(IofxChainKind::MakeSortKeysTempl1)
+    } else if name == "IOFX_remapKernel_templ$0" {
+        Some(IofxChainKind::RemapTempl0)
+    } else if name == "IOFX_remapKernel_templ$1" {
+        Some(IofxChainKind::RemapTempl1)
+    } else {
+        None
+    }
+}
+
+#[repr(C)]
+struct IofxChainCaptureSlot {
+    magic: u64,            // 0:  "IOFXCHAN"
+    launch_n: u64,         // 8
+    timestamp_ms: u64,     // 16
+    kernel_kind: u32,      // 24: IofxChainKind
+    grid_x: u32,           // 28
+    grid_y: u32,           // 32
+    grid_z: u32,           // 36
+    block_x: u32,          // 40
+    block_y: u32,          // 44
+    block_z: u32,          // 48
+    shared_mem_bytes: u32, // 52
+    raw_args_len: u32,     // 56
+    arg_meta: [u8; 8],     // 60
+    _pad0: [u8; 4],        // 68
+    kernel_name: [u8; IOFX_CHAIN_NAME_BYTES],          // 72..136
+    ptr_params: [u64; IOFX_CHAIN_POINTER_COUNT],       // 136..200
+    ptr_buffer_bytes: u32,                              // 200
+    _pad1: [u8; 4],                                     // 204
+    raw_args: [u8; IOFX_CHAIN_RAW_ARGS_BYTES],          // 208..720
+    pre_ptr_buffers: [u8; IOFX_CHAIN_POINTER_COUNT * IOFX_CHAIN_BUFFER_BYTES],
+    post_ptr_buffers: [u8; IOFX_CHAIN_POINTER_COUNT * IOFX_CHAIN_BUFFER_BYTES],
+}
+
+const IOFX_CHAIN_SLOT_SIZE: usize = std::mem::size_of::<IofxChainCaptureSlot>();
+const IOFX_CHAIN_RAW_ARGS_OFF: usize = 208;
+const IOFX_CHAIN_PRE_PTRS_OFF: usize = IOFX_CHAIN_RAW_ARGS_OFF + IOFX_CHAIN_RAW_ARGS_BYTES;
+const IOFX_CHAIN_POST_PTRS_OFF: usize =
+    IOFX_CHAIN_PRE_PTRS_OFF + IOFX_CHAIN_POINTER_COUNT * IOFX_CHAIN_BUFFER_BYTES;
+const IOFX_CHAIN_CAPTURE_TOTAL_SIZE: usize = IOFX_CHAIN_SLOT_SIZE * IOFX_CAPTURE_SLOTS;
+
+struct IofxChainCaptureState {
+    host_ptr: *mut u8,
+    dev_ptr: *mut std::ffi::c_void,
+    launch_counter: u64,
+}
+unsafe impl Send for IofxChainCaptureState {}
+unsafe impl Sync for IofxChainCaptureState {}
+
+static IOFX_CHAIN_CAPTURE: Mutex<Option<IofxChainCaptureState>> = Mutex::new(None);
+
+pub(crate) static IOFX_CHAIN_CAPTURE_HOST_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static IOFX_CHAIN_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn iofx_chain_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_IOFX_CHAIN_CAPTURE").map_or(false, |v| v == "1"))
+}
+
+unsafe fn iofx_chain_capture_init(state: &mut Option<IofxChainCaptureState>) {
+    if state.is_some() {
+        return;
+    }
+    let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let alloc_result = unsafe {
+        hipHostMalloc(
+            &mut host_ptr,
+            IOFX_CHAIN_CAPTURE_TOTAL_SIZE,
+            hipHostMallocMapped,
+        )
+    };
+    if alloc_result.is_err() || host_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] IOFX chain capture: hipHostMalloc({}) failed: {:?}",
+            IOFX_CHAIN_CAPTURE_TOTAL_SIZE, alloc_result
+        ));
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, IOFX_CHAIN_CAPTURE_TOTAL_SIZE);
+    }
+    let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
+    if map_result.is_err() || dev_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] IOFX chain capture: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] IOFX chain capture: {} slots × {} KB = {} MB pinned; host=0x{:x} dev=0x{:x}",
+        IOFX_CAPTURE_SLOTS,
+        IOFX_CHAIN_SLOT_SIZE / 1024,
+        IOFX_CHAIN_CAPTURE_TOTAL_SIZE / (1024 * 1024),
+        host_ptr as usize,
+        dev_ptr as usize,
+    ));
+    IOFX_CHAIN_CAPTURE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::SeqCst);
+    IOFX_CHAIN_CAPTURE_TOTAL_BYTES.store(
+        IOFX_CHAIN_CAPTURE_TOTAL_SIZE,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    *state = Some(IofxChainCaptureState {
+        host_ptr: host_ptr as *mut u8,
+        dev_ptr,
+        launch_counter: 0,
+    });
+}
+
+/// Scan up to N kernel_params slots as u64 ptrs; record up to ptr_count_max
+/// values that look like device pointers (HSA-mapped user-space range).
+unsafe fn iofx_chain_extract_ptrs(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    arg_slots: usize,
+    ptr_count_max: usize,
+) -> [u64; IOFX_CHAIN_POINTER_COUNT] {
+    let mut ptrs = [0u64; IOFX_CHAIN_POINTER_COUNT];
+    let mut nr = 0usize;
+    for i in 0..arg_slots {
+        if nr >= ptr_count_max {
+            break;
+        }
+        let v: u64 = match unsafe { read_kernel_arg(kernel_params, extra, i * 8, i) } {
+            Some(v) => v,
+            None => continue,
+        };
+        // Heuristic: HSA-mapped device-pointers on the Steam Deck APU sit in
+        // the 0x7f00_0000_0000 .. 0x7fff_ffff_ffff window. Skip null and
+        // small scalars; skip kernel/sentinel values.
+        if v >= 0x10000 && v < 0x0000_8000_0000_0000 {
+            ptrs[nr] = v;
+            nr += 1;
+        }
+    }
+    ptrs
+}
+
+unsafe fn capture_iofx_chain_inputs(
+    name: &str,
+    kernel_kind: IofxChainKind,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
+    shared_mem_bytes: u32,
+) -> Option<usize> {
+    if !iofx_chain_capture_enabled() {
+        return None;
+    }
+    // Argument-slot bound by kernel kind. makeSortKeys has 16 params, remap
+    // has 11. Stay strictly within these so read_kernel_arg can't walk past
+    // the array.
+    let arg_slots = match kernel_kind {
+        IofxChainKind::MakeSortKeysTempl0 | IofxChainKind::MakeSortKeysTempl1 => 16,
+        IofxChainKind::RemapTempl0 | IofxChainKind::RemapTempl1 => 11,
+    };
+    let ptrs = unsafe {
+        iofx_chain_extract_ptrs(kernel_params, extra, arg_slots, IOFX_CHAIN_POINTER_COUNT)
+    };
+    if ptrs.iter().all(|&p| p == 0) {
+        return None;
+    }
+
+    let mut guard = match IOFX_CHAIN_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    unsafe { iofx_chain_capture_init(&mut guard) };
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let this_launch = state.launch_counter;
+    state.launch_counter += 1;
+    let slot_index = (this_launch as usize) % IOFX_CAPTURE_SLOTS;
+    let slot_host = unsafe {
+        state.host_ptr.add(slot_index * IOFX_CHAIN_SLOT_SIZE) as *mut IofxChainCaptureSlot
+    };
+    unsafe {
+        std::ptr::write_bytes(slot_host as *mut u8, 0, IOFX_CHAIN_SLOT_SIZE);
+        (*slot_host).magic = IOFX_CHAIN_CAPTURE_MAGIC;
+        (*slot_host).launch_n = this_launch;
+        (*slot_host).timestamp_ms = crate::elapsed_ms();
+        (*slot_host).kernel_kind = kernel_kind as u32;
+        (*slot_host).grid_x = grid_x;
+        (*slot_host).grid_y = grid_y;
+        (*slot_host).grid_z = grid_z;
+        (*slot_host).block_x = block_x;
+        (*slot_host).block_y = block_y;
+        (*slot_host).block_z = block_z;
+        (*slot_host).shared_mem_bytes = shared_mem_bytes;
+        (*slot_host).arg_meta = encode_launch_arg_meta(kernel_params, extra);
+        (*slot_host).ptr_params = ptrs;
+        (*slot_host).ptr_buffer_bytes = IOFX_CHAIN_BUFFER_BYTES as u32;
+        // Truncate kernel_name into the fixed buffer.
+        let name_bytes = name.as_bytes();
+        let n = name_bytes.len().min(IOFX_CHAIN_NAME_BYTES);
+        let name_dst = (&raw mut (*slot_host).kernel_name) as *mut u8;
+        std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_dst, n);
+        let raw_dst = (*slot_host).raw_args.as_mut_ptr();
+        (*slot_host).raw_args_len =
+            dump_kernel_args_raw(kernel_params, extra, raw_dst, IOFX_CHAIN_RAW_ARGS_BYTES) as u32;
+    }
+    Some(slot_index)
+}
+
+unsafe fn capture_iofx_chain_ptr_regions(
+    slot_index: usize,
+    stream: hipStream_t,
+    prelaunch: bool,
+) {
+    if !iofx_chain_capture_enabled() {
+        return;
+    }
+    // Pre/post DtoD snapshotting is gated separately — 8 DtoD copies per
+    // chain launch on every PhysX frame causes IOFX_volumeMigrationKernel
+    // to fault during init (verified 2026-05-11 across N=4 runs at both
+    // 64 KB and 16 KB per-ptr buffer sizes). Default OFF; header-only
+    // capture is enough to enumerate kernel kinds, frequencies, and
+    // pointer-arg layouts. Opt in with ZLUDA_IOFX_CHAIN_CAPTURE_BUFS=1
+    // for short investigation runs where the early-init regression is
+    // tolerable.
+    static SNAPSHOT_BUFS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let snapshot_bufs = *SNAPSHOT_BUFS.get_or_init(|| {
+        std::env::var("ZLUDA_IOFX_CHAIN_CAPTURE_BUFS").map_or(false, |v| v == "1")
+    });
+    if !snapshot_bufs {
+        return;
+    }
+    let guard = match IOFX_CHAIN_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+    let slot_host = unsafe {
+        state.host_ptr.add(slot_index * IOFX_CHAIN_SLOT_SIZE) as *const IofxChainCaptureSlot
+    };
+    let slot_dev_base =
+        unsafe { (state.dev_ptr as *mut u8).add(slot_index * IOFX_CHAIN_SLOT_SIZE) };
+    let base_off = if prelaunch {
+        IOFX_CHAIN_PRE_PTRS_OFF
+    } else {
+        IOFX_CHAIN_POST_PTRS_OFF
+    };
+    for (idx, src_ptr) in unsafe { (*slot_host).ptr_params }.iter().copied().enumerate() {
+        if src_ptr == 0 {
+            continue;
+        }
+        let dst_off = base_off + idx * IOFX_CHAIN_BUFFER_BYTES;
+        unsafe {
+            let _ = hipMemcpyDtoDAsync(
+                hipDeviceptr_t(slot_dev_base.add(dst_off) as _),
+                hipDeviceptr_t(src_ptr as _),
+                IOFX_CHAIN_BUFFER_BYTES,
+                stream,
+            );
+        }
+    }
+}
+
+unsafe fn capture_iofx_chain_pre(slot_index: usize, stream: hipStream_t) {
+    unsafe { capture_iofx_chain_ptr_regions(slot_index, stream, true) };
+}
+
+unsafe fn capture_iofx_chain_post(slot_index: usize, stream: hipStream_t) {
+    unsafe { capture_iofx_chain_ptr_regions(slot_index, stream, false) };
+}
+
 unsafe fn tfs_capture_init(state: &mut Option<TfsCaptureState>) {
     if state.is_some() {
         return;
@@ -8565,6 +8891,25 @@ pub(crate) fn launch_kernel(
     } else {
         None
     };
+    let iofx_chain_slot = if let Some(chain_kind) = classify_iofx_chain_kernel(&name) {
+        unsafe {
+            capture_iofx_chain_inputs(
+                &name,
+                chain_kind,
+                kernel_params,
+                extra,
+                grid_dim_x,
+                grid_dim_y,
+                grid_dim_z,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z,
+                shared_mem_bytes,
+            )
+        }
+    } else {
+        None
+    };
     if creategrid_safe_validator_enabled() {
         unsafe {
             maybe_capture_creategrid_sort_buffer_touch(
@@ -8800,6 +9145,11 @@ pub(crate) fn launch_kernel(
             capture_cub_downsweep_pre(slot_index, stream);
         }
     }
+    if let Some(slot_index) = iofx_chain_slot {
+        unsafe {
+            capture_iofx_chain_pre(slot_index, stream);
+        }
+    }
 
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
@@ -8884,6 +9234,11 @@ pub(crate) fn launch_kernel(
     if let Some(slot_index) = iofx_bbox_slot.filter(|_| result.is_ok()) {
         unsafe {
             capture_iofx_bbox_post(slot_index, stream);
+        }
+    }
+    if let Some(slot_index) = iofx_chain_slot.filter(|_| result.is_ok()) {
+        unsafe {
+            capture_iofx_chain_post(slot_index, stream);
         }
     }
     if let Some(args) = createcell_snapshot_args.filter(|_| result.is_ok()) {
