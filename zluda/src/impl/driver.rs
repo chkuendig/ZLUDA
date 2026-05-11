@@ -425,6 +425,16 @@ fn install_fault_signal_handler() {
             c"/tmp/iofx_chain_captures.bin".as_ptr(),
         );
 
+        let cub_scan_host_ptr = super::function::CUB_SCAN_CAPTURE_HOST_PTR
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let cub_scan_total_bytes = super::function::CUB_SCAN_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            cub_scan_host_ptr,
+            cub_scan_total_bytes,
+            c"/tmp/cub_scan_captures.bin".as_ptr(),
+        );
+
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -489,6 +499,13 @@ fn install_fault_signal_handler() {
                     f,
                     "*** IOFX chain capture dumped to /tmp/iofx_chain_captures.bin ({} bytes)\n",
                     iofx_chain_total_bytes
+                );
+            }
+            if cub_scan_host_ptr != 0 && cub_scan_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** CUB scan capture dumped to /tmp/cub_scan_captures.bin ({} bytes)\n",
+                    cub_scan_total_bytes
                 );
             }
             if let Ok(guard) = KERNEL_RING.lock() {

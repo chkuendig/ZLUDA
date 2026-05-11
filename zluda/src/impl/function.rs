@@ -6724,6 +6724,7 @@ struct IofxActorRangeCaptureState {
     host_ptr: *mut u8,
     dev_ptr: *mut std::ffi::c_void,
     launch_counter: u64,
+    capture_counter: u64,
 }
 unsafe impl Send for IofxActorRangeCaptureState {}
 unsafe impl Sync for IofxActorRangeCaptureState {}
@@ -6902,6 +6903,7 @@ unsafe fn iofx_actor_range_capture_init(state: &mut Option<IofxActorRangeCapture
         host_ptr: host_ptr as *mut u8,
         dev_ptr,
         launch_counter: 0,
+        capture_counter: 0,
     });
 }
 
@@ -6970,7 +6972,6 @@ unsafe fn read_iofx_actor_range_args(
     let output_ptr_328: u64 = unsafe { read_kernel_arg(kernel_params, extra, 56, 8) }?;
     let input_ptr_329: u64 = unsafe { read_kernel_arg(kernel_params, extra, 64, 9) }?;
     if count == 0
-        || count as usize > IOFX_ACTOR_RANGE_MAX_COUNT
         || input_ptr_324 == 0
         || output_ptr_326 == 0
         || output_ptr_327 == 0
@@ -6979,6 +6980,13 @@ unsafe fn read_iofx_actor_range_args(
     {
         return None;
     }
+    // Note: count > IOFX_ACTOR_RANGE_MAX_COUNT (8192) is NOT a rejection.
+    // The slot's input buffers are pre-sized to IOFX_ACTOR_RANGE_INPUT_BYTES
+    // = 32 KB; the DtoD copy in capture_iofx_actor_range_inputs caps at
+    // `input_bytes = (count * 4).min(IOFX_ACTOR_RANGE_INPUT_BYTES)` so larger
+    // launches truncate to the first 8192 actors. The capture stays
+    // functional past launch 374, which previously was the silent cutoff
+    // for full-sim large-count launches that triggered actorRange faults.
     Some(IofxActorRangeArgs {
         count,
         input_ptr_324,
@@ -7065,9 +7073,30 @@ unsafe fn capture_iofx_actor_range_inputs(
         None => return None,
     };
 
+    // Sampling (added 2026-05-11): the 2x DtoD per actorRange launch (input
+    // 324/329) plus 3x post-launch DtoD on outputs causes stream pressure
+    // (`feedback_no_d2d_from_launch_kernel`). Two recent runs crashed at
+    // launches 161 / 2852 vs typical 30-50k+ baseline once the previous
+    // count > IOFX_ACTOR_RANGE_MAX_COUNT silent filter was removed and ALL
+    // launches now do DtoD. Sample to 1-in-N (default 64); set
+    // ZLUDA_IOFX_CAPTURE_SAMPLE=1 to capture every launch (the previous
+    // behavior, useful for short investigation runs).
+    static SAMPLE_INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let sample = *SAMPLE_INTERVAL.get_or_init(|| {
+        std::env::var("ZLUDA_IOFX_CAPTURE_SAMPLE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64)
+    });
     let this_launch = state.launch_counter;
     state.launch_counter += 1;
-    let slot_index = (this_launch as usize) % IOFX_CAPTURE_SLOTS;
+    if this_launch % sample != 0 {
+        return None;
+    }
+    let captured_n = state.capture_counter;
+    state.capture_counter += 1;
+    let slot_index = (captured_n as usize) % IOFX_CAPTURE_SLOTS;
     let slot_host = state.host_ptr.add(slot_index * IOFX_ACTOR_RANGE_SLOT_SIZE)
         as *mut IofxActorRangeCaptureSlot;
     let slot_dev_base =
@@ -7485,6 +7514,218 @@ unsafe fn capture_cub_downsweep_inputs(
     Some(slot_index)
 }
 
+// ============================================================================
+// CUB RadixSortScanKernel pre-Scan spine capture
+// ----------------------------------------------------------------------------
+// Per project_cub_scan_spine_corruption_2026_05_11.md: after the VGPR-zero
+// pass shipped, the dominant residual EARLY-crash class is CUB Downsweep
+// (3/10 of N=10). Post-mortem of cub_downsweep_captures.bin showed the spine
+// state Downsweep consumes has wildly wrong values (3000x-16000x legal max
+// in bins 16-31, while bins 0-15 healthy). Magnitudes too large to come from
+// Scan summing healthy Upsweep counts alone — Upsweep is suspect too.
+//
+// This probe captures the spine state AT Scan kernel entry (= post-Upsweep,
+// pre-Scan). Comparing pre-Scan vs post-Scan (the downsweep capture) tells
+// us definitively whether Upsweep or Scan is the corruption source. Async
+// DtoD on the same stream — no sync stall, no timing perturbation.
+//
+// Gated by ZLUDA_CUB_SCAN_PROBE=1 (default OFF). Class-name match on
+// `name.contains("RadixSortScanKernel")` is INSTRUMENTATION (allowed per
+// feedback_no_per_kernel_branching.md — kernel-name matching for diagnostic
+// capture is permitted; only fix code must not branch).
+// ============================================================================
+
+const CUB_SCAN_BUFFER_BYTES: usize = 128 * 1024;
+
+#[repr(C)]
+struct CubScanCaptureSlot {
+    magic: u64,                              // 0  "CUBSCANP"
+    launch_n: u64,                           // 8
+    timestamp_ms: u64,                       // 16
+    grid_x: u32,                             // 24
+    grid_y: u32,                             // 28
+    grid_z: u32,                             // 32
+    block_x: u32,                            // 36
+    block_y: u32,                            // 40
+    block_z: u32,                            // 44
+    shared_mem_bytes: u32,                   // 48
+    scan_n: u32,                             // 52: param_1 = total scan size
+    spine_ptr: u64,                          // 56
+    _pad0: [u8; 56],                         // 64..120
+    pre_spine: [u8; CUB_SCAN_BUFFER_BYTES],  // 120..(120+128K)
+}
+
+const CUB_SCAN_CAPTURE_MAGIC: u64 = 0x5042_4E43_5343_4255; // "UBCSCNBP" little-endian
+const CUB_SCAN_SLOT_SIZE: usize = std::mem::size_of::<CubScanCaptureSlot>();
+const CUB_SCAN_PRE_SPINE_OFF: usize = 120;
+const CUB_SCAN_CAPTURE_TOTAL_SIZE: usize = CUB_SCAN_SLOT_SIZE * IOFX_CAPTURE_SLOTS;
+
+struct CubScanCaptureState {
+    host_ptr: *mut u8,
+    dev_ptr: *mut std::ffi::c_void,
+    launch_counter: u64,
+}
+unsafe impl Send for CubScanCaptureState {}
+unsafe impl Sync for CubScanCaptureState {}
+
+static CUB_SCAN_CAPTURE: Mutex<Option<CubScanCaptureState>> = Mutex::new(None);
+
+pub(crate) static CUB_SCAN_CAPTURE_HOST_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static CUB_SCAN_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn cub_scan_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_CUB_SCAN_PROBE").map_or(false, |v| v == "1"))
+}
+
+unsafe fn cub_scan_capture_init(state: &mut Option<CubScanCaptureState>) {
+    if state.is_some() {
+        return;
+    }
+    let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let alloc_result = unsafe {
+        hipHostMalloc(
+            &mut host_ptr,
+            CUB_SCAN_CAPTURE_TOTAL_SIZE,
+            hipHostMallocMapped,
+        )
+    };
+    if alloc_result.is_err() || host_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] CUB scan capture: hipHostMalloc({}) failed: {:?}",
+            CUB_SCAN_CAPTURE_TOTAL_SIZE, alloc_result
+        ));
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, CUB_SCAN_CAPTURE_TOTAL_SIZE);
+    }
+    let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
+    if map_result.is_err() || dev_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] CUB scan capture: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] CUB scan capture: {} slots × {} KB = {} KB pinned; host=0x{:x} dev=0x{:x}",
+        IOFX_CAPTURE_SLOTS,
+        CUB_SCAN_SLOT_SIZE / 1024,
+        CUB_SCAN_CAPTURE_TOTAL_SIZE / 1024,
+        host_ptr as usize,
+        dev_ptr as usize,
+    ));
+    CUB_SCAN_CAPTURE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::SeqCst);
+    CUB_SCAN_CAPTURE_TOTAL_BYTES.store(
+        CUB_SCAN_CAPTURE_TOTAL_SIZE,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    *state = Some(CubScanCaptureState {
+        host_ptr: host_ptr as *mut u8,
+        dev_ptr,
+        launch_counter: 0,
+    });
+}
+
+unsafe fn capture_cub_scan_inputs(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
+    shared_mem_bytes: u32,
+) -> Option<usize> {
+    if !cub_scan_capture_enabled() {
+        return None;
+    }
+    let spine_ptr: u64 = unsafe { read_kernel_arg(kernel_params, extra, 0, 0) }?;
+    let scan_n: u32 = unsafe { read_kernel_arg(kernel_params, extra, 8, 1) }.unwrap_or(0);
+    if (spine_ptr >> 40) != 0x7f {
+        return None;
+    }
+
+    let mut guard = match CUB_SCAN_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    unsafe { cub_scan_capture_init(&mut guard) };
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let this_launch = state.launch_counter;
+    state.launch_counter += 1;
+    let slot_index = (this_launch as usize) % IOFX_CAPTURE_SLOTS;
+    let slot_host = unsafe {
+        state.host_ptr.add(slot_index * CUB_SCAN_SLOT_SIZE) as *mut CubScanCaptureSlot
+    };
+    unsafe {
+        std::ptr::write_bytes(slot_host as *mut u8, 0, CUB_SCAN_SLOT_SIZE);
+        (*slot_host).magic = CUB_SCAN_CAPTURE_MAGIC;
+        (*slot_host).launch_n = this_launch;
+        (*slot_host).timestamp_ms = crate::elapsed_ms();
+        (*slot_host).grid_x = grid_x;
+        (*slot_host).grid_y = grid_y;
+        (*slot_host).grid_z = grid_z;
+        (*slot_host).block_x = block_x;
+        (*slot_host).block_y = block_y;
+        (*slot_host).block_z = block_z;
+        (*slot_host).shared_mem_bytes = shared_mem_bytes;
+        (*slot_host).scan_n = scan_n;
+        (*slot_host).spine_ptr = spine_ptr;
+    }
+    Some(slot_index)
+}
+
+unsafe fn capture_cub_scan_pre(slot_index: usize, stream: hipStream_t) {
+    if !cub_scan_capture_enabled() {
+        return;
+    }
+    let guard = match CUB_SCAN_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+    let slot_host = unsafe {
+        state.host_ptr.add(slot_index * CUB_SCAN_SLOT_SIZE) as *const CubScanCaptureSlot
+    };
+    let slot_dev_base =
+        unsafe { (state.dev_ptr as *mut u8).add(slot_index * CUB_SCAN_SLOT_SIZE) };
+    let spine_ptr = unsafe { (*slot_host).spine_ptr };
+    if spine_ptr == 0 {
+        return;
+    }
+    // Spine alloc by CUB DeviceRadixSort is typically ~8 KB but the host
+    // alloc may extend; reading 128 KB is bounded by our slot buffer and is
+    // typical of CUB scratch storage. If a small spine fails the DtoD
+    // silently (per the same caveat in capture_cub_downsweep_pre), we still
+    // get the first 8 KB which contains the legitimate grid_x*num_bins
+    // region we care about.
+    unsafe {
+        let _ = hipMemcpyDtoDAsync(
+            hipDeviceptr_t(slot_dev_base.add(CUB_SCAN_PRE_SPINE_OFF) as _),
+            hipDeviceptr_t(spine_ptr as _),
+            CUB_SCAN_BUFFER_BYTES,
+            stream,
+        );
+    }
+}
+
 unsafe fn capture_cub_downsweep_pre(slot_index: usize, stream: hipStream_t) {
     if !cub_downsweep_capture_enabled() {
         return;
@@ -7540,6 +7781,7 @@ unsafe fn capture_cub_downsweep_pre(slot_index: usize, stream: hipStream_t) {
             );
         }
     }
+
 }
 
 unsafe fn capture_iofx_actor_range_pre(slot_index: usize, stream: hipStream_t) {
@@ -7585,6 +7827,8 @@ enum IofxChainKind {
     MakeSortKeysTempl1 = 1,
     RemapTempl0 = 2,
     RemapTempl1 = 3,
+    ActorRange = 4,
+    NewRadixSortStep = 5,
 }
 
 fn classify_iofx_chain_kernel(name: &str) -> Option<IofxChainKind> {
@@ -7596,6 +7840,10 @@ fn classify_iofx_chain_kernel(name: &str) -> Option<IofxChainKind> {
         Some(IofxChainKind::RemapTempl0)
     } else if name == "IOFX_remapKernel_templ$1" {
         Some(IofxChainKind::RemapTempl1)
+    } else if name == "IOFX_actorRangeKernel" {
+        Some(IofxChainKind::ActorRange)
+    } else if name == "IOFX_newRadixSortStepKernel" {
+        Some(IofxChainKind::NewRadixSortStep)
     } else {
         None
     }
@@ -7735,7 +7983,16 @@ unsafe fn iofx_chain_extract_ptrs(
             Some(v) => v,
             None => continue,
         };
-        if (v >> 40) == 0x7f {
+        // Require both: high 24 bits == 0x7f**** (HSA-mapped user range)
+        // AND low 32 bits >= 0x10000 (page-aligned past the first 64 KB
+        // of the region). This rejects false-positives where read_kernel_arg
+        // reads a u64 spanning two adjacent u32 scalar params — e.g.
+        // newRadixSortStep's `u32 param_3=4` + `u32 param_4=0x7f41` reads
+        // as 0x7f4100000004; the resulting DtoD on that bogus pointer
+        // wedges HIP's stream into an error state, causing a downstream
+        // host-side SIGABRT misattributed to whatever kernel ran next.
+        // (Verified 2026-05-11 23:42 newradix_chain_bufs_v1 run.)
+        if (v >> 40) == 0x7f && (v & 0xFFFFFFFF) >= 0x10000 {
             ptrs[nr] = v;
             nr += 1;
         }
@@ -7765,6 +8022,8 @@ unsafe fn capture_iofx_chain_inputs(
     let arg_slots = match kernel_kind {
         IofxChainKind::MakeSortKeysTempl0 | IofxChainKind::MakeSortKeysTempl1 => 16,
         IofxChainKind::RemapTempl0 | IofxChainKind::RemapTempl1 => 11,
+        IofxChainKind::ActorRange => 10,
+        IofxChainKind::NewRadixSortStep => 13,
     };
     let ptrs = unsafe {
         iofx_chain_extract_ptrs(kernel_params, extra, arg_slots, IOFX_CHAIN_POINTER_COUNT)
@@ -7833,11 +8092,45 @@ unsafe fn capture_iofx_chain_ptr_regions(
     // pointer-arg layouts. Opt in with ZLUDA_IOFX_CHAIN_CAPTURE_BUFS=1
     // for short investigation runs where the early-init regression is
     // tolerable.
+    //
+    // SAMPLING (added 2026-05-11): when BUFS=1, by default snapshot every
+    // ZLUDA_IOFX_CHAIN_CAPTURE_BUFS_SAMPLE-th launch (default 64) instead
+    // of every launch — reduces stream pressure ~64× while still filling
+    // the 16-slot ring with launches spread across the entire run.
+    // Set BUFS_SAMPLE=1 to snapshot every launch (the previous behavior).
     static SNAPSHOT_BUFS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let snapshot_bufs = *SNAPSHOT_BUFS.get_or_init(|| {
         std::env::var("ZLUDA_IOFX_CHAIN_CAPTURE_BUFS").map_or(false, |v| v == "1")
     });
     if !snapshot_bufs {
+        return;
+    }
+    static SNAPSHOT_SAMPLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let sample_interval = *SNAPSHOT_SAMPLE.get_or_init(|| {
+        std::env::var("ZLUDA_IOFX_CHAIN_CAPTURE_BUFS_SAMPLE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64)
+    });
+    // The pre and post DtoDs for a given launch share the same launch_n
+    // (captured in the slot header at the slot we were just given). Reuse
+    // that for the sampling decision so pre and post stay paired.
+    let launch_n_for_slot = {
+        let guard = match IOFX_CHAIN_CAPTURE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let slot_host = unsafe {
+            state.host_ptr.add(slot_index * IOFX_CHAIN_SLOT_SIZE) as *const IofxChainCaptureSlot
+        };
+        unsafe { (*slot_host).launch_n }
+    };
+    if launch_n_for_slot % sample_interval != 0 {
         return;
     }
     let guard = match IOFX_CHAIN_CAPTURE.lock() {
@@ -8897,6 +9190,23 @@ pub(crate) fn launch_kernel(
     } else {
         None
     };
+    let cub_scan_slot = if name.contains("RadixSortScanKernel") {
+        unsafe {
+            capture_cub_scan_inputs(
+                kernel_params,
+                extra,
+                grid_dim_x,
+                grid_dim_y,
+                grid_dim_z,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z,
+                shared_mem_bytes,
+            )
+        }
+    } else {
+        None
+    };
     let iofx_chain_slot = if let Some(chain_kind) = classify_iofx_chain_kernel(&name) {
         unsafe {
             capture_iofx_chain_inputs(
@@ -9149,6 +9459,11 @@ pub(crate) fn launch_kernel(
     if let Some(slot_index) = cub_downsweep_slot {
         unsafe {
             capture_cub_downsweep_pre(slot_index, stream);
+        }
+    }
+    if let Some(slot_index) = cub_scan_slot {
+        unsafe {
+            capture_cub_scan_pre(slot_index, stream);
         }
     }
     if let Some(slot_index) = iofx_chain_slot {
@@ -11877,9 +12192,14 @@ mod tests {
     }
 
     #[test]
-    fn read_iofx_actor_range_args_rejects_zero_or_oversized_layouts() {
+    fn read_iofx_actor_range_args_rejects_zero_pointers_and_zero_count() {
+        // Note: oversized count (> IOFX_ACTOR_RANGE_MAX_COUNT) is NOT rejected
+        // anymore as of 2026-05-11; large-count launches must be captured so
+        // we can see actorRange faults in full PhysX sim. Buffer copy still
+        // caps at IOFX_ACTOR_RANGE_INPUT_BYTES via min(count*4, ...).
         let mut raw = [0u8; 72];
-        raw[12..16].copy_from_slice(&((IOFX_ACTOR_RANGE_MAX_COUNT + 1) as u32).to_le_bytes());
+        // Zero count is still rejected.
+        raw[12..16].copy_from_slice(&0u32.to_le_bytes());
         raw[24..32].copy_from_slice(&0x1111u64.to_le_bytes());
         raw[40..48].copy_from_slice(&0x2222u64.to_le_bytes());
         raw[48..56].copy_from_slice(&0x3333u64.to_le_bytes());
@@ -11899,12 +12219,21 @@ mod tests {
         }
         .is_none());
 
+        // Zero pointer is still rejected.
         raw[12..16].copy_from_slice(&16u32.to_le_bytes());
         raw[24..32].copy_from_slice(&0u64.to_le_bytes());
         assert!(unsafe {
             read_iofx_actor_range_args(std::ptr::null_mut(), extra.as_ptr().cast_mut())
         }
         .is_none());
+
+        // Previously oversized (>= 8192) — should now be ACCEPTED.
+        raw[12..16].copy_from_slice(&((IOFX_ACTOR_RANGE_MAX_COUNT + 1) as u32).to_le_bytes());
+        raw[24..32].copy_from_slice(&0x1111u64.to_le_bytes());
+        assert!(unsafe {
+            read_iofx_actor_range_args(std::ptr::null_mut(), extra.as_ptr().cast_mut())
+        }
+        .is_some());
     }
 
     #[test]
