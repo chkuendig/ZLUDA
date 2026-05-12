@@ -7811,7 +7811,7 @@ const IOFX_CHAIN_POINTER_COUNT: usize = 8;
 // 16 KB per ptr — verified 2026-05-11 that 64 KB × 8 × 2 (= 1 MB/slot, 16 MB
 // ring) consistently broke PhysX init at IOFX_volumeMigrationKernel after
 // ~90 launches across N=3 runs. At 16 KB the slot footprint drops to
-// 16 KB × 8 × 2 = 256 KB/slot, 4 MB ring. We trade off partial input
+// 16 KB × 8 × 2 = 256 KB/slot. We trade off partial input
 // captures for early-init stability — chain replay tests can re-run a
 // single captured frame, the pre/post buffer DtoD is the diagnostic, not
 // the replay payload.
@@ -7819,6 +7819,12 @@ const IOFX_CHAIN_BUFFER_BYTES: usize = 16 * 1024;
 const IOFX_CHAIN_RAW_ARGS_BYTES: usize = 512;
 const IOFX_CHAIN_NAME_BYTES: usize = 64;
 const IOFX_CHAIN_CAPTURE_MAGIC: u64 = 0x494f4658_4348414e; // "IOFXCHAN"
+// 2026-05-12 PM (bumped 128→256): cover ~16 PhysX frames of chain history.
+// With sample=16, this gives ~16 sampled slots per ring window vs ~8 at 128
+// — enough to reach further upstream to catch makeSortKeys's bit-31-or-not
+// POST data when it doesn't land on a % 16 boundary in the immediate
+// frame. 256 × 262864 ≈ 66 MB pinned, comfortable on 16 GB UMA.
+const IOFX_CHAIN_CAPTURE_SLOTS: usize = 256;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7879,7 +7885,8 @@ const IOFX_CHAIN_RAW_ARGS_OFF: usize = 208;
 const IOFX_CHAIN_PRE_PTRS_OFF: usize = IOFX_CHAIN_RAW_ARGS_OFF + IOFX_CHAIN_RAW_ARGS_BYTES;
 const IOFX_CHAIN_POST_PTRS_OFF: usize =
     IOFX_CHAIN_PRE_PTRS_OFF + IOFX_CHAIN_POINTER_COUNT * IOFX_CHAIN_BUFFER_BYTES;
-const IOFX_CHAIN_CAPTURE_TOTAL_SIZE: usize = IOFX_CHAIN_SLOT_SIZE * IOFX_CAPTURE_SLOTS;
+const IOFX_CHAIN_CAPTURE_TOTAL_SIZE: usize =
+    IOFX_CHAIN_SLOT_SIZE * IOFX_CHAIN_CAPTURE_SLOTS;
 
 struct IofxChainCaptureState {
     host_ptr: *mut u8,
@@ -7938,11 +7945,22 @@ unsafe fn iofx_chain_capture_init(state: &mut Option<IofxChainCaptureState>) {
     }
     super::driver::zluda_log_err(&format!(
         "[ZLUDA] IOFX chain capture: {} slots × {} KB = {} MB pinned; host=0x{:x} dev=0x{:x}",
-        IOFX_CAPTURE_SLOTS,
+        IOFX_CHAIN_CAPTURE_SLOTS,
         IOFX_CHAIN_SLOT_SIZE / 1024,
         IOFX_CHAIN_CAPTURE_TOTAL_SIZE / (1024 * 1024),
         host_ptr as usize,
         dev_ptr as usize,
+    ));
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] IOFX chain capture layout: SLOT_SIZE={} PRE_PTRS_OFF={} POST_PTRS_OFF={} \
+         BUFFER_BYTES={} POINTER_COUNT={} RAW_ARGS_OFF={} RAW_ARGS_BYTES={}",
+        IOFX_CHAIN_SLOT_SIZE,
+        IOFX_CHAIN_PRE_PTRS_OFF,
+        IOFX_CHAIN_POST_PTRS_OFF,
+        IOFX_CHAIN_BUFFER_BYTES,
+        IOFX_CHAIN_POINTER_COUNT,
+        IOFX_CHAIN_RAW_ARGS_OFF,
+        IOFX_CHAIN_RAW_ARGS_BYTES,
     ));
     IOFX_CHAIN_CAPTURE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::SeqCst);
     IOFX_CHAIN_CAPTURE_TOTAL_BYTES.store(
@@ -8044,7 +8062,7 @@ unsafe fn capture_iofx_chain_inputs(
 
     let this_launch = state.launch_counter;
     state.launch_counter += 1;
-    let slot_index = (this_launch as usize) % IOFX_CAPTURE_SLOTS;
+    let slot_index = (this_launch as usize) % IOFX_CHAIN_CAPTURE_SLOTS;
     let slot_host = unsafe {
         state.host_ptr.add(slot_index * IOFX_CHAIN_SLOT_SIZE) as *mut IofxChainCaptureSlot
     };
@@ -8151,20 +8169,46 @@ unsafe fn capture_iofx_chain_ptr_regions(
     } else {
         IOFX_CHAIN_POST_PTRS_OFF
     };
+    let launch_n = unsafe { (*slot_host).launch_n };
+    let kernel_kind = unsafe { (*slot_host).kernel_kind };
     for (idx, src_ptr) in unsafe { (*slot_host).ptr_params }.iter().copied().enumerate() {
         if src_ptr == 0 {
             continue;
         }
         let dst_off = base_off + idx * IOFX_CHAIN_BUFFER_BYTES;
-        unsafe {
-            let _ = hipMemcpyDtoDAsync(
+        let res = unsafe {
+            hipMemcpyDtoDAsync(
                 hipDeviceptr_t(slot_dev_base.add(dst_off) as _),
                 hipDeviceptr_t(src_ptr as _),
                 IOFX_CHAIN_BUFFER_BYTES,
                 stream,
-            );
+            )
+        };
+        if let Err(code) = res {
+            // Log the first few failures per session so we know whether
+            // DtoD is silently failing (e.g. invalid/freed src ptr,
+            // wrong context, queue wedged). Capped to avoid log spam.
+            static ERR_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 32 {
+                super::driver::zluda_log_err(&format!(
+                    "[IOFX_CHAIN] DtoD err#{} {} launch_n={} kind={} idx={} \
+                     src=0x{:x} dst=0x{:x} bytes={} err={:?}",
+                    n,
+                    if prelaunch { "PRE" } else { "POST" },
+                    launch_n,
+                    kernel_kind,
+                    idx,
+                    src_ptr,
+                    slot_dev_base as usize + dst_off,
+                    IOFX_CHAIN_BUFFER_BYTES,
+                    code,
+                ));
+            }
         }
     }
+
 }
 
 unsafe fn capture_iofx_chain_pre(slot_index: usize, stream: hipStream_t) {
@@ -12396,6 +12440,36 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<IofxActorRangeCaptureSlot>(),
             IOFX_ACTOR_RANGE_PRE_OUTPUT_328_OFF + IOFX_ACTOR_RANGE_INPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn iofx_chain_capture_slot_layout_matches_python_parser() {
+        // tools/parse_iofx_chain.py hard-codes these offsets. If they ever
+        // drift the dumped file becomes unparsable and chain capture
+        // silently returns zero data downstream.
+        assert_eq!(IOFX_CHAIN_RAW_ARGS_OFF, 208, "header bytes");
+        assert_eq!(IOFX_CHAIN_PRE_PTRS_OFF, 720, "pre_ptrs offset");
+        assert_eq!(IOFX_CHAIN_POST_PTRS_OFF, 131792, "post_ptrs offset");
+        assert_eq!(IOFX_CHAIN_SLOT_SIZE, 262864, "slot size");
+        // Also assert the offset_of of each field is what we annotated in
+        // the struct comments — repr(C) shouldn't insert padding given the
+        // u64-then-u32-then-arrays layout but pin it down.
+        assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, magic), 0);
+        assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, launch_n), 8);
+        assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, timestamp_ms), 16);
+        assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, kernel_kind), 24);
+        assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, kernel_name), 72);
+        assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, ptr_params), 136);
+        assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, ptr_buffer_bytes), 200);
+        assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, raw_args), 208);
+        assert_eq!(
+            std::mem::offset_of!(IofxChainCaptureSlot, pre_ptr_buffers),
+            720
+        );
+        assert_eq!(
+            std::mem::offset_of!(IofxChainCaptureSlot, post_ptr_buffers),
+            131792
         );
     }
 
