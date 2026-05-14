@@ -878,23 +878,219 @@ fn has_risky_bra_to_label(
         }
         if is_predicated_bra_to(prev, label_name) {
             if accum_st_shared {
-                return true;
+                // Warp-divergence discriminator (2026-05-14): only consider
+                // a bra "risky" if its predicate is computed from a
+                // warp-id derivation (`shr.u32 _, %tid.x, 5/6`). NRSS's
+                // BB20_201 bra is `setp.lt.u32 %p, %warpid, %count` →
+                // genuine cross-warp divergence → LDS merge sync needed.
+                // IOFX_bboxKernel's BB10_184 bra is `setp.eq.s32 %p, %tid.x, 0`
+                // → uniform per-warp (all threads in a warp take it
+                // together) → no race → inserting bar.sync was a false
+                // positive that caused the 2026-05-14 in-game regression.
+                // See plan validated-inventing-babbage.md Track B.
+                if is_bra_predicate_warp_divergent(lines, j, kernel_start_idx) {
+                    return true;
+                }
+                // Predicate is uniform-per-warp (lane-check, shared-mem-fed,
+                // composite `and.pred`, etc.) → SAFE to skip. Don't return
+                // true; continue scanning backward in case an EARLIER bra
+                // to the same label is warp-divergent.
             }
-            // Reset: subsequent (= earlier in source) st.shared sightings
-            // would be BEFORE this bra, so they wouldn't be in this bra's
-            // fall-through. But the same st.shared could be in an even
-            // earlier bra's fall-through. Continue without resetting and
-            // any earlier bra to this label will be considered with the
-            // accumulated state — which is correct: st.shared we see
-            // going backward is BETWEEN this bra and an earlier bra (or
-            // start of kernel). Earlier bras' fall-through CONTAINS the
-            // current bra's fall-through, so if current bra had no
-            // st.shared, earlier ones COULD still find one further back.
         }
         if j == 0 {
             break;
         }
         j -= 1;
+    }
+    false
+}
+
+/// Trace back from a conditional `bra` to determine whether its predicate
+/// is *warp-divergent* (derived from `%tid.x >> N` where N is 5 or 6) or
+/// uniform-per-warp (derived from `%tid.x` directly, shared-memory loads,
+/// or composite `and.pred`/`or.pred` chains).
+///
+/// Returns `true` ONLY for warp-divergent predicates that match the NRSS
+/// BB20_201 pattern. Returns `false` for the IOFX_bboxKernel pattern and
+/// for any predicate we can't definitively classify (conservative — better
+/// to miss a real race than to over-insert bar.sync at a uniform site
+/// where it broke the bench).
+///
+/// Search bounded to ~200 lines backward to avoid quadratic cost on huge
+/// kernels (NRSS body is ~1850 lines; the predicate def is always close
+/// to the bra).
+fn is_bra_predicate_warp_divergent(
+    lines: &[&str],
+    bra_idx: usize,
+    kernel_start_idx: usize,
+) -> bool {
+    // Extract predicate name: "@!%p6 bra LABEL;" → "%p6"
+    let bra_line = lines[bra_idx].trim();
+    let body = bra_line.trim_start_matches('@').trim_start_matches('!');
+    let pred: String = body
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    if !pred.starts_with('%') {
+        return false;
+    }
+
+    // Scan backward up to 200 lines for the setp that defined this predicate.
+    let lower = kernel_start_idx.max(bra_idx.saturating_sub(200));
+    let mut i = bra_idx;
+    while i > lower {
+        i -= 1;
+        let line = lines[i].trim().trim_end_matches(';');
+        // Composite predicate (and.pred/or.pred/not.pred) → indeterminate,
+        // be conservative and skip. NRSS's bra predicate is a direct setp;
+        // IOFX_bboxKernel's chains through and.pred. Treating composites
+        // as "unknown" matches our intent: never patch a composite.
+        if line.starts_with("and.pred ")
+            || line.starts_with("or.pred ")
+            || line.starts_with("not.pred ")
+            || line.starts_with("xor.pred ")
+        {
+            // Check that this pred line is defining OUR predicate (first operand).
+            let after_op = line.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
+            let first_operand = after_op.split(',').next().unwrap_or("").trim();
+            if first_operand == pred {
+                return false;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("setp.") {
+            // setp.<cmp>.<type> %dst, %srcA, %srcB
+            // rest = "lt.u32 %p6, %r983, %r984"
+            let after_type = match rest.split_once(char::is_whitespace) {
+                Some((_, r)) => r.trim(),
+                None => continue,
+            };
+            let operands: Vec<&str> =
+                after_type.split(',').map(|s| s.trim()).collect();
+            if operands.len() < 3 {
+                continue;
+            }
+            if operands[0] != pred {
+                continue;
+            }
+            let src_a = operands[1];
+            let src_b = operands[2];
+            return is_operand_warp_id_derived(lines, i, kernel_start_idx, src_a)
+                || is_operand_warp_id_derived(lines, i, kernel_start_idx, src_b);
+        }
+    }
+    false
+}
+
+/// Check if a setp operand register traces back (one level) to
+/// `shr.u32 _, %tid.x, 5` or `..., 6` — i.e., a warp-id computation
+/// for wave32 / wave64 sizing respectively.
+fn is_operand_warp_id_derived(
+    lines: &[&str],
+    setp_idx: usize,
+    kernel_start_idx: usize,
+    operand: &str,
+) -> bool {
+    // Immediates / non-register operands cannot be warp-id-derived.
+    if !operand.starts_with('%') {
+        return false;
+    }
+    let lower = kernel_start_idx.max(setp_idx.saturating_sub(200));
+    let mut i = setp_idx;
+    while i > lower {
+        i -= 1;
+        let line = lines[i].trim().trim_end_matches(';');
+        // Match `shr.u32 <operand>, <src>, <shift>` or `shr.s32` variant.
+        // The shift source can be `%tid.x` directly OR a register that
+        // was mov'd from `%tid.x` (NRSS's actual pattern: `mov.u32 %r1,
+        // %tid.x; ... shr.u32 %r983, %r1, 5;`). Chase mov-chains via
+        // `is_register_bound_to_tid_x`.
+        for prefix in &["shr.u32 ", "shr.s32 "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let parts: Vec<&str> =
+                    rest.split(',').map(|s| s.trim()).collect();
+                if parts.len() == 3 && parts[0] == operand {
+                    if let Ok(shift) = parts[2].parse::<u32>() {
+                        if shift == 5 || shift == 6 {
+                            return is_register_bound_to_tid_x(
+                                lines,
+                                i,
+                                kernel_start_idx,
+                                parts[1],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Match `mov.u32 <operand>, <src>` — chase one level.
+        for prefix in &["mov.u32 ", "mov.s32 ", "mov.b32 "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let parts: Vec<&str> =
+                    rest.split(',').map(|s| s.trim()).collect();
+                if parts.len() == 2 && parts[0] == operand {
+                    // Continue chasing this src by recursing on the
+                    // upstream line. One-level recursion bound to avoid
+                    // deep stacks; the typical NRSS chain is shr→setp
+                    // directly without intermediate movs anyway.
+                    return is_operand_warp_id_derived(
+                        lines,
+                        i,
+                        kernel_start_idx,
+                        parts[1],
+                    );
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Returns true if `op` is `%tid.x` directly, or is a register chain that
+/// transitively `mov`s from `%tid.x` (bounded depth ~10 to keep cost flat).
+/// NRSS uses `mov.u32 %r1, %tid.x;` once near kernel entry then uses `%r1`
+/// in `shr.u32 _, %r1, 5;` for warp-id, so we must chase the mov chain.
+fn is_register_bound_to_tid_x(
+    lines: &[&str],
+    from_idx: usize,
+    kernel_start_idx: usize,
+    op: &str,
+) -> bool {
+    if op == "%tid.x" {
+        return true;
+    }
+    if !op.starts_with('%') {
+        return false;
+    }
+    // Walk back up to ~200 lines from from_idx; chase mov chains up to
+    // 10 levels deep (defensive against arithmetic chains that aren't
+    // really tid.x).
+    let mut current = op.to_string();
+    let mut depth = 0;
+    let lower = kernel_start_idx.max(from_idx.saturating_sub(200));
+    let mut i = from_idx;
+    while depth < 10 && i > lower {
+        i -= 1;
+        let line = lines[i].trim().trim_end_matches(';');
+        for prefix in &["mov.u32 ", "mov.s32 ", "mov.b32 "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let parts: Vec<&str> =
+                    rest.split(',').map(|s| s.trim()).collect();
+                if parts.len() == 2 && parts[0] == current {
+                    if parts[1] == "%tid.x" {
+                        return true;
+                    }
+                    if parts[1].starts_with('%') {
+                        current = parts[1].to_string();
+                        depth += 1;
+                        // Reset scan from this line and keep going back
+                        // for the new register's source.
+                        continue;
+                    }
+                    return false; // mov from immediate
+                }
+            }
+        }
     }
     false
 }
@@ -2129,6 +2325,8 @@ ret;
         // ld.shared. Must insert bar.sync 0 at the merge.
         let ptx = r#".visible .entry test_k() {
 bar.sync 0;
+shr.u32 %r5, %tid.x, 5;
+setp.lt.u32 %p1, %r5, %r6;
 @!%p1 bra L_MERGE;
 st.shared.u32 [%r1], %r2;
 L_MERGE:
@@ -2149,6 +2347,8 @@ ret;
         ensure_default_on();
         let ptx = r#".visible .entry test_k() {
 bar.sync 0;
+shr.u32 %r10, %tid.x, 5;
+setp.lt.u32 %p1, %r10, %r20;
 @%p1 bra L_MERGE;
 st.shared.u32 [%r1], %r2;
 L_MERGE:
@@ -2257,8 +2457,11 @@ ret;
         // Two conditional bras to the same merge label, each with st.shared
         // in its fall-through. Should produce exactly one inserted barrier.
         let ptx = r#".visible .entry test_k() {
+shr.u32 %r10, %tid.x, 5;
+setp.lt.u32 %p1, %r10, %r20;
 @!%p1 bra L_MERGE;
 st.shared.u32 [%r1], %r2;
+setp.lt.u32 %p2, %r10, %r21;
 @%p2 bra L_MERGE;
 st.shared.u32 [%r3], %r4;
 L_MERGE:
@@ -2285,6 +2488,8 @@ ret;
         // looked clean).
         ensure_default_on();
         let ptx = r#".visible .entry test_k() {
+shr.u32 %r10, %tid.x, 5;
+setp.lt.u32 %p1, %r10, %r20;
 @!%p1 bra L_MERGE;
 st.shared.u32 [%r1], %r2;
 L_MERGE:
@@ -2308,6 +2513,8 @@ ret;
         // store too.
         ensure_default_on();
         let ptx = r#".visible .entry test_k() {
+shr.u32 %r10, %tid.x, 5;
+setp.lt.u32 %p1, %r10, %r20;
 @!%p1 bra L_MERGE;
 st.volatile.shared.u32 [%r1], %r2;
 L_MERGE:
@@ -2316,6 +2523,161 @@ ret;
 }
 "#;
         let patched = patch_divergent_lds_merge_sync(ptx).expect("should patch (volatile st)");
+        assert!(patched.contains("bar.sync 0;\nld.shared"));
+    }
+
+    // ===== Warp-divergence discriminator tests (2026-05-14) =====
+    // The synthetic NRSS race is real, but the v1 generic pattern detector
+    // over-matched uniform-per-warp predicates in IOFX_bbox/sprite/modifier
+    // kernels, causing in-game regression. These tests enforce that the
+    // tightened pattern detector ONLY fires on warp-id-derived predicates.
+
+    #[test]
+    fn divergent_sync_fires_on_warp_id_predicate_nrss_style() {
+        ensure_default_on();
+        // NRSS BB20_201 pattern: `setp.lt.u32 %p, %warpid, %active_warps`
+        // where %warpid is `shr.u32 %_, %tid.x, 5`. Cross-warp divergent.
+        let ptx = r#".visible .entry test_k() {
+shr.u32 %r983, %tid.x, 5;
+setp.lt.u32 %p6, %r983, %r984;
+@!%p6 bra L_MERGE;
+st.shared.u32 [%r1], %r2;
+L_MERGE:
+ld.shared.u32 %r3, [%r4];
+ret;
+}
+"#;
+        let patched = patch_divergent_lds_merge_sync(ptx).expect("warp-id-derived bra must patch");
+        assert!(patched.contains("// ZLUDA divergent-LDS-write merge sync\nbar.sync 0;\nld.shared"));
+    }
+
+    #[test]
+    fn divergent_sync_fires_on_wave64_warp_id_shift_6() {
+        ensure_default_on();
+        // Wave64 variant: warpid = tid.x >> 6.
+        let ptx = r#".visible .entry test_k() {
+shr.u32 %r10, %tid.x, 6;
+setp.lt.u32 %p1, %r10, %r20;
+@!%p1 bra L_MERGE;
+st.shared.u32 [%r1], %r2;
+L_MERGE:
+ld.shared.u32 %r3, [%r4];
+ret;
+}
+"#;
+        let patched = patch_divergent_lds_merge_sync(ptx).expect("wave64 (>>6) must also match");
+        assert!(patched.contains("bar.sync 0;\nld.shared"));
+    }
+
+    #[test]
+    fn divergent_sync_skips_on_tid_zero_predicate_bbox_style() {
+        ensure_default_on();
+        // IOFX_bboxKernel BB10_184 pattern: tid.x == 0 check — uniform per
+        // warp (all threads in a warp take the bra together).
+        let ptx = r#".visible .entry test_k() {
+setp.eq.s32 %p117, %tid.x, 0;
+@!%p117 bra L_MERGE;
+st.shared.u32 [%r1], %r2;
+L_MERGE:
+ld.shared.u32 %r3, [%r4];
+ret;
+}
+"#;
+        assert!(
+            patch_divergent_lds_merge_sync(ptx).is_none(),
+            "uniform tid==0 predicate must NOT patch (was the in-game regression cause)"
+        );
+    }
+
+    #[test]
+    fn divergent_sync_skips_on_composite_and_pred() {
+        ensure_default_on();
+        // IOFX_bboxKernel's actual chain: bra → @!%p121, where %p121 is
+        // and.pred composite of multiple inner predicates. Composite
+        // predicates are indeterminate — be conservative and skip.
+        let ptx = r#".visible .entry test_k() {
+setp.eq.s32 %p117, %tid.x, 0;
+setp.eq.s32 %p118, %r722, -1;
+and.pred %p119, %p117, %p118;
+ld.volatile.shared.u32 %r723, [%r_addr];
+setp.ne.s32 %p120, %r723, -1;
+and.pred %p121, %p119, %p120;
+@!%p121 bra L_MERGE;
+st.shared.u32 [%r1], %r2;
+L_MERGE:
+ld.shared.u32 %r3, [%r4];
+ret;
+}
+"#;
+        assert!(
+            patch_divergent_lds_merge_sync(ptx).is_none(),
+            "composite and.pred predicate must NOT patch"
+        );
+    }
+
+    #[test]
+    fn divergent_sync_skips_on_shared_mem_fed_predicate() {
+        ensure_default_on();
+        // A setp fed by ld.shared/ld.const/ld.global is uniform per warp
+        // (assuming the loaded value is wave-uniform, which it typically
+        // is for the bbox-class pattern). Conservative: skip.
+        let ptx = r#".visible .entry test_k() {
+ld.shared.u32 %r5, [%r_addr];
+setp.eq.s32 %p1, %r5, -1;
+@!%p1 bra L_MERGE;
+st.shared.u32 [%r10], %r11;
+L_MERGE:
+ld.shared.u32 %r3, [%r4];
+ret;
+}
+"#;
+        assert!(
+            patch_divergent_lds_merge_sync(ptx).is_none(),
+            "shared-mem-fed predicate must NOT patch"
+        );
+    }
+
+    #[test]
+    fn divergent_sync_fires_when_shr_source_is_mov_of_tid_x() {
+        ensure_default_on();
+        // This is the ACTUAL NRSS pattern: mov.u32 %r1, %tid.x;
+        // ... shr.u32 %r983, %r1, 5; — the shr source is NOT %tid.x
+        // directly but a register that mov'd from %tid.x. Discriminator
+        // must chase the mov chain.
+        let ptx = r#".visible .entry test_k() {
+mov.u32 %r1, %tid.x;
+shr.u32 %r983, %r1, 5;
+setp.lt.u32 %p6, %r983, %r984;
+@!%p6 bra L_MERGE;
+st.shared.u32 [%r1], %r2;
+L_MERGE:
+ld.shared.u32 %r3, [%r4];
+ret;
+}
+"#;
+        let patched = patch_divergent_lds_merge_sync(ptx)
+            .expect("shr source via mov-chain from %tid.x must still patch (NRSS pattern)");
+        assert!(patched.contains("bar.sync 0;\nld.shared"));
+    }
+
+    #[test]
+    fn divergent_sync_chases_one_mov_to_find_warp_id() {
+        ensure_default_on();
+        // A `mov` between `shr.u32 ..., %tid.x, 5` and the setp should
+        // still resolve to warp-id-derived.
+        let ptx = r#".visible .entry test_k() {
+shr.u32 %r99, %tid.x, 5;
+mov.u32 %r100, %r99;
+setp.lt.u32 %p1, %r100, %r200;
+@!%p1 bra L_MERGE;
+st.shared.u32 [%r1], %r2;
+L_MERGE:
+ld.shared.u32 %r3, [%r4];
+ret;
+}
+"#;
+        let patched = patch_divergent_lds_merge_sync(ptx)
+            .expect("warp-id via single mov chain must still patch");
         assert!(patched.contains("bar.sync 0;\nld.shared"));
     }
 
