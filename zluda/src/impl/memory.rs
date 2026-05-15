@@ -213,15 +213,26 @@ pub(crate) unsafe fn alloc_v2(dptr: &mut hipDeviceptr_t, bytesize: usize) -> CUr
     let cu_context = context::get_current_context()?;
     let context: &context::Context = FromCuda::<_, CUerror>::from_cuda(&cu_context)?;
     let vram_before = vram_used_bytes();
-    // Round up to 16-byte boundary to provide headroom for vectorized over-reads.
+    // Round up to provide headroom for vectorized over-reads.
     // CUDA kernels (e.g. PhysX radix sort) use ld.global.v4.u32 to load 4 elements
     // (16 bytes) at a time. When the element count isn't a multiple of 4, the last
     // load reads 1-3 elements past the allocation. On NVIDIA, 2MB page granularity
     // makes this safe. On AMD with 4KB pages, it can cross into unmapped memory.
-    // 16 bytes covers exactly one v4.u32 vector load — the previous 256-byte pad
-    // was 16x the minimum and is being bisected as a possible suspect for the
-    // TurbulenceFS-zeros-counter cross-allocation corruption (see plan B.2).
-    let alloc_size = (bytesize + 15) & !15;
+    //
+    // 2026-05-15 v6 experiment: env-gated alignment.
+    //   ZLUDA_ALLOC_PAD=N → round up to N-byte boundary (N must be power-of-2).
+    //   Default 16 bytes (one v4.u32). Try 256 to re-test the prior bisection
+    //   suspect for TurbulenceFS-zeros-counter cross-allocation corruption.
+    static PAD_MINUS_1: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let pad = *PAD_MINUS_1.get_or_init(|| {
+        std::env::var("ZLUDA_ALLOC_PAD")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n.is_power_of_two() && n >= 16)
+            .map(|n| n - 1)
+            .unwrap_or(15)
+    });
+    let alloc_size = (bytesize + pad) & !pad;
     hipMalloc(ptr::from_mut(dptr).cast(), alloc_size)?;
     log_vram_delta("hipMalloc", vram_before, vram_used_bytes(), alloc_size);
     fill_with_zero_and_register(cu_context, context, dptr, alloc_size)?;

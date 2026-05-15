@@ -1644,7 +1644,18 @@ pub(crate) fn get_export_table(
 }
 
 pub(crate) fn get_version(version: &mut ::core::ffi::c_int) -> CUresult {
-    *version = cuda_types::cuda::CUDA_VERSION as i32;
+    // 2026-05-15 Plan v6 Step C-bis: env-override for CUDA version reporting.
+    // Default CUDA_VERSION=13000 is CUDA 13.0; PhysX-3.4 / APEX 1.4 (Batman: AK)
+    // was compiled against CUDA 8.0 era and may take wrong code paths when
+    // queried for a much-newer version. ZLUDA_CUDA_VERSION=8000 forces CUDA 8.0
+    // reporting for A/B testing.
+    static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let v = *OVERRIDE.get_or_init(|| {
+        std::env::var("ZLUDA_CUDA_VERSION")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+    });
+    *version = v.unwrap_or(cuda_types::cuda::CUDA_VERSION) as i32;
     zluda_log(&format!("[ZLUDA] cuDriverGetVersion -> {}", *version));
     Ok(())
 }

@@ -9075,19 +9075,21 @@ pub(crate) fn launch_kernel(
     if name.contains("CreateParticleShapesIncremental_MultiStage_4") {
         unsafe {
             let n: u32 = read_kernel_arg(kernel_params, extra, 24, 3).unwrap_or(0);
+            let p2: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
             let p4: u64 = read_kernel_arg(kernel_params, extra, 32, 4).unwrap_or(0);
             let p5: u64 = read_kernel_arg(kernel_params, extra, 40, 5).unwrap_or(0);
             let p6: u64 = read_kernel_arg(kernel_params, extra, 48, 6).unwrap_or(0);
             let p7: u64 = read_kernel_arg(kernel_params, extra, 56, 7).unwrap_or(0);
             static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Log every MS_4 kernel arg set. rocgdb parses the LAST one of
-            // these from /tmp/zluda_tex.log at the crash breakpoint — so
-            // we're not racing the HIP runtime's buffered trace flush.
             super::driver::zluda_log_err(&format!(
-                "MS4_ARGS #{} n={} p4=0x{:x} p5=0x{:x} p6=0x{:x} p7=0x{:x}",
-                call_n, n, p4, p5, p6, p7
+                "MS4_ARGS #{} n={} p2=0x{:x} p4=0x{:x} p5=0x{:x} p6=0x{:x} p7=0x{:x}",
+                call_n, n, p2, p4, p5, p6, p7
             ));
+            // p2=flags is just logged (no buffer read — avoid D2H from launch
+            // path per feedback_no_d2d_from_launch_kernel). The address itself
+            // shows whether flags is stable across frames (per-actor static)
+            // and lets us correlate with addresses written by upstream kernels.
             if let Ok(table) = super::memory::SMALL_HOST_ALLOCS.lock() {
                 // Legacy dump: first 16 u32s of every tracked buffer (unchanged
                 // behavior for small host counters we've been relying on).
@@ -9583,6 +9585,13 @@ pub(crate) fn launch_kernel(
             )
         }
     };
+    // 2026-05-15 Plan v6 Step C: mark "first real launch seen" so that
+    // cuStreamQuery(NULL) stops returning the startup-mask NotReady and
+    // starts passing through real hipStreamQuery results.
+    if result.is_ok() {
+        super::stream::FIRST_REAL_LAUNCH_SEEN
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     // Translate HIP error 719 (LaunchFailure) → LaunchOutOfResources.
     // On NVIDIA, launching with too many threads returns CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES (701),
     // which CUDA apps handle by reducing block size and retrying. HIP returns 719 (LAUNCH_FAILURE)

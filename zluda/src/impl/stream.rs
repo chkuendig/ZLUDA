@@ -20,7 +20,15 @@ pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
 
 fn strict_null_stream_barrier_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("ZLUDA_NULL_STREAM_STRICT").map_or(false, |v| v == "1"))
+    *ENABLED.get_or_init(|| {
+        let raw = std::env::var("ZLUDA_NULL_STREAM_STRICT").ok();
+        let v = raw.as_deref().map_or(false, |s| s == "1");
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] ZLUDA_NULL_STREAM_STRICT env={:?} → strict={}",
+            raw, v
+        ));
+        v
+    })
 }
 
 fn null_stream_uses_global_lock(stream: hipStream_t, strict: bool) -> bool {
@@ -78,6 +86,27 @@ pub(crate) fn null_stream_sync(stream: hipStream_t) -> NullStreamGuard {
     }
 }
 
+/// 2026-05-15 Plan v6 Step A: NULL-stream barrier for cuEventRecord and
+/// cuStreamWaitEvent. Per NVIDIA docs, NULL-stream actions (including
+/// kernel launches, cuEventRecord, cuStreamWaitEvent) first wait on all
+/// blocking streams. HIP doesn't enforce this. We provide the
+/// pre-action sync via the same null_stream_sync mechanism.
+///
+/// Env-disable with `ZLUDA_NULL_STREAM_BARRIER=0` for A/B testing.
+/// Default ON (matches CUDA spec).
+pub(crate) fn null_stream_sync_for_event(stream: hipStream_t) -> NullStreamGuard {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let disabled = *DISABLED
+        .get_or_init(|| std::env::var("ZLUDA_NULL_STREAM_BARRIER").map_or(false, |v| v == "0"));
+    if disabled || !stream.0.is_null() {
+        return NullStreamGuard {
+            guard: None,
+            post_sync: false,
+        };
+    }
+    null_stream_sync(stream)
+}
+
 pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
     super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize({:?})", stream));
     let result = unsafe { hipStreamSynchronize(stream) };
@@ -105,9 +134,13 @@ pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
 }
 
 pub(crate) fn create(stream: *mut hipStream_t, flags: ::core::ffi::c_uint) -> hipError_t {
-    super::driver::zluda_log(&format!("[ZLUDA] cuStreamCreate(flags={})", flags));
     let result = unsafe { hipStreamCreateWithFlags(stream, flags) };
-    super::driver::zluda_log(&format!("[ZLUDA] cuStreamCreate -> {:?}", result));
+    super::driver::zluda_log_err(&format!(
+        "cuStreamCreate(flags={:#x}) -> {:?} stream={:?}",
+        flags,
+        result,
+        unsafe { *stream }
+    ));
     result
 }
 
@@ -184,15 +217,48 @@ pub(crate) fn get_capture_info_v3(
 
 static QUERY_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// 2026-05-15 Plan v6 Step C: track whether PhysX has launched its first real
+/// kernel. Before the first launch, return NotReady for cuStreamQuery(NULL)
+/// to keep PhysX's dispatch loop alive during startup (the original masking
+/// rationale). AFTER first launch, pass through the real hipStreamQuery
+/// result — matches NVIDIA CUDA spec ("all operations in the stream have
+/// completed"; for NULL legacy stream, that means all blocking-stream work).
+pub(crate) static FIRST_REAL_LAUNCH_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn query(stream: hipStream_t) -> hipError_t {
     let hip_result = unsafe { hipStreamQuery(stream) };
     // PhysX uses cuStreamQuery(NULL) as a push-buffer flush / dispatch heartbeat.
-    // On real NVIDIA, this returns NOT_READY when there's pending GPU work.
-    // Our dispatch loop runs too fast (no real kernels), causing PhysX to
-    // decide "no GPU work needed" and tear down GPU before APEX creates actors.
-    // Always return NOT_READY for NULL stream to keep the dispatch loop alive.
+    // On real NVIDIA, this returns NOT_READY when there's pending GPU work and
+    // SUCCESS when idle. Our previous behavior was hardcoded NotReady (poisoned
+    // PhysX dispatch logic). Now: NotReady ONLY before first real launch
+    // (PhysX startup race), then real result.
+    //
+    // Env overrides:
+    //   ZLUDA_STREAM_QUERY_LEGACY=1 → restore old always-NotReady behavior
+    //   ZLUDA_STREAM_QUERY_REAL=1 → always pass through real result (no startup mask)
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        if std::env::var("ZLUDA_STREAM_QUERY_REAL").map_or(false, |v| v == "1") {
+            2 // always-real
+        } else if std::env::var("ZLUDA_STREAM_QUERY_LEGACY").map_or(false, |v| v == "1") {
+            0 // always-NotReady (old behavior)
+        } else {
+            1 // refined: NotReady before first launch, real after
+        }
+    });
     let returned = if stream.0.is_null() {
-        Err(hipErrorCode_t::NotReady)
+        match mode {
+            0 => Err(hipErrorCode_t::NotReady),
+            2 => hip_result,
+            _ => {
+                if !FIRST_REAL_LAUNCH_SEEN.load(std::sync::atomic::Ordering::Acquire) {
+                    Err(hipErrorCode_t::NotReady)
+                } else {
+                    hip_result
+                }
+            }
+        }
     } else {
         hip_result
     };
@@ -220,7 +286,21 @@ pub(crate) fn wait_event(
     event: hipEvent_t,
     flags: ::core::ffi::c_uint,
 ) -> hipError_t {
-    unsafe { hipStreamWaitEvent(stream, event, flags) }
+    // CUDA NULL-stream semantics (NVIDIA docs verified 2026-05-15):
+    // "When an action is taken in the legacy stream such as a kernel launch
+    // or cudaStreamWaitEvent(), the legacy stream first waits on all blocking
+    // streams, the action is queued in the legacy stream, and then all
+    // blocking streams wait on the legacy stream."
+    //
+    // HIP doesn't enforce the pre-action global barrier. Use null_stream_sync
+    // (env-disable via ZLUDA_NULL_STREAM_BARRIER=0).
+    let _guard = null_stream_sync_for_event(stream);
+    let r = unsafe { hipStreamWaitEvent(stream, event, flags) };
+    super::driver::zluda_log_err(&format!(
+        "cuStreamWaitEvent(stream={:?}, event={:?}, flags={:#x}) -> {:?}",
+        stream, event, flags, r
+    ));
+    r
 }
 
 #[cfg(test)]

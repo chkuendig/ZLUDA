@@ -73,6 +73,17 @@ pub(crate) unsafe fn destroy_v2(event: hipEvent_t) -> hipError_t {
 }
 
 pub(crate) unsafe fn record(event: hipEvent_t, stream: hipStream_t) -> hipError_t {
+    // CUDA NULL-stream semantics (verified against NVIDIA docs 2026-05-15):
+    // "When an action is taken in the legacy stream such as a kernel launch
+    // or cudaStreamWaitEvent(), the legacy stream first waits on all blocking
+    // streams, the action is queued in the legacy stream, and then all
+    // blocking streams wait on the legacy stream." cuEventRecord on NULL
+    // qualifies as an action on the legacy stream.
+    //
+    // HIP does NOT enforce this. We reuse null_stream_sync (which
+    // hipDeviceSynchronize's on NULL stream) to add the pre-action barrier.
+    // Env-disable with ZLUDA_NULL_STREAM_BARRIER=0 for A/B testing.
+    let _guard = super::stream::null_stream_sync_for_event(stream);
     let result = hipEventRecord(event, stream);
     super::driver::zluda_log_err(&format!(
         "cuEventRecord(event={:?}, stream={:?}) -> {:?}",
@@ -94,6 +105,8 @@ pub(crate) unsafe fn record_with_flags(
         return hipError_t::ErrorInvalidValue;
     }
 
+    // Same NULL-stream barrier as cuEventRecord above.
+    let _guard = super::stream::null_stream_sync_for_event(stream);
     hipEventRecord(event, stream)
 }
 
