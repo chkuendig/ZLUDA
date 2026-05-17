@@ -6112,6 +6112,141 @@ fn counter_snapshot_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_COUNTER_SNAPSHOT").map_or(false, |v| v == "1"))
 }
 
+// 2026-05-16 v7 Step 4: shape_table probe — D2D from shape_table to a
+// host-mapped scratch before MS_2_Batched launches. Captures the input
+// state MS_2_Batched will read at offset +8 of each 12-byte stride entry.
+// Gated on ZLUDA_SHAPE_TABLE_PROBE=1.
+//
+// Reuses the counter_snapshot pattern: hipHostMalloc(Mapped) +
+// hipHostGetDevicePointer + hipMemcpyDtoD + hipDeviceSynchronize.
+
+const SHAPE_PROBE_BYTES: usize = 384; // 32 entries × 12 bytes (covers field0..8)
+
+fn shape_table_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_SHAPE_TABLE_PROBE").map_or(false, |v| v == "1"))
+}
+
+struct ShapeProbeState {
+    scratch_host: *mut u8,
+    scratch_dev: *mut std::ffi::c_void,
+    last_bytes: [u8; SHAPE_PROBE_BYTES],
+    last_ptr: u64,
+    launch_n: u64,
+}
+unsafe impl Send for ShapeProbeState {}
+unsafe impl Sync for ShapeProbeState {}
+
+static SHAPE_PROBE: Mutex<Option<ShapeProbeState>> = Mutex::new(None);
+
+unsafe fn shape_probe_init(state: &mut Option<ShapeProbeState>) {
+    if state.is_some() {
+        return;
+    }
+    let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let alloc_result =
+        unsafe { hipHostMalloc(&mut host_ptr, SHAPE_PROBE_BYTES, hipHostMallocMapped) };
+    if alloc_result.is_err() || host_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] shape probe: hipHostMalloc({}) failed: {:?}",
+            SHAPE_PROBE_BYTES, alloc_result
+        ));
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, SHAPE_PROBE_BYTES);
+    }
+    let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
+    if map_result.is_err() || dev_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] shape probe: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] shape probe: scratch={} B pinned; host=0x{:x} dev=0x{:x}",
+        SHAPE_PROBE_BYTES, host_ptr as usize, dev_ptr as usize,
+    ));
+    *state = Some(ShapeProbeState {
+        scratch_host: host_ptr as *mut u8,
+        scratch_dev: dev_ptr,
+        last_bytes: [0u8; SHAPE_PROBE_BYTES],
+        last_ptr: 0,
+        launch_n: 0,
+    });
+}
+
+/// Snapshot shape_table state by D2D'ing from `shape_ptr` to our pinned
+/// scratch, then logging via host alias. Called from launch_kernel just
+/// before MS_4 fires (so we capture exactly what MS_4 sees AFTER MS_2_Batched
+/// ran — and indirectly, what MS_2_Batched processed at offset +8).
+unsafe fn snapshot_shape_table_before_ms4(shape_ptr: u64) {
+    if !shape_table_probe_enabled() || shape_ptr == 0 {
+        return;
+    }
+    let mut guard = match SHAPE_PROBE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    shape_probe_init(&mut guard);
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    if state.last_ptr != shape_ptr {
+        state.last_bytes = [0u8; SHAPE_PROBE_BYTES];
+        state.last_ptr = shape_ptr;
+    }
+    state.launch_n += 1;
+    let n = state.launch_n;
+
+    let copy_result = hipMemcpyDtoD(
+        hipDeviceptr_t(state.scratch_dev),
+        hipDeviceptr_t(shape_ptr as _),
+        SHAPE_PROBE_BYTES,
+    );
+    if copy_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "[SHAPE] snapshot D2D failed for ptr=0x{:x}: {:?}",
+            shape_ptr, copy_result
+        ));
+        return;
+    }
+    let _ = hipDeviceSynchronize();
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+    let cur_slice: &[u8] =
+        std::slice::from_raw_parts(state.scratch_host, SHAPE_PROBE_BYTES);
+    if cur_slice == state.last_bytes {
+        return; // no change since last snapshot for this ptr
+    }
+    // Log the .field8 (offset +8 within each 12-byte stride) of the
+    // first 32 entries as i32 — that's the value MS_2_Batched reads.
+    let mut field8s = String::with_capacity(256);
+    field8s.push('[');
+    let base = state.scratch_host as *const u8;
+    for i in 0..32 {
+        if i > 0 {
+            field8s.push(',');
+        }
+        let v: i32 = std::ptr::read_unaligned(base.add(i * 12 + 8) as *const i32);
+        field8s.push_str(&v.to_string());
+    }
+    field8s.push(']');
+    super::driver::zluda_log_err(&format!(
+        "[SHAPE PROBE] launch_n={} shape_ptr=0x{:x} field8[0..32]={}",
+        n, shape_ptr, field8s
+    ));
+    state.last_bytes.copy_from_slice(cur_slice);
+}
+
 /// Most recently observed MS_4 counter pointer (kp[7]). Updated by
 /// `latch_counter_ptr_from_ms4` immediately before each MS_4 launch, read
 /// by `snapshot_counter_after_launch` after every other launch. 0 = unset.
@@ -6128,6 +6263,361 @@ unsafe impl Send for CounterSnapshotState {}
 unsafe impl Sync for CounterSnapshotState {}
 
 static COUNTER_SNAPSHOT: Mutex<Option<CounterSnapshotState>> = Mutex::new(None);
+
+// 2026-05-16 v7 Step 6: flag-count probe — D2D the flags buffer slice
+// MS_4 will read, then count bits matching `(flags & 0x11) == 1` to verify
+// the OVERCOUNT hypothesis. Compare against sum(counters); should be equal
+// on NVIDIA, larger on ZLUDA if InitColl writes too many flag=1 bits.
+//
+// Gated on ZLUDA_FLAG_COUNT_PROBE=1. Scratch is fixed 1 MB (256K u32) —
+// for 4-byte-stride flags arrays of up to 256K elements (largest seen
+// ~62K, so plenty of headroom). Larger writes truncated.
+
+const FLAG_PROBE_BYTES: usize = 1024 * 1024;
+
+fn flag_count_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_FLAG_COUNT_PROBE").map_or(false, |v| v == "1"))
+}
+
+struct FlagProbeState {
+    scratch_host: *mut u8,
+    scratch_dev: *mut std::ffi::c_void,
+    launch_n: u64,
+}
+unsafe impl Send for FlagProbeState {}
+unsafe impl Sync for FlagProbeState {}
+
+static FLAG_PROBE: Mutex<Option<FlagProbeState>> = Mutex::new(None);
+
+unsafe fn flag_probe_init(state: &mut Option<FlagProbeState>) {
+    if state.is_some() {
+        return;
+    }
+    let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let alloc_result =
+        unsafe { hipHostMalloc(&mut host_ptr, FLAG_PROBE_BYTES, hipHostMallocMapped) };
+    if alloc_result.is_err() || host_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] flag probe: hipHostMalloc({}) failed: {:?}",
+            FLAG_PROBE_BYTES, alloc_result
+        ));
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, FLAG_PROBE_BYTES);
+    }
+    let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let map_result = unsafe { hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0) };
+    if map_result.is_err() || dev_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] flag probe: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        unsafe {
+            let _ = hipHostFree(host_ptr);
+        }
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] flag probe: scratch={} KB pinned; host=0x{:x} dev=0x{:x}",
+        FLAG_PROBE_BYTES / 1024, host_ptr as usize, dev_ptr as usize,
+    ));
+    *state = Some(FlagProbeState {
+        scratch_host: host_ptr as *mut u8,
+        scratch_dev: dev_ptr,
+        launch_n: 0,
+    });
+}
+
+/// Generic flag-count probe. Copies up to `n_threads * 4` bytes from
+/// `flags_ptr` to pinned scratch, then counts bits matching MS_4's
+/// filter `(flag & 0x11) == 1`. Logs with `label` prefix to
+/// distinguish call sites (pre-MS_4 vs pre-InitColl).
+///
+/// flags is u16 per element with 4-byte STRIDE (MS_4 PTX:
+/// `mul.wide.u32 %rd8, %r1, 4; ... ld.global.u16 [%rd9]`).
+unsafe fn snapshot_flag_count_at(
+    label: &str,
+    flags_ptr: u64,
+    n_threads: u32,
+    extra_ptr: u64,
+) {
+    if !flag_count_probe_enabled() || flags_ptr == 0 || n_threads == 0 {
+        return;
+    }
+    let bytes = (n_threads as usize).saturating_mul(4).min(FLAG_PROBE_BYTES);
+    let mut guard = match FLAG_PROBE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    flag_probe_init(&mut guard);
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+    state.launch_n += 1;
+    let n = state.launch_n;
+
+    let copy_result = hipMemcpyDtoD(
+        hipDeviceptr_t(state.scratch_dev),
+        hipDeviceptr_t(flags_ptr as _),
+        bytes,
+    );
+    if copy_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "[FLAG PROBE {}] D2D failed for flags=0x{:x}: {:?}",
+            label, flags_ptr, copy_result
+        ));
+        return;
+    }
+    let _ = hipDeviceSynchronize();
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+    let mut count_pass: u32 = 0;
+    let mut count_zero: u32 = 0;
+    let mut count_set_any: u32 = 0;
+    let base = state.scratch_host as *const u8;
+    for i in 0..n_threads as usize {
+        let f: u16 = std::ptr::read_unaligned(base.add(i * 4) as *const u16);
+        if f == 0 {
+            count_zero += 1;
+        }
+        if f != 0 {
+            count_set_any += 1;
+        }
+        if (f & 0x11) == 1 {
+            count_pass += 1;
+        }
+    }
+    super::driver::zluda_log_err(&format!(
+        "[FLAG PROBE {}] launch_n={} flags=0x{:x} extra=0x{:x} n_threads={} pass={} zero={} set_any={}",
+        label, n, flags_ptr, extra_ptr, n_threads, count_pass, count_zero, count_set_any
+    ));
+}
+
+unsafe fn snapshot_flag_count_before_ms4(flags_ptr: u64, n_threads: u32, counter_ptr: u64) {
+    snapshot_flag_count_at("PRE_MS4", flags_ptr, n_threads, counter_ptr)
+}
+
+/// Pre-InitColl flag probe. Called from launch_kernel hook when
+/// InitCollDataAndApplyConstraints fires. InitColl's flags ptr is
+/// param_3 (DEV3 in KARG_LOG). n_threads = grid_dim_x * block_dim_x.
+unsafe fn snapshot_flag_count_before_initcoll(flags_ptr: u64, n_threads: u32) {
+    snapshot_flag_count_at("PRE_INITCOLL", flags_ptr, n_threads, 0)
+}
+
+/// 2026-05-16 v8 Step 3: latched MS_4 flags ptr + n_threads, set from
+/// MS_4 launch hook. Used by post-MS_1 probe to count bit-4-set on
+/// the SAME buffer MS_4 will read.
+static MS4_FLAGS_PTR_LATCHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MS4_N_LATCHED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// 2026-05-16 v11 Step 2: MS_1 gate-trace buffer.
+/// Per-kernel-name PTX instrumentation (allowed per user clarification 2026-05-16)
+/// inserted at MS_1 entry's bit-4-set gate (module_10:2122-2128). Counts
+/// per-thread predicate outcomes into 4 atomic counters:
+///   [0]:  count of threads with %r178 == 0
+///   [4]:  count of threads with %r178 != 0 AND [SPL+16] == 0
+///   [8]:  count of threads with %r178 != 0 AND [SPL+16] != 0 (bit-4 fires)
+///   [12]: total threads reaching the gate
+///
+/// Patch_ms1_gate_trace in module.rs takes the dev_ptr value and
+/// substitutes it as a literal in the PTX. Gated on ZLUDA_MS1_GATE_TRACE=1.
+const MS1_GATE_TRACE_BYTES: usize = 16;
+static MS1_GATE_TRACE_HOST_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static MS1_GATE_TRACE_DEV_PTR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MS1_GATE_TRACE_DUMP_TICK: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn ms1_gate_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_MS1_GATE_TRACE").map_or(false, |v| v == "1"))
+}
+
+/// Initialize the trace buffer; idempotent. Returns the DEVICE pointer
+/// to embed as a PTX literal, or 0 on failure.
+pub(crate) fn ms1_gate_trace_get_or_init_dev_ptr() -> u64 {
+    if !ms1_gate_trace_enabled() {
+        return 0;
+    }
+    let cached = MS1_GATE_TRACE_DEV_PTR.load(std::sync::atomic::Ordering::Acquire);
+    if cached != 0 {
+        return cached;
+    }
+    unsafe {
+        let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let alloc =
+            hipHostMalloc(&mut host_ptr, MS1_GATE_TRACE_BYTES, hipHostMallocMapped);
+        if alloc.is_err() || host_ptr.is_null() {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] ms1_gate_trace: hipHostMalloc failed: {:?}",
+                alloc
+            ));
+            return 0;
+        }
+        std::ptr::write_bytes(host_ptr as *mut u8, 0, MS1_GATE_TRACE_BYTES);
+        let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let map = hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0);
+        if map.is_err() || dev_ptr.is_null() {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] ms1_gate_trace: hipHostGetDevicePointer failed: {:?}",
+                map
+            ));
+            let _ = hipHostFree(host_ptr);
+            return 0;
+        }
+        MS1_GATE_TRACE_HOST_PTR.store(host_ptr as usize, std::sync::atomic::Ordering::Release);
+        MS1_GATE_TRACE_DEV_PTR.store(dev_ptr as u64, std::sync::atomic::Ordering::Release);
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] ms1_gate_trace: scratch={} B pinned; host=0x{:x} dev=0x{:x}",
+            MS1_GATE_TRACE_BYTES, host_ptr as usize, dev_ptr as usize
+        ));
+        dev_ptr as u64
+    }
+}
+
+/// Dump + reset the trace counters. Called after every Nth MS_1 launch
+/// (gated on ZLUDA_MS1_GATE_TRACE=1).
+unsafe fn ms1_gate_trace_dump_and_reset() {
+    if !ms1_gate_trace_enabled() {
+        return;
+    }
+    let host_ptr = MS1_GATE_TRACE_HOST_PTR.load(std::sync::atomic::Ordering::Acquire);
+    if host_ptr == 0 {
+        return;
+    }
+    let tick = MS1_GATE_TRACE_DUMP_TICK
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Sync to ensure prior atomic writes are visible
+    let _ = hipDeviceSynchronize();
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    let bucket = host_ptr as *mut u32;
+    let r178_zero = std::ptr::read_volatile(bucket);
+    let state_zero = std::ptr::read_volatile(bucket.add(1));
+    let bit4_fires = std::ptr::read_volatile(bucket.add(2));
+    let total = std::ptr::read_volatile(bucket.add(3));
+    super::driver::zluda_log_err(&format!(
+        "[MS1_GATE_TRACE] tick={} r178_zero={} state_zero={} bit4_fires={} total={}",
+        tick, r178_zero, state_zero, bit4_fires, total
+    ));
+    // Reset
+    std::ptr::write_volatile(bucket, 0);
+    std::ptr::write_volatile(bucket.add(1), 0);
+    std::ptr::write_volatile(bucket.add(2), 0);
+    std::ptr::write_volatile(bucket.add(3), 0);
+}
+
+/// 2026-05-16 v10 Step 1: Probe MS_1's pool counter at `[pool_ptr + 22176]`.
+/// MS_1 atomically increments this counter to reserve slots; if it stays
+/// saturated (>= 924), all MS_1 allocations fail → bit-4 never set →
+/// MS_4 wild scatter (per project_rd5_22176_counter_never_reset_2026_05_16).
+/// On NVIDIA, RemoveParticleShapes resets this to 0 between frames.
+/// On ZLUDA, RemoveParticleShapes is never dispatched (verified run #20).
+///
+/// Gated on `ZLUDA_POOL_22176_PROBE=1`. Reuses FLAG_PROBE scratch (8 bytes).
+unsafe fn snapshot_pool_22176_counter(pool_ptr: u64) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_POOL_22176_PROBE").map_or(false, |v| v == "1"));
+    if !enabled || pool_ptr == 0 {
+        return;
+    }
+    let mut guard = match FLAG_PROBE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    flag_probe_init(&mut guard);
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+    static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let copy_result = hipMemcpyDtoD(
+        hipDeviceptr_t(state.scratch_dev),
+        hipDeviceptr_t((pool_ptr + 22176) as _),
+        8,
+    );
+    if copy_result.is_err() {
+        return;
+    }
+    let _ = hipDeviceSynchronize();
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+    let cnt_22176: u32 = std::ptr::read_unaligned(state.scratch_host as *const u32);
+    let cnt_22180: u32 =
+        std::ptr::read_unaligned((state.scratch_host as *const u32).add(1));
+    super::driver::zluda_log_err(&format!(
+        "[POOL_22176] call_n={} pool_ptr=0x{:x} +22176={} +22180={}",
+        call_n, pool_ptr, cnt_22176, cnt_22180
+    ));
+}
+
+/// Generic flag-bit-distribution probe. Reads `n_threads * 4` bytes
+/// from `flags_ptr` and counts bit 0 vs bit 4 set.
+unsafe fn snapshot_flag_bit4_at(label: &str, flags_ptr: u64, n_threads: u32) {
+    if !flag_count_probe_enabled() || flags_ptr == 0 || n_threads == 0 {
+        return;
+    }
+    let bytes = (n_threads as usize).saturating_mul(4).min(FLAG_PROBE_BYTES);
+    let mut guard = match FLAG_PROBE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    flag_probe_init(&mut guard);
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+    state.launch_n += 1;
+    let n = state.launch_n;
+
+    let copy_result = hipMemcpyDtoD(
+        hipDeviceptr_t(state.scratch_dev),
+        hipDeviceptr_t(flags_ptr as _),
+        bytes,
+    );
+    if copy_result.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "[FLAG PROBE {}] D2D failed for flags=0x{:x}: {:?}",
+            label, flags_ptr, copy_result
+        ));
+        return;
+    }
+    let _ = hipDeviceSynchronize();
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+    let mut bit0_set: u32 = 0;
+    let mut bit4_set: u32 = 0;
+    let mut both_bits_set: u32 = 0;
+    let mut zero: u32 = 0;
+    let base = state.scratch_host as *const u8;
+    for i in 0..n_threads as usize {
+        let f: u16 = std::ptr::read_unaligned(base.add(i * 4) as *const u16);
+        if f == 0 {
+            zero += 1;
+        }
+        if (f & 0x01) != 0 {
+            bit0_set += 1;
+        }
+        if (f & 0x10) != 0 {
+            bit4_set += 1;
+        }
+        if (f & 0x11) == 0x11 {
+            both_bits_set += 1;
+        }
+    }
+    super::driver::zluda_log_err(&format!(
+        "[FLAG PROBE {}] launch_n={} flags=0x{:x} n={} bit0_set={} bit4_set={} both={} zero={}",
+        label, n, flags_ptr, n_threads, bit0_set, bit4_set, both_bits_set, zero
+    ));
+}
 
 unsafe fn counter_snapshot_init(state: &mut Option<CounterSnapshotState>) {
     if state.is_some() {
@@ -9065,6 +9555,104 @@ pub(crate) fn launch_kernel(
     // future validator MUST NOT call hipMemcpyDtoH from launch_kernel.
     let _ = &validate_kernel_inputs; // reference so dead-code warning is quiet
 
+    // Plan v19 Phase C: hook MemCopyBatchedAsync to log src/dst of each
+    // copy in its batch. The kernel signature (inferred from KARG logs:
+    // `args=[val0=0x0 DEV1=0x6fff00000002 DEV2=0x7fb8144a3000 p3=null]`)
+    // is roughly: param_0 reserved, param_1 = packed (count|flags),
+    // param_2 = pointer to descriptor array. grid_y == descriptor count.
+    // Each descriptor is { void* src; void* dst; size_t bytes; } = 24 B.
+    //
+    // We only log batches that contain a dst falling in a tracked mapped
+    // buffer at an interesting offset (663640 ± 16 for the actor table
+    // relay, OR 1056768 ± 16 for the upstream-relay buffer the count
+    // first lands in). Otherwise the spam would be enormous (~6k batches
+    // per crashed run).
+    //
+    // Gated on ZLUDA_MEMCPY_SRC_TRACE=1. Default OFF.
+    if name == "MemCopyBatchedAsync" {
+        unsafe {
+            static MEMCPY_SRC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *MEMCPY_SRC_TRACE.get_or_init(|| {
+                std::env::var("ZLUDA_MEMCPY_SRC_TRACE").map_or(false, |v| v == "1")
+            }) {
+                // Decoded descriptor format (from MEMCPY_RAW_DATA observation,
+                // 2026-05-17): 32 bytes per descriptor:
+                //   +0  : src u64  (device pointer)
+                //   +8  : dst u64  (device pointer; can be 0 for fill/clear)
+                //   +16 : size u64 (bytes)
+                //   +24 : flags u64 (0 or 0x6fff_xxxxxxxx or 0x7f18_00000001…)
+                // Descriptor count = grid_y (one block per descriptor).
+                let desc_ptr: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+                let num_descs = grid_dim_y.max(1) as usize;
+                static MEMCPY_CALL_N: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let call_n = MEMCPY_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(table) = super::memory::SMALL_HOST_ALLOCS.lock() {
+                    let mut desc_host: Option<usize> = None;
+                    for &(host, dev, size) in table.iter() {
+                        let dev_end = dev.wrapping_add(size);
+                        if (desc_ptr as usize) >= dev && (desc_ptr as usize) < dev_end {
+                            let off = (desc_ptr as usize) - dev;
+                            desc_host = Some(host + off);
+                            break;
+                        }
+                    }
+                    if let Some(dh) = desc_host {
+                        for i in 0..num_descs.min(64) {
+                            let base = (dh + i * 32) as *const u64;
+                            let d_src = std::ptr::read_volatile(base);
+                            let d_dst = std::ptr::read_volatile(base.add(1));
+                            let d_size = std::ptr::read_volatile(base.add(2));
+                            // Resolve dst to a tracked mapped buffer if applicable.
+                            let mut matched_dst: Option<(u64, usize)> = None;
+                            for &(host, dev, size) in table.iter() {
+                                let dev_end = dev.wrapping_add(size);
+                                if (d_dst as usize) >= dev && (d_dst as usize) < dev_end {
+                                    matched_dst = Some((host as u64, (d_dst as usize) - dev));
+                                    break;
+                                }
+                            }
+                            if let Some((dst_host, dst_off)) = matched_dst {
+                                // Filter by SIZE: only 4-byte writes catch
+                                // single-u32 counter relays (the relevant
+                                // pattern for shape-count propagation).
+                                // The relay slot offset varies per run, so
+                                // can't filter by offset. Size filter limits
+                                // events to ~tens per second instead of
+                                // thousands.
+                                let interesting = d_size == 4;
+                                if interesting {
+                                    // Try to read the source u32 value too —
+                                    // resolve src to a tracked buffer first.
+                                    let mut src_value: Option<u32> = None;
+                                    for &(host, dev, size) in table.iter() {
+                                        let dev_end = dev.wrapping_add(size);
+                                        if (d_src as usize) >= dev && (d_src as usize) < dev_end {
+                                            let off = (d_src as usize) - dev;
+                                            if off + 4 <= size {
+                                                src_value = Some(
+                                                    std::ptr::read_volatile((host + off) as *const u32)
+                                                );
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    super::driver::zluda_log_err(&format!(
+                                        "MEMCPY_SRC #{} i={}/{} dst_off={} \
+                                         src=0x{:x} src_u32={:?} dst=0x{:x} \
+                                         dst_host=0x{:x} size={}",
+                                        call_n, i, num_descs, dst_off, d_src,
+                                        src_value, d_dst, dst_host, d_size
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Host-side zero-copy counter dump — runs for every MS_4 launch.
     // Pure CPU reads, no DtoH, no GPU ops — safe from the ProfilingSignal
     // race. The widened HOST_ALLOCS tracker now records (host, dev, size)
@@ -9086,6 +9674,44 @@ pub(crate) fn launch_kernel(
                 "MS4_ARGS #{} n={} p2=0x{:x} p4=0x{:x} p5=0x{:x} p6=0x{:x} p7=0x{:x}",
                 call_n, n, p2, p4, p5, p6, p7
             ));
+            // Plan v13 Step 1C: scan all `cuMemHostAlloc` (zero-copy
+            // mapped) buffers for the u32 value `n`. Whoever holds it is
+            // the buffer PhysX read from to compute MS_4 grid_size. Gated
+            // on ZLUDA_MAPPED_N_SCAN=1 (default OFF: scan cost is ~2.5M
+            // cmps per MS_4 launch, run unaffected with env unset).
+            static SCAN_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *SCAN_ENABLED
+                .get_or_init(|| std::env::var("ZLUDA_MAPPED_N_SCAN").map_or(false, |v| v == "1"))
+            {
+                let matches = super::memory::scan_mapped_for_u32(n, 16);
+                if matches.is_empty() {
+                    super::driver::zluda_log_err(&format!(
+                        "[MAPPED_N_SCAN #{}] n={} NO_MATCH (value not in any cuMemHostAlloc buffer)",
+                        call_n, n
+                    ));
+                } else {
+                    for (host, size, off, ctx) in matches.iter() {
+                        super::driver::zluda_log_err(&format!(
+                            "[MAPPED_N_SCAN #{}] n={} host=0x{:x} size={} off={} ctx=[{:08x} {:08x} {:08x} {:08x}]",
+                            call_n, n, host, size, off, ctx[0], ctx[1], ctx[2], ctx[3]
+                        ));
+                    }
+                }
+            }
+            // v7 Step 4: probe shape_table (p4) state right before MS_4 fires.
+            // Gated on ZLUDA_SHAPE_TABLE_PROBE=1.
+            snapshot_shape_table_before_ms4(p4);
+            // v7 Step 6: count (flags & 0x11)==1 bits MS_4 will dispatch.
+            // Compare to sum(counter[]) — overcount hypothesis: pass > sum_counters.
+            // Gated on ZLUDA_FLAG_COUNT_PROBE=1.
+            snapshot_flag_count_before_ms4(p2, n, p7);
+            // v8 Step 3: latch MS_4's flags ptr + n for post-MS_1 probe.
+            // Different MS_4 launches use different actor flag ptrs, so we
+            // latch the most recent one; post-MS_1 probe uses this to look
+            // at the buffer that MS_4 will read in the next dispatch.
+            MS4_FLAGS_PTR_LATCHED
+                .store(p2, std::sync::atomic::Ordering::Release);
+            MS4_N_LATCHED.store(n, std::sync::atomic::Ordering::Release);
             // p2=flags is just logged (no buffer read — avoid D2H from launch
             // path per feedback_no_d2d_from_launch_kernel). The address itself
             // shows whether flags is stable across frames (per-actor static)
@@ -9146,6 +9772,242 @@ pub(crate) fn launch_kernel(
                 // triggering the ProfilingSignal libstdc++ race (p9, p10
                 // both aborted early). ARG_DUMP above is cheap enough to
                 // keep. For device-only buffers we need rocgdb, not scans.
+
+                // 2026-05-17 evening: Plan v18 Step 7 — counter-array sum
+                // probe. MS_4 atom-decrements per-shape counters at p7. The
+                // working theory of the wild-VA story is
+                // `n_threads > Σ counter[]` → atom.add(-1) underflows. This
+                // probe surfaces Σ counter[0..n] (and the full-buffer sum +
+                // nonzero stats) at each MS_4 launch so the gap is visible
+                // directly rather than inferred. Read-only single-buffer
+                // scan; n_threads ≤ ~32k → ≤128 KB per launch.
+                static COUNTER_SUM_ENABLED: std::sync::OnceLock<bool> =
+                    std::sync::OnceLock::new();
+                if *COUNTER_SUM_ENABLED.get_or_init(|| {
+                    std::env::var("ZLUDA_COUNTER_SUM_PROBE").map_or(false, |v| v == "1")
+                }) && p7 != 0
+                {
+                    for &(host, dev, size) in table.iter() {
+                        let dev_end = dev.wrapping_add(size);
+                        if (p7 as usize) >= dev && (p7 as usize) < dev_end {
+                            let offset = (p7 as usize) - dev;
+                            let remaining = size - offset;
+                            let total_words = remaining / 4;
+                            let n_words = (n as usize).min(total_words);
+                            let base = (host + offset) as *const u32;
+                            let mut sum_first_n: u64 = 0;
+                            let mut sum_full: u64 = 0;
+                            let mut nonzero: u32 = 0;
+                            let mut last_nz: i64 = -1;
+                            for i in 0..total_words {
+                                let w = std::ptr::read_volatile(base.add(i)) as u64;
+                                if i < n_words {
+                                    sum_first_n = sum_first_n.wrapping_add(w);
+                                }
+                                sum_full = sum_full.wrapping_add(w);
+                                if w != 0 {
+                                    nonzero += 1;
+                                    last_nz = i as i64;
+                                }
+                            }
+                            let gap: i64 = (n as i64) - (sum_first_n as i64);
+                            super::driver::zluda_log_err(&format!(
+                                "MS4_COUNTER_SUM #{} n={} sum_first_n={} sum_full={} \
+                                 gap={} nonzero={} last_nz={} total_words={} \
+                                 host=0x{:x} p7=0x{:x} offset={}",
+                                call_n, n, sum_first_n, sum_full, gap, nonzero,
+                                last_nz, total_words, host, p7, offset
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            // 2026-05-17 evening: Plan v18 Step 6 — per-MS_4 actor-entry probe.
+            // Discovered Batman runs TWO PhysX particle systems with an actor
+            // table at off=663552 + N*176 in a 2 MB mapped buffer. For each
+            // entry we want the candidate "per-frame counter" slots:
+            //   - +0    : mValidParticleRange (count, monotonic)
+            //   - +22976: candidate destroyedShapeCount (oscillating 0-9)
+            //   - +22980: candidate createdShapeCount  (oscillating 0-4)
+            // Gated on ZLUDA_ACTOR_ENTRY_PROBE=1 (default OFF). Cheap: at
+            // most a few u32 reads per MS_4 launch.
+            static ACTOR_PROBE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ACTOR_PROBE_ENABLED
+                .get_or_init(|| std::env::var("ZLUDA_ACTOR_ENTRY_PROBE").map_or(false, |v| v == "1"))
+            {
+                if let Ok(table) = super::memory::SMALL_HOST_ALLOCS.lock() {
+                    // Per-entry stride and slot offsets discovered offline.
+                    const ENTRY_BASE: usize = 663552;
+                    const ENTRY_STRIDE: usize = 176;
+                    const NUM_ENTRIES: usize = 4; // probe up to 4 systems
+                    const COUNT_REL: usize = 0;
+                    const DSTR_REL: usize = 22976; // 686528-663552
+                    const CREA_REL: usize = 22980; // 686532-663552
+                    for &(host, _dev, size) in table.iter() {
+                        // Need at least 2 MB to host the actor table.
+                        if size < 700_000 {
+                            continue;
+                        }
+                        let mut line =
+                            format!("ACTOR_ENTRY_PROBE #{} n={} host=0x{:x}", call_n, n, host);
+                        let mut any_nonzero = false;
+                        for entry in 0..NUM_ENTRIES {
+                            let base = ENTRY_BASE + entry * ENTRY_STRIDE;
+                            if base + 23000 > size {
+                                break;
+                            }
+                            let cnt = std::ptr::read_volatile(
+                                (host + base + COUNT_REL) as *const u32,
+                            );
+                            let dstr = std::ptr::read_volatile(
+                                (host + base + DSTR_REL) as *const u32,
+                            );
+                            let crea = std::ptr::read_volatile(
+                                (host + base + CREA_REL) as *const u32,
+                            );
+                            if cnt != 0 || dstr != 0 || crea != 0 {
+                                any_nonzero = true;
+                            }
+                            line.push_str(&format!(
+                                " e{}=[cnt={} dstr={} crea={}]",
+                                entry, cnt, dstr, crea
+                            ));
+                        }
+                        if any_nonzero {
+                            super::driver::zluda_log_err(&line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2026-05-16 v7 Step 3: per-launch shape_table pipeline logging.
+    // Gated on ZLUDA_SHAPE_PIPELINE_LOG=1. Captures MS_1 + InitParticleShapes
+    // per launch (not one-shot). Cross-reference with MS4_ARGS to detect
+    // which actor's shape_table state is wrong at MS_4 entry.
+    static SHAPE_PIPELINE_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let shape_pipeline_log = *SHAPE_PIPELINE_LOG
+        .get_or_init(|| std::env::var("ZLUDA_SHAPE_PIPELINE_LOG").map_or(false, |v| v == "1"));
+    if shape_pipeline_log {
+        if name.contains("CreateParticleShapesIncremental_MultiStage_1") {
+            unsafe {
+                // MS_1 params: 0..u64 (0), 1..u16 (8 pad to 16), 2..u64 (16),
+                // 3..u64 (24), 4..u32 (32), 5..f32 (36), 6..u64 (40) = pool struct
+                // (contains shape_table AND the +22176 allocation counter),
+                // 7..u64 (48), 8..u64 (56), 9..u64 (64), 10..u64 (72), 11..u64 (80).
+                let p4_n: u32 = read_kernel_arg(kernel_params, extra, 32, 4).unwrap_or(0);
+                let p6_pool: u64 = read_kernel_arg(kernel_params, extra, 40, 6).unwrap_or(0);
+                let p7: u64 = read_kernel_arg(kernel_params, extra, 48, 7).unwrap_or(0);
+                static MS1_CALL_N: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let call_n = MS1_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::driver::zluda_log_err(&format!(
+                    "MS1_ARGS #{} n={} p6_pool=0x{:x} p7=0x{:x} grid=[{},{},{}] block=[{},{},{}]",
+                    call_n, p4_n, p6_pool, p7,
+                    grid_dim_x, grid_dim_y, grid_dim_z,
+                    block_dim_x, block_dim_y, block_dim_z
+                ));
+                // v10 Step 1: probe the [+22176] pool allocation counter BEFORE
+                // MS_1 increments it. Should be 0 each frame if reset works.
+                // If saturated (>= 924), the reset kernel didn't run.
+                snapshot_pool_22176_counter(p6_pool);
+            }
+        }
+        if name == "InitParticleShapes" {
+            unsafe {
+                // InitParticleShapes params: 0..u64 (0), 1..u16 (8), 2..u64 (16)
+                // = shape_table, 3..u32 (24), 4..u64 (32), 5..u32 (40), ...
+                let p2_shape: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+                let p3_n: u32 = read_kernel_arg(kernel_params, extra, 24, 3).unwrap_or(0);
+                let p4: u64 = read_kernel_arg(kernel_params, extra, 32, 4).unwrap_or(0);
+                let p5_n: u32 = read_kernel_arg(kernel_params, extra, 40, 5).unwrap_or(0);
+                static IPS_CALL_N: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let call_n = IPS_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::driver::zluda_log_err(&format!(
+                    "INITPS_ARGS #{} p2_shape=0x{:x} p3_n={} p4=0x{:x} p5_n={} grid=[{},{},{}] block=[{},{},{}]",
+                    call_n, p2_shape, p3_n, p4, p5_n,
+                    grid_dim_x, grid_dim_y, grid_dim_z,
+                    block_dim_x, block_dim_y, block_dim_z
+                ));
+            }
+        }
+        if name == "InitCollDataAndApplyConstraints" {
+            unsafe {
+                // InitColl params: 0..u64 (0), 1..u16 (8), 2..u64 (16),
+                // 3..u64 (24) = FLAGS (DEV3 in KARG_LOG), 4..u64 (32),
+                // 5..u64 (40), 6..u64 (48), 7..u64 (56), ...
+                // n_threads for the probe = grid_dim_x * block_dim_x
+                // (InitColl is 1D: grid=[N,1,1] block=[128,1,1])
+                let p3_flags: u64 = read_kernel_arg(kernel_params, extra, 24, 3).unwrap_or(0);
+                let n_threads = grid_dim_x.saturating_mul(block_dim_x);
+                static INITCOLL_CALL_N: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let call_n =
+                    INITCOLL_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::driver::zluda_log_err(&format!(
+                    "INITCOLL_ARGS #{} p3_flags=0x{:x} n_threads={} grid=[{},{},{}] block=[{},{},{}]",
+                    call_n, p3_flags, n_threads,
+                    grid_dim_x, grid_dim_y, grid_dim_z,
+                    block_dim_x, block_dim_y, block_dim_z
+                ));
+                // v8 Step 1: probe flags BEFORE InitColl runs. If bit 0 is
+                // already set 100%, the upstream writer is the culprit.
+                // If bit 0 distribution is normal pre-InitColl and only
+                // 100% post-InitColl, then InitColl itself is wrong.
+                snapshot_flag_count_before_initcoll(p3_flags, n_threads);
+            }
+        }
+        // v8 Step 2: ParticleCollisionStaticBox probe. Its param_2 is a 64-byte
+        // by-value struct holding 6 u64 ptrs at offsets 0,8,16,24,32,40.
+        // Per PTX (line 20024-20100): flags ptr = struct+40 (DEV4 in struct).
+        // Flat-arg offset = 16 (param_2 start, after param_0 u64 + padded u16
+        // param_1) + 40 = 56.
+        if name == "ParticleCollisionStaticBox" {
+            unsafe {
+                let flags_ptr: u64 =
+                    read_kernel_arg(kernel_params, extra, 56, 2).unwrap_or(0);
+                // param_6 (u32 at offset 16 + 64 = 80 + 8 = 88) is n_particles
+                // actually: param_4 u32 at 80, param_5 u64 at 88, param_6 u32 at 96.
+                // Let's read param_6 = u32 at offset 96 (post param_5 u64).
+                let n_particles: u32 =
+                    read_kernel_arg(kernel_params, extra, 96, 6).unwrap_or(0);
+                let n_threads_kernel = grid_dim_x.saturating_mul(block_dim_x);
+                static PCSB_CALL_N: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let call_n =
+                    PCSB_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::driver::zluda_log_err(&format!(
+                    "PCSB_ARGS #{} flags=0x{:x} n_particles={} n_threads={} grid=[{},{},{}] block=[{},{},{}]",
+                    call_n, flags_ptr, n_particles, n_threads_kernel,
+                    grid_dim_x, grid_dim_y, grid_dim_z,
+                    block_dim_x, block_dim_y, block_dim_z
+                ));
+                // Pre-PCSB probe: how many particles already have bit 4 set?
+                // n_threads = min(n_particles, 256) — first 256 for cheap probe
+                let probe_n = n_particles.min(256);
+                snapshot_flag_bit4_at("PRE_PCSB", flags_ptr, probe_n);
+            }
+        }
+        if name.contains("CreateParticleShapesIncremental_MultiStage_2_Batched") {
+            unsafe {
+                // MS_2_Batched has only 3 params: 0..u64 (0), 1..u16 (8 pad to 16),
+                // 2..u64 (16) = per-CTA struct array. Reading higher indices
+                // walks past the kernel_params array and segfaults — DON'T.
+                // Just log the per-CTA struct ptr; shape_table is loaded from
+                // offset +72 within each 88-byte CTA struct.
+                let p2_ctas: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+                static MS2B_CALL_N: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let call_n = MS2B_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::driver::zluda_log_err(&format!(
+                    "MS2B_ARGS #{} p2_ctas=0x{:x} grid=[{},{},{}] block=[{},{},{}]",
+                    call_n, p2_ctas,
+                    grid_dim_x, grid_dim_y, grid_dim_z,
+                    block_dim_x, block_dim_y, block_dim_z
+                ));
             }
         }
     }
@@ -9518,6 +10380,26 @@ pub(crate) fn launch_kernel(
         }
     }
 
+    // Plan v15+v16: pre-launch sync + mirror refresh for clean per-kernel
+    // attribution, with BETWEEN-launch diff emit. Drains all prior async
+    // work BEFORE we snapshot the mapped-buffer state, so:
+    //   - The mirror reflects the post-sync state of the PRIOR launch
+    //   - BEFORE refreshing, emit MAPPED_BETWEEN events for any changes
+    //     that happened since (CPU-side writes, mostly)
+    //   - Then refresh the mirror so the post-launch diff sees ONLY this
+    //     kernel's writes
+    // Gated by ZLUDA_MAPPED_WRITE_TRACE=1 — no overhead when off.
+    if super::memory::mapped_write_trace_enabled() {
+        unsafe {
+            let _ = hip_runtime_sys::hipDeviceSynchronize();
+        }
+        static REFRESH_SEQ: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let refresh_seq =
+            REFRESH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::memory::mapped_write_refresh_pre(refresh_seq);
+    }
+
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra
     let hip_launch_param_end = 0x3usize as *mut ::core::ffi::c_void;
     let cu_launch_param_buffer_pointer = 0x1usize as *mut ::core::ffi::c_void;
@@ -9885,6 +10767,46 @@ pub(crate) fn launch_kernel(
             // log if any kernel mutates it. Independent of MS4_CAPTURE /
             // F.6 gates — uses ZLUDA_COUNTER_SNAPSHOT=1.
             snapshot_counter_after_launch(&name);
+            // Plan v14 Step 1: per-kernel mapped-buffer write tracer.
+            // Gated by ZLUDA_MAPPED_WRITE_TRACE=1 (default OFF). Reads each
+            // tracked cuMemHostAlloc buffer, diffs vs mirror, emits
+            // [MAPPED_WRITE] lines per changed u32 attributing the change
+            // to this kernel. Used to identify which kernel grows / shrinks
+            // each MS_4 n_threads slot at {host+663552, +663640, +663728}.
+            static MAPPED_WRITE_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let seq = MAPPED_WRITE_SEQ
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::memory::mapped_write_diff_post(seq, &name);
+            // v8 Step 2: POST_PCSB flag probe — after ParticleCollisionStaticBox
+            // returns, count bit 4 (0x10) distribution. NOTE: PCSB writes to a
+            // DIFFERENT buffer than MS_4's flags (verified run #19), so this
+            // probe is informational; bit-4 changes here don't affect MS_4.
+            if name == "ParticleCollisionStaticBox" {
+                let flags_ptr: u64 =
+                    read_kernel_arg(kernel_params, extra, 56, 2).unwrap_or(0);
+                let n_particles: u32 =
+                    read_kernel_arg(kernel_params, extra, 96, 6).unwrap_or(0);
+                let probe_n = n_particles.min(256);
+                snapshot_flag_bit4_at("POST_PCSB", flags_ptr, probe_n);
+            }
+            // v8 Step 3: POST_MS_1 flag probe — after MS_1 launches, probe
+            // MS_4's flags buffer (via latched ptr). MS_1's internal helper
+            // at module_10:1001 has the bit-4-set site we suspect fails on
+            // ZLUDA. If bit-4-set stays ~0% after MS_1, this site is the bug.
+            if name.contains("CreateParticleShapesIncremental_MultiStage_1") {
+                let flags_ptr =
+                    MS4_FLAGS_PTR_LATCHED.load(std::sync::atomic::Ordering::Acquire);
+                let n =
+                    MS4_N_LATCHED.load(std::sync::atomic::Ordering::Acquire);
+                if flags_ptr != 0 && n != 0 {
+                    let probe_n = n.min(1024);
+                    snapshot_flag_bit4_at("POST_MS1", flags_ptr, probe_n);
+                }
+                // v11: dump + reset MS_1 gate-trace counters. Captures per-
+                // launch outcomes of the bit-4-set gate predicates.
+                ms1_gate_trace_dump_and_reset();
+            }
         }
     }
     // Explicitly drop the guard to make the lifetime scope obvious (mode 2 releases here).

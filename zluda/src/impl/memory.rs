@@ -125,6 +125,500 @@ fn dtoh_log_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_DTOH_LOG").map_or(false, |v| v == "1"))
 }
 
+/// Plan v13 Step 1C scan: at MS_4 launch, locate which `cuMemHostAlloc`
+/// (zero-copy mapped host memory) buffer carries the `n_threads` value.
+///
+/// Background: Plan v13 Step 1 + 1B proved MS_4's n_threads is NOT in any
+/// cuMemcpyDtoH transfer (≤4KB cap, head/mid/tail sampled, 0/2847 matches
+/// in run #2). Then `cuMemHostAlloc size=... same=true` log entries
+/// surfaced — PhysX uses zero-copy mapped memory, so GPU writes are visible
+/// to the CPU via the host pointer with NO DtoH involved.
+///
+/// This scan walks every tracked `(host, dev, size)` and reports any
+/// 4-byte-aligned u32 slot whose value matches `needle`. Bounded by the
+/// total mapped-memory size (~10 MB in Batman) so cost is ~2.5M cmps per
+/// scan, spread across MS_4 launches.
+///
+/// Returns up to `max_matches` `(host_base, offset, surrounding_u32s[4])`
+/// tuples. The surrounding context disambiguates a coincidental scalar
+/// match from a structured count-vector at a stable offset.
+pub(crate) fn scan_mapped_for_u32(
+    needle: u32,
+    max_matches: usize,
+) -> Vec<(usize, usize, usize, [u32; 4])> {
+    let mut out = Vec::new();
+    let allocs = match SMALL_HOST_ALLOCS.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => return out,
+    };
+    for &(host, _dev, size) in allocs.iter() {
+        if host == 0 || size < 4 {
+            continue;
+        }
+        let n_words = size / 4;
+        unsafe {
+            let base = host as *const u32;
+            for i in 0..n_words {
+                if base.add(i).read_unaligned() == needle {
+                    // Capture 4 surrounding dwords: [i-1, i, i+1, i+2] when
+                    // possible — the count is often part of a small struct.
+                    let mut ctx = [0u32; 4];
+                    let start = if i == 0 { 0 } else { i - 1 };
+                    for (k, j) in (start..start + 4).enumerate() {
+                        if j < n_words {
+                            ctx[k] = base.add(j).read_unaligned();
+                        }
+                    }
+                    out.push((host, size, i * 4, ctx));
+                    if out.len() >= max_matches {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Plan v14 Step 1: per-kernel mapped-buffer write tracer.
+///
+/// Background: Plan v13 Step 1C found MS_4's n_threads in `cuMemHostAlloc`
+/// mapped buffers, with at least 3 stable u32 slots — one growing unbounded,
+/// one shrinking. Open question: WHICH kernel mutates each slot, and is any
+/// kernel ever decrementing the runaway slots?
+///
+/// Approach: hold a per-buffer mirror of the last-seen u32 contents. After
+/// every `cuLaunchKernel` (post-sync), re-read each tracked mapped buffer,
+/// diff against the mirror, and emit one `[MAPPED_WRITE]` line per changed
+/// slot attributing the change to the just-finished kernel. Update the
+/// mirror to current values for the next launch's diff baseline.
+///
+/// Cost: ~6 MB of memcmp per launch (run #3 had 3 × 2 MB buffers). At
+/// typical launch rates this is ~1-3 ms / launch — acceptable for a
+/// diagnostic build, default OFF in normal operation.
+///
+/// The first sighting of any buffer populates the mirror WITHOUT emitting
+/// diff lines (we'd otherwise log every non-zero slot as a fresh "write"
+/// at game start, which is noise). Real diffs only fire on subsequent
+/// launches once a baseline exists.
+pub(crate) fn mapped_write_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZLUDA_MAPPED_WRITE_TRACE").map_or(false, |v| v == "1")
+    })
+}
+
+/// State for the mapped-write tracer.
+///
+/// `mirror`: last-known u32 contents per tracked mapped buffer.
+/// `slot_changes`: per-slot change count, keyed by (host_ptr, u32_index).
+/// v14.next.next replaces v14.next's per-buffer noisy demotion with per-slot
+/// tracking — a quiet particle-count slot survives even if it shares a
+/// buffer with FleX's RasterizeConvexGrid that hammers other slots.
+pub(crate) struct MappedTraceState {
+    pub mirror: std::collections::HashMap<usize, Vec<u32>>,
+    pub slot_changes: std::collections::HashMap<(usize, usize), u32>,
+}
+
+impl MappedTraceState {
+    fn new() -> Self {
+        Self {
+            mirror: std::collections::HashMap::new(),
+            slot_changes: std::collections::HashMap::new(),
+        }
+    }
+}
+
+static MAPPED_TRACE_STATE: std::sync::OnceLock<std::sync::Mutex<MappedTraceState>> =
+    std::sync::OnceLock::new();
+
+fn mapped_trace_state() -> &'static std::sync::Mutex<MappedTraceState> {
+    MAPPED_TRACE_STATE.get_or_init(|| std::sync::Mutex::new(MappedTraceState::new()))
+}
+
+/// Per-SLOT cumulative change threshold above which we stop emitting for
+/// that slot specifically. v14.next run #1 had particle-count slot writes
+/// every ~10 MS_4 launches (~40 changes over 400 MS_4), but a noisy buffer
+/// header could change 500× per launch. 200 cumulative cleanly excludes
+/// the heavy bulk-writers while letting particle-count slots emit ~50×
+/// across a full benchmark run.
+const SLOT_HOT_THRESHOLD: u32 = 200;
+
+/// Diff each tracked mapped buffer against the mirror, emit MAPPED_WRITE
+/// lines for each changed u32 slot, and update the mirror.
+///
+/// `seq` is a monotonic launch counter (used in log lines so the offline
+/// analyzer can join MAPPED_WRITE entries to the corresponding launch).
+/// `kernel` is the name of the kernel that just completed.
+///
+/// Per-buffer per-launch emit cap (32 lines) prevents a `memset`-style
+/// kernel from flooding the log; truncated counts surface as a
+/// `(+N more changes truncated)` tail.
+/// Plan v15: pre-launch refresh. Re-read every tracked mapped buffer's
+/// current contents into the mirror. Called immediately AFTER a
+/// `hipDeviceSynchronize` at the START of each `cuLaunchKernel`. Combined
+/// with the existing post-sync diff, this ensures the post-diff observes
+/// ONLY this kernel's writes.
+///
+/// Plan v16 (Plan B "between-launch tracker"): BEFORE refreshing the mirror,
+/// diff it against the current state and emit `[MAPPED_BETWEEN]` events.
+/// These are changes that happened between [post-sync of prior launch] and
+/// [pre-sync of this launch] — i.e., CPU-side writes via the host pointer
+/// alias of the mapped buffer (plus possibly other-thread GPU launches).
+/// v15 proved that the particle-count slots (off=663552/640/728) never
+/// appear in [MAPPED_WRITE] DURING events; they must change BETWEEN
+/// launches, and this hook captures those changes.
+///
+/// First-sighting behavior: populate mirror without emitting BETWEEN diff
+/// (we don't know the baseline yet).
+///
+/// Per-slot change counter is shared with the DURING tracker — a slot that
+/// reaches HOT in either path is silenced for both.
+pub(crate) fn mapped_write_refresh_pre(seq: u64) {
+    if !mapped_write_trace_enabled() {
+        return;
+    }
+    let allocs = match SMALL_HOST_ALLOCS.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => return,
+    };
+    let mut state = match mapped_trace_state().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let MappedTraceState { mirror, slot_changes } = &mut *state;
+    for &(host, _dev, size) in allocs.iter() {
+        if host == 0 || size < 4 {
+            continue;
+        }
+        let n_words = size / 4;
+        let entry = mirror.entry(host).or_insert_with(Vec::new);
+        let first_sighting = entry.is_empty();
+        if entry.len() != n_words {
+            entry.resize(n_words, 0u32);
+        }
+        if first_sighting {
+            // Initial population — no BETWEEN diff possible yet.
+            unsafe {
+                let base = host as *const u32;
+                for i in 0..n_words {
+                    entry[i] = base.add(i).read_unaligned();
+                }
+            }
+            continue;
+        }
+        // BETWEEN diff: compare current state vs mirror (which holds the
+        // post-sync state of the PRIOR launch). Any change here happened
+        // outside any single launch's pre/post envelope — most likely a
+        // CPU-side write via the host pointer.
+        let mut emits = 0u32;
+        let mut more = 0u32;
+        const EMIT_CAP: u32 = 32;
+        unsafe {
+            let base = host as *const u32;
+            for i in 0..n_words {
+                let cur = base.add(i).read_unaligned();
+                let old = entry[i];
+                if cur != old {
+                    let count = slot_changes.entry((host, i)).or_insert(0);
+                    *count += 1;
+                    let just_demoted = *count == SLOT_HOT_THRESHOLD + 1;
+                    if just_demoted {
+                        super::driver::zluda_log_err(&format!(
+                            "[MAPPED_BETWEEN seq={}] host=0x{:x} off={} slot marked HOT (changes={} > {}); future emits suppressed",
+                            seq, host, i * 4, *count, SLOT_HOT_THRESHOLD
+                        ));
+                    }
+                    if *count <= SLOT_HOT_THRESHOLD {
+                        if emits < EMIT_CAP {
+                            super::driver::zluda_log_err(&format!(
+                                "[MAPPED_BETWEEN seq={}] host=0x{:x} off={} old=0x{:08x} new=0x{:08x} slot_changes={}",
+                                seq, host, i * 4, old, cur, *count
+                            ));
+                            emits += 1;
+                        } else {
+                            more += 1;
+                        }
+                    }
+                    entry[i] = cur;
+                }
+            }
+        }
+        if more > 0 {
+            super::driver::zluda_log_err(&format!(
+                "[MAPPED_BETWEEN seq={}] host=0x{:x} (+{} more eligible changes truncated)",
+                seq, host, more
+            ));
+        }
+    }
+}
+
+pub(crate) fn mapped_write_diff_post(seq: u64, kernel: &str) {
+    if !mapped_write_trace_enabled() {
+        return;
+    }
+    let allocs = match SMALL_HOST_ALLOCS.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => return,
+    };
+    let mut state = match mapped_trace_state().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let MappedTraceState { mirror, slot_changes } = &mut *state;
+    for &(host, _dev, size) in allocs.iter() {
+        if host == 0 || size < 4 {
+            continue;
+        }
+        let n_words = size / 4;
+        let entry = mirror.entry(host).or_insert_with(Vec::new);
+        let first_sighting = entry.is_empty();
+        if entry.len() != n_words {
+            entry.resize(n_words, 0u32);
+        }
+        if first_sighting {
+            // Populate mirror with current contents. No diff lines —
+            // we don't know which kernel "wrote" the initial state.
+            unsafe {
+                let base = host as *const u32;
+                for i in 0..n_words {
+                    entry[i] = base.add(i).read_unaligned();
+                }
+            }
+            continue;
+        }
+        let mut emits = 0u32;
+        let mut more = 0u32;
+        const EMIT_CAP: u32 = 32;
+        unsafe {
+            let base = host as *const u32;
+            for i in 0..n_words {
+                let cur = base.add(i).read_unaligned();
+                let old = entry[i];
+                if cur != old {
+                    let count = slot_changes.entry((host, i)).or_insert(0);
+                    *count += 1;
+                    let just_demoted = *count == SLOT_HOT_THRESHOLD + 1;
+                    if just_demoted {
+                        super::driver::zluda_log_err(&format!(
+                            "[MAPPED_WRITE seq={}] host=0x{:x} off={} slot marked HOT (changes={} > {}); future emits suppressed",
+                            seq, host, i * 4, *count, SLOT_HOT_THRESHOLD
+                        ));
+                    }
+                    if *count <= SLOT_HOT_THRESHOLD {
+                        if emits < EMIT_CAP {
+                            super::driver::zluda_log_err(&format!(
+                                "[MAPPED_WRITE seq={}] kernel='{}' host=0x{:x} off={} old=0x{:08x} new=0x{:08x} slot_changes={}",
+                                seq, kernel, host, i * 4, old, cur, *count
+                            ));
+                            emits += 1;
+                        } else {
+                            more += 1;
+                        }
+                    }
+                    entry[i] = cur;
+                }
+            }
+        }
+        if more > 0 {
+            super::driver::zluda_log_err(&format!(
+                "[MAPPED_WRITE seq={}] kernel='{}' host=0x{:x} (+{} more eligible changes truncated)",
+                seq, kernel, host, more
+            ));
+        }
+    }
+}
+
+/// Plan v14.next/v14.next.next: log writes into tracked mapped buffers.
+///
+/// Background: Plan v14 Step 1 (run #1) showed `MemCopyBatchedAsync` (HIP's
+/// bulk DtoD memcpy kernel) accounts for ~80% of writes to the particle-count
+/// buffer slots. PhysX uses bulk memcpy to REFRESH counters from some
+/// upstream buffer (GPU OR CPU). v14.next run #1 caught 0 MAPPED_DTOD because
+/// PhysX routes through `cuMemcpyAsync` (CU_MEMORYTYPE_DEVICE inferred),
+/// not the typed DtoD variants. v14.next.next broadens the hook to all
+/// async / H2D memcpy variants.
+///
+/// `src_is_host=true` for H2D paths — src is a CPU pointer we can dereference
+/// directly. For DtoD/Async paths, src is a device pointer; we attempt to
+/// resolve it through SMALL_HOST_ALLOCS in case it points into another
+/// zero-copy mapped buffer.
+///
+/// Gated by `ZLUDA_MAPPED_WRITE_TRACE=1` (same env var as the kernel-write
+/// tracer — the two are joined by their shared diagnostic purpose).
+pub(crate) unsafe fn log_memcpy_into_mapped(
+    dst_device_or_host: u64,
+    src: u64,
+    byte_count: usize,
+    src_is_host: bool,
+    label: &str,
+) {
+    if !mapped_write_trace_enabled() {
+        return;
+    }
+    if byte_count == 0 {
+        return;
+    }
+    let allocs = match SMALL_HOST_ALLOCS.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => return,
+    };
+    // Find which tracked mapped buffer's device range contains dst.
+    for &(host, dev, size) in allocs.iter() {
+        let dev_end = dev.wrapping_add(size);
+        let dst = dst_device_or_host as usize;
+        if dst < dev || dst >= dev_end {
+            continue;
+        }
+        let off = dst - dev;
+        // Peek at source contents — up to 8 u32s.
+        let mut src_ctx: Option<[u32; 8]> = None;
+        if src_is_host {
+            // Direct CPU read.
+            if src != 0 {
+                let mut ctx = [0u32; 8];
+                let words = (byte_count / 4).min(8);
+                let base = src as *const u32;
+                for k in 0..words {
+                    ctx[k] = base.add(k).read_unaligned();
+                }
+                src_ctx = Some(ctx);
+            }
+        } else {
+            // Device pointer — look up in mapped allocs.
+            for &(s_host, s_dev, s_size) in allocs.iter() {
+                let s_end = s_dev.wrapping_add(s_size);
+                let s = src as usize;
+                if s >= s_dev && s < s_end {
+                    let s_off = s - s_dev;
+                    let words_avail = (s_size - s_off) / 4;
+                    let words = words_avail.min(8).min(byte_count / 4);
+                    let mut ctx = [0u32; 8];
+                    let base = (s_host + s_off) as *const u32;
+                    for k in 0..words {
+                        ctx[k] = base.add(k).read_unaligned();
+                    }
+                    src_ctx = Some(ctx);
+                    break;
+                }
+            }
+        }
+        let ctx_str = match src_ctx {
+            Some(c) => format!(
+                " src_u32=[{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}]",
+                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]
+            ),
+            None => String::new(),
+        };
+        super::driver::zluda_log_err(&format!(
+            "[MAPPED_MEMCPY/{}] dst_host=0x{:x} dst_off={} src=0x{:x} src_is_host={} bytes={}{}",
+            label, host, off, src, src_is_host, byte_count, ctx_str
+        ));
+        return;
+    }
+}
+
+/// Backward-compatible alias for the v14.next-era DtoD hook callers.
+pub(crate) unsafe fn log_dtod_into_mapped(
+    dst_device: u64,
+    src_device: u64,
+    byte_count: usize,
+    label: &str,
+) {
+    log_memcpy_into_mapped(dst_device, src_device, byte_count, false, label)
+}
+
+/// Plan v13 Step 1: small-DtoH trace gated by `ZLUDA_DTOH_TRACE=1`.
+///
+/// Differs from `ZLUDA_DTOH_LOG` in three ways:
+/// 1. ONLY fires for transfers of ≤ 256 bytes (PhysX-style scalar readback)
+/// 2. Routes through `zluda_log_err` (timestamped, `/tmp/zluda_tex.log`)
+///    so it shares the same log file as MS4_ARGS — offline correlator
+///    just greps both prefixes by timestamp.
+/// 3. Always prints the first 1-8 u32s of the dst buffer for direct
+///    value-match against MS_4 param_3 (n_threads).
+///
+/// Purpose: find which cuMemcpyDtoH returns the u32 that PhysX subsequently
+/// packs into MS_4's `param_3` (n_threads). Per Plan v13 if a clean
+/// correlator exists, we identify the producer kernel.
+fn dtoh_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_DTOH_TRACE").map_or(false, |v| v == "1"))
+}
+
+/// Plan v13 Step 1 helper. Emits a `[DTOH_TRACE/<label>]` line into the
+/// timestamped err log if the copy completed and the size is ≤ 4096 bytes.
+///
+/// Run #1 (256B cap) captured 1601 small DtoHs but 0 of them carried any
+/// MS_4 n_threads value. Run #2 widens to 4096B AND samples 3 windows
+/// (head/middle/tail of 32 bytes each) for buffers >64B so a count
+/// stored mid-buffer or in a trailing footer is still visible. Anything
+/// >4KB is still suppressed to keep log volume bounded.
+///
+/// Caller must ensure the dst buffer is host-visible + the copy completed
+/// (i.e. call this AFTER any required stream-sync).
+unsafe fn log_dtoh_trace(
+    label: &str,
+    dst_host: *const ::core::ffi::c_void,
+    src_device: hipDeviceptr_t,
+    byte_count: usize,
+) {
+    if !dtoh_trace_enabled() {
+        return;
+    }
+    if byte_count == 0 || byte_count > 4096 {
+        return;
+    }
+    let dst_u8 = dst_host as *const u8;
+    let line = if byte_count <= 64 {
+        // Small: full dump up to 8 dwords (≤32 B).
+        let n_u32 = (byte_count / 4).min(8);
+        let mut vals = String::with_capacity(n_u32 * 9);
+        for i in 0..n_u32 {
+            let v = (dst_u8 as *const u32).add(i).read_unaligned();
+            if i > 0 {
+                vals.push(' ');
+            }
+            vals.push_str(&format!("{:08x}", v));
+        }
+        format!(
+            "[DTOH_TRACE/{}] src={:p} dst={:p} size={} u32=[{}]",
+            label, src_device.0, dst_host, byte_count, vals
+        )
+    } else {
+        // Medium (65..=4096): three 32-byte windows (head/mid/tail).
+        // 8 dwords × 3 = 24 dwords logged. Mid-window aligned to 4.
+        let q1 = (byte_count / 2) & !0x3;
+        let q1 = q1.min(byte_count.saturating_sub(32));
+        let qt = byte_count.saturating_sub(32) & !0x3;
+        let read_window = |off: usize| -> String {
+            let n = ((byte_count - off) / 4).min(8);
+            let mut s = String::with_capacity(n * 9);
+            for i in 0..n {
+                let v = (dst_u8.add(off) as *const u32).add(i).read_unaligned();
+                if i > 0 {
+                    s.push(' ');
+                }
+                s.push_str(&format!("{:08x}", v));
+            }
+            s
+        };
+        format!(
+            "[DTOH_TRACE/{}] src={:p} dst={:p} size={} u32@0=[{}] u32@{}=[{}] u32@{}=[{}]",
+            label,
+            src_device.0,
+            dst_host,
+            byte_count,
+            read_window(0),
+            q1,
+            read_window(q1),
+            qt,
+            read_window(qt)
+        )
+    };
+    super::driver::zluda_log_err(&line);
+}
+
 /// Format up to 16 dwords (64 bytes) at byte offset `off` from `dst_host`.
 /// Caller must guarantee the slice is mapped + readable.
 unsafe fn format_dwords_at(dst_host: *const u8, off: usize, n_bytes: usize) -> String {
@@ -283,6 +777,9 @@ pub(crate) fn copy_dto_h_v2(
             dst_host, src_device.0, byte_count, dwords
         ));
     }
+    if result.is_ok() {
+        unsafe { log_dtoh_trace("sync", dst_host, src_device, byte_count) };
+    }
     result
 }
 
@@ -291,6 +788,18 @@ pub(crate) fn copy_hto_d_v2(
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
 ) -> hipError_t {
+    // Plan v14.next.next: H2D into a tracked mapped buffer = CPU directly
+    // overwriting a slot. PhysX's per-frame counter bookkeeping may take
+    // this path (set values from CPU-side state).
+    unsafe {
+        log_memcpy_into_mapped(
+            dst_device.0 as u64,
+            src_host as u64,
+            byte_count,
+            true,
+            "hto_d_v2",
+        );
+    }
     if dtoh_log_enabled() {
         let dwords = unsafe { format_dtoh_dwords(src_host as *const u8, byte_count) };
         super::driver::zluda_log(&format!(
@@ -393,6 +902,9 @@ pub(crate) fn copy_dto_h_v2_ptds(
             "[DTOH/ptds] dst={:p} src={:p} size={} bytes={}",
             dst_host, src_device.0, byte_count, dwords
         ));
+    }
+    if result.is_ok() {
+        unsafe { log_dtoh_trace("ptds", dst_host, src_device, byte_count) };
     }
     result
 }
@@ -606,6 +1118,14 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    // Plan v14.next.next: same as copy_hto_d_v2 but async.
+    log_memcpy_into_mapped(
+        dst_device.0 as u64,
+        src_host as u64,
+        byte_count,
+        true,
+        "hto_d_async_v2",
+    );
     if dtoh_log_enabled() {
         let dwords = unsafe { format_dtoh_dwords(src_host as *const u8, byte_count) };
         super::driver::zluda_log(&format!(
@@ -687,6 +1207,13 @@ pub(crate) unsafe fn copy_dto_h_async_v2(
             dst_host, src_device.0, byte_count, stream.0, dwords
         ));
     }
+    if result.is_ok() && dtoh_trace_enabled() && byte_count > 0 && byte_count <= 256 {
+        // Same reasoning as the DTOH_LOG path: need a stream-sync before
+        // reading dst, otherwise we capture pre-copy stale bytes. Only
+        // pay the sync cost when trace is actually on AND size is in range.
+        let _ = hipStreamSynchronize(stream);
+        log_dtoh_trace("async", dst_host, src_device, byte_count);
+    }
     result
 }
 
@@ -700,6 +1227,12 @@ pub(crate) unsafe fn copy_dto_d_v2(
         src_device.0 as u64,
         byte_count,
         hipStream_t(std::ptr::null_mut()),
+    );
+    log_dtod_into_mapped(
+        dst_device.0 as u64,
+        src_device.0 as u64,
+        byte_count,
+        "sync",
     );
     hipMemcpyDtoD(dst_device, src_device, byte_count)
 }
@@ -716,8 +1249,33 @@ pub(crate) unsafe fn copy_dto_d_async_v2(
         byte_count,
         stream,
     );
+    log_dtod_into_mapped(
+        dst_device.0 as u64,
+        src_device.0 as u64,
+        byte_count,
+        "async",
+    );
     let _guard = super::stream::null_stream_sync(stream);
     hipMemcpyDtoDAsync(dst_device, src_device, byte_count, stream)
+}
+
+/// Plan v14.next.next.next: `cuMemcpy` un-typed sync entry. Not present in
+/// lib.rs's wired list previously — was falling through to "UNIMPL" path,
+/// which means PhysX's cuMemcpy calls went unhandled or were rerouted via
+/// HIP. With this implementation they go through hipMemcpy(Default) and
+/// the MAPPED_MEMCPY hook fires.
+pub(crate) unsafe fn copy(
+    dst: hipDeviceptr_t,
+    src: hipDeviceptr_t,
+    byte_count: usize,
+) -> hipError_t {
+    log_memcpy_into_mapped(dst.0 as u64, src.0 as u64, byte_count, false, "copy");
+    hip_runtime_sys::hipMemcpy(
+        dst.0,
+        src.0,
+        byte_count,
+        hipMemcpyKind::hipMemcpyDefault,
+    )
 }
 
 pub(crate) unsafe fn copy_async(
@@ -726,6 +1284,12 @@ pub(crate) unsafe fn copy_async(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    // Plan v14.next.next: log when dst falls in a tracked mapped buffer.
+    // PhysX 3.4 routes most counter refreshes through cuMemcpyAsync
+    // (CU_MEMORYTYPE_DEVICE inferred), not the typed DtoD variants —
+    // v14.next run #1 caught 0 MAPPED_DTOD events despite ~5000 attribution
+    // hits to MemCopyBatchedAsync. This hook closes that gap.
+    log_memcpy_into_mapped(dst.0 as u64, src.0 as u64, byte_count, false, "copy_async");
     let _guard = super::stream::null_stream_sync(stream);
     hipMemcpyAsync(
         dst.0,

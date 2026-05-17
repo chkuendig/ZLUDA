@@ -825,6 +825,174 @@ pub fn patch_divergent_lds_merge_sync(ptx: &str) -> Option<String> {
     }
 }
 
+/// v11 (2026-05-16): MS_1 gate-trace instrumentation. Per-kernel-name
+/// PTX patch (allowed for INSTRUMENTATION; forbidden for fixes/workarounds).
+///
+/// MS_1 entry has a bit-4-set gate at line 2122-2128 that determines whether
+/// flag bit 4 is set for a particle. Two predicates gate it:
+///   setp.eq.s32 %p54, %r178, 0;       // %r178 = state code; if 0, skip
+///   @%p54 bra BB9_91;
+///   ld.local.u32 %r162, [%rd36];       // [SPL+16] = secondary state
+///   setp.eq.s32 %p55, %r162, 0;        // if [SPL+16] == 0, skip
+///   @%p55 bra BB9_91;
+///
+/// Run #20 verified bit-4-set NEVER fires on ZLUDA (2845/2845 launches).
+/// One of these predicates is always failing. This patch inserts an atomic
+/// counter increment at 4 outcomes:
+///   [trace+0]:  r178 == 0 (skip via first predicate)
+///   [trace+4]:  r178 != 0 AND state == 0 (skip via second predicate)
+///   [trace+8]:  r178 != 0 AND state != 0 (bit-4 would fire)
+///   [trace+12]: total threads reaching the gate
+///
+/// Gated on ZLUDA_MS1_GATE_TRACE=1. Trace buffer is allocated host-side
+/// (in function.rs) and dev_ptr passed as literal into the inserted PTX.
+pub fn patch_ms1_gate_trace(ptx: &str, trace_dev_ptr: u64) -> Option<String> {
+    // DIAGNOSTIC: log entry conditions to debug patch application failures
+    let has_ms1_entry =
+        ptx.contains(".visible .entry CreateParticleShapesIncremental_MultiStage_1(");
+    if has_ms1_entry {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] patch_ms1_gate_trace ENTRY: dev_ptr=0x{:x} ptx_len={}",
+            trace_dev_ptr,
+            ptx.len()
+        ));
+    }
+    if trace_dev_ptr == 0 {
+        if has_ms1_entry {
+            super::driver::zluda_log_err(
+                "[ZLUDA] patch_ms1_gate_trace: SKIP (trace_dev_ptr=0)",
+            );
+        }
+        return None;
+    }
+    // Only patch MS_1 entry kernel (per-kernel-name allowed for trace).
+    // CRITICAL: there's a templated HELPER kernel (.visible .func) that
+    // also contains the same bit-4-set pattern at line ~1001, but that
+    // helper is NEVER LAUNCHED in practice. We must patch only the
+    // .visible .entry (MS_1 entry) site at line ~2137.
+    let entry_marker =
+        ".visible .entry CreateParticleShapesIncremental_MultiStage_1(";
+    let ms1_entry_start = ptx.find(entry_marker)?;
+    let ms2_entry_marker = ".visible .entry CreateParticleShapesIncremental_MultiStage_2";
+    let ms1_entry_end = ptx[ms1_entry_start..]
+        .find(ms2_entry_marker)
+        .map(|n| ms1_entry_start + n)
+        .unwrap_or(ptx.len());
+    let entry_block = &ptx[ms1_entry_start..ms1_entry_end];
+
+    // Find the gate signature: `setp.eq.s32 %pXX, %r178, 0;\n@%pXX bra BBn_NN;`
+    // followed by `ld.local.u32 %rNN, [%rdNN];\nsetp.eq.s32 %pNN, %rNN, 0;\n@%pNN bra BBn_NN;`
+    // We detect via the unique register %r178 and the local-load + bra pattern.
+    // The bit-4-set `or.b32 %r165, %r164, 16;` is the immediately-following
+    // instruction. Search ONLY within MS_1 entry block.
+    let bit4_marker = "or.b32 %r165, %r164, 16;";
+    let bit4_idx_in_entry = match entry_block.find(bit4_marker) {
+        Some(i) => i,
+        None => {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] patch_ms1_gate_trace: SKIP (no bit4_marker in entry; entry_block_len={})",
+                entry_block.len()
+            ));
+            return None;
+        }
+    };
+    let bit4_idx = ms1_entry_start + bit4_idx_in_entry;
+    // Search backwards from bit4_marker for the first setp on %r178.
+    // The gate sequence is:
+    //   setp.eq.s32 %pXX, %r178, 0;
+    //   @%pXX bra BBn_NN;
+    //   ld.local.u32 %rYY, [%rd36];
+    //   setp.eq.s32 %pYY, %rYY, 0;
+    //   @%pYY bra BBn_NN;
+    //   (bit-4 set follows immediately)
+    // Look for `%r178, 0;` (more specific) then walk back to start of its line.
+    let window_start = bit4_idx.saturating_sub(800);
+    let window = &ptx[window_start..bit4_idx];
+    let r178_substr = "%r178, 0;";
+    let r178_offset = match window.rfind(r178_substr) {
+        Some(o) => o,
+        None => {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] patch_ms1_gate_trace: SKIP (no '%r178, 0;' in 800-char window before bit4_marker)"
+            ));
+            return None;
+        }
+    };
+    // Find the start of the line containing this %r178 reference.
+    let line_start_in_window = window[..r178_offset]
+        .rfind('\n')
+        .map(|n| n + 1)
+        .unwrap_or(0);
+    let absolute_insert_idx = window_start + line_start_in_window;
+
+    // Confirm: at absolute_insert_idx, we should see "setp.eq.s32" leading
+    // up to "%r178, 0;", and within the next few lines we should see
+    // "ld.local.u32" loading [%rd36].
+    let confirm_window_end = (absolute_insert_idx + 400).min(ptx.len());
+    let confirm_window = &ptx[absolute_insert_idx..confirm_window_end];
+    if !confirm_window.starts_with("setp.eq.s32") || !confirm_window.contains("[%rd36]") {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] patch_ms1_gate_trace: SKIP (confirm_window mismatch; first_200={:?})",
+            &confirm_window[..confirm_window.len().min(200)]
+        ));
+        return None;
+    }
+
+    // Generate trace PTX. Use high-numbered registers that won't conflict.
+    // MS_1 entry declares .reg .s32 %r<187> and .reg .pred %p<67>; we'll
+    // patch those declarations too. Use unique register IDs 187,188,189 for
+    // s32, and 67,68 for pred.
+    let trace_code = format!(
+        "\t// === ZLUDA MS1_GATE_TRACE (v11) ===\n\t\
+         mov.u64 %rd172, 0x{:x};\n\t\
+         ld.local.u32 %r187, [%rd36];\n\t\
+         atom.global.add.u32 %r188, [%rd172+12], 1;\n\t\
+         setp.eq.s32 %p67, %r178, 0;\n\t\
+         @%p67 atom.global.add.u32 %r189, [%rd172], 1;\n\t\
+         @%p67 bra ZLUDA_TRACE_DONE_MS1;\n\t\
+         setp.eq.s32 %p68, %r187, 0;\n\t\
+         @%p68 atom.global.add.u32 %r189, [%rd172+4], 1;\n\t\
+         @!%p68 atom.global.add.u32 %r189, [%rd172+8], 1;\n\
+         ZLUDA_TRACE_DONE_MS1:\n\t\
+         // === END TRACE ===\n",
+        trace_dev_ptr
+    );
+
+    // Build result: ptx[..absolute_insert_idx] + trace_code + ptx[absolute_insert_idx..]
+    let mut out = String::with_capacity(ptx.len() + trace_code.len() + 200);
+    out.push_str(&ptx[..absolute_insert_idx]);
+    out.push_str(&trace_code);
+    out.push_str(&ptx[absolute_insert_idx..]);
+
+    // Bump register declarations in MS_1 entry to make room for our temps.
+    // Replace `.reg .s32 %r<187>;` -> `.reg .s32 %r<200>;`
+    //         `.reg .s64 %rd<173>;` -> `.reg .s64 %rd<175>;`
+    //         `.reg .pred %p<67>;` -> `.reg .pred %p<72>;`
+    // We patch only within the MS_1 entry block. Find the entry block.
+    let ms1_start = out.find(".visible .entry CreateParticleShapesIncremental_MultiStage_1(")?;
+    let ms1_end_next = ".visible .entry CreateParticleShapesIncremental_MultiStage_2";
+    let ms1_end = out[ms1_start..]
+        .find(ms1_end_next)
+        .map(|n| ms1_start + n)
+        .unwrap_or(out.len());
+    let ms1_block = &out[ms1_start..ms1_end];
+    let mut patched_ms1 = ms1_block.to_string();
+    for (from, to) in &[
+        (".reg .s32 %r<187>;", ".reg .s32 %r<200>;"),
+        (".reg .s64 %rd<173>;", ".reg .s64 %rd<175>;"),
+        (".reg .pred %p<67>;", ".reg .pred %p<72>;"),
+    ] {
+        patched_ms1 = patched_ms1.replacen(from, to, 1);
+    }
+    out.replace_range(ms1_start..ms1_end, &patched_ms1);
+
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] patch_ms1_gate_trace: inserted trace at offset {} (trace_buf=0x{:x})",
+        absolute_insert_idx, trace_dev_ptr
+    ));
+    Some(out)
+}
+
 /// Extract the label name from a line that's just `LABEL:` or `LABEL: comment`.
 /// Returns None if the line is not a bare label.
 fn extract_ptx_label(trimmed: &str) -> Option<&str> {
@@ -1342,10 +1510,17 @@ fn get_best_ptx_and_compile(
                             Some(p) => Cow::Owned(p),
                             None => after_membar,
                         };
-                    let final_ptx: Cow<str> =
+                    let after_divergent: Cow<str> =
                         match patch_divergent_lds_merge_sync(after_scan.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_scan,
+                        };
+                    // v11: MS_1 gate-trace instrumentation (env-gated).
+                    let trace_dev_ptr = super::function::ms1_gate_trace_get_or_init_dev_ptr();
+                    let final_ptx: Cow<str> =
+                        match patch_ms1_gate_trace(after_divergent.as_ref(), trace_dev_ptr) {
+                            Some(p) => Cow::Owned(p),
+                            None => after_divergent,
                         };
                     ptx_modules.push(final_ptx);
                 }
@@ -1415,13 +1590,23 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => after_membar,
                                         };
-                                    let final_ptx: Cow<str> =
+                                    let after_divergent: Cow<str> =
                                         match patch_divergent_lds_merge_sync(
                                             after_scan.as_ref(),
                                         ) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_scan,
                                         };
+                                    // v11: MS_1 gate-trace instrumentation.
+                                    let trace_dev_ptr =
+                                        super::function::ms1_gate_trace_get_or_init_dev_ptr();
+                                    let final_ptx: Cow<str> = match patch_ms1_gate_trace(
+                                        after_divergent.as_ref(),
+                                        trace_dev_ptr,
+                                    ) {
+                                        Some(p) => Cow::Owned(p),
+                                        None => after_divergent,
+                                    };
                                     ptx_modules.push(final_ptx);
                                 }
                                 None => {
