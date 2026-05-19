@@ -84,6 +84,14 @@ pub(crate) unsafe fn record(event: hipEvent_t, stream: hipStream_t) -> hipError_
     // hipDeviceSynchronize's on NULL stream) to add the pre-action barrier.
     // Env-disable with ZLUDA_NULL_STREAM_BARRIER=0 for A/B testing.
     let _guard = super::stream::null_stream_sync_for_event(stream);
+    // Plan v25 Phase B.2: drain DEV5/6/7 dump queue. cuEventRecord fires
+    // ~91k times/run (vs ~120k for cuEventSynchronize); adding the drain
+    // here shrinks the worst-case "MS_4 launched but its dump hasn't run"
+    // gap from ~134 ms to ~10-20 ms. Drain is a no-op when ZLUDA_DEV5_DUMP=0.
+    super::memory::drain_dev5_dump_queue();
+    // Plan v26 Phase B.3: drain IOFX_actorRange param_4 dump queue. Same
+    // safety properties as the DEV5 drain; no-op when ZLUDA_ACTORRANGE_DUMP=0.
+    super::memory::drain_iofx_ar_dump_queue();
     let result = hipEventRecord(event, stream);
     super::driver::zluda_log_err(&format!(
         "cuEventRecord(event={:?}, stream={:?}) -> {:?}",
@@ -112,6 +120,13 @@ pub(crate) unsafe fn record_with_flags(
 
 pub(crate) unsafe fn synchronize(event: hipEvent_t) -> hipError_t {
     super::driver::zluda_log_err(&format!("cuEventSynchronize(event={:?}) ENTER", event));
+    // Plan v24 Phase B.2: drain DEV5 dump queue. cuEventSynchronize is a
+    // host-thread call (safe for DtoH per feedback_no_d2d_from_launch_kernel),
+    // fires very frequently from PhysX (120k+ calls per run). Drain is a
+    // no-op if ZLUDA_DEV5_DUMP=0 or queue is empty.
+    super::memory::drain_dev5_dump_queue();
+    // Plan v26 Phase B.3: drain IOFX_actorRange dump queue (sibling).
+    super::memory::drain_iofx_ar_dump_queue();
     let result = hipEventSynchronize(event);
     super::driver::zluda_log_err(&format!(
         "cuEventSynchronize(event={:?}) -> {:?}",

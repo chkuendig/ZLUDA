@@ -1821,6 +1821,53 @@ unsafe fn check_rd5_22176_mutation(current_kernel: &str) {
 /// is confirmed as the root cause.
 static LAUNCH_LOCK: Mutex<()> = Mutex::new(());
 
+/// Plan v22 Phase B.1: set of every distinct DEV5 (p5) pointer ever observed
+/// at MS_4 launch. The per-launch IOFX kernarg probe (gated on
+/// ZLUDA_REMAP_KARGS=1) compares IOFX_remap/sort/actorRange/makeSortKeys
+/// kernel arg pointers against this set to find launches whose output lands
+/// in DEV5 — those are MS_4's upstream writers, the suspects for DEV5
+/// corruption.
+static MS4_DEV5_ADDRS: std::sync::OnceLock<Mutex<std::collections::HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+/// Plan v25 Phase B.2: queue of `(p4, p5, p6, p7, n_threads, launch_n)`
+/// tuples pushed by the MS_4 launch hook in `launch_kernel`, drained by
+/// the `cuEventRecord` and `cuEventSynchronize` handlers (host-thread
+/// contexts where DtoH is allowed per
+/// `feedback_no_d2d_from_launch_kernel`). The consumer does
+/// `hipDeviceSynchronize` + `hipMemcpyDtoH` to read DEV5, DEV6, DEV7
+/// contents and log histograms.
+///
+/// Tuple expanded from 3 to 6 elements in Plan v25 so the consumer can
+/// dump DEV6 (initial counter, indexed by `r6*12`) and DEV7 (atomic
+/// counter, indexed by `r6*4`) in addition to DEV5. Run e6 saw clean
+/// DEV5 contents but only sampled indices 0..1023 (cap was 1024); the
+/// crashing launch had n_threads=1722 so entries 1024..1721 were not
+/// visible. v25 lifts that cap and adds the sibling buffers.
+///
+/// Gated on `ZLUDA_DEV5_DUMP=1`. Capped at 64 entries; drop-oldest on
+/// overflow. Push side holds the lock only for the push itself (no
+/// HIP calls) to avoid the UAF class of 2026-05-18.
+pub(crate) static MS4_DEV5_DUMP_QUEUE: std::sync::OnceLock<
+    Mutex<std::collections::VecDeque<(u64, u64, u64, u64, u32, u32)>>,
+> = std::sync::OnceLock::new();
+
+/// Plan v27 Phase B.3 (extended 2026-05-19): queue of
+/// `(param_4_ptr, param_6_ptr, param_9_ptr, launch_n)` tuples pushed by
+/// the IOFX_actorRangeKernel hook. The consumer dumps all three READ
+/// buffers (per Explore-identified PTX usage: param_4, param_6, param_9
+/// are loaded as global u32, param_7+param_8 are written).
+///
+/// Run e18 (2026-05-19 01:14) caught 142 wild dumps from param_4. The
+/// other 13 crashes in the same overnight loop showed no param_4
+/// wildness — but they might have wild param_6 or param_9. Extending
+/// to all three reads catches more of the same bug class.
+///
+/// Gated on `ZLUDA_ACTORRANGE_DUMP=1`. Capped at 64 entries; drop-oldest.
+pub(crate) static IOFX_AR_DUMP_QUEUE: std::sync::OnceLock<
+    Mutex<std::collections::VecDeque<(u64, u64, u64, u32)>>,
+> = std::sync::OnceLock::new();
+
 fn launch_mutex(lock_mode: u8) -> Option<&'static Mutex<()>> {
     if lock_mode >= 1 {
         Some(&LAUNCH_LOCK)
@@ -9342,6 +9389,91 @@ pub(crate) fn launch_kernel(
     let log_launches = *LOG_LAUNCHES
         .get_or_init(|| std::env::var("ZLUDA_LOG_LAUNCHES").map_or(false, |v| v == "1"));
     let name = lookup_name(f.base);
+
+    // 2026-05-18 Plan v20.3: per-launch n_threads slot barrier read.
+    //
+    // The Batman: Arkham Knight MS_4 wild-VA crash is timing/coherency
+    // sensitive. Reading the n_threads carrier slots
+    // (v[663640] and v[1056768] — empirically confirmed via
+    // ZLUDA_RELAY_SLOT_PROBE on 2026-05-18) from every tracked >=2MB
+    // mapped buffer at each kernel launch entry forces the writes that
+    // populate those slots to be visible before the next kernel reads
+    // them. This was discovered as a side effect of the diagnostic
+    // ZLUDA_NTHREADS_WRITER tracker: the instrumented run completed
+    // cleanly (419k kernels) where the bare-baseline run crashes.
+    //
+    // Two modes share the same read loop:
+    //   - ZLUDA_NTHREADS_BARRIER=1 (DEFAULT-ON, the fix): silent reads.
+    //   - ZLUDA_NTHREADS_WRITER=1  (OPT-IN diagnostic): emits V_CHANGE
+    //     log lines attributing slot changes to the previously-launched
+    //     kernel. WRITER implies BARRIER (the read happens unconditionally
+    //     when either is on).
+    {
+        static BARRIER_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static WRITER_TRACK_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let barrier_on = *BARRIER_ENABLED.get_or_init(|| {
+            std::env::var("ZLUDA_NTHREADS_BARRIER")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        });
+        let writer_log_on = *WRITER_TRACK_ENABLED.get_or_init(|| {
+            std::env::var("ZLUDA_NTHREADS_WRITER").map_or(false, |v| v == "1")
+        });
+        if barrier_on || writer_log_on {
+            const OFFSETS: [usize; 2] = [663640, 1056768];
+            // Per-(host,off) previous value + previous kernel name. Only
+            // touched when writer_log_on; the barrier path doesn't need
+            // memory.
+            static PREV_STATE: std::sync::Mutex<
+                Option<std::collections::HashMap<(usize, usize), (u32, String)>>,
+            > = std::sync::Mutex::new(None);
+            unsafe {
+                if let Ok(table) = super::memory::SMALL_HOST_ALLOCS.lock() {
+                    let mut state_opt_guard = if writer_log_on {
+                        PREV_STATE.lock().ok()
+                    } else {
+                        None
+                    };
+                    let mut state = state_opt_guard
+                        .as_mut()
+                        .map(|g| g.get_or_insert_with(std::collections::HashMap::new));
+                    for &(host, _dev, size) in table.iter() {
+                        if size < 2_000_000 {
+                            continue;
+                        }
+                        for &off in OFFSETS.iter() {
+                            if off + 4 > size {
+                                continue;
+                            }
+                            // Volatile read prevents the optimiser from
+                            // eliding it; this is the barrier itself.
+                            let cur = std::ptr::read_volatile(
+                                (host + off) as *const u32,
+                            );
+                            // Force the read to participate in a fence so
+                            // the compiler can't reorder it past the next
+                            // HIP call.
+                            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                            if let Some(state) = state.as_deref_mut() {
+                                let key = (host, off);
+                                if let Some((prev_v, prev_k)) = state.get(&key) {
+                                    if cur != *prev_v {
+                                        super::driver::zluda_log_err(&format!(
+                                            "V_CHANGE host=0x{:x} off={} prev_kernel='{}' \
+                                             v: {} -> {} (this_kernel='{}')",
+                                            host, off, prev_k, prev_v, cur, name
+                                        ));
+                                    }
+                                }
+                                state.insert(key, (cur, name.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if log_launches {
         super::driver::zluda_log_err(&format!(
             "cuLaunchKernel '{}' grid=[{},{},{}] block=[{},{},{}] shared={}",
@@ -9460,6 +9592,109 @@ pub(crate) fn launch_kernel(
                 block_dim_z,
                 all_args.join(" ")
             ));
+        }
+    }
+    // Plan v22 Phase B.1 — per-launch IOFX kernarg probe.
+    //
+    // Goal: identify which IOFX_remap / IOFX_makeSortKeys / IOFX_newRadixSort*
+    // / IOFX_actorRange launch writes corruption into MS_4's DEV5 buffer.
+    // Filter: kernel name matches the IOFX-family regex AND at least one
+    // kernarg is a pointer that matches (exact or within 64 MiB of) a known
+    // MS_4 DEV5 (p5) address — keeps log volume tractable.
+    //
+    // Safety: only reads from `kernel_params` (alive for the duration of this
+    // call). Does NOT touch SMALL_HOST_ALLOCS or any tracker that requires
+    // holding another lock. Probe-induced UAF (2026-05-18 incident) is the
+    // primary failure mode for new probes; this one is read-only on
+    // ProtoBuf-shaped contiguous param slots.
+    //
+    // Gated on ZLUDA_REMAP_KARGS=1, default OFF.
+    static REMAP_KARGS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let remap_kargs = *REMAP_KARGS_ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_REMAP_KARGS").map_or(false, |v| v == "1"));
+    if remap_kargs && !kernel_params.is_null() {
+        // Filter restored to e2 state (2026-05-18). e3 (no filter) and e4
+        // (wider PhysX-family filter, walk=12) both SIGSEGV'd in
+        // launch_kernel after the first MS_4 — coredump top frame in our
+        // libcuda.so.1's launch_kernel. The kernarg walk is fundamentally
+        // unsafe for kernels whose kernel_params layout we haven't
+        // explicitly observed safe.
+        //
+        // Phase B.1 with this filter is complete (run e2): MS_1/MS_2_Batched/
+        // MS_3 touch MS_4's DEV5 pool but none writes at the DEV5 offset.
+        // To find the actual DEV5 writer, pivot to Plan v22 Phase B.2
+        // (DEV5 DtoH dump from cuMemcpyAsync handler) — different code path,
+        // no per-launch kernarg walks of arbitrary kernels.
+        let is_dev5_candidate = name.contains("IOFX_remap")
+            || name.contains("IOFX_makeSortKeys")
+            || name.contains("IOFX_newRadixSort")
+            || name.contains("IOFX_actorRange")
+            || name.contains("CreateParticleShapesIncremental_MultiStage_1")
+            || name.contains("CreateParticleShapesIncremental_MultiStage_2_Batched")
+            || name.contains("CreateParticleShapesIncremental_MultiStage_3");
+        if is_dev5_candidate {
+            // Snapshot the tracked DEV5 set without holding the lock across
+            // the kernarg reads.
+            let dev5_addrs: Vec<u64> = MS4_DEV5_ADDRS
+                .get()
+                .and_then(|m| m.lock().ok().map(|s| s.iter().copied().collect()))
+                .unwrap_or_default();
+            if !dev5_addrs.is_empty() {
+                // Plan v23 — same 2 MiB-aligned-base match. Run e1 proved
+                // ±64 MiB is too tight (PhysX sub-buffer arenas are ~1.1 GiB
+                // apart). All observed MS_4 / IOFX allocations are exactly
+                // 2 MiB (0x200000) so the 2 MiB-aligned-base heuristic is
+                // empirically safe; upgrade to full ALLOC-table lookup only
+                // if this returns false negatives we can prove.
+                const POOL_MASK: u64 = !0x1f_ffffu64; // 2 MiB align mask
+                const PTR_LO: u64 = 0x1000;
+                const PTR_HI: u64 = 0x0000_8000_0000_0000;
+                let mut all_args: Vec<String> = Vec::new();
+                let mut hit_any = false;
+                // Walk cap: 16 slots is safe for the e2 filter (MS_1 has 13
+                // kernargs, others fewer). Restored after e3/e4 SIGSEGV with
+                // unfiltered/wider walks.
+                for i in 0..16usize {
+                    let slot_ptr = unsafe { *kernel_params.add(i) } as u64;
+                    if slot_ptr == 0 {
+                        all_args.push(format!("p{}=null", i));
+                        break;
+                    }
+                    if slot_ptr < PTR_LO || slot_ptr >= PTR_HI {
+                        all_args.push(format!("p{}=oob(0x{:x})", i, slot_ptr));
+                        break;
+                    }
+                    let v = unsafe { std::ptr::read_unaligned(slot_ptr as *const u64) };
+                    let v_u32 = (v & 0xFFFF_FFFF) as u32;
+                    let mut tag = "val".to_string();
+                    let v_pool = v & POOL_MASK;
+                    for &dev5 in dev5_addrs.iter() {
+                        if v_pool == (dev5 & POOL_MASK) {
+                            hit_any = true;
+                            let off_in_pool = v & 0x1f_ffffu64;
+                            let dev5_off = dev5 & 0x1f_ffffu64;
+                            tag = format!(
+                                "DEV5pool(p5@+{:#x},this@+{:#x})",
+                                dev5_off, off_in_pool
+                            );
+                            break;
+                        }
+                    }
+                    all_args.push(format!("p{}={}=0x{:x}(u32=0x{:x})", i, tag, v, v_u32));
+                }
+                if hit_any {
+                    static REMAP_SEQ: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let seq = REMAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    super::driver::zluda_log_err(&format!(
+                        "[REMAP_KARGS #{}] '{}' grid=[{},{},{}] block=[{},{},{}] args=[{}]",
+                        seq, name,
+                        grid_dim_x, grid_dim_y, grid_dim_z,
+                        block_dim_x, block_dim_y, block_dim_z,
+                        all_args.join(" ")
+                    ));
+                }
+            }
         }
     }
     // Capture every MemCopyAsync / MemCopyBatchedAsync launch's packed
@@ -9674,6 +9909,42 @@ pub(crate) fn launch_kernel(
                 "MS4_ARGS #{} n={} p2=0x{:x} p4=0x{:x} p5=0x{:x} p6=0x{:x} p7=0x{:x}",
                 call_n, n, p2, p4, p5, p6, p7
             ));
+            // Plan v22 Phase B.1: record DEV5 (p5) addresses for the IOFX
+            // per-launch kernarg probe to cross-reference against. Bounded
+            // size — only the most recent ~64 distinct values matter.
+            if p5 != 0 {
+                let set = MS4_DEV5_ADDRS
+                    .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+                if let Ok(mut s) = set.lock() {
+                    if s.len() < 256 {
+                        s.insert(p5);
+                    }
+                }
+            }
+            // Plan v25 Phase B.2: push 6-tuple (p4, p5, p6, p7, n, call_n)
+            // onto the dump queue so cuEventRecord / cuEventSynchronize can
+            // drain it later (DtoH from launch_kernel is forbidden per
+            // feedback_no_d2d_from_launch_kernel). The 4-pointer tuple lets
+            // the consumer dump DEV5/6/7 (and optionally DEV4) in a single
+            // drain pass. Gated on ZLUDA_DEV5_DUMP=1. Drop-oldest at 64
+            // entries; queue lock held only across the push itself, NEVER
+            // across a HIP call.
+            static DEV5_DUMP_ENABLED: std::sync::OnceLock<bool> =
+                std::sync::OnceLock::new();
+            if *DEV5_DUMP_ENABLED
+                .get_or_init(|| std::env::var("ZLUDA_DEV5_DUMP").map_or(false, |v| v == "1"))
+                && p5 != 0
+            {
+                let queue = MS4_DEV5_DUMP_QUEUE.get_or_init(|| {
+                    std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))
+                });
+                if let Ok(mut q) = queue.lock() {
+                    while q.len() >= 64 {
+                        q.pop_front();
+                    }
+                    q.push_back((p4, p5, p6, p7, n, call_n));
+                }
+            }
             // Plan v13 Step 1C: scan all `cuMemHostAlloc` (zero-copy
             // mapped) buffers for the u32 value `n`. Whoever holds it is
             // the buffer PhysX read from to compute MS_4 grid_size. Gated
@@ -9716,7 +9987,20 @@ pub(crate) fn launch_kernel(
             // path per feedback_no_d2d_from_launch_kernel). The address itself
             // shows whether flags is stable across frames (per-actor static)
             // and lets us correlate with addresses written by upstream kernels.
+            // 2026-05-18: gate the legacy MS4_HOST_COUNTERS + MS4_ARG_DUMP
+            // dumps behind ZLUDA_MS4_HOST_DUMP=1. Previously unconditional;
+            // they dereference (host + offset) from every tracked mapped
+            // buffer and were a suspect for the host-side SIGABRT class
+            // that masqueraded as "GPU fault likely" through the
+            // 2026-05-18 D-series. Default OFF for production; turn on
+            // only when actively debugging MS_4 pre-launch state.
+            static MS4_HOST_DUMP_ENABLED: std::sync::OnceLock<bool> =
+                std::sync::OnceLock::new();
+            let ms4_host_dump_on = *MS4_HOST_DUMP_ENABLED.get_or_init(|| {
+                std::env::var("ZLUDA_MS4_HOST_DUMP").map_or(false, |v| v == "1")
+            });
             if let Ok(table) = super::memory::SMALL_HOST_ALLOCS.lock() {
+                if ms4_host_dump_on {
                 // Legacy dump: first 16 u32s of every tracked buffer (unchanged
                 // behavior for small host counters we've been relying on).
                 for &(host, dev, size) in table.iter() {
@@ -9767,6 +10051,7 @@ pub(crate) fn launch_kernel(
                         }
                     }
                 }
+                } // end if ms4_host_dump_on
                 // NOTE: full-buffer sentinel scan removed — 6MB × 200 launches
                 // = 1.2 GB of CPU reads during init was correlated with
                 // triggering the ProfilingSignal libstdc++ race (p9, p10
@@ -9878,6 +10163,106 @@ pub(crate) fn launch_kernel(
                             super::driver::zluda_log_err(&line);
                         }
                     }
+                }
+            }
+            // 2026-05-18 Plan v20.1 D2: relay-slot probe. At each MS_4
+            // launch, read u32 at the known dst offsets that Phase C
+            // identified as MemCopyBatchedAsync relay targets. Logged
+            // alongside ACTOR_ENTRY_PROBE so the value progression can
+            // be correlated with n_threads in the same line stream.
+            // Offsets are hardcoded from two empirical sources:
+            //   - 663640 / 1056768 : Plan v19 SLOT_IDENTIFIED memory
+            //   - 657408 / 1312768 : Phase C run on 2026-05-18 night
+            // Both pairs included because the slot offsets shift between
+            // runs (different PhysX particle-system layouts).
+            // Cheap: 4 u32 reads per tracked >=2MB mapped buffer per launch.
+            static RELAY_SLOT_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *RELAY_SLOT_PROBE
+                .get_or_init(|| std::env::var("ZLUDA_RELAY_SLOT_PROBE").map_or(false, |v| v == "1"))
+            {
+                if let Ok(table) = super::memory::SMALL_HOST_ALLOCS.lock() {
+                    const OFFSETS: [usize; 4] = [657408, 663640, 1056768, 1312768];
+                    for &(host, _dev, size) in table.iter() {
+                        if size < 2_000_000 {
+                            continue;
+                        }
+                        let mut line =
+                            format!("RELAY_SLOT_PROBE #{} n={} host=0x{:x}", call_n, n, host);
+                        let mut any_nonzero = false;
+                        for &off in OFFSETS.iter() {
+                            if off + 4 > size {
+                                continue;
+                            }
+                            let v = std::ptr::read_volatile((host + off) as *const u32);
+                            if v != 0 {
+                                any_nonzero = true;
+                            }
+                            line.push_str(&format!(" v[{}]={}", off, v));
+                        }
+                        if any_nonzero {
+                            super::driver::zluda_log_err(&line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Plan v26 Phase B.3: IOFX_actorRangeKernel param_4 dump producer.
+    // Pushes (param_4_ptr, call_n) onto IOFX_AR_DUMP_QUEUE so cuEventRecord /
+    // cuEventSynchronize can drain it later. param_4 is the suspected wild
+    // value source per project_actorrange_wild_input_root_cause_2026_05_11.
+    //
+    // PTX param layout (u64+u16+u32+u32+u64+...): param_4 starts at byte 24
+    // when u16 is padded to its natural alignment (u16 at 8, u32 at 12, u32
+    // at 16, u64 at 24 with alignment-8 padding inserted). Verified via
+    // KARG_LOG output where slot[3] of 8-byte slots = DEV3 = first device
+    // ptr = param_4.
+    //
+    // Gated on ZLUDA_ACTORRANGE_DUMP=1, default OFF.
+    if name.contains("IOFX_actorRange") {
+        static AR_DUMP_ENABLED: std::sync::OnceLock<bool> =
+            std::sync::OnceLock::new();
+        if *AR_DUMP_ENABLED
+            .get_or_init(|| std::env::var("ZLUDA_ACTORRANGE_DUMP").map_or(false, |v| v == "1"))
+        {
+            unsafe {
+                // PTX param layout for IOFX_actorRange (Explore-confirmed):
+                //   param_4 u64 @ byte 24 — first READ buffer (the one e18
+                //                            caught wild)
+                //   param_6 u64 @ byte 40 — second READ buffer
+                //   param_9 u64 @ byte 64 — third READ buffer
+                // (param_5 is .u32 at byte 32; param_7+8 are WRITE buffers,
+                //  not interesting for wild-VA source identification)
+                let p4: u64 = read_kernel_arg(kernel_params, extra, 24, 4).unwrap_or(0);
+                let p6: u64 = read_kernel_arg(kernel_params, extra, 40, 6).unwrap_or(0);
+                let p9: u64 = read_kernel_arg(kernel_params, extra, 64, 9).unwrap_or(0);
+                static AR_CALL_N: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let call_n = AR_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Plausibility check: param_4 must look like a user-space
+                // pointer. param_6 and param_9 are also validated and
+                // zeroed-out if not plausible (consumer will skip 0 entries).
+                const PTR_LO: u64 = 0x1000;
+                const PTR_HI: u64 = 0x0000_8000_0000_0000;
+                let plausible = |p: u64| p >= PTR_LO && p < PTR_HI;
+                if plausible(p4) {
+                    let p6_safe = if plausible(p6) { p6 } else { 0 };
+                    let p9_safe = if plausible(p9) { p9 } else { 0 };
+                    let queue = IOFX_AR_DUMP_QUEUE.get_or_init(|| {
+                        std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))
+                    });
+                    if let Ok(mut q) = queue.lock() {
+                        while q.len() >= 64 {
+                            q.pop_front();
+                        }
+                        q.push_back((p4, p6_safe, p9_safe, call_n));
+                    }
+                } else {
+                    super::driver::zluda_log_err(&format!(
+                        "[IOFX_AR_PUSH #{}] '{}' p4=0x{:x} not plausible — skipping push",
+                        call_n, name, p4
+                    ));
                 }
             }
         }
@@ -10398,6 +10783,26 @@ pub(crate) fn launch_kernel(
         let refresh_seq =
             REFRESH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         super::memory::mapped_write_refresh_pre(refresh_seq);
+    }
+
+    // 2026-05-18 Plan v20.4 option 1: hard-sync immediately before MS_4
+    // (CreateParticleShapesIncremental_MultiStage_4) launches. The MS_4
+    // wild-VA crash is timing/coherency sensitive: every per-launch CPU
+    // read of the n_threads carrier slot (v[663640] / v[1056768]) we add
+    // delays the crash by ~30-70× without eliminating it. A
+    // hipStreamSynchronize *just before* MS_4 dispatches forces the
+    // strongest possible barrier between the CPU read of n_threads (as
+    // kernarg) and the kernel's execution. Gated on ZLUDA_MS4_HARD_SYNC=1.
+    // Costs one stream sync per MS_4 launch (hundreds per second at peak).
+    if name == "CreateParticleShapesIncremental_MultiStage_4" {
+        static MS4_HARD_SYNC_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MS4_HARD_SYNC_ENABLED.get_or_init(|| {
+            std::env::var("ZLUDA_MS4_HARD_SYNC").map_or(false, |v| v == "1")
+        }) {
+            unsafe {
+                let _ = hip_runtime_sys::hipStreamSynchronize(stream);
+            }
+        }
     }
 
     // CU_LAUNCH_PARAM_END=0x0, HIP_LAUNCH_PARAM_END=0x3 — translate if using extra

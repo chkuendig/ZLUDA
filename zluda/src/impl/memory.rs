@@ -1012,9 +1012,16 @@ pub(crate) fn get_info_v2(free: *mut usize, total: *mut usize) -> hipError_t {
 }
 
 pub(crate) unsafe fn free_host(ptr: *mut ::core::ffi::c_void) -> CUresult {
-    let hip_result = hipFreeHost(ptr);
+    // 2026-05-18: untrack BEFORE hipFreeHost. Any diagnostic probe that
+    // iterates SMALL_HOST_ALLOCS and dereferences (host + off) races
+    // against this free — if hipFreeHost runs first the memory is
+    // unmapped while the probe still holds a (host, _dev, size) tuple
+    // from the previous lock-and-clone, leading to SIGSEGV that our
+    // signal handler misattributes as "GPU fault likely". This was
+    // the source of the entire D2-D6 ghost crash class (2026-05-18).
     untrack_host_alloc(ptr);
     untrack_hostbuf(ptr);
+    let hip_result = hipFreeHost(ptr);
     remove_allocation(ptr)?;
     Ok(hip_result?)
 }
@@ -1278,12 +1285,279 @@ pub(crate) unsafe fn copy(
     )
 }
 
+/// Plan v25 Phase B.2: drain `MS4_DEV5_DUMP_QUEUE`. Called at the entry of
+/// `event::record` and `event::synchronize` (host-thread contexts where
+/// DtoH is allowed per `feedback_no_d2d_from_launch_kernel`).
+///
+/// For each `(p4, p5, p6, p7, n_threads, launch_n)` pushed by the MS_4
+/// launch hook in `function.rs`, do `hipDeviceSynchronize` plus three
+/// synchronous `hipMemcpyDtoH` reads: DEV5 (index buffer, cap 65536
+/// u32 = 256 KiB), DEV6 (initial-counter buffer with 12-byte stride,
+/// cap 16384 u32 = 64 KiB), DEV7 (atomic-counter buffer, cap 65536
+/// u32 = 256 KiB). Log per-buffer histograms.
+///
+/// Run e6 (2026-05-18) saw DEV5 clean for 28 launches but the cap
+/// was 1024 — indices past that were unread. v25 lifts the cap and
+/// adds DEV6/DEV7 so we cover the other wild-VA candidates in MS_4.
+///
+/// Safety:
+/// - Queue lock is held ONLY for the swap-out clone. HIP calls happen
+///   outside the critical section — no UAF class.
+/// - `hipMemcpyDtoH` returns an error rather than crashing on a freed
+///   device pointer, so stale entries log a fail line and skip.
+/// - Gated on `ZLUDA_DEV5_DUMP=1`, default OFF.
+pub(crate) fn drain_dev5_dump_queue() {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("ZLUDA_DEV5_DUMP").map_or(false, |v| v == "1")) {
+        return;
+    }
+    let items: Vec<(u64, u64, u64, u64, u32, u32)> =
+        match super::function::MS4_DEV5_DUMP_QUEUE.get() {
+            Some(m) => match m.lock() {
+                Ok(mut q) => q.drain(..).collect(),
+                Err(_) => return,
+            },
+            None => return,
+        };
+    if items.is_empty() {
+        return;
+    }
+    const DEV5_CAP: u32 = 65536;
+    // DEV6 is indexed by r6*12 (3-u32 struct). We cap at 16384 u32s
+    // = 5461 structs to bound per-launch DtoH cost at 64 KiB.
+    const DEV6_CAP_U32S: u32 = 16384;
+    // DEV7 is indexed by r6*4 (single u32). Cap mirrors DEV5.
+    const DEV7_CAP: u32 = 65536;
+    for (_p4, p5, p6, p7, n_threads, launch_n) in items {
+        let sync_res = unsafe { hipDeviceSynchronize() };
+        if sync_res.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "[DEV5_DUMP #{}] hipDeviceSynchronize failed err={:?}",
+                launch_n, sync_res
+            ));
+            continue;
+        }
+        // --- DEV5 ---
+        let dev5_count = n_threads.min(DEV5_CAP) as usize;
+        let mut max_r6: u32 = 0;
+        if dev5_count == 0 {
+            super::driver::zluda_log_err(&format!(
+                "[DEV5_DUMP #{}] n_threads=0 — skipping",
+                launch_n
+            ));
+        } else if p5 == 0 {
+            super::driver::zluda_log_err(&format!(
+                "[DEV5_DUMP #{}] p5=null — skipping",
+                launch_n
+            ));
+        } else {
+            let mut local: Vec<u32> = vec![0u32; dev5_count];
+            let copy_res = unsafe {
+                hipMemcpyDtoH(
+                    local.as_mut_ptr() as *mut std::ffi::c_void,
+                    hipDeviceptr_t(p5 as *mut std::ffi::c_void),
+                    dev5_count * 4,
+                )
+            };
+            if copy_res.is_err() {
+                super::driver::zluda_log_err(&format!(
+                    "[DEV5_DUMP #{}] DtoH failed err={:?} dev5=0x{:x} dump={}",
+                    launch_n, copy_res, p5, dev5_count
+                ));
+            } else {
+                let bit31 = local.iter().filter(|&&v| v & 0x8000_0000 != 0).count();
+                let huge = local.iter().filter(|&&v| v > (1u32 << 24)).count();
+                let min_v = local.iter().min().copied().unwrap_or(0);
+                let max_v = local.iter().max().copied().unwrap_or(0);
+                max_r6 = max_v;
+                let sample_n = local.len().min(16);
+                let sample: Vec<String> =
+                    local[..sample_n].iter().map(|v| format!("0x{:x}", v)).collect();
+                super::driver::zluda_log_err(&format!(
+                    "[DEV5_DUMP #{}] dev5=0x{:x} n_threads={} dump={} bit31={} huge={} min=0x{:x} max=0x{:x} sample=[{}]",
+                    launch_n,
+                    p5,
+                    n_threads,
+                    dev5_count,
+                    bit31,
+                    huge,
+                    min_v,
+                    max_v,
+                    sample.join(" ")
+                ));
+            }
+        }
+        // --- DEV6 (indexed by r6*12, 3-u32 struct) ---
+        // We dump up to max_r6+1 u32 structs from p6. Cap at DEV6_CAP_U32S
+        // total u32s = ~5461 structs (64 KiB). If max_r6 is 0, dump 16 u32s
+        // as a probe sample anyway.
+        let dev6_struct_count = (max_r6.saturating_add(1)).min(DEV6_CAP_U32S / 3);
+        let dev6_u32_count = (dev6_struct_count as usize)
+            .saturating_mul(3)
+            .max(if max_r6 == 0 { 16 } else { 0 });
+        if p6 != 0 && dev6_u32_count > 0 {
+            let mut local: Vec<u32> = vec![0u32; dev6_u32_count];
+            let copy_res = unsafe {
+                hipMemcpyDtoH(
+                    local.as_mut_ptr() as *mut std::ffi::c_void,
+                    hipDeviceptr_t(p6 as *mut std::ffi::c_void),
+                    dev6_u32_count * 4,
+                )
+            };
+            if copy_res.is_err() {
+                super::driver::zluda_log_err(&format!(
+                    "[DEV6_DUMP #{}] DtoH failed err={:?} dev6=0x{:x} dump={}",
+                    launch_n, copy_res, p6, dev6_u32_count
+                ));
+            } else {
+                let bit31 = local.iter().filter(|&&v| v & 0x8000_0000 != 0).count();
+                let huge = local.iter().filter(|&&v| v > (1u32 << 24)).count();
+                let min_v = local.iter().min().copied().unwrap_or(0);
+                let max_v = local.iter().max().copied().unwrap_or(0);
+                let sample_n = local.len().min(16);
+                let sample: Vec<String> =
+                    local[..sample_n].iter().map(|v| format!("0x{:x}", v)).collect();
+                super::driver::zluda_log_err(&format!(
+                    "[DEV6_DUMP #{}] dev6=0x{:x} dump={} (structs~{}) bit31={} huge={} min=0x{:x} max=0x{:x} sample=[{}]",
+                    launch_n,
+                    p6,
+                    dev6_u32_count,
+                    dev6_u32_count / 3,
+                    bit31,
+                    huge,
+                    min_v,
+                    max_v,
+                    sample.join(" ")
+                ));
+            }
+        }
+        // --- DEV7 (atomic counter, indexed by r6*4, single u32) ---
+        let dev7_count = (max_r6.saturating_add(1)).min(DEV7_CAP) as usize;
+        let dev7_count = dev7_count.max(if max_r6 == 0 { 16 } else { 0 });
+        if p7 != 0 && dev7_count > 0 {
+            let mut local: Vec<u32> = vec![0u32; dev7_count];
+            let copy_res = unsafe {
+                hipMemcpyDtoH(
+                    local.as_mut_ptr() as *mut std::ffi::c_void,
+                    hipDeviceptr_t(p7 as *mut std::ffi::c_void),
+                    dev7_count * 4,
+                )
+            };
+            if copy_res.is_err() {
+                super::driver::zluda_log_err(&format!(
+                    "[DEV7_DUMP #{}] DtoH failed err={:?} dev7=0x{:x} dump={}",
+                    launch_n, copy_res, p7, dev7_count
+                ));
+            } else {
+                let bit31 = local.iter().filter(|&&v| v & 0x8000_0000 != 0).count();
+                let huge = local.iter().filter(|&&v| v > (1u32 << 24)).count();
+                let min_v = local.iter().min().copied().unwrap_or(0);
+                let max_v = local.iter().max().copied().unwrap_or(0);
+                let sample_n = local.len().min(16);
+                let sample: Vec<String> =
+                    local[..sample_n].iter().map(|v| format!("0x{:x}", v)).collect();
+                super::driver::zluda_log_err(&format!(
+                    "[DEV7_DUMP #{}] dev7=0x{:x} dump={} bit31={} huge={} min=0x{:x} max=0x{:x} sample=[{}]",
+                    launch_n,
+                    p7,
+                    dev7_count,
+                    bit31,
+                    huge,
+                    min_v,
+                    max_v,
+                    sample.join(" ")
+                ));
+            }
+        }
+    }
+}
+
+/// Plan v26 Phase B.3: drain `IOFX_AR_DUMP_QUEUE`. Same pattern as
+/// `drain_dev5_dump_queue`. For each (param_4_ptr, launch_n), do a
+/// `hipDeviceSynchronize` + `hipMemcpyDtoH` of up to 4096 u32s
+/// (16 KiB). Logs histogram (bit-31 count, huge count, min, max,
+/// first 16 hex values).
+///
+/// Gated on `ZLUDA_ACTORRANGE_DUMP=1`, default OFF.
+pub(crate) fn drain_iofx_ar_dump_queue() {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("ZLUDA_ACTORRANGE_DUMP").map_or(false, |v| v == "1"))
+    {
+        return;
+    }
+    let items: Vec<(u64, u64, u64, u32)> = match super::function::IOFX_AR_DUMP_QUEUE.get() {
+        Some(m) => match m.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => return,
+        },
+        None => return,
+    };
+    if items.is_empty() {
+        return;
+    }
+    const AR_DUMP_CAP: usize = 4096;
+    // Helper: dump one buffer and emit one log line per (launch, label).
+    let dump_one = |label: &str, ptr: u64, launch_n: u32| {
+        if ptr == 0 {
+            return; // skipped (not plausible) — already logged at push site
+        }
+        let mut local: Vec<u32> = vec![0u32; AR_DUMP_CAP];
+        let copy_res = unsafe {
+            hipMemcpyDtoH(
+                local.as_mut_ptr() as *mut std::ffi::c_void,
+                hipDeviceptr_t(ptr as *mut std::ffi::c_void),
+                AR_DUMP_CAP * 4,
+            )
+        };
+        if copy_res.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "[IOFX_AR_DUMP {} #{}] DtoH failed err={:?} ptr=0x{:x} dump={}",
+                label, launch_n, copy_res, ptr, AR_DUMP_CAP
+            ));
+            return;
+        }
+        let bit31 = local.iter().filter(|&&v| v & 0x8000_0000 != 0).count();
+        let huge = local.iter().filter(|&&v| v > (1u32 << 24)).count();
+        let min_v = local.iter().min().copied().unwrap_or(0);
+        let max_v = local.iter().max().copied().unwrap_or(0);
+        let sample_n = local.len().min(16);
+        let sample: Vec<String> =
+            local[..sample_n].iter().map(|v| format!("0x{:x}", v)).collect();
+        super::driver::zluda_log_err(&format!(
+            "[IOFX_AR_DUMP {} #{}] ptr=0x{:x} dump={} bit31={} huge={} min=0x{:x} max=0x{:x} sample=[{}]",
+            label, launch_n, ptr, AR_DUMP_CAP, bit31, huge, min_v, max_v, sample.join(" ")
+        ));
+    };
+    for (p4, p6, p9, launch_n) in items {
+        let sync_res = unsafe { hipDeviceSynchronize() };
+        if sync_res.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "[IOFX_AR_DUMP #{}] hipDeviceSynchronize failed err={:?}",
+                launch_n, sync_res
+            ));
+            continue;
+        }
+        // Emit one log line per buffer. The "p4" label preserves
+        // backward-compat grep (lots of analysis scripts grep
+        // IOFX_AR_DUMP); the new "p6" / "p9" lines are additional.
+        dump_one("p4", p4, launch_n);
+        dump_one("p6", p6, launch_n);
+        dump_one("p9", p9, launch_n);
+    }
+}
+
 pub(crate) unsafe fn copy_async(
     dst: hipDeviceptr_t,
     src: hipDeviceptr_t,
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
+    // Plan v24 Phase B.2: drain the DEV5 dump queue here. cuMemcpyAsync is
+    // the documented-safe place for synchronous DtoH (per
+    // feedback_no_d2d_from_launch_kernel + project_phase_c_memcpy_descriptor).
+    // Swap the queue out under lock, release lock, then process — never hold
+    // a tracker lock across a HIP call (UAF class of 2026-05-18).
+    drain_dev5_dump_queue();
     // Plan v14.next.next: log when dst falls in a tracked mapped buffer.
     // PhysX 3.4 routes most counter refreshes through cuMemcpyAsync
     // (CU_MEMORYTYPE_DEVICE inferred), not the typed DtoD variants —
