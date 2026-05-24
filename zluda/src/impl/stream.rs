@@ -18,6 +18,29 @@ use std::sync::Mutex;
 /// (memory.rs) so that ALL NULL-stream operations serialize with each other.
 pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
 
+/// Dirty flag: set when a kernel launches on a non-default stream.
+/// Cleared after hipDeviceSynchronize in null_stream_sync.
+/// When false, null-stream memops skip the expensive device sync
+/// because no cross-stream work is outstanding.
+static NON_DEFAULT_STREAM_DIRTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn mark_non_default_stream_dirty() {
+    NON_DEFAULT_STREAM_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn non_default_stream_is_dirty() -> bool {
+    NON_DEFAULT_STREAM_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn clear_non_default_stream_dirty() {
+    NON_DEFAULT_STREAM_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn clear_dirty_flag_after_device_sync() {
+    clear_non_default_stream_dirty();
+}
+
 fn strict_null_stream_barrier_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -36,7 +59,7 @@ fn null_stream_uses_global_lock(stream: hipStream_t, strict: bool) -> bool {
 }
 
 fn null_stream_needs_pre_sync(stream: hipStream_t) -> bool {
-    stream.0.is_null()
+    stream.0.is_null() && non_default_stream_is_dirty()
 }
 
 fn null_stream_needs_post_sync(stream: hipStream_t, strict: bool) -> bool {
@@ -79,6 +102,7 @@ pub(crate) fn null_stream_sync(stream: hipStream_t) -> NullStreamGuard {
     };
     if null_stream_needs_pre_sync(stream) {
         let _ = unsafe { hipDeviceSynchronize() };
+        clear_non_default_stream_dirty();
     }
     NullStreamGuard {
         guard,
@@ -125,8 +149,7 @@ pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
         .get_or_init(|| std::env::var("ZLUDA_HDP_FLUSH_ON_SYNC").map_or(true, |v| v != "0"));
     if hdp_flush {
         let _ = unsafe { hipDeviceSynchronize() };
-        // Also issue a CPU-side memory fence to invalidate any stale CPU
-        // caches that might be holding pre-write values.
+        clear_non_default_stream_dirty();
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
     super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize -> {:?}", result));
@@ -268,8 +291,8 @@ pub(crate) fn query(stream: hipStream_t) -> hipError_t {
         // Show both real HIP result and what we return, to detect masking
         if stream.0.is_null() {
             super::driver::zluda_log_err(&format!(
-                "cuStreamQuery(NULL) hip={:?} returned=NOT_READY [#{}]",
-                hip_result, count
+                "cuStreamQuery(NULL) hip={:?} returned={:?} [#{}]",
+                hip_result, returned, count
             ));
         } else {
             super::driver::zluda_log_err(&format!(

@@ -18,11 +18,16 @@ pub(crate) unsafe fn sync_synthetic_texref(tex_ref: *mut textureReference) {
             "[ZLUDA] sync_synthetic_texref: writing tex_obj={:p} to device {:p}",
             tex_obj, device_global.0
         ));
-        let _ = hipMemcpyHtoD(
-            device_global,
-            &tex_obj as *const _ as *mut std::ffi::c_void,
-            mem::size_of::<hipTextureObject_t>(),
-        );
+        {
+            let _guard = super::stream::null_stream_sync(
+                hipStream_t(std::ptr::null_mut()),
+            );
+            let _ = hipMemcpyHtoD(
+                device_global,
+                &tex_obj as *const _ as *mut std::ffi::c_void,
+                mem::size_of::<hipTextureObject_t>(),
+            );
+        }
     }
     let mut res_desc: hipResourceDesc = mem::zeroed();
     let mut tex_desc: hipTextureDesc = mem::zeroed();
@@ -415,10 +420,7 @@ pub(crate) unsafe fn object_create(
     // returned handle escapes to the caller. Cost: ~50–200µs added
     // latency per call; Batman creates ~6–12 per frame → ~3% perf hit.
     // Gated by ZLUDA_TEXOBJ_SYNC=0 to disable for A/B testing.
-    if std::env::var("ZLUDA_TEXOBJ_SYNC")
-        .ok()
-        .as_deref() != Some("0")
-    {
+    if std::env::var("ZLUDA_TEXOBJ_SYNC").ok().as_deref() != Some("0") {
         let _ = hip_runtime_sys::hipDeviceSynchronize();
     }
     // Encode pixel shift in top 3 bits of the handle, same as cuSurfObjectCreate.

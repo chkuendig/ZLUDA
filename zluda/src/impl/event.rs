@@ -89,6 +89,8 @@ pub(crate) unsafe fn record(event: hipEvent_t, stream: hipStream_t) -> hipError_
     // here shrinks the worst-case "MS_4 launched but its dump hasn't run"
     // gap from ~134 ms to ~10-20 ms. Drain is a no-op when ZLUDA_DEV5_DUMP=0.
     super::memory::drain_dev5_dump_queue();
+    // MS2 batched descriptor/value drain (host-thread safe DtoH).
+    super::memory::drain_ms2_dump_queue();
     // Plan v26 Phase B.3: drain IOFX_actorRange param_4 dump queue. Same
     // safety properties as the DEV5 drain; no-op when ZLUDA_ACTORRANGE_DUMP=0.
     super::memory::drain_iofx_ar_dump_queue();
@@ -125,6 +127,7 @@ pub(crate) unsafe fn synchronize(event: hipEvent_t) -> hipError_t {
     // fires very frequently from PhysX (120k+ calls per run). Drain is a
     // no-op if ZLUDA_DEV5_DUMP=0 or queue is empty.
     super::memory::drain_dev5_dump_queue();
+    super::memory::drain_ms2_dump_queue();
     // Plan v26 Phase B.3: drain IOFX_actorRange dump queue (sibling).
     super::memory::drain_iofx_ar_dump_queue();
     let result = hipEventSynchronize(event);

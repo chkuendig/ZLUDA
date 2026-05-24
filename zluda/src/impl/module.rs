@@ -74,8 +74,7 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
     // 2026-04-28: env-gated for retirement testing on zluda-physx-clean.
     // Set ZLUDA_IOFX_BBOX_GUARD=0 to disable. If smoke + game stability
     // unaffected, the patch can be deleted entirely.
-    let env_off = std::env::var("ZLUDA_IOFX_BBOX_GUARD")
-        .map_or(false, |v| v == "0");
+    let env_off = std::env::var("ZLUDA_IOFX_BBOX_GUARD").map_or(false, |v| v == "0");
     if env_off {
         return None;
     }
@@ -123,11 +122,7 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
         //   ^BB<N>_<M>:\n
         //   ^setp.eq.s64\s+%p<X>, %rd<Y>, 0;\n
         //   ^@%p<X>\s+bra\s+BB<A>_<B>;\n
-        if in_bbox_kernel
-            && brace_depth >= 1
-            && is_bb_label(trimmed)
-            && i + 2 < lines.len()
-        {
+        if in_bbox_kernel && brace_depth >= 1 && is_bb_label(trimmed) && i + 2 < lines.len() {
             let setp_line = lines[i + 1].trim_start();
             let bra_line = lines[i + 2].trim_start();
             if let Some((pred_a, target_label)) = match_setp_eq_s64_zero_pair(setp_line, bra_line) {
@@ -151,10 +146,7 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
         // happens to have 0/-1 which is either benign-race or filtered by the
         // -1 guard. Adding a tid==0 guard after the -1 check prevents the wild
         // stores.
-        if in_bbox_kernel
-            && brace_depth >= 1
-            && i + 1 < lines.len()
-        {
+        if in_bbox_kernel && brace_depth >= 1 && i + 1 < lines.len() {
             let setp_line = lines[i].trim_start();
             let bra_line = lines[i + 1].trim_start();
             if let Some((reg_name, target_label)) =
@@ -225,10 +217,7 @@ fn emit_lane0_guard(out: &mut String, target_label: &str, uid: usize) {
 ///   `setp.eq.s32<ws>%p<digits>, %r<digits>, -1;`
 ///   `@%p<same_digits> bra BB<digits>_<digits>;`
 /// Returns (register_name_with_%, target_label) on match.
-fn match_setp_eq_s32_minus_one_pair(
-    setp_line: &str,
-    bra_line: &str,
-) -> Option<(String, String)> {
+fn match_setp_eq_s32_minus_one_pair(setp_line: &str, bra_line: &str) -> Option<(String, String)> {
     let setp = setp_line.trim_end();
     let rest = setp.strip_prefix("setp.eq.s32")?;
     let rest = rest.trim_start();
@@ -423,6 +412,7 @@ pub fn patch_iofx_actor_range_membar(ptx: &str) -> Option<String> {
     }
 }
 
+
 /// 2026-04-29: convert `ld.shared.<T>` → `ld.volatile.shared.<T>` across
 /// PhysX/FleX/TFS/IOFX/ParticleIOS kernels affected by the cross-wave LDS
 /// visibility class. The membar.cta + s_waitcnt fixes target HW-level
@@ -451,8 +441,7 @@ pub fn patch_iofx_actor_range_membar(ptx: &str) -> Option<String> {
 /// don't trigger the AMDGPU race. For our hardware (gfx1033) and goal
 /// (gameplay correctness over benchmark perf), correctness wins.
 pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
-    let env_off = std::env::var("ZLUDA_BROAD_VOLATILE_LDS")
-        .map_or(false, |v| v == "0");
+    let env_off = std::env::var("ZLUDA_BROAD_VOLATILE_LDS").map_or(false, |v| v == "0");
     if env_off {
         return None;
     }
@@ -461,8 +450,7 @@ pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
     let mut in_kernel = false;
     let mut brace_depth: i32 = 0;
     let mut total_patches = 0usize;
-    let mut patched_kernels: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut patched_kernels: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current_name = String::new();
     for line in &lines {
         let trimmed = line.trim_start();
@@ -632,8 +620,7 @@ pub fn patch_broad_membar_before_bar_sync(ptx: &str) -> Option<String> {
 ///
 /// Default ON. Set `ZLUDA_SCAN_READER_ACQUIRE=0` to disable.
 pub fn patch_scan_kernel_reader_acquire(ptx: &str) -> Option<String> {
-    let env_off = std::env::var("ZLUDA_SCAN_READER_ACQUIRE")
-        .map_or(false, |v| v == "0");
+    let env_off = std::env::var("ZLUDA_SCAN_READER_ACQUIRE").map_or(false, |v| v == "0");
     if env_off {
         return None;
     }
@@ -723,8 +710,7 @@ pub fn patch_scan_kernel_reader_acquire(ptx: &str) -> Option<String> {
 ///
 /// Env-gate: `ZLUDA_DIVERGENT_LDS_MERGE_SYNC=0` to disable. Default ON.
 pub fn patch_divergent_lds_merge_sync(ptx: &str) -> Option<String> {
-    let env_off = std::env::var("ZLUDA_DIVERGENT_LDS_MERGE_SYNC")
-        .map_or(false, |v| v == "0");
+    let env_off = std::env::var("ZLUDA_DIVERGENT_LDS_MERGE_SYNC").map_or(false, |v| v == "0");
     if env_off {
         return None;
     }
@@ -735,8 +721,7 @@ pub fn patch_divergent_lds_merge_sync(ptx: &str) -> Option<String> {
     let mut brace_depth: i32 = 0;
     let mut kernel_start_idx: usize = 0;
     let mut patched = 0usize;
-    let mut patched_kernels: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut patched_kernels: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current_kernel_name = String::new();
 
     for i in 0..lines.len() {
@@ -859,9 +844,7 @@ pub fn patch_ms1_gate_trace(ptx: &str, trace_dev_ptr: u64) -> Option<String> {
     }
     if trace_dev_ptr == 0 {
         if has_ms1_entry {
-            super::driver::zluda_log_err(
-                "[ZLUDA] patch_ms1_gate_trace: SKIP (trace_dev_ptr=0)",
-            );
+            super::driver::zluda_log_err("[ZLUDA] patch_ms1_gate_trace: SKIP (trace_dev_ptr=0)");
         }
         return None;
     }
@@ -870,8 +853,7 @@ pub fn patch_ms1_gate_trace(ptx: &str, trace_dev_ptr: u64) -> Option<String> {
     // also contains the same bit-4-set pattern at line ~1001, but that
     // helper is NEVER LAUNCHED in practice. We must patch only the
     // .visible .entry (MS_1 entry) site at line ~2137.
-    let entry_marker =
-        ".visible .entry CreateParticleShapesIncremental_MultiStage_1(";
+    let entry_marker = ".visible .entry CreateParticleShapesIncremental_MultiStage_1(";
     let ms1_entry_start = ptx.find(entry_marker)?;
     let ms2_entry_marker = ".visible .entry CreateParticleShapesIncremental_MultiStage_2";
     let ms1_entry_end = ptx[ms1_entry_start..]
@@ -1095,10 +1077,7 @@ fn is_bra_predicate_warp_divergent(
     // Extract predicate name: "@!%p6 bra LABEL;" → "%p6"
     let bra_line = lines[bra_idx].trim();
     let body = bra_line.trim_start_matches('@').trim_start_matches('!');
-    let pred: String = body
-        .chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect();
+    let pred: String = body.chars().take_while(|c| !c.is_whitespace()).collect();
     if !pred.starts_with('%') {
         return false;
     }
@@ -1133,8 +1112,7 @@ fn is_bra_predicate_warp_divergent(
                 Some((_, r)) => r.trim(),
                 None => continue,
             };
-            let operands: Vec<&str> =
-                after_type.split(',').map(|s| s.trim()).collect();
+            let operands: Vec<&str> = after_type.split(',').map(|s| s.trim()).collect();
             if operands.len() < 3 {
                 continue;
             }
@@ -1175,8 +1153,7 @@ fn is_operand_warp_id_derived(
         // `is_register_bound_to_tid_x`.
         for prefix in &["shr.u32 ", "shr.s32 "] {
             if let Some(rest) = line.strip_prefix(prefix) {
-                let parts: Vec<&str> =
-                    rest.split(',').map(|s| s.trim()).collect();
+                let parts: Vec<&str> = rest.split(',').map(|s| s.trim()).collect();
                 if parts.len() == 3 && parts[0] == operand {
                     if let Ok(shift) = parts[2].parse::<u32>() {
                         if shift == 5 || shift == 6 {
@@ -1194,19 +1171,13 @@ fn is_operand_warp_id_derived(
         // Match `mov.u32 <operand>, <src>` — chase one level.
         for prefix in &["mov.u32 ", "mov.s32 ", "mov.b32 "] {
             if let Some(rest) = line.strip_prefix(prefix) {
-                let parts: Vec<&str> =
-                    rest.split(',').map(|s| s.trim()).collect();
+                let parts: Vec<&str> = rest.split(',').map(|s| s.trim()).collect();
                 if parts.len() == 2 && parts[0] == operand {
                     // Continue chasing this src by recursing on the
                     // upstream line. One-level recursion bound to avoid
                     // deep stacks; the typical NRSS chain is shr→setp
                     // directly without intermediate movs anyway.
-                    return is_operand_warp_id_derived(
-                        lines,
-                        i,
-                        kernel_start_idx,
-                        parts[1],
-                    );
+                    return is_operand_warp_id_derived(lines, i, kernel_start_idx, parts[1]);
                 }
             }
         }
@@ -1242,8 +1213,7 @@ fn is_register_bound_to_tid_x(
         let line = lines[i].trim().trim_end_matches(';');
         for prefix in &["mov.u32 ", "mov.s32 ", "mov.b32 "] {
             if let Some(rest) = line.strip_prefix(prefix) {
-                let parts: Vec<&str> =
-                    rest.split(',').map(|s| s.trim()).collect();
+                let parts: Vec<&str> = rest.split(',').map(|s| s.trim()).collect();
                 if parts.len() == 2 && parts[0] == current {
                     if parts[1] == "%tid.x" {
                         return true;
@@ -1570,9 +1540,7 @@ fn get_best_ptx_and_compile(
                                             None => after_bbox,
                                         };
                                     let after_volatile: Cow<str> =
-                                        match patch_broad_volatile_lds(
-                                            after_actor.as_ref(),
-                                        ) {
+                                        match patch_broad_volatile_lds(after_actor.as_ref()) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_actor,
                                         };
@@ -1591,9 +1559,7 @@ fn get_best_ptx_and_compile(
                                             None => after_membar,
                                         };
                                     let after_divergent: Cow<str> =
-                                        match patch_divergent_lds_merge_sync(
-                                            after_scan.as_ref(),
-                                        ) {
+                                        match patch_divergent_lds_merge_sync(after_scan.as_ref()) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_scan,
                                         };
@@ -2655,7 +2621,9 @@ ret;
 }
 "#;
         let patched = patch_divergent_lds_merge_sync(ptx).expect("should patch");
-        let injected = patched.matches("// ZLUDA divergent-LDS-write merge sync").count();
+        let injected = patched
+            .matches("// ZLUDA divergent-LDS-write merge sync")
+            .count();
         assert_eq!(
             injected, 1,
             "should insert exactly one bar.sync at the shared merge, got {}:\n{}",

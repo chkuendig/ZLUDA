@@ -27,8 +27,7 @@ pub(crate) static SMALL_HOST_ALLOCS: std::sync::Mutex<Vec<(usize, usize, usize)>
 /// Each entry is just `host_ptr` (the size==1040000 invariant identifies
 /// the buffer; use the index in this vec as a stable label across log
 /// messages). Gated by `ZLUDA_HOSTBUF_SAMPLE=1`.
-pub(crate) static HOSTBUF_TRACKER: std::sync::Mutex<Vec<usize>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static HOSTBUF_TRACKER: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
 pub(crate) fn hostbuf_sample_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -203,9 +202,7 @@ pub(crate) fn scan_mapped_for_u32(
 /// launches once a baseline exists.
 pub(crate) fn mapped_write_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ZLUDA_MAPPED_WRITE_TRACE").map_or(false, |v| v == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_MAPPED_WRITE_TRACE").map_or(false, |v| v == "1"))
 }
 
 /// State for the mapped-write tracer.
@@ -286,7 +283,10 @@ pub(crate) fn mapped_write_refresh_pre(seq: u64) {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    let MappedTraceState { mirror, slot_changes } = &mut *state;
+    let MappedTraceState {
+        mirror,
+        slot_changes,
+    } = &mut *state;
     for &(host, _dev, size) in allocs.iter() {
         if host == 0 || size < 4 {
             continue;
@@ -365,7 +365,10 @@ pub(crate) fn mapped_write_diff_post(seq: u64, kernel: &str) {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    let MappedTraceState { mirror, slot_changes } = &mut *state;
+    let MappedTraceState {
+        mirror,
+        slot_changes,
+    } = &mut *state;
     for &(host, _dev, size) in allocs.iter() {
         if host == 0 || size < 4 {
             continue;
@@ -528,6 +531,64 @@ pub(crate) unsafe fn log_dtod_into_mapped(
     log_memcpy_into_mapped(dst_device, src_device, byte_count, false, label)
 }
 
+fn ms2_rd6_watch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_MS2_RD6_WATCH").map_or(false, |v| v == "1"))
+}
+
+unsafe fn log_memcpy_into_ms2_rd6_watch(
+    dst_device_or_host: u64,
+    src: u64,
+    byte_count: usize,
+    src_is_host: bool,
+    label: &str,
+) {
+    if !ms2_rd6_watch_enabled() || byte_count == 0 {
+        return;
+    }
+    let watch = super::function::ms2_rd6_watch_snapshot();
+    if watch.is_empty() {
+        return;
+    }
+    let dst_start = dst_device_or_host;
+    let dst_end = dst_start.saturating_add(byte_count as u64);
+    let mapped_src_allocs = if src_is_host {
+        Vec::new()
+    } else {
+        match SMALL_HOST_ALLOCS.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => Vec::new(),
+        }
+    };
+    for (rd6, launch_n) in watch {
+        let watch_start = rd6.saturating_add(8);
+        let watch_end = watch_start.saturating_add(4);
+        if dst_start >= watch_end || dst_end <= watch_start {
+            continue;
+        }
+        let src_u32 = if src == 0 {
+            None
+        } else if src_is_host {
+            Some((src as *const u32).read_unaligned())
+        } else {
+            let mut out = None;
+            for &(host, dev, size) in mapped_src_allocs.iter() {
+                let dev_end = dev.saturating_add(size);
+                let s = src as usize;
+                if s >= dev && s + 4 <= dev_end {
+                    out = Some(((host + (s - dev)) as *const u32).read_unaligned());
+                    break;
+                }
+            }
+            out
+        };
+        super::driver::zluda_log_err(&format!(
+            "[MS2_RD6_WATCH/{label}] launch_n={} rd6=0x{:x} watch=[0x{:x}..0x{:x}) dst=0x{:x} bytes={} src=0x{:x} src_is_host={} src_u32={:?}",
+            launch_n, rd6, watch_start, watch_end, dst_start, byte_count, src, src_is_host, src_u32
+        ));
+    }
+}
+
 /// Plan v13 Step 1: small-DtoH trace gated by `ZLUDA_DTOH_TRACE=1`.
 ///
 /// Differs from `ZLUDA_DTOH_LOG` in three ways:
@@ -647,7 +708,7 @@ unsafe fn format_dtoh_dwords(dst_host: *const u8, byte_count: usize) -> String {
         return format!("[{}]", dwords);
     }
     // Big buffer: 4 sample windows × 16 bytes (4 dwords) each
-    let q1 = (byte_count / 4) & !0x3;       // align to 4
+    let q1 = (byte_count / 4) & !0x3; // align to 4
     let q2 = (byte_count / 2) & !0x3;
     let q3 = (3 * byte_count / 4) & !0x3;
     let w0 = format_dwords_at(dst_host, 0, 16);
@@ -769,6 +830,7 @@ pub(crate) fn copy_dto_h_v2(
     src_device: hipDeviceptr_t,
     byte_count: usize,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     let result = unsafe { hipMemcpyDtoH(dst_host, src_device, byte_count) };
     if result.is_ok() && dtoh_log_enabled() {
         let dwords = unsafe { format_dtoh_dwords(dst_host as *const u8, byte_count) };
@@ -788,6 +850,7 @@ pub(crate) fn copy_hto_d_v2(
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     // Plan v14.next.next: H2D into a tracked mapped buffer = CPU directly
     // overwriting a slot. PhysX's per-frame counter bookkeeping may take
     // this path (set values from CPU-side state).
@@ -799,6 +862,26 @@ pub(crate) fn copy_hto_d_v2(
             true,
             "hto_d_v2",
         );
+        log_memcpy_into_ms2_rd6_watch(
+            dst_device.0 as u64,
+            src_host as u64,
+            byte_count,
+            true,
+            "hto_d_v2",
+        );
+    }
+    if let Some(rd5) =
+        super::function::check_memset_hits_rd5_counter(dst_device.0 as u64, byte_count as u64)
+    {
+        let first_word = if byte_count >= 4 {
+            unsafe { *(src_host as *const u32) }
+        } else {
+            0xFFFFFFFFu32
+        };
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET hto_d_v2 dst=0x{:x} src=0x{:x} bytes={} first_word=0x{:x} hits rd5=0x{:x} +22176",
+            dst_device.0 as u64, src_host as u64, byte_count, first_word, rd5
+        ));
     }
     if dtoh_log_enabled() {
         let dwords = unsafe { format_dtoh_dwords(src_host as *const u8, byte_count) };
@@ -923,7 +1006,10 @@ fn log_memset(kind: &str, dst: u64, value: u64, n: usize) {
     if dtoh_log_enabled() {
         super::driver::zluda_log(&format!(
             "[MEMSET/{}] dst=0x{:x} value=0x{:x} n={} bytes={}",
-            kind, dst, value, n,
+            kind,
+            dst,
+            value,
+            n,
             // Approximate total bytes: D8=n, D16=n*2, D32=n*4
             match kind {
                 "d8" | "d8a" => n,
@@ -936,7 +1022,14 @@ fn log_memset(kind: &str, dst: u64, value: u64, n: usize) {
 }
 
 pub(crate) fn set_d8_v2(dst: hipDeviceptr_t, value: ::core::ffi::c_uchar, n: usize) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     log_memset("d8", dst.0 as u64, value as u64, n);
+    if let Some(rd5) = super::function::check_memset_hits_rd5_counter(dst.0 as u64, n as u64) {
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET d8 dst=0x{:x} value=0x{:x} n_bytes={} hits rd5=0x{:x} +22176",
+            dst.0 as u64, value, n, rd5
+        ));
+    }
     unsafe { hipMemsetD8(dst, value, n) }
 }
 
@@ -947,6 +1040,12 @@ pub(crate) fn set_d8_async(
     stream: hipStream_t,
 ) -> hipError_t {
     log_memset("d8a", dst.0 as u64, value as u64, n);
+    if let Some(rd5) = super::function::check_memset_hits_rd5_counter(dst.0 as u64, n as u64) {
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET d8a dst=0x{:x} value=0x{:x} n_bytes={} stream=0x{:x} hits rd5=0x{:x} +22176",
+            dst.0 as u64, value, n, stream.0 as u64, rd5
+        ));
+    }
     let _guard = super::stream::null_stream_sync(stream);
     unsafe { hipMemsetD8Async(dst, value, n, stream) }
 }
@@ -956,7 +1055,16 @@ pub(crate) fn set_d16_v2(
     value: ::core::ffi::c_ushort,
     n: usize,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     log_memset("d16", dst.0 as u64, value as u64, n);
+    if let Some(rd5) =
+        super::function::check_memset_hits_rd5_counter(dst.0 as u64, (n as u64) * 2)
+    {
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET d16 dst=0x{:x} value=0x{:x} n_halfs={} hits rd5=0x{:x} +22176",
+            dst.0 as u64, value, n, rd5
+        ));
+    }
     unsafe { hipMemsetD16(dst, value, n) }
 }
 
@@ -967,12 +1075,29 @@ pub(crate) fn set_d16_async(
     stream: hipStream_t,
 ) -> hipError_t {
     log_memset("d16a", dst.0 as u64, value as u64, n);
+    if let Some(rd5) =
+        super::function::check_memset_hits_rd5_counter(dst.0 as u64, (n as u64) * 2)
+    {
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET d16a dst=0x{:x} value=0x{:x} n_halfs={} stream=0x{:x} hits rd5=0x{:x} +22176",
+            dst.0 as u64, value, n, stream.0 as u64, rd5
+        ));
+    }
     let _guard = super::stream::null_stream_sync(stream);
     unsafe { hipMemsetD16Async(dst, value, n, stream) }
 }
 
 pub(crate) fn set_d32_v2(dst: hipDeviceptr_t, value: ::core::ffi::c_uint, n: usize) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     log_memset("d32", dst.0 as u64, value as u64, n);
+    if let Some(rd5) =
+        super::function::check_memset_hits_rd5_counter(dst.0 as u64, (n as u64) * 4)
+    {
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET d32 dst=0x{:x} value=0x{:x} n_words={} hits rd5=0x{:x} +22176",
+            dst.0 as u64, value, n, rd5
+        ));
+    }
     unsafe { hipMemsetD32(dst, value as _, n) }
 }
 
@@ -983,6 +1108,14 @@ pub(crate) fn set_d32_async(
     stream: hipStream_t,
 ) -> hipError_t {
     log_memset("d32a", dst.0 as u64, value as u64, n);
+    if let Some(rd5) =
+        super::function::check_memset_hits_rd5_counter(dst.0 as u64, (n as u64) * 4)
+    {
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET d32a dst=0x{:x} value=0x{:x} n_words={} stream=0x{:x} hits rd5=0x{:x} +22176",
+            dst.0 as u64, value, n, stream.0 as u64, rd5
+        ));
+    }
     let _guard = super::stream::null_stream_sync(stream);
     unsafe { hipMemsetD32Async(dst, value as _, n, stream) }
 }
@@ -1133,6 +1266,13 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
         true,
         "hto_d_async_v2",
     );
+    log_memcpy_into_ms2_rd6_watch(
+        dst_device.0 as u64,
+        src_host as u64,
+        byte_count,
+        true,
+        "hto_d_async_v2",
+    );
     if dtoh_log_enabled() {
         let dwords = unsafe { format_dtoh_dwords(src_host as *const u8, byte_count) };
         super::driver::zluda_log(&format!(
@@ -1235,12 +1375,22 @@ pub(crate) unsafe fn copy_dto_d_v2(
         byte_count,
         hipStream_t(std::ptr::null_mut()),
     );
-    log_dtod_into_mapped(
+    log_dtod_into_mapped(dst_device.0 as u64, src_device.0 as u64, byte_count, "sync");
+    log_memcpy_into_ms2_rd6_watch(
         dst_device.0 as u64,
         src_device.0 as u64,
         byte_count,
-        "sync",
+        false,
+        "dto_d_v2",
     );
+    if let Some(rd5) =
+        super::function::check_memset_hits_rd5_counter(dst_device.0 as u64, byte_count as u64)
+    {
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET dto_d_v2 dst=0x{:x} src=0x{:x} bytes={} hits rd5=0x{:x} +22176",
+            dst_device.0 as u64, src_device.0 as u64, byte_count, rd5
+        ));
+    }
     hipMemcpyDtoD(dst_device, src_device, byte_count)
 }
 
@@ -1262,6 +1412,21 @@ pub(crate) unsafe fn copy_dto_d_async_v2(
         byte_count,
         "async",
     );
+    log_memcpy_into_ms2_rd6_watch(
+        dst_device.0 as u64,
+        src_device.0 as u64,
+        byte_count,
+        false,
+        "dto_d_async_v2",
+    );
+    if let Some(rd5) =
+        super::function::check_memset_hits_rd5_counter(dst_device.0 as u64, byte_count as u64)
+    {
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET dto_d_async_v2 dst=0x{:x} src=0x{:x} bytes={} stream=0x{:x} hits rd5=0x{:x} +22176",
+            dst_device.0 as u64, src_device.0 as u64, byte_count, stream.0 as u64, rd5
+        ));
+    }
     let _guard = super::stream::null_stream_sync(stream);
     hipMemcpyDtoDAsync(dst_device, src_device, byte_count, stream)
 }
@@ -1277,12 +1442,8 @@ pub(crate) unsafe fn copy(
     byte_count: usize,
 ) -> hipError_t {
     log_memcpy_into_mapped(dst.0 as u64, src.0 as u64, byte_count, false, "copy");
-    hip_runtime_sys::hipMemcpy(
-        dst.0,
-        src.0,
-        byte_count,
-        hipMemcpyKind::hipMemcpyDefault,
-    )
+    log_memcpy_into_ms2_rd6_watch(dst.0 as u64, src.0 as u64, byte_count, false, "copy");
+    hip_runtime_sys::hipMemcpy(dst.0, src.0, byte_count, hipMemcpyKind::hipMemcpyDefault)
 }
 
 /// Plan v25 Phase B.2: drain `MS4_DEV5_DUMP_QUEUE`. Called at the entry of
@@ -1346,10 +1507,7 @@ pub(crate) fn drain_dev5_dump_queue() {
                 launch_n
             ));
         } else if p5 == 0 {
-            super::driver::zluda_log_err(&format!(
-                "[DEV5_DUMP #{}] p5=null — skipping",
-                launch_n
-            ));
+            super::driver::zluda_log_err(&format!("[DEV5_DUMP #{}] p5=null — skipping", launch_n));
         } else {
             let mut local: Vec<u32> = vec![0u32; dev5_count];
             let copy_res = unsafe {
@@ -1371,8 +1529,10 @@ pub(crate) fn drain_dev5_dump_queue() {
                 let max_v = local.iter().max().copied().unwrap_or(0);
                 max_r6 = max_v;
                 let sample_n = local.len().min(16);
-                let sample: Vec<String> =
-                    local[..sample_n].iter().map(|v| format!("0x{:x}", v)).collect();
+                let sample: Vec<String> = local[..sample_n]
+                    .iter()
+                    .map(|v| format!("0x{:x}", v))
+                    .collect();
                 super::driver::zluda_log_err(&format!(
                     "[DEV5_DUMP #{}] dev5=0x{:x} n_threads={} dump={} bit31={} huge={} min=0x{:x} max=0x{:x} sample=[{}]",
                     launch_n,
@@ -1415,8 +1575,10 @@ pub(crate) fn drain_dev5_dump_queue() {
                 let min_v = local.iter().min().copied().unwrap_or(0);
                 let max_v = local.iter().max().copied().unwrap_or(0);
                 let sample_n = local.len().min(16);
-                let sample: Vec<String> =
-                    local[..sample_n].iter().map(|v| format!("0x{:x}", v)).collect();
+                let sample: Vec<String> = local[..sample_n]
+                    .iter()
+                    .map(|v| format!("0x{:x}", v))
+                    .collect();
                 super::driver::zluda_log_err(&format!(
                     "[DEV6_DUMP #{}] dev6=0x{:x} dump={} (structs~{}) bit31={} huge={} min=0x{:x} max=0x{:x} sample=[{}]",
                     launch_n,
@@ -1454,8 +1616,10 @@ pub(crate) fn drain_dev5_dump_queue() {
                 let min_v = local.iter().min().copied().unwrap_or(0);
                 let max_v = local.iter().max().copied().unwrap_or(0);
                 let sample_n = local.len().min(16);
-                let sample: Vec<String> =
-                    local[..sample_n].iter().map(|v| format!("0x{:x}", v)).collect();
+                let sample: Vec<String> = local[..sample_n]
+                    .iter()
+                    .map(|v| format!("0x{:x}", v))
+                    .collect();
                 super::driver::zluda_log_err(&format!(
                     "[DEV7_DUMP #{}] dev7=0x{:x} dump={} bit31={} huge={} min=0x{:x} max=0x{:x} sample=[{}]",
                     launch_n,
@@ -1521,8 +1685,10 @@ pub(crate) fn drain_iofx_ar_dump_queue() {
         let min_v = local.iter().min().copied().unwrap_or(0);
         let max_v = local.iter().max().copied().unwrap_or(0);
         let sample_n = local.len().min(16);
-        let sample: Vec<String> =
-            local[..sample_n].iter().map(|v| format!("0x{:x}", v)).collect();
+        let sample: Vec<String> = local[..sample_n]
+            .iter()
+            .map(|v| format!("0x{:x}", v))
+            .collect();
         super::driver::zluda_log_err(&format!(
             "[IOFX_AR_DUMP {} #{}] ptr=0x{:x} dump={} bit31={} huge={} min=0x{:x} max=0x{:x} sample=[{}]",
             label, launch_n, ptr, AR_DUMP_CAP, bit31, huge, min_v, max_v, sample.join(" ")
@@ -1546,6 +1712,230 @@ pub(crate) fn drain_iofx_ar_dump_queue() {
     }
 }
 
+fn decode_ms2_batch_descriptor(desc: &[u8]) -> Option<(u32, u64, u64, u64)> {
+    if desc.len() < 88 {
+        return None;
+    }
+    let active = u32::from_le_bytes(desc[0..4].try_into().ok()?);
+    let rd5 = u64::from_le_bytes(desc[32..40].try_into().ok()?);
+    let rd6 = u64::from_le_bytes(desc[72..80].try_into().ok()?);
+    let rd7 = u64::from_le_bytes(desc[80..88].try_into().ok()?);
+    Some((active, rd5, rd6, rd7))
+}
+
+/// Drain queued `CreateParticleShapesIncremental_MultiStage_2_Batched`
+/// descriptors and sample the exact MS2 counter-source loads:
+///
+/// - descriptor fields at +0/+32/+72/+80 (active, rd5, rd6, rd7)
+/// - first few `rd7[i]` entries (shape->cell mapping)
+/// - corresponding `rd6[rd7[i] * 12 + 8]` (`r38` in PTX BB11_9 / BB11_21)
+/// - `rd5[i*12 + 4]` after-kernel counter value for the same shape index
+///
+/// Gated on `ZLUDA_MS2_CAPTURE=1`, default OFF.
+pub(crate) fn drain_ms2_dump_queue() {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("ZLUDA_MS2_CAPTURE").map_or(false, |v| v == "1")) {
+        return;
+    }
+    let items: Vec<(u64, u32, u32, u32, u32)> = match super::function::MS2_BATCH_DUMP_QUEUE.get() {
+        Some(m) => match m.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => return,
+        },
+        None => return,
+    };
+    if items.is_empty() {
+        return;
+    }
+    const DESC_BYTES: usize = 88;
+    const MAX_CTA_DUMP: usize = 16;
+    const SAMPLE_SHAPES: usize = 8;
+    const MAX_RD6_SLOTS: usize = 4096;
+    for (p2_ctas, grid_x, grid_y, grid_z, launch_n) in items {
+        let total_ctas = (grid_x as usize)
+            .saturating_mul(grid_y as usize)
+            .saturating_mul(grid_z as usize);
+        if p2_ctas == 0 || total_ctas == 0 {
+            super::driver::zluda_log_err(&format!(
+                "[MS2_CAPTURE #{}] skip invalid launch meta p2_ctas=0x{:x} grid=[{},{},{}]",
+                launch_n, p2_ctas, grid_x, grid_y, grid_z
+            ));
+            continue;
+        }
+        let sync_res = unsafe { hipDeviceSynchronize() };
+        if sync_res.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "[MS2_CAPTURE #{}] hipDeviceSynchronize failed err={:?}",
+                launch_n, sync_res
+            ));
+            continue;
+        }
+        let cta_dump = total_ctas.min(MAX_CTA_DUMP);
+        let mut desc_bytes = vec![0u8; cta_dump * DESC_BYTES];
+        let desc_copy_res = unsafe {
+            hipMemcpyDtoH(
+                desc_bytes.as_mut_ptr().cast(),
+                hipDeviceptr_t(p2_ctas as *mut std::ffi::c_void),
+                desc_bytes.len(),
+            )
+        };
+        if desc_copy_res.is_err() {
+            super::driver::zluda_log_err(&format!(
+                "[MS2_CAPTURE #{}] descriptor DtoH failed err={:?} p2_ctas=0x{:x} bytes={}",
+                launch_n,
+                desc_copy_res,
+                p2_ctas,
+                desc_bytes.len()
+            ));
+            continue;
+        }
+        super::driver::zluda_log_err(&format!(
+            "[MS2_CAPTURE #{}] grid=[{},{},{}] total_ctas={} dumped_ctas={}{} p2_ctas=0x{:x}",
+            launch_n,
+            grid_x,
+            grid_y,
+            grid_z,
+            total_ctas,
+            cta_dump,
+            if cta_dump < total_ctas {
+                " (truncated)"
+            } else {
+                ""
+            },
+            p2_ctas
+        ));
+        for cta in 0..cta_dump {
+            let start = cta * DESC_BYTES;
+            let end = start + DESC_BYTES;
+            let Some((active, rd5, rd6, rd7)) =
+                decode_ms2_batch_descriptor(&desc_bytes[start..end])
+            else {
+                super::driver::zluda_log_err(&format!(
+                    "[MS2_CAPTURE #{} cta={}] malformed descriptor bytes",
+                    launch_n, cta
+                ));
+                continue;
+            };
+            let desc_addr = p2_ctas.saturating_add((cta * DESC_BYTES) as u64);
+            super::driver::zluda_log_err(&format!(
+                "[MS2_CAPTURE_DESC #{} cta={}] desc=0x{:x} active={} rd5=0x{:x} rd6=0x{:x} rd7=0x{:x}",
+                launch_n, cta, desc_addr, active, rd5, rd6, rd7
+            ));
+            if rd6 != 0 {
+                super::function::ms2_rd6_watch_track(rd6, launch_n as u64);
+            }
+            if active == 0 || rd5 == 0 || rd6 == 0 || rd7 == 0 {
+                continue;
+            }
+            let mut shape_count = 0u32;
+            let shape_count_res = unsafe {
+                hipMemcpyDtoH(
+                    (&mut shape_count as *mut u32).cast(),
+                    hipDeviceptr_t((rd5 + 22176) as *mut std::ffi::c_void),
+                    std::mem::size_of::<u32>(),
+                )
+            };
+            if shape_count_res.is_err() {
+                super::driver::zluda_log_err(&format!(
+                    "[MS2_CAPTURE #{} cta={}] shape_count DtoH failed err={:?} ptr=0x{:x}",
+                    launch_n,
+                    cta,
+                    shape_count_res,
+                    rd5 + 22176
+                ));
+                continue;
+            }
+            let sample_shapes = (shape_count as usize).min(SAMPLE_SHAPES);
+            if sample_shapes == 0 {
+                super::driver::zluda_log_err(&format!(
+                    "[MS2_CAPTURE #{} cta={}] shape_count=0",
+                    launch_n, cta
+                ));
+                continue;
+            }
+            let mut rd7_shape_map = vec![0u32; sample_shapes];
+            let rd7_res = unsafe {
+                hipMemcpyDtoH(
+                    rd7_shape_map.as_mut_ptr().cast(),
+                    hipDeviceptr_t(rd7 as *mut std::ffi::c_void),
+                    rd7_shape_map.len() * std::mem::size_of::<u32>(),
+                )
+            };
+            if rd7_res.is_err() {
+                super::driver::zluda_log_err(&format!(
+                    "[MS2_CAPTURE #{} cta={}] rd7 DtoH failed err={:?} ptr=0x{:x} shapes={}",
+                    launch_n, cta, rd7_res, rd7, sample_shapes
+                ));
+                continue;
+            }
+            let max_slot = rd7_shape_map.iter().copied().max().unwrap_or(0) as usize;
+            let rd6_slots_dump = max_slot.saturating_add(1).min(MAX_RD6_SLOTS);
+            if rd6_slots_dump == 0 {
+                continue;
+            }
+            let mut rd6_cells = vec![0u32; rd6_slots_dump * 3];
+            let rd6_res = unsafe {
+                hipMemcpyDtoH(
+                    rd6_cells.as_mut_ptr().cast(),
+                    hipDeviceptr_t(rd6 as *mut std::ffi::c_void),
+                    rd6_cells.len() * std::mem::size_of::<u32>(),
+                )
+            };
+            if rd6_res.is_err() {
+                super::driver::zluda_log_err(&format!(
+                    "[MS2_CAPTURE #{} cta={}] rd6 DtoH failed err={:?} ptr=0x{:x} slots={}",
+                    launch_n, cta, rd6_res, rd6, rd6_slots_dump
+                ));
+                continue;
+            }
+            let mut rd5_shapes = vec![0u32; sample_shapes * 3];
+            let rd5_res = unsafe {
+                hipMemcpyDtoH(
+                    rd5_shapes.as_mut_ptr().cast(),
+                    hipDeviceptr_t(rd5 as *mut std::ffi::c_void),
+                    rd5_shapes.len() * std::mem::size_of::<u32>(),
+                )
+            };
+            if rd5_res.is_err() {
+                super::driver::zluda_log_err(&format!(
+                    "[MS2_CAPTURE #{} cta={}] rd5 DtoH failed err={:?} ptr=0x{:x} shapes={}",
+                    launch_n, cta, rd5_res, rd5, sample_shapes
+                ));
+                continue;
+            }
+            let mut entries = Vec::with_capacity(sample_shapes);
+            for (i, slot) in rd7_shape_map.iter().copied().enumerate() {
+                let rd5_base = i * 3;
+                let rd5_p0 = rd5_shapes.get(rd5_base).copied().unwrap_or(0);
+                let rd5_p4 = rd5_shapes.get(rd5_base + 1).copied().unwrap_or(0);
+                if (slot as usize) < rd6_slots_dump {
+                    let r38 = rd6_cells[slot as usize * 3 + 2];
+                    let r39 = r38.wrapping_sub(1);
+                    entries.push(format!(
+                        "i{}:slot={} r38={} r39={} rd5_p0={} rd5_p4={}",
+                        i, slot, r38, r39, rd5_p0, rd5_p4
+                    ));
+                } else {
+                    entries.push(format!(
+                        "i{}:slot={} OOB(rd6_slots={}) rd5_p0={} rd5_p4={}",
+                        i, slot, rd6_slots_dump, rd5_p0, rd5_p4
+                    ));
+                }
+            }
+            super::driver::zluda_log_err(&format!(
+                "[MS2_CAPTURE_SAMPLE #{} cta={}] shape_count={} sample_shapes={} max_slot={} rd6_slots_dump={} sample=[{}]",
+                launch_n,
+                cta,
+                shape_count,
+                sample_shapes,
+                max_slot,
+                rd6_slots_dump,
+                entries.join(" | ")
+            ));
+        }
+    }
+}
+
 pub(crate) unsafe fn copy_async(
     dst: hipDeviceptr_t,
     src: hipDeviceptr_t,
@@ -1564,6 +1954,15 @@ pub(crate) unsafe fn copy_async(
     // v14.next run #1 caught 0 MAPPED_DTOD events despite ~5000 attribution
     // hits to MemCopyBatchedAsync. This hook closes that gap.
     log_memcpy_into_mapped(dst.0 as u64, src.0 as u64, byte_count, false, "copy_async");
+    log_memcpy_into_ms2_rd6_watch(dst.0 as u64, src.0 as u64, byte_count, false, "copy_async");
+    if let Some(rd5) =
+        super::function::check_memset_hits_rd5_counter(dst.0 as u64, byte_count as u64)
+    {
+        super::driver::zluda_log_err(&format!(
+            "RD5_MEMSET copy_async dst=0x{:x} src=0x{:x} bytes={} stream=0x{:x} hits rd5=0x{:x} +22176",
+            dst.0 as u64, src.0 as u64, byte_count, stream.0 as u64, rd5
+        ));
+    }
     let _guard = super::stream::null_stream_sync(stream);
     hipMemcpyAsync(
         dst.0,
@@ -1617,10 +2016,8 @@ pub(crate) unsafe fn copy_2d_v2(memcpy: hip_Memcpy2D) -> CUresult {
     Ok(())
 }
 
-pub(crate) unsafe fn copy_2d_async_v2(
-    memcpy: hip_Memcpy2D,
-    stream: hipStream_t,
-) -> CUresult {
+pub(crate) unsafe fn copy_2d_async_v2(memcpy: hip_Memcpy2D, stream: hipStream_t) -> CUresult {
+    let _guard = super::stream::null_stream_sync(stream);
     // 2026-05-09 Phase E (plan fluttering-waddling-zephyr.md):
     // APEX TurbulenceFS calls cuMemcpy2DAsync_v2 with our D3D11
     // sentinel as `dstArray` (confirmed in run_20260509_phaseA_diag).
@@ -1648,17 +2045,13 @@ pub(crate) unsafe fn copy_2d_unaligned_v2(memcpy: hip_Memcpy2D) -> CUresult {
 /// is ignored on the sentinel side (CUDA spec says it's ignored when
 /// the corresponding memory type is ARRAY, so APEX may pass garbage).
 unsafe fn rewrite_2d_for_sentinel(mut memcpy: hip_Memcpy2D) -> hip_Memcpy2D {
-    if let Some((dev, _size, pitch)) =
-        super::d3d11_interop::d3d11_array_layout(memcpy.srcArray)
-    {
+    if let Some((dev, _size, pitch)) = super::d3d11_interop::d3d11_array_layout(memcpy.srcArray) {
         memcpy.srcArray = std::ptr::null_mut();
         memcpy.srcMemoryType = hipMemoryType::hipMemoryTypeDevice;
         memcpy.srcDevice = hipDeviceptr_t(dev);
         memcpy.srcPitch = pitch as usize;
     }
-    if let Some((dev, _size, pitch)) =
-        super::d3d11_interop::d3d11_array_layout(memcpy.dstArray)
-    {
+    if let Some((dev, _size, pitch)) = super::d3d11_interop::d3d11_array_layout(memcpy.dstArray) {
         memcpy.dstArray = std::ptr::null_mut();
         memcpy.dstMemoryType = hipMemoryType::hipMemoryTypeDevice;
         memcpy.dstDevice = hipDeviceptr_t(dev);
@@ -1760,11 +2153,12 @@ pub(crate) unsafe fn copy_ato_h_v2(
         "cuMemcpyAtoH_v2",
         "src",
         src_array as hipArray_t,
-        &format!("offset={} bytes={} dst_host={:p}", src_offset, byte_count, dst_host),
+        &format!(
+            "offset={} bytes={} dst_host={:p}",
+            src_offset, byte_count, dst_host
+        ),
     );
-    if let Some((dev, _, _)) =
-        super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t)
-    {
+    if let Some((dev, _, _)) = super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t) {
         hipMemcpyDtoH(
             dst_host,
             hipDeviceptr_t((dev as *mut u8).add(src_offset) as *mut std::ffi::c_void),
@@ -1792,9 +2186,7 @@ pub(crate) unsafe fn copy_ato_h_async_v2(
             src_offset, byte_count, dst_host, stream.0
         ),
     );
-    if let Some((dev, _, _)) =
-        super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t)
-    {
+    if let Some((dev, _, _)) = super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t) {
         hipMemcpyDtoHAsync(
             dst_host,
             hipDeviceptr_t((dev as *mut u8).add(src_offset) as *mut std::ffi::c_void),
@@ -1803,7 +2195,13 @@ pub(crate) unsafe fn copy_ato_h_async_v2(
         )?;
         return Ok(());
     }
-    hipMemcpyAtoHAsync(dst_host, src_array as hipArray_t, src_offset, byte_count, stream)?;
+    hipMemcpyAtoHAsync(
+        dst_host,
+        src_array as hipArray_t,
+        src_offset,
+        byte_count,
+        stream,
+    )?;
     Ok(())
 }
 
@@ -1817,11 +2215,12 @@ pub(crate) unsafe fn copy_hto_a_v2(
         "cuMemcpyHtoA_v2",
         "dst",
         dst_array as hipArray_t,
-        &format!("offset={} bytes={} src_host={:p}", dst_offset, byte_count, src_host),
+        &format!(
+            "offset={} bytes={} src_host={:p}",
+            dst_offset, byte_count, src_host
+        ),
     );
-    if let Some((dev, _, _)) =
-        super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t)
-    {
+    if let Some((dev, _, _)) = super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t) {
         hipMemcpyHtoD(
             hipDeviceptr_t((dev as *mut u8).add(dst_offset) as *mut std::ffi::c_void),
             src_host as *mut std::ffi::c_void,
@@ -1849,9 +2248,7 @@ pub(crate) unsafe fn copy_hto_a_async_v2(
             dst_offset, byte_count, src_host, stream.0
         ),
     );
-    if let Some((dev, _, _)) =
-        super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t)
-    {
+    if let Some((dev, _, _)) = super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t) {
         hipMemcpyHtoDAsync(
             hipDeviceptr_t((dev as *mut u8).add(dst_offset) as *mut std::ffi::c_void),
             src_host as *mut std::ffi::c_void,
@@ -1860,7 +2257,13 @@ pub(crate) unsafe fn copy_hto_a_async_v2(
         )?;
         return Ok(());
     }
-    hipMemcpyHtoAAsync(dst_array as hipArray_t, dst_offset, src_host, byte_count, stream)?;
+    hipMemcpyHtoAAsync(
+        dst_array as hipArray_t,
+        dst_offset,
+        src_host,
+        byte_count,
+        stream,
+    )?;
     Ok(())
 }
 
@@ -1879,9 +2282,7 @@ pub(crate) unsafe fn copy_ato_d_v2(
             src_offset, byte_count, dst_device.0 as usize
         ),
     );
-    if let Some((dev, _, _)) =
-        super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t)
-    {
+    if let Some((dev, _, _)) = super::d3d11_interop::d3d11_array_layout(src_array as hipArray_t) {
         hipMemcpyDtoD(
             dst_device,
             hipDeviceptr_t((dev as *mut u8).add(src_offset) as *mut std::ffi::c_void),
@@ -1908,9 +2309,7 @@ pub(crate) unsafe fn copy_dto_a_v2(
             dst_offset, byte_count, src_device.0 as usize
         ),
     );
-    if let Some((dev, _, _)) =
-        super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t)
-    {
+    if let Some((dev, _, _)) = super::d3d11_interop::d3d11_array_layout(dst_array as hipArray_t) {
         hipMemcpyDtoD(
             hipDeviceptr_t((dev as *mut u8).add(dst_offset) as *mut std::ffi::c_void),
             src_device,
@@ -1940,7 +2339,13 @@ pub(crate) unsafe fn copy_ato_a_v2(
             super::driver::zluda_log_err(&format!(
                 "[D3D11_MEMCPY] cuMemcpyAtoA_v2 src_array={:p} src_sentinel={} dst_array={:p} \
                  dst_sentinel={} src_offset={} dst_offset={} bytes={}",
-                src_array, src_sentinel, dst_array, dst_sentinel, src_offset, dst_offset, byte_count,
+                src_array,
+                src_sentinel,
+                dst_array,
+                dst_sentinel,
+                src_offset,
+                dst_offset,
+                byte_count,
             ));
         }
     }
@@ -2000,17 +2405,13 @@ pub(crate) unsafe fn copy_3d_async_v2(memcpy: HIP_MEMCPY3D, stream: hipStream_t)
 }
 
 unsafe fn rewrite_3d_for_sentinel(mut memcpy: HIP_MEMCPY3D) -> HIP_MEMCPY3D {
-    if let Some((dev, _size, pitch)) =
-        super::d3d11_interop::d3d11_array_layout(memcpy.srcArray)
-    {
+    if let Some((dev, _size, pitch)) = super::d3d11_interop::d3d11_array_layout(memcpy.srcArray) {
         memcpy.srcArray = std::ptr::null_mut();
         memcpy.srcMemoryType = hipMemoryType::hipMemoryTypeDevice;
         memcpy.srcDevice = hipDeviceptr_t(dev);
         memcpy.srcPitch = pitch as usize;
     }
-    if let Some((dev, _size, pitch)) =
-        super::d3d11_interop::d3d11_array_layout(memcpy.dstArray)
-    {
+    if let Some((dev, _size, pitch)) = super::d3d11_interop::d3d11_array_layout(memcpy.dstArray) {
         memcpy.dstArray = std::ptr::null_mut();
         memcpy.dstMemoryType = hipMemoryType::hipMemoryTypeDevice;
         memcpy.dstDevice = hipDeviceptr_t(dev);
@@ -2026,6 +2427,7 @@ pub(crate) unsafe fn set_d_2d32_v2(
     width: usize,
     height: usize,
 ) -> hipError_t {
+    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     hipMemset2D(dst_device.0, dst_pitch, value as _, width, height)
 }
 #[cfg(test)]
@@ -2121,6 +2523,29 @@ mod tests {
             assert_eq!(out.dstMemoryType.0, hipMemoryType::hipMemoryTypeArray.0);
             assert_eq!(out.dstPitch, 999_999);
         }
+    }
+
+    #[test]
+    fn decode_ms2_batch_descriptor_reads_expected_offsets() {
+        let mut desc = [0u8; 88];
+        desc[0..4].copy_from_slice(&7u32.to_le_bytes());
+        desc[32..40].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        desc[72..80].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+        desc[80..88].copy_from_slice(&0x9999_aaaa_bbbb_ccccu64.to_le_bytes());
+        assert_eq!(
+            super::decode_ms2_batch_descriptor(&desc),
+            Some((
+                7,
+                0x1111_2222_3333_4444,
+                0x5555_6666_7777_8888,
+                0x9999_aaaa_bbbb_cccc
+            ))
+        );
+    }
+
+    #[test]
+    fn decode_ms2_batch_descriptor_rejects_short_buffers() {
+        assert_eq!(super::decode_ms2_batch_descriptor(&[0u8; 87]), None);
     }
 }
 

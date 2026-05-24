@@ -975,6 +975,198 @@ fn track_rd5_ptr(ptr: u64) {
     }
 }
 
+fn mcb_descriptor_hits_rd5_reset_window(
+    d_dst: u64,
+    d_size: u64,
+    tracked_rd5: &[u64],
+) -> Option<u64> {
+    let dst_end = d_dst.saturating_add(d_size);
+    for &rd5 in tracked_rd5 {
+        let watch_start = rd5.saturating_add(F6_OFFSET_IN_RD5 as u64);
+        let watch_end = watch_start.saturating_add(4);
+        if d_dst < watch_end && dst_end > watch_start {
+            return Some(rd5);
+        }
+    }
+    None
+}
+
+/// MS_1 defensive reset: rd5 values whose `+22176` slot needs zeroing
+/// before the next MS_1 launches. Marked by MS_4 launch hook (end of
+/// the prior MS-chain cycle), consumed once by the first MS_1 of the
+/// next cycle. Throttled to exactly ONE `hipMemsetD32` per rd5 per
+/// cycle to avoid the HIP ProfilingSignal race documented in
+/// `feedback_no_d2d_from_launch_kernel.md`.
+static MS1_RD5_RESET_PENDING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+fn ms1_rd5_reset_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled =
+            std::env::var("ZLUDA_MS1_RD5_RESET").map_or(false, |v| v == "1");
+        if enabled {
+            super::driver::zluda_log_err(
+                "[ZLUDA] MS_1 defensive reset of *(rd5+22176) enabled",
+            );
+        }
+        enabled
+    })
+}
+
+/// Called at MS_4 launch (end of MS-chain cycle). Adds the rd5 pointer
+/// (= MS_4's p4) to the pending-reset set. Per-cycle, called once per
+/// active entry's MS_4.
+fn mark_rd5_reset_pending(rd5_ptr: u64) {
+    if rd5_ptr == 0 || !ms1_rd5_reset_enabled() {
+        return;
+    }
+    let mut guard = match MS1_RD5_RESET_PENDING.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if !guard.contains(&rd5_ptr) && guard.len() < 16 {
+        guard.push(rd5_ptr);
+    }
+}
+
+/// Called at MS_1 launch (start of a new MS-chain cycle). Drains the
+/// pending-reset set and returns the rd5 pointers that need their
+/// `+22176` slot zeroed.
+fn take_pending_rd5_resets() -> Vec<u64> {
+    if !ms1_rd5_reset_enabled() {
+        return Vec::new();
+    }
+    let mut guard = match MS1_RD5_RESET_PENDING.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let drained: Vec<u64> = guard.drain(..).collect();
+    drained
+}
+
+/// SIGSEGV-safe check: is the page containing `addr` mapped readable
+/// in this process? Parses `/proc/self/maps` and looks for a region
+/// covering `addr` with 'r' permission. One-shot per call (cheap; the
+/// probe only fires at MS_1 launches which are rare).
+fn is_addr_readable(addr: u64) -> bool {
+    let s = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for line in s.lines() {
+        // Format: "start-end perms offset dev inode  path"
+        let mut parts = line.split_whitespace();
+        let range = match parts.next() {
+            Some(r) => r,
+            None => continue,
+        };
+        let perms = match parts.next() {
+            Some(p) => p,
+            None => continue,
+        };
+        let mut bounds = range.split('-');
+        let start = match bounds.next().and_then(|h| u64::from_str_radix(h, 16).ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let end = match bounds.next().and_then(|h| u64::from_str_radix(h, 16).ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        if addr >= start && addr < end {
+            return perms.starts_with('r');
+        }
+    }
+    false
+}
+
+/// Diagnostic probe: at MS_1 launch, compare CPU-direct read of
+/// `*(rd5+22176)` to GPU-side reading via hipMemcpyDtoH. If they
+/// differ, we have a CPU-GPU cache-coherency issue.
+///
+/// SIGSEGV-safe: checks /proc/self/maps for the page's permissions
+/// BEFORE dereferencing. If the page isn't CPU-readable, returns
+/// (0xDEAD, gpu_value, false-with-special-marker) without faulting.
+///
+/// Returns (cpu_value, gpu_value, equal).
+unsafe fn probe_rd5_counter_cpu_vs_gpu(rd5: u64) -> (u32, u32, bool) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_RD5_CPU_PROBE").map_or(false, |v| v == "1"))
+    {
+        return (0, 0, true);
+    }
+    if rd5 == 0 {
+        return (0, 0, true);
+    }
+    let cpu_addr = rd5 + F6_OFFSET_IN_RD5 as u64;
+    // SIGSEGV-safe gate
+    let cpu_readable = is_addr_readable(cpu_addr);
+    // GPU read via DtoH (always works for valid device pointers)
+    let mut gpu_value: u32 = 0xCAFEBABE;
+    let r = hipMemcpyDtoH(
+        &mut gpu_value as *mut u32 as *mut std::ffi::c_void,
+        hipDeviceptr_t(cpu_addr as *mut std::ffi::c_void),
+        4,
+    );
+    if r.is_err() {
+        gpu_value = 0xCAFEBABE;
+    }
+    if !cpu_readable {
+        // Encode "not CPU-readable" as 0xDEADBEEF + not-equal (unless
+        // gpu happened to also be 0xDEADBEEF, unlikely).
+        return (0xDEADBEEFu32, gpu_value, false);
+    }
+    let cpu_value = std::ptr::read_volatile(cpu_addr as *const u32);
+    (cpu_value, gpu_value, cpu_value == gpu_value)
+}
+
+/// At MS_1 launch, consume any pending reset markers and zero
+/// `*(rd5+22176)` for each. Issues `hipMemsetD32` synchronously so
+/// completion-handler signals back-pressure rather than pool the queue.
+unsafe fn ms1_consume_rd5_resets() {
+    let pending = take_pending_rd5_resets();
+    if pending.is_empty() {
+        return;
+    }
+    static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for rd5 in pending {
+        let dst = (rd5 + F6_OFFSET_IN_RD5 as u64) as *mut std::ffi::c_void;
+        let r = hipMemsetD32(hipDeviceptr_t(dst), 0, 1);
+        let ok = !r.is_err();
+        super::driver::zluda_log_err(&format!(
+            "MS1_RD5_RESET #{} rd5=0x{:x} target=0x{:x} hipMemsetD32 ok={}",
+            call_n, rd5, dst as u64, ok
+        ));
+    }
+}
+
+/// If `dst_dev_ptr + dst_byte_len` overlaps any tracked rd5+22176 word,
+/// returns the matching rd5 base. Used by memory.rs to detect host-side
+/// `cuMemsetD32_v2 / cuMemsetD32Async` calls that target the
+/// particleShapesCounter reset slot. Only returns Some when env
+/// `ZLUDA_RD5_MEMSET_TRACE=1` is set.
+pub(crate) fn check_memset_hits_rd5_counter(
+    dst_dev_ptr: u64,
+    dst_byte_len: u64,
+) -> Option<u64> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_RD5_MEMSET_TRACE").map_or(false, |v| v == "1"))
+    {
+        return None;
+    }
+    let snapshot: Vec<u64> = match TRACKED_RD5_PTRS.lock() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    };
+    if snapshot.is_empty() {
+        return None;
+    }
+    mcb_descriptor_hits_rd5_reset_window(dst_dev_ptr, dst_byte_len, &snapshot)
+}
+
 unsafe fn ms3_capture_init(state: &mut Option<Ms3CaptureState>) {
     if state.is_some() {
         return;
@@ -1866,6 +2058,28 @@ pub(crate) static MS4_DEV5_DUMP_QUEUE: std::sync::OnceLock<
 /// Gated on `ZLUDA_ACTORRANGE_DUMP=1`. Capped at 64 entries; drop-oldest.
 pub(crate) static IOFX_AR_DUMP_QUEUE: std::sync::OnceLock<
     Mutex<std::collections::VecDeque<(u64, u64, u64, u32)>>,
+> = std::sync::OnceLock::new();
+
+/// Queue of `(batch_desc_array_ptr, grid_x, grid_y, grid_z, launch_n)` for
+/// `CreateParticleShapesIncremental_MultiStage_2_Batched` launches.
+///
+/// Producer runs in `launch_kernel` and only enqueues metadata. Consumer runs
+/// from event handlers (host-thread context) and performs synchronized DtoH
+/// reads of the 88-byte batch descriptors (+32/+72/+80 pointers) and first
+/// shape samples (`rd7[i]`, `rd6[rd7[i]*12+8]`) to expose the true source of
+/// MS4 counters.
+///
+/// Gated on `ZLUDA_MS2_CAPTURE=1`. Capped at 64 entries; drop-oldest.
+pub(crate) static MS2_BATCH_DUMP_QUEUE: std::sync::OnceLock<
+    Mutex<std::collections::VecDeque<(u64, u32, u32, u32, u32)>>,
+> = std::sync::OnceLock::new();
+
+/// Recent `(rd6_ptr, ms2_launch_n)` watchlist extracted from
+/// `CreateParticleShapesIncremental_MultiStage_2_Batched` entry descriptors.
+/// Used by memcpy hooks in `memory.rs` to attribute writes that hit
+/// `rd6[*12+8]` source words consumed by the MS2 `r38-1 -> r39` path.
+pub(crate) static MS2_RD6_WATCH: std::sync::OnceLock<
+    Mutex<std::collections::VecDeque<(u64, u64)>>,
 > = std::sync::OnceLock::new();
 
 fn launch_mutex(lock_mode: u8) -> Option<&'static Mutex<()>> {
@@ -6171,8 +6385,7 @@ const SHAPE_PROBE_BYTES: usize = 384; // 32 entries × 12 bytes (covers field0..
 
 fn shape_table_probe_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("ZLUDA_SHAPE_TABLE_PROBE").map_or(false, |v| v == "1"))
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_SHAPE_TABLE_PROBE").map_or(false, |v| v == "1"))
 }
 
 struct ShapeProbeState {
@@ -6269,8 +6482,7 @@ unsafe fn snapshot_shape_table_before_ms4(shape_ptr: u64) {
     let _ = hipDeviceSynchronize();
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
-    let cur_slice: &[u8] =
-        std::slice::from_raw_parts(state.scratch_host, SHAPE_PROBE_BYTES);
+    let cur_slice: &[u8] = std::slice::from_raw_parts(state.scratch_host, SHAPE_PROBE_BYTES);
     if cur_slice == state.last_bytes {
         return; // no change since last snapshot for this ptr
     }
@@ -6368,7 +6580,9 @@ unsafe fn flag_probe_init(state: &mut Option<FlagProbeState>) {
     }
     super::driver::zluda_log_err(&format!(
         "[ZLUDA] flag probe: scratch={} KB pinned; host=0x{:x} dev=0x{:x}",
-        FLAG_PROBE_BYTES / 1024, host_ptr as usize, dev_ptr as usize,
+        FLAG_PROBE_BYTES / 1024,
+        host_ptr as usize,
+        dev_ptr as usize,
     ));
     *state = Some(FlagProbeState {
         scratch_host: host_ptr as *mut u8,
@@ -6384,12 +6598,7 @@ unsafe fn flag_probe_init(state: &mut Option<FlagProbeState>) {
 ///
 /// flags is u16 per element with 4-byte STRIDE (MS_4 PTX:
 /// `mul.wide.u32 %rd8, %r1, 4; ... ld.global.u16 [%rd9]`).
-unsafe fn snapshot_flag_count_at(
-    label: &str,
-    flags_ptr: u64,
-    n_threads: u32,
-    extra_ptr: u64,
-) {
+unsafe fn snapshot_flag_count_at(label: &str, flags_ptr: u64, n_threads: u32, extra_ptr: u64) {
     if !flag_count_probe_enabled() || flags_ptr == 0 || n_threads == 0 {
         return;
     }
@@ -6457,10 +6666,8 @@ unsafe fn snapshot_flag_count_before_initcoll(flags_ptr: u64, n_threads: u32) {
 /// 2026-05-16 v8 Step 3: latched MS_4 flags ptr + n_threads, set from
 /// MS_4 launch hook. Used by post-MS_1 probe to count bit-4-set on
 /// the SAME buffer MS_4 will read.
-static MS4_FLAGS_PTR_LATCHED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static MS4_N_LATCHED: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static MS4_FLAGS_PTR_LATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MS4_N_LATCHED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 2026-05-16 v11 Step 2: MS_1 gate-trace buffer.
 /// Per-kernel-name PTX instrumentation (allowed per user clarification 2026-05-16)
@@ -6476,8 +6683,7 @@ static MS4_N_LATCHED: std::sync::atomic::AtomicU32 =
 const MS1_GATE_TRACE_BYTES: usize = 16;
 static MS1_GATE_TRACE_HOST_PTR: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-static MS1_GATE_TRACE_DEV_PTR: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static MS1_GATE_TRACE_DEV_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MS1_GATE_TRACE_DUMP_TICK: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
@@ -6498,8 +6704,7 @@ pub(crate) fn ms1_gate_trace_get_or_init_dev_ptr() -> u64 {
     }
     unsafe {
         let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let alloc =
-            hipHostMalloc(&mut host_ptr, MS1_GATE_TRACE_BYTES, hipHostMallocMapped);
+        let alloc = hipHostMalloc(&mut host_ptr, MS1_GATE_TRACE_BYTES, hipHostMallocMapped);
         if alloc.is_err() || host_ptr.is_null() {
             super::driver::zluda_log_err(&format!(
                 "[ZLUDA] ms1_gate_trace: hipHostMalloc failed: {:?}",
@@ -6538,8 +6743,7 @@ unsafe fn ms1_gate_trace_dump_and_reset() {
     if host_ptr == 0 {
         return;
     }
-    let tick = MS1_GATE_TRACE_DUMP_TICK
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tick = MS1_GATE_TRACE_DUMP_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Sync to ensure prior atomic writes are visible
     let _ = hipDeviceSynchronize();
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -6598,8 +6802,7 @@ unsafe fn snapshot_pool_22176_counter(pool_ptr: u64) {
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
     let cnt_22176: u32 = std::ptr::read_unaligned(state.scratch_host as *const u32);
-    let cnt_22180: u32 =
-        std::ptr::read_unaligned((state.scratch_host as *const u32).add(1));
+    let cnt_22180: u32 = std::ptr::read_unaligned((state.scratch_host as *const u32).add(1));
     super::driver::zluda_log_err(&format!(
         "[POOL_22176] call_n={} pool_ptr=0x{:x} +22176={} +22180={}",
         call_n, pool_ptr, cnt_22176, cnt_22180
@@ -7092,10 +7295,11 @@ unsafe fn scan_ms4_shape_idx(
 // 256-slot pinned host-mapped buffer dumped from the SIGABRT handler to
 // `/tmp/tfs_captures.bin` (same dump pattern as MS_4 / MS_2_Batched / MS_3).
 
-const TFS_CAPTURE_SLOTS: usize = 256;
+const TFS_CAPTURE_SLOTS: usize = 4096;
 const TFS_DESC_BYTES: usize = 456;
 const TFS_KERNEL_NAME_BYTES: usize = 64;
 const TFS_RAW_ARGS_BYTES: usize = 512; // covers struct + scalar args + extras
+const TFS_RAW_ARGS_OFF: usize = 120;
 const TFS_SLOT_SIZE: usize = std::mem::size_of::<TfsCaptureSlot>();
 const TFS_CAPTURE_TOTAL_SIZE: usize = TFS_SLOT_SIZE * TFS_CAPTURE_SLOTS;
 const TFS_CAPTURE_MAGIC: u64 = 0x5446_5343_4150_5455; // "TFSCAPTU"
@@ -7137,6 +7341,9 @@ const TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS1: u32 = 13;
 const TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED: u32 = 14;
 const TFS_KERNEL_ID_FIELD_SAMPLER_POINTS: u32 = 15;
 const TFS_KERNEL_ID_IOFX_ACTOR_RANGE: u32 = 16;
+const TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2: u32 = 17;
+const TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS3: u32 = 18;
+const TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS4: u32 = 19;
 
 fn classify_tfs_kernel(name: &str) -> Option<u32> {
     if !name.starts_with("TurbulenceFS_") {
@@ -7149,6 +7356,15 @@ fn classify_tfs_kernel(name: &str) -> Option<u32> {
             }
             "CreateParticleShapesIncremental_MultiStage_2_Batched" => {
                 TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED
+            }
+            "CreateParticleShapesIncremental_MultiStage_2" => {
+                TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2
+            }
+            "CreateParticleShapesIncremental_MultiStage_3" => {
+                TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS3
+            }
+            "CreateParticleShapesIncremental_MultiStage_4" => {
+                TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS4
             }
             "IOFX_actorRangeKernel" => TFS_KERNEL_ID_IOFX_ACTOR_RANGE,
             _ => return None,
@@ -7886,22 +8102,23 @@ const CUB_DOWNSWEEP_CAPTURE_MAGIC: u64 = 0x43554244_4f574e53; // "CUBDOWNS"
 
 #[repr(C)]
 struct CubDownsweepCaptureSlot {
-    magic: u64,                                                              // 0
-    launch_n: u64,                                                           // 8
-    timestamp_ms: u64,                                                       // 16
-    grid_x: u32,                                                             // 24
-    grid_y: u32,                                                             // 28
-    grid_z: u32,                                                             // 32
-    block_x: u32,                                                            // 36
-    block_y: u32,                                                            // 40
-    block_z: u32,                                                            // 44
-    shared_mem_bytes: u32,                                                   // 48
-    raw_args_len: u32,                                                       // 52
-    ptr_params: [u64; CUB_DOWNSWEEP_POINTER_COUNT],                          // 56..96
-    buffer_bytes_per_ptr: u32,                                               // 96
-    _pad0: [u8; 4],                                                          // 100
-    raw_args: [u8; CUB_DOWNSWEEP_RAW_ARGS_BYTES],                            // 104..232
-    _pad1: [u8; 24],                                                         // 232..256
+    magic: u64,                                     // 0
+    launch_n: u64,                                  // 8
+    timestamp_ms: u64,                              // 16
+    grid_x: u32,                                    // 24
+    grid_y: u32,                                    // 28
+    grid_z: u32,                                    // 32
+    block_x: u32,                                   // 36
+    block_y: u32,                                   // 40
+    block_z: u32,                                   // 44
+    shared_mem_bytes: u32,                          // 48
+    raw_args_len: u32,                              // 52
+    ptr_params: [u64; CUB_DOWNSWEEP_POINTER_COUNT], // 56..96
+    buffer_bytes_per_ptr: u32,                      // 96
+    _pad0: [u8; 4],                                 // 100
+    raw_args: [u8; CUB_DOWNSWEEP_RAW_ARGS_BYTES],   // 104..232
+    global_launch_n: u64,                           // 232
+    _pad1: [u8; 16],                                // 240..256
     pre_ptr_buffers: [u8; CUB_DOWNSWEEP_POINTER_COUNT * CUB_DOWNSWEEP_BUFFER_BYTES],
 }
 
@@ -7926,9 +8143,7 @@ pub(crate) static CUB_DOWNSWEEP_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUs
 
 fn cub_downsweep_capture_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ZLUDA_DOWNSWEEP_CAPTURE").map_or(false, |v| v == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_DOWNSWEEP_CAPTURE").map_or(false, |v| v == "1"))
 }
 
 unsafe fn cub_downsweep_capture_init(state: &mut Option<CubDownsweepCaptureState>) {
@@ -7987,6 +8202,7 @@ unsafe fn cub_downsweep_capture_init(state: &mut Option<CubDownsweepCaptureState
 
 unsafe fn capture_cub_downsweep_inputs(
     extra: *mut *mut ::core::ffi::c_void,
+    global_launch_n: u64,
     grid_x: u32,
     grid_y: u32,
     grid_z: u32,
@@ -8025,9 +8241,7 @@ unsafe fn capture_cub_downsweep_inputs(
     state.launch_counter += 1;
     let slot_index = (this_launch as usize) % IOFX_CAPTURE_SLOTS;
     let slot_host = unsafe {
-        state
-            .host_ptr
-            .add(slot_index * CUB_DOWNSWEEP_SLOT_SIZE) as *mut CubDownsweepCaptureSlot
+        state.host_ptr.add(slot_index * CUB_DOWNSWEEP_SLOT_SIZE) as *mut CubDownsweepCaptureSlot
     };
     unsafe {
         std::ptr::write_bytes(slot_host as *mut u8, 0, CUB_DOWNSWEEP_SLOT_SIZE);
@@ -8047,6 +8261,7 @@ unsafe fn capture_cub_downsweep_inputs(
         let dst = (*slot_host).raw_args.as_mut_ptr();
         std::ptr::copy_nonoverlapping(buf, dst, 88);
         (*slot_host).raw_args_len = 88;
+        (*slot_host).global_launch_n = global_launch_n;
     }
     Some(slot_index)
 }
@@ -8076,20 +8291,23 @@ const CUB_SCAN_BUFFER_BYTES: usize = 128 * 1024;
 
 #[repr(C)]
 struct CubScanCaptureSlot {
-    magic: u64,                              // 0  "CUBSCANP"
-    launch_n: u64,                           // 8
-    timestamp_ms: u64,                       // 16
-    grid_x: u32,                             // 24
-    grid_y: u32,                             // 28
-    grid_z: u32,                             // 32
-    block_x: u32,                            // 36
-    block_y: u32,                            // 40
-    block_z: u32,                            // 44
-    shared_mem_bytes: u32,                   // 48
-    scan_n: u32,                             // 52: param_1 = total scan size
-    spine_ptr: u64,                          // 56
-    _pad0: [u8; 56],                         // 64..120
-    pre_spine: [u8; CUB_SCAN_BUFFER_BYTES],  // 120..(120+128K)
+    magic: u64,                             // 0  "CUBSCANP"
+    launch_n: u64,                          // 8
+    timestamp_ms: u64,                      // 16
+    grid_x: u32,                            // 24
+    grid_y: u32,                            // 28
+    grid_z: u32,                            // 32
+    block_x: u32,                           // 36
+    block_y: u32,                           // 40
+    block_z: u32,                           // 44
+    shared_mem_bytes: u32,                  // 48
+    scan_n: u32,                            // 52: param_1 = total scan size
+    spine_ptr: u64,                         // 56
+    pre_spine_bytes: u32,                   // 64: bytes copied into pre_spine
+    _pad0: u32,                             // 68..72
+    global_launch_n: u64,                   // 72
+    _pad1: [u8; 40],                        // 80..120
+    pre_spine: [u8; CUB_SCAN_BUFFER_BYTES], // 120..(120+128K)
 }
 
 const CUB_SCAN_CAPTURE_MAGIC: u64 = 0x5042_4E43_5343_4255; // "UBCSCNBP" little-endian
@@ -8114,8 +8332,7 @@ pub(crate) static CUB_SCAN_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize =
 
 fn cub_scan_capture_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("ZLUDA_CUB_SCAN_PROBE").map_or(false, |v| v == "1"))
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_CUB_SCAN_PROBE").map_or(false, |v| v == "1"))
 }
 
 unsafe fn cub_scan_capture_init(state: &mut Option<CubScanCaptureState>) {
@@ -8175,6 +8392,7 @@ unsafe fn cub_scan_capture_init(state: &mut Option<CubScanCaptureState>) {
 unsafe fn capture_cub_scan_inputs(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
+    global_launch_n: u64,
     grid_x: u32,
     grid_y: u32,
     grid_z: u32,
@@ -8205,9 +8423,8 @@ unsafe fn capture_cub_scan_inputs(
     let this_launch = state.launch_counter;
     state.launch_counter += 1;
     let slot_index = (this_launch as usize) % IOFX_CAPTURE_SLOTS;
-    let slot_host = unsafe {
-        state.host_ptr.add(slot_index * CUB_SCAN_SLOT_SIZE) as *mut CubScanCaptureSlot
-    };
+    let slot_host =
+        unsafe { state.host_ptr.add(slot_index * CUB_SCAN_SLOT_SIZE) as *mut CubScanCaptureSlot };
     unsafe {
         std::ptr::write_bytes(slot_host as *mut u8, 0, CUB_SCAN_SLOT_SIZE);
         (*slot_host).magic = CUB_SCAN_CAPTURE_MAGIC;
@@ -8222,6 +8439,8 @@ unsafe fn capture_cub_scan_inputs(
         (*slot_host).shared_mem_bytes = shared_mem_bytes;
         (*slot_host).scan_n = scan_n;
         (*slot_host).spine_ptr = spine_ptr;
+        (*slot_host).pre_spine_bytes = 0;
+        (*slot_host).global_launch_n = global_launch_n;
     }
     Some(slot_index)
 }
@@ -8238,26 +8457,45 @@ unsafe fn capture_cub_scan_pre(slot_index: usize, stream: hipStream_t) {
         Some(s) => s,
         None => return,
     };
-    let slot_host = unsafe {
-        state.host_ptr.add(slot_index * CUB_SCAN_SLOT_SIZE) as *const CubScanCaptureSlot
-    };
-    let slot_dev_base =
-        unsafe { (state.dev_ptr as *mut u8).add(slot_index * CUB_SCAN_SLOT_SIZE) };
+    let slot_host =
+        unsafe { state.host_ptr.add(slot_index * CUB_SCAN_SLOT_SIZE) as *mut CubScanCaptureSlot };
+    let slot_dev_base = unsafe { (state.dev_ptr as *mut u8).add(slot_index * CUB_SCAN_SLOT_SIZE) };
     let spine_ptr = unsafe { (*slot_host).spine_ptr };
+    let scan_n = unsafe { (*slot_host).scan_n };
     if spine_ptr == 0 {
         return;
     }
-    // Spine alloc by CUB DeviceRadixSort is typically ~8 KB but the host
-    // alloc may extend; reading 128 KB is bounded by our slot buffer and is
-    // typical of CUB scratch storage. If a small spine fails the DtoD
-    // silently (per the same caveat in capture_cub_downsweep_pre), we still
-    // get the first 8 KB which contains the legitimate grid_x*num_bins
-    // region we care about.
+    // Scan spine allocations are often much smaller than 128 KB. A flat
+    // 128 KB DtoD on a small allocation can fail and leave this slot zeroed.
+    // Bound the copy to both scan_n-derived size and the source allocation's
+    // available bytes.
+    let mut copy_bytes = if scan_n > 0 {
+        (scan_n as usize).saturating_mul(std::mem::size_of::<u32>())
+    } else {
+        0
+    };
+    if copy_bytes == 0 {
+        copy_bytes = CUB_SCAN_BUFFER_BYTES;
+    }
+    copy_bytes = copy_bytes.max(64).min(CUB_SCAN_BUFFER_BYTES);
+    if let Some((_, alloc_size, alloc_off)) = unsafe { query_device_pointer_range(spine_ptr) } {
+        let available = alloc_size.saturating_sub(alloc_off);
+        copy_bytes = copy_bytes.min(available);
+    }
+    if copy_bytes == 0 {
+        unsafe {
+            (*slot_host).pre_spine_bytes = 0;
+        }
+        return;
+    }
+    unsafe {
+        (*slot_host).pre_spine_bytes = copy_bytes as u32;
+    }
     unsafe {
         let _ = hipMemcpyDtoDAsync(
             hipDeviceptr_t(slot_dev_base.add(CUB_SCAN_PRE_SPINE_OFF) as _),
             hipDeviceptr_t(spine_ptr as _),
-            CUB_SCAN_BUFFER_BYTES,
+            copy_bytes,
             stream,
         );
     }
@@ -8276,9 +8514,7 @@ unsafe fn capture_cub_downsweep_pre(slot_index: usize, stream: hipStream_t) {
         None => return,
     };
     let slot_host = unsafe {
-        state
-            .host_ptr
-            .add(slot_index * CUB_DOWNSWEEP_SLOT_SIZE) as *const CubDownsweepCaptureSlot
+        state.host_ptr.add(slot_index * CUB_DOWNSWEEP_SLOT_SIZE) as *const CubDownsweepCaptureSlot
     };
     let slot_dev_base =
         unsafe { (state.dev_ptr as *mut u8).add(slot_index * CUB_DOWNSWEEP_SLOT_SIZE) };
@@ -8307,7 +8543,11 @@ unsafe fn capture_cub_downsweep_pre(slot_index: usize, stream: hipStream_t) {
         if src_ptr == 0 {
             continue;
         }
-        let n_bytes = if idx == 4 { spine_bytes } else { key_value_bytes };
+        let n_bytes = if idx == 4 {
+            spine_bytes
+        } else {
+            key_value_bytes
+        };
         let dst_off = CUB_DOWNSWEEP_PRE_PTRS_OFF + idx * CUB_DOWNSWEEP_BUFFER_BYTES;
         unsafe {
             let _ = hipMemcpyDtoDAsync(
@@ -8318,7 +8558,6 @@ unsafe fn capture_cub_downsweep_pre(slot_index: usize, stream: hipStream_t) {
             );
         }
     }
-
 }
 
 unsafe fn capture_iofx_actor_range_pre(slot_index: usize, stream: hipStream_t) {
@@ -8356,11 +8595,11 @@ const IOFX_CHAIN_BUFFER_BYTES: usize = 16 * 1024;
 const IOFX_CHAIN_RAW_ARGS_BYTES: usize = 512;
 const IOFX_CHAIN_NAME_BYTES: usize = 64;
 const IOFX_CHAIN_CAPTURE_MAGIC: u64 = 0x494f4658_4348414e; // "IOFXCHAN"
-// 2026-05-12 PM (bumped 128→256): cover ~16 PhysX frames of chain history.
-// With sample=16, this gives ~16 sampled slots per ring window vs ~8 at 128
-// — enough to reach further upstream to catch makeSortKeys's bit-31-or-not
-// POST data when it doesn't land on a % 16 boundary in the immediate
-// frame. 256 × 262864 ≈ 66 MB pinned, comfortable on 16 GB UMA.
+                                                           // 2026-05-12 PM (bumped 128→256): cover ~16 PhysX frames of chain history.
+                                                           // With sample=16, this gives ~16 sampled slots per ring window vs ~8 at 128
+                                                           // — enough to reach further upstream to catch makeSortKeys's bit-31-or-not
+                                                           // POST data when it doesn't land on a % 16 boundary in the immediate
+                                                           // frame. 256 × 262864 ≈ 66 MB pinned, comfortable on 16 GB UMA.
 const IOFX_CHAIN_CAPTURE_SLOTS: usize = 256;
 
 #[repr(u32)]
@@ -8394,25 +8633,25 @@ fn classify_iofx_chain_kernel(name: &str) -> Option<IofxChainKind> {
 
 #[repr(C)]
 struct IofxChainCaptureSlot {
-    magic: u64,            // 0:  "IOFXCHAN"
-    launch_n: u64,         // 8
-    timestamp_ms: u64,     // 16
-    kernel_kind: u32,      // 24: IofxChainKind
-    grid_x: u32,           // 28
-    grid_y: u32,           // 32
-    grid_z: u32,           // 36
-    block_x: u32,          // 40
-    block_y: u32,          // 44
-    block_z: u32,          // 48
-    shared_mem_bytes: u32, // 52
-    raw_args_len: u32,     // 56
-    arg_meta: [u8; 8],     // 60
-    _pad0: [u8; 4],        // 68
-    kernel_name: [u8; IOFX_CHAIN_NAME_BYTES],          // 72..136
-    ptr_params: [u64; IOFX_CHAIN_POINTER_COUNT],       // 136..200
-    ptr_buffer_bytes: u32,                              // 200
-    _pad1: [u8; 4],                                     // 204
-    raw_args: [u8; IOFX_CHAIN_RAW_ARGS_BYTES],          // 208..720
+    magic: u64,                                  // 0:  "IOFXCHAN"
+    launch_n: u64,                               // 8
+    timestamp_ms: u64,                           // 16
+    kernel_kind: u32,                            // 24: IofxChainKind
+    grid_x: u32,                                 // 28
+    grid_y: u32,                                 // 32
+    grid_z: u32,                                 // 36
+    block_x: u32,                                // 40
+    block_y: u32,                                // 44
+    block_z: u32,                                // 48
+    shared_mem_bytes: u32,                       // 52
+    raw_args_len: u32,                           // 56
+    arg_meta: [u8; 8],                           // 60
+    _pad0: [u8; 4],                              // 68
+    kernel_name: [u8; IOFX_CHAIN_NAME_BYTES],    // 72..136
+    ptr_params: [u64; IOFX_CHAIN_POINTER_COUNT], // 136..200
+    ptr_buffer_bytes: u32,                       // 200
+    _pad1: [u8; 4],                              // 204
+    raw_args: [u8; IOFX_CHAIN_RAW_ARGS_BYTES],   // 208..720
     pre_ptr_buffers: [u8; IOFX_CHAIN_POINTER_COUNT * IOFX_CHAIN_BUFFER_BYTES],
     post_ptr_buffers: [u8; IOFX_CHAIN_POINTER_COUNT * IOFX_CHAIN_BUFFER_BYTES],
 }
@@ -8422,8 +8661,7 @@ const IOFX_CHAIN_RAW_ARGS_OFF: usize = 208;
 const IOFX_CHAIN_PRE_PTRS_OFF: usize = IOFX_CHAIN_RAW_ARGS_OFF + IOFX_CHAIN_RAW_ARGS_BYTES;
 const IOFX_CHAIN_POST_PTRS_OFF: usize =
     IOFX_CHAIN_PRE_PTRS_OFF + IOFX_CHAIN_POINTER_COUNT * IOFX_CHAIN_BUFFER_BYTES;
-const IOFX_CHAIN_CAPTURE_TOTAL_SIZE: usize =
-    IOFX_CHAIN_SLOT_SIZE * IOFX_CHAIN_CAPTURE_SLOTS;
+const IOFX_CHAIN_CAPTURE_TOTAL_SIZE: usize = IOFX_CHAIN_SLOT_SIZE * IOFX_CHAIN_CAPTURE_SLOTS;
 
 struct IofxChainCaptureState {
     host_ptr: *mut u8,
@@ -8442,8 +8680,7 @@ pub(crate) static IOFX_CHAIN_CAPTURE_TOTAL_BYTES: std::sync::atomic::AtomicUsize
 
 fn iofx_chain_capture_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("ZLUDA_IOFX_CHAIN_CAPTURE").map_or(false, |v| v == "1"))
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_IOFX_CHAIN_CAPTURE").map_or(false, |v| v == "1"))
 }
 
 unsafe fn iofx_chain_capture_init(state: &mut Option<IofxChainCaptureState>) {
@@ -8631,11 +8868,7 @@ unsafe fn capture_iofx_chain_inputs(
     Some(slot_index)
 }
 
-unsafe fn capture_iofx_chain_ptr_regions(
-    slot_index: usize,
-    stream: hipStream_t,
-    prelaunch: bool,
-) {
+unsafe fn capture_iofx_chain_ptr_regions(slot_index: usize, stream: hipStream_t, prelaunch: bool) {
     if !iofx_chain_capture_enabled() {
         return;
     }
@@ -8654,9 +8887,8 @@ unsafe fn capture_iofx_chain_ptr_regions(
     // the 16-slot ring with launches spread across the entire run.
     // Set BUFS_SAMPLE=1 to snapshot every launch (the previous behavior).
     static SNAPSHOT_BUFS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let snapshot_bufs = *SNAPSHOT_BUFS.get_or_init(|| {
-        std::env::var("ZLUDA_IOFX_CHAIN_CAPTURE_BUFS").map_or(false, |v| v == "1")
-    });
+    let snapshot_bufs = *SNAPSHOT_BUFS
+        .get_or_init(|| std::env::var("ZLUDA_IOFX_CHAIN_CAPTURE_BUFS").map_or(false, |v| v == "1"));
     if !snapshot_bufs {
         return;
     }
@@ -8708,7 +8940,11 @@ unsafe fn capture_iofx_chain_ptr_regions(
     };
     let launch_n = unsafe { (*slot_host).launch_n };
     let kernel_kind = unsafe { (*slot_host).kernel_kind };
-    for (idx, src_ptr) in unsafe { (*slot_host).ptr_params }.iter().copied().enumerate() {
+    for (idx, src_ptr) in unsafe { (*slot_host).ptr_params }
+        .iter()
+        .copied()
+        .enumerate()
+    {
         if src_ptr == 0 {
             continue;
         }
@@ -8725,8 +8961,7 @@ unsafe fn capture_iofx_chain_ptr_regions(
             // Log the first few failures per session so we know whether
             // DtoD is silently failing (e.g. invalid/freed src ptr,
             // wrong context, queue wedged). Capped to avoid log spam.
-            static ERR_COUNT: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
+            static ERR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 32 {
                 super::driver::zluda_log_err(&format!(
@@ -8745,7 +8980,6 @@ unsafe fn capture_iofx_chain_ptr_regions(
             }
         }
     }
-
 }
 
 unsafe fn capture_iofx_chain_pre(slot_index: usize, stream: hipStream_t) {
@@ -8930,14 +9164,1877 @@ fn should_skip_tfs_raw_arg_dump(name: &str) -> bool {
         name,
         "CreateParticleShapesIncremental_MultiStage_1"
             | "CreateParticleShapesIncremental_MultiStage_2_Batched"
+            | "CreateParticleShapesIncremental_MultiStage_3"
+            | "CreateParticleShapesIncremental_MultiStage_4"
             | "InitCollDataAndApplyConstraints"
             | "FinalizeCollision"
             | "ParticleCollisionStaticBox"
     )
 }
 
+const TFS_MS2B_ARGS_CAPTURE_MAGIC: u32 = 0x4D32_4241; // "M2BA"
+const TFS_MS2B_ARGS_CAPTURE_VERSION: u32 = 1;
+const TFS_MS2B_ARGS_CAPTURE_VERSION_V2: u32 = 2;
+const TFS_MS2B_ARGS_CAPTURE_VERSION_V3: u32 = 3;
+const TFS_MS2B_ARGS_CAPTURE_VERSION_V4: u32 = 4;
+const TFS_MS2B_PACKET_SAMPLE_BYTES: usize = 88 * 3;
+const TFS_MS2B_PACKET_ENTRY_BYTES: usize = 88;
+const TFS_MS2B_PACKET_SAMPLE_ENTRIES: usize =
+    TFS_MS2B_PACKET_SAMPLE_BYTES / TFS_MS2B_PACKET_ENTRY_BYTES;
+const TFS_MS2B_RD_SAMPLE_WORDS: usize = 8;
+const TFS_MS2B_SLOT_PROBE_WORDS: usize = 4;
+const TFS_MS3_ARGS_CAPTURE_MAGIC: u32 = 0x4D53_3341; // "MS3A"
+const TFS_MS3_ARGS_CAPTURE_VERSION: u32 = 1;
+const TFS_MS3_ARGS_CAPTURE_VERSION_V2: u32 = 2;
+const TFS_MS3_P2_SAMPLE_WORDS: usize = 8;
+const TFS_MS3_P3_SAMPLE_WORDS: usize = 8;
+const TFS_MS4_ARGS_CAPTURE_MAGIC: u32 = 0x4D53_3441; // "MS4A"
+const TFS_MS4_ARGS_CAPTURE_VERSION: u32 = 1;
+const TFS_MS4_ARGS_CAPTURE_VERSION_V2: u32 = 2;
+const TFS_MS4_P2_SAMPLE_WORDS: usize = 32;
+const TFS_MS4_P4_SAMPLE_WORDS: usize = 8;
+const TFS_MS4_P6_SAMPLE_WORDS: usize = 32;
+const TFS_MS4_P7_SAMPLE_WORDS: usize = 32;
+const TFS_ATOMIC_TO_TEX_CAPTURE_MAGIC: u32 = 0x4154_5841; // "ATXA"
+const TFS_ATOMIC_TO_TEX_CAPTURE_VERSION: u32 = 1;
+const TFS_ATOMIC_TO_TEX_SAMPLE_WORDS: usize = 8;
+const TFS_ATOMIC_TO_TEX_SURFACE_DESC_WORDS: usize = 8;
+const TFS_MUT_P47_CAPTURE_MAGIC: u32 = 0x4D50_3437; // "MP47"
+const TFS_MUT_P47_CAPTURE_VERSION: u32 = 4;
+const TFS_MUT_P47_CAPTURE_VERSION_V3: u32 = 3;
+const TFS_MUT_P47_CAPTURE_VERSION_V2: u32 = 2;
+const TFS_MUT_P47_CAPTURE_VERSION_V1: u32 = 1;
+const TFS_MUT_P47_SAMPLE_WORDS: usize = 8;
+const TFS_MUT_P47_ARG_PREFIX_WORDS: usize = 16;
+/// Byte offset within rd5 of the "particleShapesCounter" persistent slot.
+/// MS_2_Batched's BB11_4 loads `*(rd5 + 22176)` into LDS as the active-shape
+/// count. MS_1 is the suspected writer; the counter probe captures it at
+/// every MUT_P47 sample point to verify whether MS_1 receives a stale
+/// non-zero counter in the failing cycle.
+const TFS_RD5_PARTICLE_SHAPES_COUNTER_OFFSET: usize = 22176;
+static TFS_MUT_P47_LAST_MS2_LAUNCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static TFS_MUT_P47_LAST_RD5: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TFS_MUT_P47_LAST_RD6: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TFS_MUT_P47_LAST_RD7: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TFS_MUT_P47_ENTRY_INDEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static TFS_MUT_P47_BROAD_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct TfsMs2BatchedArgsCaptureV1 {
+    magic: u32,
+    version: u32,
+    p2: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsMs2BatchedArgsCaptureV2 {
+    magic: u32,
+    version: u32,
+    p2: u64,
+    grid_x: u32,
+    block_x: u32,
+    packet_sample_bytes: u32,
+    _pad0: u32,
+    packet_sample: [u8; TFS_MS2B_PACKET_SAMPLE_BYTES],
+}
+
+impl Default for TfsMs2BatchedArgsCaptureV2 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_MS2B_ARGS_CAPTURE_MAGIC,
+            version: TFS_MS2B_ARGS_CAPTURE_VERSION_V2,
+            p2: 0,
+            grid_x: 0,
+            block_x: 0,
+            packet_sample_bytes: 0,
+            _pad0: 0,
+            packet_sample: [0; TFS_MS2B_PACKET_SAMPLE_BYTES],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsMs2BatchedArgsCaptureV3 {
+    magic: u32,
+    version: u32,
+    p2: u64,
+    grid_x: u32,
+    block_x: u32,
+    packet_sample_bytes: u32,
+    _pad0: u32,
+    packet_sample: [u8; TFS_MS2B_PACKET_SAMPLE_BYTES],
+    rd5_words: u32,
+    rd6_words: u32,
+    rd7_words: u32,
+    _pad1: u32,
+    rd5_words_data: [u32; TFS_MS2B_RD_SAMPLE_WORDS],
+    rd6_words_data: [u32; TFS_MS2B_RD_SAMPLE_WORDS],
+    rd7_words_data: [u32; TFS_MS2B_RD_SAMPLE_WORDS],
+}
+
+impl Default for TfsMs2BatchedArgsCaptureV3 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_MS2B_ARGS_CAPTURE_MAGIC,
+            version: TFS_MS2B_ARGS_CAPTURE_VERSION_V3,
+            p2: 0,
+            grid_x: 0,
+            block_x: 0,
+            packet_sample_bytes: 0,
+            _pad0: 0,
+            packet_sample: [0; TFS_MS2B_PACKET_SAMPLE_BYTES],
+            rd5_words: 0,
+            rd6_words: 0,
+            rd7_words: 0,
+            _pad1: 0,
+            rd5_words_data: [0; TFS_MS2B_RD_SAMPLE_WORDS],
+            rd6_words_data: [0; TFS_MS2B_RD_SAMPLE_WORDS],
+            rd7_words_data: [0; TFS_MS2B_RD_SAMPLE_WORDS],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsMs2BatchedArgsCaptureV4 {
+    magic: u32,
+    version: u32,
+    p2: u64,
+    grid_x: u32,
+    block_x: u32,
+    packet_sample_bytes: u32,
+    _pad0: u32,
+    packet_sample: [u8; TFS_MS2B_PACKET_SAMPLE_BYTES],
+    rd5_words: u32,
+    rd6_words: u32,
+    rd7_words: u32,
+    _pad1: u32,
+    rd5_words_data: [u32; TFS_MS2B_RD_SAMPLE_WORDS],
+    rd6_words_data: [u32; TFS_MS2B_RD_SAMPLE_WORDS],
+    rd7_words_data: [u32; TFS_MS2B_RD_SAMPLE_WORDS],
+    requested_entry: u32,
+    effective_entry: u32,
+    slot_probe_words: u32,
+    slot_probe_rd5_mask: u32,
+    slot_probe_r38_mask: u32,
+    _pad2: u32,
+    slot_probe_slots: [u32; TFS_MS2B_SLOT_PROBE_WORDS],
+    slot_probe_rd5_p4: [u32; TFS_MS2B_SLOT_PROBE_WORDS],
+    slot_probe_r38: [u32; TFS_MS2B_SLOT_PROBE_WORDS],
+}
+
+impl Default for TfsMs2BatchedArgsCaptureV4 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_MS2B_ARGS_CAPTURE_MAGIC,
+            version: TFS_MS2B_ARGS_CAPTURE_VERSION_V4,
+            p2: 0,
+            grid_x: 0,
+            block_x: 0,
+            packet_sample_bytes: 0,
+            _pad0: 0,
+            packet_sample: [0; TFS_MS2B_PACKET_SAMPLE_BYTES],
+            rd5_words: 0,
+            rd6_words: 0,
+            rd7_words: 0,
+            _pad1: 0,
+            rd5_words_data: [0; TFS_MS2B_RD_SAMPLE_WORDS],
+            rd6_words_data: [0; TFS_MS2B_RD_SAMPLE_WORDS],
+            rd7_words_data: [0; TFS_MS2B_RD_SAMPLE_WORDS],
+            requested_entry: 0,
+            effective_entry: 0,
+            slot_probe_words: 0,
+            slot_probe_rd5_mask: 0,
+            slot_probe_r38_mask: 0,
+            _pad2: 0,
+            slot_probe_slots: [0; TFS_MS2B_SLOT_PROBE_WORDS],
+            slot_probe_rd5_p4: [0; TFS_MS2B_SLOT_PROBE_WORDS],
+            slot_probe_r38: [0; TFS_MS2B_SLOT_PROBE_WORDS],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct TfsMs3ArgsCaptureV1 {
+    magic: u32,
+    version: u32,
+    p2: u64,
+    p3: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsMs3ArgsCaptureV2 {
+    magic: u32,
+    version: u32,
+    p2: u64,
+    p3: u64,
+    p2_words: u32,
+    p3_words: u32,
+    p2_words_data: [u32; TFS_MS3_P2_SAMPLE_WORDS],
+    p3_words_data: [u32; TFS_MS3_P3_SAMPLE_WORDS],
+}
+
+impl Default for TfsMs3ArgsCaptureV2 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_MS3_ARGS_CAPTURE_MAGIC,
+            version: TFS_MS3_ARGS_CAPTURE_VERSION_V2,
+            p2: 0,
+            p3: 0,
+            p2_words: 0,
+            p3_words: 0,
+            p2_words_data: [0; TFS_MS3_P2_SAMPLE_WORDS],
+            p3_words_data: [0; TFS_MS3_P3_SAMPLE_WORDS],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct TfsMs4ArgsCaptureV1 {
+    magic: u32,
+    version: u32,
+    n: u32,
+    _pad0: u32,
+    p2: u64,
+    p4: u64,
+    p5: u64,
+    p6: u64,
+    p7: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsMs4ArgsCaptureV2 {
+    magic: u32,
+    version: u32,
+    n: u32,
+    _pad0: u32,
+    p2: u64,
+    p4: u64,
+    p5: u64,
+    p6: u64,
+    p7: u64,
+    p2_words: u32,
+    p4_words: u32,
+    p6_words: u32,
+    p7_words: u32,
+    p2_words_data: [u32; TFS_MS4_P2_SAMPLE_WORDS],
+    p4_words_data: [u32; TFS_MS4_P4_SAMPLE_WORDS],
+    p6_words_data: [u32; TFS_MS4_P6_SAMPLE_WORDS],
+    p7_words_data: [u32; TFS_MS4_P7_SAMPLE_WORDS],
+}
+
+impl Default for TfsMs4ArgsCaptureV2 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_MS4_ARGS_CAPTURE_MAGIC,
+            version: TFS_MS4_ARGS_CAPTURE_VERSION_V2,
+            n: 0,
+            _pad0: 0,
+            p2: 0,
+            p4: 0,
+            p5: 0,
+            p6: 0,
+            p7: 0,
+            p2_words: 0,
+            p4_words: 0,
+            p6_words: 0,
+            p7_words: 0,
+            p2_words_data: [0; TFS_MS4_P2_SAMPLE_WORDS],
+            p4_words_data: [0; TFS_MS4_P4_SAMPLE_WORDS],
+            p6_words_data: [0; TFS_MS4_P6_SAMPLE_WORDS],
+            p7_words_data: [0; TFS_MS4_P7_SAMPLE_WORDS],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsMutP47CaptureV1 {
+    magic: u32,
+    version: u32,
+    source_ms2_launch_n: u64,
+    rd5: u64,
+    rd7: u64,
+    rd5_words: u32,
+    rd7_words: u32,
+    rd5_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    rd7_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+}
+
+impl Default for TfsMutP47CaptureV1 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_MUT_P47_CAPTURE_MAGIC,
+            version: TFS_MUT_P47_CAPTURE_VERSION_V1,
+            source_ms2_launch_n: 0,
+            rd5: 0,
+            rd7: 0,
+            rd5_words: 0,
+            rd7_words: 0,
+            rd5_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            rd7_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsMutP47CaptureV2 {
+    magic: u32,
+    version: u32,
+    source_ms2_launch_n: u64,
+    rd5: u64,
+    rd7: u64,
+    rd5_words: u32,
+    rd7_words: u32,
+    rd5_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    rd7_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    arg_words: u32,
+    arg_mode: u32, // 1=flat raw args, 2=kernel_params ptr slots
+    arg_words_data: [u32; TFS_MUT_P47_ARG_PREFIX_WORDS],
+}
+
+impl Default for TfsMutP47CaptureV2 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_MUT_P47_CAPTURE_MAGIC,
+            version: TFS_MUT_P47_CAPTURE_VERSION_V2,
+            source_ms2_launch_n: 0,
+            rd5: 0,
+            rd7: 0,
+            rd5_words: 0,
+            rd7_words: 0,
+            rd5_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            rd7_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            arg_words: 0,
+            arg_mode: 0,
+            arg_words_data: [0; TFS_MUT_P47_ARG_PREFIX_WORDS],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsMutP47CaptureV3 {
+    magic: u32,
+    version: u32,
+    source_ms2_launch_n: u64,
+    rd5: u64,
+    rd6: u64,
+    rd7: u64,
+    rd5_words: u32,
+    rd6_words: u32,
+    rd7_words: u32,
+    arg_words: u32,
+    arg_mode: u32,
+    _pad0: u32,
+    rd5_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    rd6_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    rd7_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    arg_words_data: [u32; TFS_MUT_P47_ARG_PREFIX_WORDS],
+}
+
+impl Default for TfsMutP47CaptureV3 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_MUT_P47_CAPTURE_MAGIC,
+            version: TFS_MUT_P47_CAPTURE_VERSION_V3,
+            source_ms2_launch_n: 0,
+            rd5: 0,
+            rd6: 0,
+            rd7: 0,
+            rd5_words: 0,
+            rd6_words: 0,
+            rd7_words: 0,
+            arg_words: 0,
+            arg_mode: 0,
+            _pad0: 0,
+            rd5_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            rd6_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            rd7_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            arg_words_data: [0; TFS_MUT_P47_ARG_PREFIX_WORDS],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsMutP47CaptureV4 {
+    magic: u32,
+    version: u32,
+    source_ms2_launch_n: u64,
+    rd5: u64,
+    rd6: u64,
+    rd7: u64,
+    rd5_words: u32,
+    rd6_words: u32,
+    rd7_words: u32,
+    arg_words: u32,
+    arg_mode: u32,
+    /// `*(rd5 + 22176)` — particleShapesCounter sampled into the slot via
+    /// the same D2D mechanism as the rd5/6/7 heads. 0xFFFFFFFF means the
+    /// read was out-of-range (rd5 too short or pointer invalid).
+    rd5_off_22176: u32,
+    rd5_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    rd6_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    rd7_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    arg_words_data: [u32; TFS_MUT_P47_ARG_PREFIX_WORDS],
+}
+
+impl Default for TfsMutP47CaptureV4 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_MUT_P47_CAPTURE_MAGIC,
+            version: TFS_MUT_P47_CAPTURE_VERSION,
+            source_ms2_launch_n: 0,
+            rd5: 0,
+            rd6: 0,
+            rd7: 0,
+            rd5_words: 0,
+            rd6_words: 0,
+            rd7_words: 0,
+            arg_words: 0,
+            arg_mode: 0,
+            rd5_off_22176: 0xFFFFFFFF,
+            rd5_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            rd6_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            rd7_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            arg_words_data: [0; TFS_MUT_P47_ARG_PREFIX_WORDS],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TfsAtomicToTexCaptureV1 {
+    magic: u32,
+    version: u32,
+    source_ms2_launch_n: u64,
+    rd5: u64,
+    rd7: u64,
+    source_ptr: u64,
+    surface_handle: u64,
+    surface_desc_ptr: u64,
+    output_base: u64,
+    dim_x: u32,
+    dim_y: u32,
+    dim_z: u32,
+    surface_shift: u32,
+    rd5_words: u32,
+    rd7_words: u32,
+    arg_words: u32,
+    arg_mode: u32,
+    source_words: u32,
+    output_pre_words: u32,
+    output_post_words: u32,
+    _pad0: u32,
+    rd5_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    rd7_words_data: [u32; TFS_MUT_P47_SAMPLE_WORDS],
+    arg_words_data: [u32; TFS_MUT_P47_ARG_PREFIX_WORDS],
+    surface_desc_words_data: [u32; TFS_ATOMIC_TO_TEX_SURFACE_DESC_WORDS],
+    source_words_data: [u32; TFS_ATOMIC_TO_TEX_SAMPLE_WORDS],
+    output_pre_words_data: [u32; TFS_ATOMIC_TO_TEX_SAMPLE_WORDS],
+    output_post_words_data: [u32; TFS_ATOMIC_TO_TEX_SAMPLE_WORDS],
+}
+
+impl Default for TfsAtomicToTexCaptureV1 {
+    fn default() -> Self {
+        Self {
+            magic: TFS_ATOMIC_TO_TEX_CAPTURE_MAGIC,
+            version: TFS_ATOMIC_TO_TEX_CAPTURE_VERSION,
+            source_ms2_launch_n: 0,
+            rd5: 0,
+            rd7: 0,
+            source_ptr: 0,
+            surface_handle: 0,
+            surface_desc_ptr: 0,
+            output_base: 0,
+            dim_x: 0,
+            dim_y: 0,
+            dim_z: 0,
+            surface_shift: 0,
+            rd5_words: 0,
+            rd7_words: 0,
+            arg_words: 0,
+            arg_mode: 0,
+            source_words: 0,
+            output_pre_words: 0,
+            output_post_words: 0,
+            _pad0: 0,
+            rd5_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            rd7_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+            arg_words_data: [0; TFS_MUT_P47_ARG_PREFIX_WORDS],
+            surface_desc_words_data: [0; TFS_ATOMIC_TO_TEX_SURFACE_DESC_WORDS],
+            source_words_data: [0; TFS_ATOMIC_TO_TEX_SAMPLE_WORDS],
+            output_pre_words_data: [0; TFS_ATOMIC_TO_TEX_SAMPLE_WORDS],
+            output_post_words_data: [0; TFS_ATOMIC_TO_TEX_SAMPLE_WORDS],
+        }
+    }
+}
+
+unsafe fn dump_tfs_ms4_args(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null()
+        || dst_len < std::mem::size_of::<TfsMs4ArgsCaptureV1>()
+        || (kernel_params.is_null() && extra.is_null())
+    {
+        return 0;
+    }
+    let encoded = TfsMs4ArgsCaptureV1 {
+        magic: TFS_MS4_ARGS_CAPTURE_MAGIC,
+        version: TFS_MS4_ARGS_CAPTURE_VERSION,
+        n: read_kernel_arg(kernel_params, extra, 24, 3).unwrap_or(0),
+        _pad0: 0,
+        p2: read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0),
+        p4: read_kernel_arg(kernel_params, extra, 32, 4).unwrap_or(0),
+        p5: read_kernel_arg(kernel_params, extra, 40, 5).unwrap_or(0),
+        p6: read_kernel_arg(kernel_params, extra, 48, 6).unwrap_or(0),
+        p7: read_kernel_arg(kernel_params, extra, 56, 7).unwrap_or(0),
+    };
+    std::ptr::write_unaligned(dst as *mut TfsMs4ArgsCaptureV1, encoded);
+    std::mem::size_of::<TfsMs4ArgsCaptureV1>()
+}
+
+unsafe fn tfs_bounded_sample_words(ptr: u64, max_words: usize) -> u32 {
+    if ptr < 0x1000 || max_words == 0 {
+        return 0;
+    }
+    let mut alloc_base = hipDeviceptr_t(std::ptr::null_mut());
+    let mut alloc_size = 0usize;
+    if super::memory::get_address_range_v2(
+        &mut alloc_base as *mut _,
+        &mut alloc_size as *mut _,
+        hipDeviceptr_t(ptr as *mut std::ffi::c_void),
+    )
+    .is_err()
+    {
+        return 0;
+    }
+    let base = alloc_base.0 as usize;
+    let ptr_usize = ptr as usize;
+    if base == 0 || ptr_usize < base {
+        return 0;
+    }
+    let offset = ptr_usize - base;
+    let available_bytes = alloc_size.saturating_sub(offset);
+    (available_bytes / 4).min(max_words) as u32
+}
+
+unsafe fn tfs_bounded_sample_bytes(ptr: u64, max_bytes: usize) -> u32 {
+    if ptr < 0x1000 || max_bytes == 0 {
+        return 0;
+    }
+    let mut alloc_base = hipDeviceptr_t(std::ptr::null_mut());
+    let mut alloc_size = 0usize;
+    if super::memory::get_address_range_v2(
+        &mut alloc_base as *mut _,
+        &mut alloc_size as *mut _,
+        hipDeviceptr_t(ptr as *mut std::ffi::c_void),
+    )
+    .is_err()
+    {
+        return 0;
+    }
+    let base = alloc_base.0 as usize;
+    let ptr_usize = ptr as usize;
+    if base == 0 || ptr_usize < base {
+        return 0;
+    }
+    let offset = ptr_usize - base;
+    let available_bytes = alloc_size.saturating_sub(offset);
+    available_bytes.min(max_bytes) as u32
+}
+
+unsafe fn tfs_capture_d2d_bytes(
+    slot_dev_base: *mut u8,
+    src_ptr: u64,
+    raw_args_field_off: usize,
+    copy_bytes: usize,
+    tag: &str,
+) {
+    if slot_dev_base.is_null() || src_ptr == 0 || copy_bytes == 0 {
+        return;
+    }
+    let dst_dev = hipDeviceptr_t(slot_dev_base.add(TFS_RAW_ARGS_OFF + raw_args_field_off) as _);
+    let src_dev = hipDeviceptr_t(src_ptr as *mut std::ffi::c_void);
+    if let Err(err) = hipMemcpyDtoD(dst_dev, src_dev, copy_bytes) {
+        static ERR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 16 {
+            super::driver::zluda_log_err(&format!(
+                "[{}] DtoD err#{} src=0x{:x} dst=0x{:x} bytes={} err={:?}",
+                tag,
+                n,
+                src_ptr,
+                slot_dev_base as usize + TFS_RAW_ARGS_OFF + raw_args_field_off,
+                copy_bytes,
+                err
+            ));
+        }
+    }
+}
+
+unsafe fn tfs_capture_d2d_bytes_async(
+    slot_dev_base: *mut u8,
+    src_ptr: u64,
+    raw_args_field_off: usize,
+    copy_bytes: usize,
+    stream: hipStream_t,
+    tag: &str,
+) {
+    if slot_dev_base.is_null() || src_ptr == 0 || copy_bytes == 0 {
+        return;
+    }
+    let dst_dev = hipDeviceptr_t(slot_dev_base.add(TFS_RAW_ARGS_OFF + raw_args_field_off) as _);
+    let src_dev = hipDeviceptr_t(src_ptr as *mut std::ffi::c_void);
+    if let Err(err) = hipMemcpyDtoDAsync(dst_dev, src_dev, copy_bytes, stream) {
+        static ERR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 16 {
+            super::driver::zluda_log_err(&format!(
+                "[{}] DtoDAsync err#{} src=0x{:x} dst=0x{:x} bytes={} err={:?}",
+                tag,
+                n,
+                src_ptr,
+                slot_dev_base as usize + TFS_RAW_ARGS_OFF + raw_args_field_off,
+                copy_bytes,
+                err
+            ));
+        }
+    }
+}
+
+unsafe fn tfs_ms4_capture_words_d2d(
+    slot_dev_base: *mut u8,
+    src_ptr: u64,
+    raw_args_word_field_off: usize,
+    words: u32,
+) {
+    tfs_capture_d2d_bytes(
+        slot_dev_base,
+        src_ptr,
+        raw_args_word_field_off,
+        (words as usize) * 4,
+        "TFS_MS4A_V2",
+    );
+}
+
+unsafe fn tfs_ms2b_capture_words_d2d(
+    slot_dev_base: *mut u8,
+    src_ptr: u64,
+    raw_args_word_field_off: usize,
+    words: u32,
+) {
+    tfs_capture_d2d_bytes(
+        slot_dev_base,
+        src_ptr,
+        raw_args_word_field_off,
+        (words as usize) * 4,
+        "TFS_M2BA_V3",
+    );
+}
+
+unsafe fn tfs_ms3_capture_words_d2d(
+    slot_dev_base: *mut u8,
+    src_ptr: u64,
+    raw_args_word_field_off: usize,
+    words: u32,
+) {
+    tfs_capture_d2d_bytes(
+        slot_dev_base,
+        src_ptr,
+        raw_args_word_field_off,
+        (words as usize) * 4,
+        "TFS_MS3A_V2",
+    );
+}
+
+fn tfs_mut_p47_track(rd5: u64, rd6: u64, rd7: u64, launch_n: u64) {
+    TFS_MUT_P47_LAST_RD5.store(rd5, std::sync::atomic::Ordering::Relaxed);
+    TFS_MUT_P47_LAST_RD6.store(rd6, std::sync::atomic::Ordering::Relaxed);
+    TFS_MUT_P47_LAST_RD7.store(rd7, std::sync::atomic::Ordering::Relaxed);
+    TFS_MUT_P47_LAST_MS2_LAUNCH.store(launch_n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn parse_tfs_mut_p47_entry_index(raw: Option<String>) -> usize {
+    let parsed = raw
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    parsed.min(TFS_MS2B_PACKET_SAMPLE_ENTRIES.saturating_sub(1))
+}
+
+fn tfs_mut_p47_entry_index() -> usize {
+    *TFS_MUT_P47_ENTRY_INDEX.get_or_init(|| {
+        let entry_index =
+            parse_tfs_mut_p47_entry_index(std::env::var("ZLUDA_TFS_MUT_P47_ENTRY").ok());
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] TFS_MUT_P47 tracking MS2 packet entry {}",
+            entry_index
+        ));
+        entry_index
+    })
+}
+
+fn parse_tfs_mut_p47_broad_probe(raw: Option<String>) -> bool {
+    raw.map_or(false, |value| value == "1")
+}
+
+fn tfs_mut_p47_broad_probe_enabled() -> bool {
+    *TFS_MUT_P47_BROAD_PROBE.get_or_init(|| {
+        let enabled = parse_tfs_mut_p47_broad_probe(std::env::var("ZLUDA_TFS_MUT_P47_BROAD").ok());
+        if enabled {
+            super::driver::zluda_log_err(
+                "[ZLUDA] TFS_MUT_P47 broad probe enabled (capturing CLEAR/OTHER/MS3 window)",
+            );
+        }
+        enabled
+    })
+}
+
+fn tfs_atomic_to_tex_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZLUDA_TFS_ATOMIC_TO_TEX_CAPTURE").map_or(false, |v| v == "1")
+    })
+}
+
+fn parse_tfs_capture_only_atomic_to_tex(raw: Option<String>) -> bool {
+    raw.map_or(false, |value| value == "1")
+}
+
+fn parse_tfs_capture_only_ms_chain(raw: Option<String>) -> bool {
+    raw.map_or(false, |value| value == "1")
+}
+
+fn tfs_capture_only_atomic_to_tex_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = parse_tfs_capture_only_atomic_to_tex(
+            std::env::var("ZLUDA_TFS_CAPTURE_ONLY_ATOMIC_TO_TEX").ok(),
+        );
+        if enabled {
+            super::driver::zluda_log_err(
+                "[ZLUDA] TFS capture focused on ParticleDensityAtomicToTex only",
+            );
+        }
+        enabled
+    })
+}
+
+fn tfs_capture_only_ms_chain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled =
+            parse_tfs_capture_only_ms_chain(std::env::var("ZLUDA_TFS_CAPTURE_ONLY_MS_CHAIN").ok());
+        if enabled {
+            super::driver::zluda_log_err("[ZLUDA] TFS capture focused on MS2_Batched/MS3/MS4 only");
+        }
+        enabled
+    })
+}
+
+fn should_capture_tfs_kernel_for_mode(
+    kernel_id: u32,
+    atomic_only: bool,
+    ms_chain_only: bool,
+) -> bool {
+    if atomic_only {
+        return kernel_id == TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX;
+    }
+    if ms_chain_only {
+        return matches!(
+            kernel_id,
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED
+                | TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS3
+                | TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS4
+        );
+    }
+    true
+}
+
+fn should_capture_tfs_kernel(kernel_id: u32) -> bool {
+    should_capture_tfs_kernel_for_mode(
+        kernel_id,
+        tfs_capture_only_atomic_to_tex_enabled(),
+        tfs_capture_only_ms_chain_enabled(),
+    )
+}
+
+pub(crate) fn ms2_rd6_watch_track(rd6: u64, launch_n: u64) {
+    if rd6 < 0x1000 {
+        return;
+    }
+    let watch =
+        MS2_RD6_WATCH.get_or_init(|| Mutex::new(std::collections::VecDeque::with_capacity(64)));
+    if let Ok(mut q) = watch.lock() {
+        if let Some(pos) = q.iter().position(|(ptr, _)| *ptr == rd6) {
+            q.remove(pos);
+        }
+        while q.len() >= 64 {
+            q.pop_front();
+        }
+        q.push_back((rd6, launch_n));
+    }
+}
+
+pub(crate) fn ms2_rd6_watch_snapshot() -> Vec<(u64, u64)> {
+    match MS2_RD6_WATCH.get() {
+        Some(watch) => match watch.lock() {
+            Ok(q) => q.iter().copied().collect(),
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    }
+}
+
+fn ms2_rd6_watch_candidates(watch: &[(u64, u64)], max: usize) -> Vec<(u64, u64)> {
+    if max == 0 {
+        return Vec::new();
+    }
+    const PTR_LO: u64 = 0x1000;
+    const PTR_HI: u64 = 0x0000_8000_0000_0000;
+    let mut out = Vec::with_capacity(max.min(watch.len()));
+    for &(rd6, launch_n) in watch.iter().rev() {
+        if rd6 < PTR_LO || rd6 >= PTR_HI {
+            continue;
+        }
+        if out.iter().any(|(seen, _)| *seen == rd6) {
+            continue;
+        }
+        out.push((rd6, launch_n));
+        if out.len() >= max {
+            break;
+        }
+    }
+    out.reverse();
+    out
+}
+
+const MS2_RD6_TRACE_MAX_PTRS: usize = 8;
+const MS2_RD6_TRACE_WORD_BYTES: usize = 4;
+const MS2_RD6_TRACE_SCRATCH_BYTES: usize = MS2_RD6_TRACE_MAX_PTRS * MS2_RD6_TRACE_WORD_BYTES;
+
+struct Ms2Rd6Tracker {
+    scratch_host: *mut u8,
+    scratch_dev: *mut std::ffi::c_void,
+    last_state: std::collections::HashMap<u64, u32>,
+    copy_error_count: u32,
+}
+unsafe impl Send for Ms2Rd6Tracker {}
+unsafe impl Sync for Ms2Rd6Tracker {}
+
+static MS2_RD6_TRACKER: Mutex<Option<Ms2Rd6Tracker>> = Mutex::new(None);
+
+fn ms2_rd6_kernel_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_MS2_RD6_KERNEL_TRACE").map_or(false, |v| v == "1"))
+}
+
+unsafe fn ms2_rd6_tracker_init(state: &mut Option<Ms2Rd6Tracker>) {
+    if state.is_some() {
+        return;
+    }
+    let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let alloc_result = hipHostMalloc(
+        &mut host_ptr,
+        MS2_RD6_TRACE_SCRATCH_BYTES,
+        hipHostMallocMapped,
+    );
+    if alloc_result.is_err() || host_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] MS2 rd6 tracker: hipHostMalloc({}) failed: {:?}",
+            MS2_RD6_TRACE_SCRATCH_BYTES, alloc_result
+        ));
+        return;
+    }
+    std::ptr::write_bytes(host_ptr as *mut u8, 0, MS2_RD6_TRACE_SCRATCH_BYTES);
+    let mut dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let map_result = hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0);
+    if map_result.is_err() || dev_ptr.is_null() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] MS2 rd6 tracker: hipHostGetDevicePointer failed: {:?}",
+            map_result
+        ));
+        let _ = hipHostFree(host_ptr);
+        return;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] MS2 rd6 tracker: scratch={} B pinned; host=0x{:x} dev=0x{:x}",
+        MS2_RD6_TRACE_SCRATCH_BYTES, host_ptr as usize, dev_ptr as usize
+    ));
+    *state = Some(Ms2Rd6Tracker {
+        scratch_host: host_ptr as *mut u8,
+        scratch_dev: dev_ptr,
+        last_state: std::collections::HashMap::new(),
+        copy_error_count: 0,
+    });
+}
+
+unsafe fn check_ms2_rd6_mutation(current_kernel: &str, current_launch_n: Option<u64>) {
+    if !ms2_rd6_kernel_trace_enabled() {
+        return;
+    }
+    let watch = ms2_rd6_watch_snapshot();
+    let tracked = ms2_rd6_watch_candidates(&watch, MS2_RD6_TRACE_MAX_PTRS);
+    if tracked.is_empty() {
+        return;
+    }
+    let mut guard = match MS2_RD6_TRACKER.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    ms2_rd6_tracker_init(&mut guard);
+    let tracker = match guard.as_mut() {
+        Some(t) => t,
+        None => return,
+    };
+    let mut copied = [false; MS2_RD6_TRACE_MAX_PTRS];
+    for (i, (rd6, _source_ms2_launch_n)) in tracked.iter().enumerate() {
+        let dst =
+            (tracker.scratch_dev as usize + i * MS2_RD6_TRACE_WORD_BYTES) as *mut std::ffi::c_void;
+        let src = rd6.saturating_add(8) as *mut std::ffi::c_void;
+        let copy_result = hipMemcpyDtoD(
+            hipDeviceptr_t(dst),
+            hipDeviceptr_t(src),
+            MS2_RD6_TRACE_WORD_BYTES,
+        );
+        if copy_result.is_ok() {
+            copied[i] = true;
+        } else if tracker.copy_error_count < 16 {
+            super::driver::zluda_log_err(&format!(
+                "[MS2_RD6_KERNEL_TRACE] copy failed kernel='{}' launch_n={:?} rd6=0x{:x} err={:?}",
+                current_kernel, current_launch_n, rd6, copy_result
+            ));
+            tracker.copy_error_count += 1;
+        }
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    for (i, (rd6, source_ms2_launch_n)) in tracked.iter().enumerate() {
+        if !copied[i] {
+            continue;
+        }
+        let value =
+            (tracker.scratch_host.add(i * MS2_RD6_TRACE_WORD_BYTES) as *const u32).read_unaligned();
+        let previous = tracker.last_state.insert(*rd6, value);
+        if let Some(prev) = previous {
+            if prev != value {
+                super::driver::zluda_log_err(&format!(
+                    "[MS2_RD6_KERNEL_TRACE] kernel='{}' launch_n={:?} rd6=0x{:x} source_ms2_launch={} prev=0x{:08x} new=0x{:08x}",
+                    current_kernel,
+                    current_launch_n,
+                    rd6,
+                    source_ms2_launch_n,
+                    prev,
+                    value
+                ));
+            }
+        }
+    }
+    tracker
+        .last_state
+        .retain(|ptr, _| tracked.iter().any(|(tracked_ptr, _)| tracked_ptr == ptr));
+}
+
+fn tfs_mut_p47_read_track() -> (u64, u64, u64, u64) {
+    (
+        TFS_MUT_P47_LAST_RD5.load(std::sync::atomic::Ordering::Relaxed),
+        TFS_MUT_P47_LAST_RD6.load(std::sync::atomic::Ordering::Relaxed),
+        TFS_MUT_P47_LAST_RD7.load(std::sync::atomic::Ordering::Relaxed),
+        TFS_MUT_P47_LAST_MS2_LAUNCH.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+unsafe fn tfs_mut_p47_capture_words_d2d(
+    slot_dev_base: *mut u8,
+    src_ptr: u64,
+    raw_args_word_field_off: usize,
+    words: u32,
+) {
+    tfs_capture_d2d_bytes(
+        slot_dev_base,
+        src_ptr,
+        raw_args_word_field_off,
+        (words as usize) * 4,
+        "TFS_MUT_P47",
+    );
+}
+
+unsafe fn tfs_ms2b_entry_ptr(
+    sample_bytes: u32,
+    packet_sample: &[u8; TFS_MS2B_PACKET_SAMPLE_BYTES],
+    entry_index: usize,
+    entry_field_off: usize,
+) -> u64 {
+    let sample_bytes = sample_bytes as usize;
+    let entry_base = entry_index.saturating_mul(TFS_MS2B_PACKET_ENTRY_BYTES);
+    if sample_bytes < entry_base + TFS_MS2B_PACKET_ENTRY_BYTES
+        || entry_field_off + 8 > TFS_MS2B_PACKET_ENTRY_BYTES
+        || entry_base + entry_field_off + 8 > packet_sample.len()
+    {
+        return 0;
+    }
+    u64::from_le_bytes(
+        packet_sample[entry_base + entry_field_off..entry_base + entry_field_off + 8]
+            .try_into()
+            .unwrap_or([0; 8]),
+    )
+}
+
+fn tfs_ms2b_entry_count(
+    sample_bytes: u32,
+    packet_sample: &[u8; TFS_MS2B_PACKET_SAMPLE_BYTES],
+    entry_index: usize,
+) -> u32 {
+    let sample_bytes = sample_bytes as usize;
+    let entry_base = entry_index.saturating_mul(TFS_MS2B_PACKET_ENTRY_BYTES);
+    if sample_bytes < entry_base + 4 || entry_base + 4 > packet_sample.len() {
+        return 0;
+    }
+    u32::from_le_bytes(
+        packet_sample[entry_base..entry_base + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    )
+}
+
+fn tfs_ms2b_effective_entry_index(
+    sample_bytes: u32,
+    packet_sample: &[u8; TFS_MS2B_PACKET_SAMPLE_BYTES],
+    requested_entry: usize,
+) -> usize {
+    let available_entries =
+        ((sample_bytes as usize) / TFS_MS2B_PACKET_ENTRY_BYTES).min(TFS_MS2B_PACKET_SAMPLE_ENTRIES);
+    if available_entries == 0 {
+        return requested_entry;
+    }
+    if requested_entry < available_entries {
+        return requested_entry;
+    }
+    for idx in (0..available_entries).rev() {
+        if tfs_ms2b_entry_count(sample_bytes, packet_sample, idx) > 0 {
+            return idx;
+        }
+    }
+    available_entries - 1
+}
+
+unsafe fn tfs_mut_p47_capture_arg_prefix(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> (u32, u32, [u32; TFS_MUT_P47_ARG_PREFIX_WORDS]) {
+    let mut out_words = [0u32; TFS_MUT_P47_ARG_PREFIX_WORDS];
+    let mut tmp = [0u8; TFS_MUT_P47_ARG_PREFIX_WORDS * 4];
+    let mut mode = 0u32;
+    let mut bytes = 0usize;
+    if !kernel_params.is_null() || !extra.is_null() {
+        bytes = dump_kernel_args_raw(kernel_params, extra, tmp.as_mut_ptr(), tmp.len());
+        if bytes > 0 {
+            mode = 1;
+        } else if !kernel_params.is_null() {
+            bytes = dump_kernel_param_ptrs(kernel_params, tmp.as_mut_ptr(), tmp.len());
+            if bytes > 0 {
+                mode = 2;
+            }
+        }
+    }
+    let copy_bytes = bytes.min(tmp.len());
+    let full_words = copy_bytes / 4;
+    let tail_bytes = copy_bytes % 4;
+    for i in 0..full_words {
+        let off = i * 4;
+        out_words[i] = u32::from_le_bytes(tmp[off..off + 4].try_into().unwrap_or([0; 4]));
+    }
+    if tail_bytes != 0 && full_words < out_words.len() {
+        let off = full_words * 4;
+        let mut last = [0u8; 4];
+        last[..tail_bytes].copy_from_slice(&tmp[off..off + tail_bytes]);
+        out_words[full_words] = u32::from_le_bytes(last);
+    }
+    (
+        ((copy_bytes + 3) / 4).min(TFS_MUT_P47_ARG_PREFIX_WORDS) as u32,
+        mode,
+        out_words,
+    )
+}
+
+unsafe fn dump_tfs_mut_p47_capture(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    slot_dev_base: *mut u8,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null() || dst_len < std::mem::size_of::<TfsMutP47CaptureV1>() {
+        return 0;
+    }
+    let (rd5, rd6, rd7, source_ms2_launch_n) = tfs_mut_p47_read_track();
+    let (arg_words, arg_mode, arg_words_data) =
+        tfs_mut_p47_capture_arg_prefix(kernel_params, extra);
+    if dst_len >= std::mem::size_of::<TfsMutP47CaptureV4>() {
+        // Probe `*(rd5 + 22176)` only if the bounded sample call shows
+        // we have at least that many bytes available in the allocation.
+        let counter_available = if rd5 != 0 {
+            tfs_bounded_sample_words(
+                rd5.saturating_add(TFS_RD5_PARTICLE_SHAPES_COUNTER_OFFSET as u64),
+                1,
+            ) >= 1
+        } else {
+            false
+        };
+        let encoded = TfsMutP47CaptureV4 {
+            source_ms2_launch_n,
+            rd5,
+            rd6,
+            rd7,
+            rd5_words: tfs_bounded_sample_words(rd5, TFS_MUT_P47_SAMPLE_WORDS),
+            rd6_words: tfs_bounded_sample_words(rd6, TFS_MUT_P47_SAMPLE_WORDS),
+            rd7_words: tfs_bounded_sample_words(rd7, TFS_MUT_P47_SAMPLE_WORDS),
+            arg_words,
+            arg_mode,
+            arg_words_data,
+            ..Default::default()
+        };
+        std::ptr::write_unaligned(dst as *mut TfsMutP47CaptureV4, encoded);
+        tfs_mut_p47_capture_words_d2d(
+            slot_dev_base,
+            rd5,
+            std::mem::offset_of!(TfsMutP47CaptureV4, rd5_words_data),
+            encoded.rd5_words,
+        );
+        tfs_mut_p47_capture_words_d2d(
+            slot_dev_base,
+            rd6,
+            std::mem::offset_of!(TfsMutP47CaptureV4, rd6_words_data),
+            encoded.rd6_words,
+        );
+        tfs_mut_p47_capture_words_d2d(
+            slot_dev_base,
+            rd7,
+            std::mem::offset_of!(TfsMutP47CaptureV4, rd7_words_data),
+            encoded.rd7_words,
+        );
+        if counter_available {
+            tfs_capture_d2d_bytes(
+                slot_dev_base,
+                rd5 + TFS_RD5_PARTICLE_SHAPES_COUNTER_OFFSET as u64,
+                std::mem::offset_of!(TfsMutP47CaptureV4, rd5_off_22176),
+                4,
+                "TFS_MUT_P47_CNT",
+            );
+        }
+        return std::mem::size_of::<TfsMutP47CaptureV4>();
+    }
+    if dst_len >= std::mem::size_of::<TfsMutP47CaptureV3>() {
+        let encoded = TfsMutP47CaptureV3 {
+            source_ms2_launch_n,
+            rd5,
+            rd6,
+            rd7,
+            rd5_words: tfs_bounded_sample_words(rd5, TFS_MUT_P47_SAMPLE_WORDS),
+            rd6_words: tfs_bounded_sample_words(rd6, TFS_MUT_P47_SAMPLE_WORDS),
+            rd7_words: tfs_bounded_sample_words(rd7, TFS_MUT_P47_SAMPLE_WORDS),
+            arg_words,
+            arg_mode,
+            arg_words_data,
+            ..Default::default()
+        };
+        std::ptr::write_unaligned(dst as *mut TfsMutP47CaptureV3, encoded);
+        tfs_mut_p47_capture_words_d2d(
+            slot_dev_base,
+            rd5,
+            std::mem::offset_of!(TfsMutP47CaptureV3, rd5_words_data),
+            encoded.rd5_words,
+        );
+        tfs_mut_p47_capture_words_d2d(
+            slot_dev_base,
+            rd6,
+            std::mem::offset_of!(TfsMutP47CaptureV3, rd6_words_data),
+            encoded.rd6_words,
+        );
+        tfs_mut_p47_capture_words_d2d(
+            slot_dev_base,
+            rd7,
+            std::mem::offset_of!(TfsMutP47CaptureV3, rd7_words_data),
+            encoded.rd7_words,
+        );
+        return std::mem::size_of::<TfsMutP47CaptureV3>();
+    }
+    if dst_len >= std::mem::size_of::<TfsMutP47CaptureV2>() {
+        let encoded = TfsMutP47CaptureV2 {
+            source_ms2_launch_n,
+            rd5,
+            rd7,
+            rd5_words: tfs_bounded_sample_words(rd5, TFS_MUT_P47_SAMPLE_WORDS),
+            rd7_words: tfs_bounded_sample_words(rd7, TFS_MUT_P47_SAMPLE_WORDS),
+            arg_words,
+            arg_mode,
+            arg_words_data,
+            ..Default::default()
+        };
+        std::ptr::write_unaligned(dst as *mut TfsMutP47CaptureV2, encoded);
+        tfs_mut_p47_capture_words_d2d(
+            slot_dev_base,
+            rd5,
+            std::mem::offset_of!(TfsMutP47CaptureV2, rd5_words_data),
+            encoded.rd5_words,
+        );
+        tfs_mut_p47_capture_words_d2d(
+            slot_dev_base,
+            rd7,
+            std::mem::offset_of!(TfsMutP47CaptureV2, rd7_words_data),
+            encoded.rd7_words,
+        );
+        return std::mem::size_of::<TfsMutP47CaptureV2>();
+    }
+    let encoded = TfsMutP47CaptureV1 {
+        source_ms2_launch_n,
+        rd5,
+        rd7,
+        rd5_words: tfs_bounded_sample_words(rd5, TFS_MUT_P47_SAMPLE_WORDS),
+        rd7_words: tfs_bounded_sample_words(rd7, TFS_MUT_P47_SAMPLE_WORDS),
+        ..Default::default()
+    };
+    std::ptr::write_unaligned(dst as *mut TfsMutP47CaptureV1, encoded);
+    tfs_mut_p47_capture_words_d2d(
+        slot_dev_base,
+        rd5,
+        std::mem::offset_of!(TfsMutP47CaptureV1, rd5_words_data),
+        encoded.rd5_words,
+    );
+    tfs_mut_p47_capture_words_d2d(
+        slot_dev_base,
+        rd7,
+        std::mem::offset_of!(TfsMutP47CaptureV1, rd7_words_data),
+        encoded.rd7_words,
+    );
+    std::mem::size_of::<TfsMutP47CaptureV1>()
+}
+
+unsafe fn read_kernel_arg_bytes(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    flat_arg_offset: usize,
+    arg_index: usize,
+    dst: *mut u8,
+    len: usize,
+) -> bool {
+    if dst.is_null() || len == 0 {
+        return false;
+    }
+    if !extra.is_null() {
+        let extra_arr = std::slice::from_raw_parts(extra, 5);
+        if extra_arr[0] == (0x1usize as *mut ::core::ffi::c_void)
+            && extra_arr[2] == (0x2usize as *mut ::core::ffi::c_void)
+        {
+            let buffer = extra_arr[1] as *const u8;
+            let size_ptr = extra_arr[3] as *const usize;
+            if !buffer.is_null() && !size_ptr.is_null() {
+                let size = *size_ptr;
+                if flat_arg_offset <= size && len <= size.saturating_sub(flat_arg_offset) {
+                    std::ptr::copy_nonoverlapping(buffer.add(flat_arg_offset), dst, len);
+                    return true;
+                }
+            }
+        }
+    }
+    if !kernel_params.is_null() {
+        let param_ptr = *kernel_params.add(arg_index);
+        if !param_ptr.is_null() {
+            std::ptr::copy_nonoverlapping(param_ptr as *const u8, dst, len);
+            return true;
+        }
+    }
+    false
+}
+
+fn tfs_atomic_to_tex_surface_desc_ptr(surface_handle: u64) -> (u32, u64) {
+    (
+        ((surface_handle >> 61) & 0x7) as u32,
+        (surface_handle << 3) >> 3,
+    )
+}
+
+fn tfs_atomic_to_tex_surface_desc_base(words: &[u32; TFS_ATOMIC_TO_TEX_SURFACE_DESC_WORDS]) -> u64 {
+    // AMD image/surface descriptors store a 256-byte-aligned base split across
+    // word0 and the low 16 bits of word1; the remaining word1 bits are
+    // descriptor metadata. Reconstruct the byte address instead of treating the
+    // first 64 bits as a raw pointer.
+    ((((words[1] as u64) & 0xFFFF) << 32) | (words[0] as u64)) << 8
+}
+
+unsafe fn dump_tfs_atomic_to_tex_capture(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    slot_dev_base: *mut u8,
+    stream: hipStream_t,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null() || dst_len < std::mem::size_of::<TfsAtomicToTexCaptureV1>() {
+        return 0;
+    }
+    const PARAM5_FLAT_OFFSET: usize = 24;
+    const PARAM5_STRUCT_BYTES: usize = 456;
+    const PARAM5_DIM_X_OFF: usize = 28;
+    const PARAM5_DIM_Y_OFF: usize = 32;
+    const PARAM5_DIM_Z_OFF: usize = 36;
+    const PARAM5_SURFACE_HANDLE_OFF: usize = 368;
+    const PARAM6_FLAT_OFFSET: usize = PARAM5_FLAT_OFFSET + PARAM5_STRUCT_BYTES;
+
+    let (rd5, _rd6, rd7, source_ms2_launch_n) = tfs_mut_p47_read_track();
+    let (arg_words, arg_mode, arg_words_data) =
+        tfs_mut_p47_capture_arg_prefix(kernel_params, extra);
+    let mut param5 = [0u8; PARAM5_STRUCT_BYTES];
+    let _ = read_kernel_arg_bytes(
+        kernel_params,
+        extra,
+        PARAM5_FLAT_OFFSET,
+        5,
+        param5.as_mut_ptr(),
+        param5.len(),
+    );
+    let source_ptr: u64 = read_kernel_arg(kernel_params, extra, PARAM6_FLAT_OFFSET, 6).unwrap_or(0);
+    let dim_x = u32::from_le_bytes(
+        param5[PARAM5_DIM_X_OFF..PARAM5_DIM_X_OFF + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    let dim_y = u32::from_le_bytes(
+        param5[PARAM5_DIM_Y_OFF..PARAM5_DIM_Y_OFF + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    let dim_z = u32::from_le_bytes(
+        param5[PARAM5_DIM_Z_OFF..PARAM5_DIM_Z_OFF + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    let surface_handle = u64::from_le_bytes(
+        param5[PARAM5_SURFACE_HANDLE_OFF..PARAM5_SURFACE_HANDLE_OFF + 8]
+            .try_into()
+            .unwrap_or([0; 8]),
+    );
+    let (surface_shift, surface_desc_ptr) = tfs_atomic_to_tex_surface_desc_ptr(surface_handle);
+    let mut surface_desc_words = [0u32; TFS_ATOMIC_TO_TEX_SURFACE_DESC_WORDS];
+    if surface_desc_ptr >= 0x1000 {
+        let _ = hipMemcpyDtoH(
+            surface_desc_words.as_mut_ptr() as _,
+            hipDeviceptr_t(surface_desc_ptr as *mut std::ffi::c_void),
+            std::mem::size_of_val(&surface_desc_words),
+        );
+    }
+    let output_base = tfs_atomic_to_tex_surface_desc_base(&surface_desc_words);
+    let encoded = TfsAtomicToTexCaptureV1 {
+        source_ms2_launch_n,
+        rd5,
+        rd7,
+        source_ptr,
+        surface_handle,
+        surface_desc_ptr,
+        output_base,
+        dim_x,
+        dim_y,
+        dim_z,
+        surface_shift,
+        rd5_words: tfs_bounded_sample_words(rd5, TFS_MUT_P47_SAMPLE_WORDS),
+        rd7_words: tfs_bounded_sample_words(rd7, TFS_MUT_P47_SAMPLE_WORDS),
+        arg_words,
+        arg_mode,
+        source_words: tfs_bounded_sample_words(source_ptr, TFS_ATOMIC_TO_TEX_SAMPLE_WORDS),
+        output_pre_words: tfs_bounded_sample_words(output_base, TFS_ATOMIC_TO_TEX_SAMPLE_WORDS),
+        output_post_words: tfs_bounded_sample_words(output_base, TFS_ATOMIC_TO_TEX_SAMPLE_WORDS),
+        rd5_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+        rd7_words_data: [0; TFS_MUT_P47_SAMPLE_WORDS],
+        arg_words_data,
+        surface_desc_words_data: surface_desc_words,
+        source_words_data: [0; TFS_ATOMIC_TO_TEX_SAMPLE_WORDS],
+        output_pre_words_data: [0; TFS_ATOMIC_TO_TEX_SAMPLE_WORDS],
+        output_post_words_data: [0; TFS_ATOMIC_TO_TEX_SAMPLE_WORDS],
+        ..Default::default()
+    };
+    std::ptr::write_unaligned(dst as *mut TfsAtomicToTexCaptureV1, encoded);
+    tfs_capture_d2d_bytes_async(
+        slot_dev_base,
+        rd5,
+        std::mem::offset_of!(TfsAtomicToTexCaptureV1, rd5_words_data),
+        encoded.rd5_words as usize * 4,
+        stream,
+        "TFS_ATXA_RD5",
+    );
+    tfs_capture_d2d_bytes_async(
+        slot_dev_base,
+        rd7,
+        std::mem::offset_of!(TfsAtomicToTexCaptureV1, rd7_words_data),
+        encoded.rd7_words as usize * 4,
+        stream,
+        "TFS_ATXA_RD7",
+    );
+    tfs_capture_d2d_bytes_async(
+        slot_dev_base,
+        source_ptr,
+        std::mem::offset_of!(TfsAtomicToTexCaptureV1, source_words_data),
+        encoded.source_words as usize * 4,
+        stream,
+        "TFS_ATXA_SRC",
+    );
+    tfs_capture_d2d_bytes_async(
+        slot_dev_base,
+        output_base,
+        std::mem::offset_of!(TfsAtomicToTexCaptureV1, output_pre_words_data),
+        encoded.output_pre_words as usize * 4,
+        stream,
+        "TFS_ATXA_PRE",
+    );
+    std::mem::size_of::<TfsAtomicToTexCaptureV1>()
+}
+
+unsafe fn dump_tfs_ms4_args_v2(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    slot_dev_base: *mut u8,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null()
+        || dst_len < std::mem::size_of::<TfsMs4ArgsCaptureV2>()
+        || (kernel_params.is_null() && extra.is_null())
+    {
+        return 0;
+    }
+    let p2: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+    let p4: u64 = read_kernel_arg(kernel_params, extra, 32, 4).unwrap_or(0);
+    let p5: u64 = read_kernel_arg(kernel_params, extra, 40, 5).unwrap_or(0);
+    let p6: u64 = read_kernel_arg(kernel_params, extra, 48, 6).unwrap_or(0);
+    let p7: u64 = read_kernel_arg(kernel_params, extra, 56, 7).unwrap_or(0);
+
+    let encoded = TfsMs4ArgsCaptureV2 {
+        n: read_kernel_arg(kernel_params, extra, 24, 3).unwrap_or(0),
+        p2,
+        p4,
+        p5,
+        p6,
+        p7,
+        p2_words: tfs_bounded_sample_words(p2, TFS_MS4_P2_SAMPLE_WORDS),
+        p4_words: tfs_bounded_sample_words(p4, TFS_MS4_P4_SAMPLE_WORDS),
+        p6_words: tfs_bounded_sample_words(p6, TFS_MS4_P6_SAMPLE_WORDS),
+        p7_words: tfs_bounded_sample_words(p7, TFS_MS4_P7_SAMPLE_WORDS),
+        ..Default::default()
+    };
+    std::ptr::write_unaligned(dst as *mut TfsMs4ArgsCaptureV2, encoded);
+
+    tfs_ms4_capture_words_d2d(
+        slot_dev_base,
+        p2,
+        std::mem::offset_of!(TfsMs4ArgsCaptureV2, p2_words_data),
+        encoded.p2_words,
+    );
+    tfs_ms4_capture_words_d2d(
+        slot_dev_base,
+        p4,
+        std::mem::offset_of!(TfsMs4ArgsCaptureV2, p4_words_data),
+        encoded.p4_words,
+    );
+    tfs_ms4_capture_words_d2d(
+        slot_dev_base,
+        p6,
+        std::mem::offset_of!(TfsMs4ArgsCaptureV2, p6_words_data),
+        encoded.p6_words,
+    );
+    tfs_ms4_capture_words_d2d(
+        slot_dev_base,
+        p7,
+        std::mem::offset_of!(TfsMs4ArgsCaptureV2, p7_words_data),
+        encoded.p7_words,
+    );
+
+    std::mem::size_of::<TfsMs4ArgsCaptureV2>()
+}
+
+unsafe fn dump_tfs_ms2_batched_args_v4(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    slot_dev_base: *mut u8,
+    launch_n: u64,
+    grid_x: u32,
+    block_x: u32,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null()
+        || dst_len < std::mem::size_of::<TfsMs2BatchedArgsCaptureV4>()
+        || (kernel_params.is_null() && extra.is_null())
+    {
+        return 0;
+    }
+    let p2: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+    let requested_bytes = ((grid_x as usize) * 88).min(TFS_MS2B_PACKET_SAMPLE_BYTES);
+    let sample_bytes = tfs_bounded_sample_bytes(p2, requested_bytes);
+    let requested_entry = tfs_mut_p47_entry_index();
+    let mut encoded = TfsMs2BatchedArgsCaptureV4 {
+        p2,
+        grid_x,
+        block_x,
+        packet_sample_bytes: sample_bytes,
+        requested_entry: requested_entry as u32,
+        ..Default::default()
+    };
+    std::ptr::write_unaligned(dst as *mut TfsMs2BatchedArgsCaptureV4, encoded);
+    tfs_capture_d2d_bytes(
+        slot_dev_base,
+        p2,
+        std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, packet_sample),
+        sample_bytes as usize,
+        "TFS_M2BA_V4",
+    );
+    encoded = std::ptr::read_unaligned(dst as *const TfsMs2BatchedArgsCaptureV4);
+    let effective_entry =
+        tfs_ms2b_effective_entry_index(sample_bytes, &encoded.packet_sample, requested_entry);
+    encoded.effective_entry = effective_entry as u32;
+    let rd5_ptr = tfs_ms2b_entry_ptr(sample_bytes, &encoded.packet_sample, effective_entry, 32);
+    let rd6_ptr = tfs_ms2b_entry_ptr(sample_bytes, &encoded.packet_sample, effective_entry, 72);
+    let rd7_ptr = tfs_ms2b_entry_ptr(sample_bytes, &encoded.packet_sample, effective_entry, 80);
+    tfs_mut_p47_track(rd5_ptr, rd6_ptr, rd7_ptr, launch_n);
+    track_rd5_ptr(rd5_ptr);
+    ms2_rd6_watch_track(rd6_ptr, launch_n);
+    encoded.rd5_words = tfs_bounded_sample_words(rd5_ptr, TFS_MS2B_RD_SAMPLE_WORDS);
+    encoded.rd6_words = tfs_bounded_sample_words(rd6_ptr, TFS_MS2B_RD_SAMPLE_WORDS);
+    encoded.rd7_words = tfs_bounded_sample_words(rd7_ptr, TFS_MS2B_RD_SAMPLE_WORDS);
+    std::ptr::write_unaligned(dst as *mut TfsMs2BatchedArgsCaptureV4, encoded);
+    tfs_ms2b_capture_words_d2d(
+        slot_dev_base,
+        rd5_ptr,
+        std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, rd5_words_data),
+        encoded.rd5_words,
+    );
+    tfs_ms2b_capture_words_d2d(
+        slot_dev_base,
+        rd6_ptr,
+        std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, rd6_words_data),
+        encoded.rd6_words,
+    );
+    tfs_ms2b_capture_words_d2d(
+        slot_dev_base,
+        rd7_ptr,
+        std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, rd7_words_data),
+        encoded.rd7_words,
+    );
+
+    encoded = std::ptr::read_unaligned(dst as *const TfsMs2BatchedArgsCaptureV4);
+    let probe_words = (encoded.rd7_words as usize).min(TFS_MS2B_SLOT_PROBE_WORDS);
+    let mut rd5_src_ptrs = [0u64; TFS_MS2B_SLOT_PROBE_WORDS];
+    let mut rd6_src_ptrs = [0u64; TFS_MS2B_SLOT_PROBE_WORDS];
+    encoded.slot_probe_words = probe_words as u32;
+    for i in 0..probe_words {
+        let slot = encoded.rd7_words_data[i];
+        encoded.slot_probe_slots[i] = slot;
+        if let Some(rd5_word_index) = i.checked_mul(3).and_then(|v| v.checked_add(1)) {
+            if (tfs_bounded_sample_words(rd5_ptr, rd5_word_index.saturating_add(1)) as usize)
+                > rd5_word_index
+            {
+                if let Some(byte_off) = rd5_word_index.checked_mul(4).map(|v| v as u64) {
+                    if let Some(src_ptr) = rd5_ptr.checked_add(byte_off) {
+                        encoded.slot_probe_rd5_mask |= 1u32 << i;
+                        rd5_src_ptrs[i] = src_ptr;
+                    }
+                }
+            }
+        }
+        if let Some(rd6_word_index) = (slot as usize)
+            .checked_mul(3)
+            .and_then(|v| v.checked_add(2))
+        {
+            if (tfs_bounded_sample_words(rd6_ptr, rd6_word_index.saturating_add(1)) as usize)
+                > rd6_word_index
+            {
+                if let Some(byte_off) = rd6_word_index.checked_mul(4).map(|v| v as u64) {
+                    if let Some(src_ptr) = rd6_ptr.checked_add(byte_off) {
+                        encoded.slot_probe_r38_mask |= 1u32 << i;
+                        rd6_src_ptrs[i] = src_ptr;
+                    }
+                }
+            }
+        }
+    }
+    std::ptr::write_unaligned(dst as *mut TfsMs2BatchedArgsCaptureV4, encoded);
+    for i in 0..probe_words {
+        if (encoded.slot_probe_rd5_mask & (1u32 << i)) != 0 {
+            tfs_capture_d2d_bytes(
+                slot_dev_base,
+                rd5_src_ptrs[i],
+                std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, slot_probe_rd5_p4) + i * 4,
+                4,
+                "TFS_M2BA_V4",
+            );
+        }
+        if (encoded.slot_probe_r38_mask & (1u32 << i)) != 0 {
+            tfs_capture_d2d_bytes(
+                slot_dev_base,
+                rd6_src_ptrs[i],
+                std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, slot_probe_r38) + i * 4,
+                4,
+                "TFS_M2BA_V4",
+            );
+        }
+    }
+    std::mem::size_of::<TfsMs2BatchedArgsCaptureV4>()
+}
+
+unsafe fn dump_tfs_ms2_batched_args_v3(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    slot_dev_base: *mut u8,
+    launch_n: u64,
+    grid_x: u32,
+    block_x: u32,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null()
+        || dst_len < std::mem::size_of::<TfsMs2BatchedArgsCaptureV3>()
+        || (kernel_params.is_null() && extra.is_null())
+    {
+        return 0;
+    }
+    let p2: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+    let requested_bytes = ((grid_x as usize) * 88).min(TFS_MS2B_PACKET_SAMPLE_BYTES);
+    let sample_bytes = tfs_bounded_sample_bytes(p2, requested_bytes);
+    let mut encoded = TfsMs2BatchedArgsCaptureV3 {
+        p2,
+        grid_x,
+        block_x,
+        packet_sample_bytes: sample_bytes,
+        ..Default::default()
+    };
+    std::ptr::write_unaligned(dst as *mut TfsMs2BatchedArgsCaptureV3, encoded);
+    tfs_capture_d2d_bytes(
+        slot_dev_base,
+        p2,
+        std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, packet_sample),
+        sample_bytes as usize,
+        "TFS_M2BA_V3",
+    );
+    encoded = std::ptr::read_unaligned(dst as *const TfsMs2BatchedArgsCaptureV3);
+    let tracked_entry = tfs_mut_p47_entry_index();
+    let rd5_ptr = tfs_ms2b_entry_ptr(sample_bytes, &encoded.packet_sample, tracked_entry, 32);
+    let rd6_ptr = tfs_ms2b_entry_ptr(sample_bytes, &encoded.packet_sample, tracked_entry, 72);
+    let rd7_ptr = tfs_ms2b_entry_ptr(sample_bytes, &encoded.packet_sample, tracked_entry, 80);
+    tfs_mut_p47_track(rd5_ptr, rd6_ptr, rd7_ptr, launch_n);
+    ms2_rd6_watch_track(rd6_ptr, launch_n);
+    encoded.rd5_words = tfs_bounded_sample_words(rd5_ptr, TFS_MS2B_RD_SAMPLE_WORDS);
+    encoded.rd6_words = tfs_bounded_sample_words(rd6_ptr, TFS_MS2B_RD_SAMPLE_WORDS);
+    encoded.rd7_words = tfs_bounded_sample_words(rd7_ptr, TFS_MS2B_RD_SAMPLE_WORDS);
+    std::ptr::write_unaligned(dst as *mut TfsMs2BatchedArgsCaptureV3, encoded);
+    tfs_ms2b_capture_words_d2d(
+        slot_dev_base,
+        rd5_ptr,
+        std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, rd5_words_data),
+        encoded.rd5_words,
+    );
+    tfs_ms2b_capture_words_d2d(
+        slot_dev_base,
+        rd6_ptr,
+        std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, rd6_words_data),
+        encoded.rd6_words,
+    );
+    tfs_ms2b_capture_words_d2d(
+        slot_dev_base,
+        rd7_ptr,
+        std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, rd7_words_data),
+        encoded.rd7_words,
+    );
+    std::mem::size_of::<TfsMs2BatchedArgsCaptureV3>()
+}
+
+unsafe fn dump_tfs_ms2_batched_args(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null()
+        || dst_len < std::mem::size_of::<TfsMs2BatchedArgsCaptureV1>()
+        || (kernel_params.is_null() && extra.is_null())
+    {
+        return 0;
+    }
+    let encoded = TfsMs2BatchedArgsCaptureV1 {
+        magic: TFS_MS2B_ARGS_CAPTURE_MAGIC,
+        version: TFS_MS2B_ARGS_CAPTURE_VERSION,
+        p2: read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0),
+    };
+    std::ptr::write_unaligned(dst as *mut TfsMs2BatchedArgsCaptureV1, encoded);
+    std::mem::size_of::<TfsMs2BatchedArgsCaptureV1>()
+}
+
+unsafe fn dump_tfs_ms2_batched_args_v2(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    slot_dev_base: *mut u8,
+    grid_x: u32,
+    block_x: u32,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null()
+        || dst_len < std::mem::size_of::<TfsMs2BatchedArgsCaptureV2>()
+        || (kernel_params.is_null() && extra.is_null())
+    {
+        return 0;
+    }
+    let p2: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+    let requested_bytes = ((grid_x as usize) * 88).min(TFS_MS2B_PACKET_SAMPLE_BYTES);
+    let sample_bytes = tfs_bounded_sample_bytes(p2, requested_bytes);
+    let encoded = TfsMs2BatchedArgsCaptureV2 {
+        p2,
+        grid_x,
+        block_x,
+        packet_sample_bytes: sample_bytes,
+        ..Default::default()
+    };
+    std::ptr::write_unaligned(dst as *mut TfsMs2BatchedArgsCaptureV2, encoded);
+    tfs_capture_d2d_bytes(
+        slot_dev_base,
+        p2,
+        std::mem::offset_of!(TfsMs2BatchedArgsCaptureV2, packet_sample),
+        sample_bytes as usize,
+        "TFS_M2BA_V2",
+    );
+    std::mem::size_of::<TfsMs2BatchedArgsCaptureV2>()
+}
+
+unsafe fn dump_tfs_ms3_args(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null()
+        || dst_len < std::mem::size_of::<TfsMs3ArgsCaptureV1>()
+        || (kernel_params.is_null() && extra.is_null())
+    {
+        return 0;
+    }
+    let encoded = TfsMs3ArgsCaptureV1 {
+        magic: TFS_MS3_ARGS_CAPTURE_MAGIC,
+        version: TFS_MS3_ARGS_CAPTURE_VERSION,
+        p2: read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0),
+        p3: read_kernel_arg(kernel_params, extra, 24, 3).unwrap_or(0),
+    };
+    std::ptr::write_unaligned(dst as *mut TfsMs3ArgsCaptureV1, encoded);
+    std::mem::size_of::<TfsMs3ArgsCaptureV1>()
+}
+
+unsafe fn dump_tfs_ms3_args_v2(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    slot_dev_base: *mut u8,
+    dst: *mut u8,
+    dst_len: usize,
+) -> usize {
+    if dst.is_null()
+        || dst_len < std::mem::size_of::<TfsMs3ArgsCaptureV2>()
+        || (kernel_params.is_null() && extra.is_null())
+    {
+        return 0;
+    }
+    let p2: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+    let p3: u64 = read_kernel_arg(kernel_params, extra, 24, 3).unwrap_or(0);
+    let encoded = TfsMs3ArgsCaptureV2 {
+        p2,
+        p3,
+        p2_words: tfs_bounded_sample_words(p2, TFS_MS3_P2_SAMPLE_WORDS),
+        p3_words: tfs_bounded_sample_words(p3, TFS_MS3_P3_SAMPLE_WORDS),
+        ..Default::default()
+    };
+    std::ptr::write_unaligned(dst as *mut TfsMs3ArgsCaptureV2, encoded);
+    tfs_ms3_capture_words_d2d(
+        slot_dev_base,
+        p2,
+        std::mem::offset_of!(TfsMs3ArgsCaptureV2, p2_words_data),
+        encoded.p2_words,
+    );
+    tfs_ms3_capture_words_d2d(
+        slot_dev_base,
+        p3,
+        std::mem::offset_of!(TfsMs3ArgsCaptureV2, p3_words_data),
+        encoded.p3_words,
+    );
+    std::mem::size_of::<TfsMs3ArgsCaptureV2>()
+}
+
 fn should_capture_ms2b(name: &str, grid_x: u32) -> bool {
     name == "CreateParticleShapesIncremental_MultiStage_2_Batched" && grid_x >= 3
+}
+
+fn should_capture_mut_p47_probe_for_mode(kernel_id: u32, broad_probe: bool) -> bool {
+    let tail_window = matches!(
+        kernel_id,
+        TFS_KERNEL_ID_MIGRATE
+            | TFS_KERNEL_ID_ADVECT
+            | TFS_KERNEL_ID_COUPLE_FROM_PARTICLES
+            | TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX
+            | TFS_KERNEL_ID_PARTICLE_DENSITY_SMOOTH
+    );
+    if tail_window {
+        return true;
+    }
+    broad_probe
+        && matches!(
+            kernel_id,
+            TFS_KERNEL_ID_CLEAR
+                | TFS_KERNEL_ID_OTHER
+                | TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS3
+                | TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS1
+        )
+}
+
+fn should_capture_mut_p47_probe(kernel_id: u32) -> bool {
+    should_capture_mut_p47_probe_for_mode(kernel_id, tfs_mut_p47_broad_probe_enabled())
+}
+
+unsafe fn capture_tfs_atomic_to_tex_post(slot_index: usize, stream: hipStream_t) {
+    if !tfs_capture_enabled() {
+        return;
+    }
+    let guard = match TFS_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+    let slot_host = state.host_ptr.add(slot_index * TFS_SLOT_SIZE) as *const TfsCaptureSlot;
+    let slot_dev_base = (state.dev_ptr as usize + slot_index * TFS_SLOT_SIZE) as *mut u8;
+    let encoded =
+        std::ptr::read_unaligned((*slot_host).raw_args.as_ptr() as *const TfsAtomicToTexCaptureV1);
+    if encoded.magic != TFS_ATOMIC_TO_TEX_CAPTURE_MAGIC
+        || encoded.version != TFS_ATOMIC_TO_TEX_CAPTURE_VERSION
+        || encoded.output_base < 0x1000
+        || encoded.output_post_words == 0
+    {
+        return;
+    }
+    tfs_capture_d2d_bytes_async(
+        slot_dev_base,
+        encoded.output_base,
+        std::mem::offset_of!(TfsAtomicToTexCaptureV1, output_post_words_data),
+        encoded.output_post_words as usize * 4,
+        stream,
+        "TFS_ATXA_POST",
+    );
 }
 
 /// Capture a TurbulenceFS kernel launch into the ring buffer. Called from
@@ -8949,15 +11046,19 @@ unsafe fn capture_tfs_launch(
     kernel_id: u32,
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
+    stream: hipStream_t,
     grid_x: u32,
     grid_y: u32,
     grid_z: u32,
     block_x: u32,
     block_y: u32,
     block_z: u32,
-) {
+) -> Option<usize> {
     if !tfs_capture_enabled() {
-        return;
+        return None;
+    }
+    if !should_capture_tfs_kernel(kernel_id) {
+        return None;
     }
 
     let mut guard = match TFS_CAPTURE.lock() {
@@ -8967,7 +11068,7 @@ unsafe fn capture_tfs_launch(
     tfs_capture_init(&mut guard);
     let state = match guard.as_mut() {
         Some(s) => s,
-        None => return,
+        None => return None,
     };
 
     let this_launch = state.launch_counter;
@@ -8975,6 +11076,7 @@ unsafe fn capture_tfs_launch(
     let slot_index = (this_launch as usize) % TFS_CAPTURE_SLOTS;
 
     let slot_ptr = state.host_ptr.add(slot_index * TFS_SLOT_SIZE) as *mut TfsCaptureSlot;
+    let slot_dev_base = (state.dev_ptr as usize + slot_index * TFS_SLOT_SIZE) as *mut u8;
     // Zero the slot first.
     std::ptr::write_bytes(slot_ptr as *mut u8, 0, TFS_SLOT_SIZE);
 
@@ -9001,18 +11103,210 @@ unsafe fn capture_tfs_launch(
     (*slot_ptr).arg_meta = encode_launch_arg_meta(kernel_params, extra);
 
     if should_skip_tfs_raw_arg_dump(name) {
-        (*slot_ptr).raw_args_len = dump_kernel_param_ptrs(
+        // These kernels previously went through generic pointer-slot dumping and
+        // were fragile under unknown launch layouts. Keep them on audited,
+        // fixed-field extractors only.
+        if name == "CreateParticleShapesIncremental_MultiStage_2_Batched" {
+            let ms2b_v4_len = dump_tfs_ms2_batched_args_v4(
+                kernel_params,
+                extra,
+                slot_dev_base,
+                this_launch,
+                grid_x,
+                block_x,
+                (*slot_ptr).raw_args.as_mut_ptr(),
+                TFS_RAW_ARGS_BYTES,
+            ) as u32;
+            (*slot_ptr).raw_args_len = if ms2b_v4_len > 0 {
+                ms2b_v4_len
+            } else {
+                let ms2b_v3_len = dump_tfs_ms2_batched_args_v3(
+                    kernel_params,
+                    extra,
+                    slot_dev_base,
+                    this_launch,
+                    grid_x,
+                    block_x,
+                    (*slot_ptr).raw_args.as_mut_ptr(),
+                    TFS_RAW_ARGS_BYTES,
+                ) as u32;
+                if ms2b_v3_len > 0 {
+                    ms2b_v3_len
+                } else {
+                    let ms2b_v2_len = dump_tfs_ms2_batched_args_v2(
+                        kernel_params,
+                        extra,
+                        slot_dev_base,
+                        grid_x,
+                        block_x,
+                        (*slot_ptr).raw_args.as_mut_ptr(),
+                        TFS_RAW_ARGS_BYTES,
+                    ) as u32;
+                    if ms2b_v2_len > 0 {
+                        ms2b_v2_len
+                    } else {
+                        dump_tfs_ms2_batched_args(
+                            kernel_params,
+                            extra,
+                            (*slot_ptr).raw_args.as_mut_ptr(),
+                            TFS_RAW_ARGS_BYTES,
+                        ) as u32
+                    }
+                }
+            };
+        } else if name == "CreateParticleShapesIncremental_MultiStage_3" {
+            let ms3_v2_len = dump_tfs_ms3_args_v2(
+                kernel_params,
+                extra,
+                slot_dev_base,
+                (*slot_ptr).raw_args.as_mut_ptr(),
+                TFS_RAW_ARGS_BYTES,
+            ) as u32;
+            (*slot_ptr).raw_args_len = if ms3_v2_len > 0 {
+                ms3_v2_len
+            } else {
+                dump_tfs_ms3_args(
+                    kernel_params,
+                    extra,
+                    (*slot_ptr).raw_args.as_mut_ptr(),
+                    TFS_RAW_ARGS_BYTES,
+                ) as u32
+            };
+        } else if name == "CreateParticleShapesIncremental_MultiStage_4" {
+            let ms4_v2_len = dump_tfs_ms4_args_v2(
+                kernel_params,
+                extra,
+                slot_dev_base,
+                (*slot_ptr).raw_args.as_mut_ptr(),
+                TFS_RAW_ARGS_BYTES,
+            ) as u32;
+            (*slot_ptr).raw_args_len = if ms4_v2_len > 0 {
+                ms4_v2_len
+            } else {
+                dump_tfs_ms4_args(
+                    kernel_params,
+                    extra,
+                    (*slot_ptr).raw_args.as_mut_ptr(),
+                    TFS_RAW_ARGS_BYTES,
+                ) as u32
+            };
+        } else if name == "CreateParticleShapesIncremental_MultiStage_1" {
+            // CPU-vs-GPU coherency probe (gated). Reads *(rd5+22176)
+            // via CPU pointer AND via hipMemcpyDtoH — if they differ,
+            // we have a UMA coherency issue on Steam Deck APU.
+            // Snapshot tracked rd5 list BEFORE consuming resets so we
+            // see the pre-reset values.
+            {
+                let snapshot: Vec<u64> = match TRACKED_RD5_PTRS.lock() {
+                    Ok(g) => g.clone(),
+                    Err(p) => p.into_inner().clone(),
+                };
+                static PROBE_CALL_N: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                for &rd5 in snapshot.iter().take(4) {
+                    let (cpu_val, gpu_val, eq) = probe_rd5_counter_cpu_vs_gpu(rd5);
+                    if !eq {
+                        let n = PROBE_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        super::driver::zluda_log_err(&format!(
+                            "RD5_CPU_PROBE #{} rd5=0x{:x} CPU_view=0x{:x} GPU_view=0x{:x} DIVERGED",
+                            n, rd5, cpu_val, gpu_val
+                        ));
+                    } else if cpu_val != 0 {
+                        // Non-zero but coherent — log occasionally for trend
+                        let n = PROBE_CALL_N.load(std::sync::atomic::Ordering::Relaxed);
+                        if n % 50 == 0 {
+                            super::driver::zluda_log_err(&format!(
+                                "RD5_CPU_PROBE coherent rd5=0x{:x} value=0x{:x} (CPU==GPU)",
+                                rd5, cpu_val
+                            ));
+                        }
+                    }
+                }
+            }
+            // Defensive reset (gated): zero `*(rd5+22176)` for each rd5
+            // that the prior MS_4 marked as pending. Fires BEFORE the
+            // V4 probe so the probe captures the post-reset counter
+            // value. Throttled to one memset per cycle per rd5.
+            ms1_consume_rd5_resets();
+            if should_capture_mut_p47_probe(kernel_id) {
+                // MS_1 is the suspected writer of shape indices into rd7.
+                // Capture rd5/rd6/rd7 heads at MS_1 launch time using the
+                // existing MS_2 tracker, so the chain
+                //   MS_2 (post) → MS_1 #a → MS_1 #b → MS_2 (pre)
+                // reveals whether MS_1 transitions rd7 from cleared to
+                // populated.
+                let probe_len = dump_tfs_mut_p47_capture(
+                    kernel_params,
+                    extra,
+                    slot_dev_base,
+                    (*slot_ptr).raw_args.as_mut_ptr(),
+                    TFS_RAW_ARGS_BYTES,
+                ) as u32;
+                (*slot_ptr).raw_args_len = if probe_len > 0 {
+                    probe_len
+                } else {
+                    dump_kernel_param_ptrs(
+                        kernel_params,
+                        (*slot_ptr).raw_args.as_mut_ptr(),
+                        TFS_RAW_ARGS_BYTES,
+                    ) as u32
+                };
+            } else {
+                (*slot_ptr).raw_args_len = dump_kernel_param_ptrs(
+                    kernel_params,
+                    (*slot_ptr).raw_args.as_mut_ptr(),
+                    TFS_RAW_ARGS_BYTES,
+                ) as u32;
+            }
+        } else {
+            (*slot_ptr).raw_args_len = dump_kernel_param_ptrs(
+                kernel_params,
+                (*slot_ptr).raw_args.as_mut_ptr(),
+                TFS_RAW_ARGS_BYTES,
+            ) as u32;
+        }
+        return None;
+    }
+
+    if kernel_id == TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX
+        && tfs_atomic_to_tex_capture_enabled()
+    {
+        let capture_len = dump_tfs_atomic_to_tex_capture(
             kernel_params,
+            extra,
+            slot_dev_base,
+            stream,
             (*slot_ptr).raw_args.as_mut_ptr(),
             TFS_RAW_ARGS_BYTES,
         ) as u32;
-        return;
+        if capture_len > 0 {
+            (*slot_ptr).raw_args_len = capture_len;
+            return Some(slot_index);
+        }
+    }
+
+    if should_capture_mut_p47_probe(kernel_id) {
+        let probe_len = dump_tfs_mut_p47_capture(
+            kernel_params,
+            extra,
+            slot_dev_base,
+            (*slot_ptr).raw_args.as_mut_ptr(),
+            TFS_RAW_ARGS_BYTES,
+        ) as u32;
+        if probe_len > 0 {
+            (*slot_ptr).raw_args_len = probe_len;
+            return None;
+        }
     }
 
     // Dump the raw kernel argument bytes.
     let raw_dst = (*slot_ptr).raw_args.as_mut_ptr();
-    let raw_len = dump_kernel_args_raw(kernel_params, extra, raw_dst, TFS_RAW_ARGS_BYTES);
+    let mut raw_len = dump_kernel_args_raw(kernel_params, extra, raw_dst, TFS_RAW_ARGS_BYTES);
+    if raw_len == 0 && !kernel_params.is_null() {
+        raw_len = dump_kernel_param_ptrs(kernel_params, raw_dst, TFS_RAW_ARGS_BYTES);
+    }
     (*slot_ptr).raw_args_len = raw_len as u32;
+    None
 }
 
 pub(crate) fn register_name(f: hipFunction_t, name: &str) {
@@ -9389,6 +11683,13 @@ pub(crate) fn launch_kernel(
     let log_launches = *LOG_LAUNCHES
         .get_or_init(|| std::env::var("ZLUDA_LOG_LAUNCHES").map_or(false, |v| v == "1"));
     let name = lookup_name(f.base);
+    static KERNEL_LAUNCH_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let global_launch_n = if name.is_empty() {
+        None
+    } else {
+        Some(KERNEL_LAUNCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    };
 
     // 2026-05-18 Plan v20.3: per-launch n_threads slot barrier read.
     //
@@ -9416,9 +11717,8 @@ pub(crate) fn launch_kernel(
                 .map(|v| v != "0")
                 .unwrap_or(true)
         });
-        let writer_log_on = *WRITER_TRACK_ENABLED.get_or_init(|| {
-            std::env::var("ZLUDA_NTHREADS_WRITER").map_or(false, |v| v == "1")
-        });
+        let writer_log_on = *WRITER_TRACK_ENABLED
+            .get_or_init(|| std::env::var("ZLUDA_NTHREADS_WRITER").map_or(false, |v| v == "1"));
         if barrier_on || writer_log_on {
             const OFFSETS: [usize; 2] = [663640, 1056768];
             // Per-(host,off) previous value + previous kernel name. Only
@@ -9447,9 +11747,7 @@ pub(crate) fn launch_kernel(
                             }
                             // Volatile read prevents the optimiser from
                             // eliding it; this is the barrier itself.
-                            let cur = std::ptr::read_volatile(
-                                (host + off) as *const u32,
-                            );
+                            let cur = std::ptr::read_volatile((host + off) as *const u32);
                             // Force the read to participate in a fence so
                             // the compiler can't reorder it past the next
                             // HIP call.
@@ -9476,7 +11774,7 @@ pub(crate) fn launch_kernel(
 
     if log_launches {
         super::driver::zluda_log_err(&format!(
-            "cuLaunchKernel '{}' grid=[{},{},{}] block=[{},{},{}] shared={}",
+            "cuLaunchKernel '{}' grid=[{},{},{}] block=[{},{},{}] shared={} stream=0x{:x}",
             name,
             grid_dim_x,
             grid_dim_y,
@@ -9484,7 +11782,8 @@ pub(crate) fn launch_kernel(
             block_dim_x,
             block_dim_y,
             block_dim_z,
-            shared_mem_bytes
+            shared_mem_bytes,
+            stream.0 as u64
         ));
     }
 
@@ -9492,8 +11791,7 @@ pub(crate) fn launch_kernel(
     // 1040000-byte cuMemHostAlloc'd buffer. We only fire every Nth launch
     // to avoid log explosion (game does ~400k launches per benchmark cycle).
     if super::memory::hostbuf_sample_enabled() {
-        static LAUNCH_TICK: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static LAUNCH_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = LAUNCH_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Sample every 1000th launch — at typical launch rate that's ~1 sample/sec.
         if n % 1000 == 0 {
@@ -9511,8 +11809,8 @@ pub(crate) fn launch_kernel(
     // pointers. Goal: cross-reference DtoH source pointers with kernel args
     // to see whether always-zero DtoH'd buffers are ever bound to a kernel.
     static KARG_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let karg_log = *KARG_LOG
-        .get_or_init(|| std::env::var("ZLUDA_KARG_LOG").map_or(false, |v| v == "1"));
+    let karg_log =
+        *KARG_LOG.get_or_init(|| std::env::var("ZLUDA_KARG_LOG").map_or(false, |v| v == "1"));
     if karg_log {
         static KARG_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
             std::sync::OnceLock::new();
@@ -9673,10 +11971,7 @@ pub(crate) fn launch_kernel(
                             hit_any = true;
                             let off_in_pool = v & 0x1f_ffffu64;
                             let dev5_off = dev5 & 0x1f_ffffu64;
-                            tag = format!(
-                                "DEV5pool(p5@+{:#x},this@+{:#x})",
-                                dev5_off, off_in_pool
-                            );
+                            tag = format!("DEV5pool(p5@+{:#x},this@+{:#x})", dev5_off, off_in_pool);
                             break;
                         }
                     }
@@ -9688,9 +11983,14 @@ pub(crate) fn launch_kernel(
                     let seq = REMAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     super::driver::zluda_log_err(&format!(
                         "[REMAP_KARGS #{}] '{}' grid=[{},{},{}] block=[{},{},{}] args=[{}]",
-                        seq, name,
-                        grid_dim_x, grid_dim_y, grid_dim_z,
-                        block_dim_x, block_dim_y, block_dim_z,
+                        seq,
+                        name,
+                        grid_dim_x,
+                        grid_dim_y,
+                        grid_dim_z,
+                        block_dim_x,
+                        block_dim_y,
+                        block_dim_z,
                         all_args.join(" ")
                     ));
                 }
@@ -9719,8 +12019,7 @@ pub(crate) fn launch_kernel(
                 let ty = std::ptr::read_unaligned(buf.add(24) as *const u64);
                 let p0 = read_kernel_arg::<u64>(kernel_params, extra, 0, 0).unwrap_or(0);
                 let p1 = read_kernel_arg::<u64>(kernel_params, extra, 8, 1).unwrap_or(0);
-                static MC_SEQ: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
+                static MC_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 let seq = MC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 super::driver::zluda_log_err(&format!(
                     "MEMCPY_ARGS#{} {} grid=[{},{},{}] p0=0x{:x} p1=0x{:x} f0=0x{:x} pa=0x{:x} pb=0x{:x} ty=0x{:x}",
@@ -9730,11 +12029,10 @@ pub(crate) fn launch_kernel(
         }
     }
 
-    // Capture CUB RadixSort kernel args (Downsweep + Upsweep) including
-    // GridEvenShare and the 5 pointer params. Pure CPU reads from the extra
-    // buffer — no GPU ops, no ProfilingSignal risk. Every launch logs (was
-    // previously gated to a single sort's worth of passes, which was hiding
-    // the crashing Downsweep's state).
+    // Capture CUB RadixSort kernel args (Downsweep + Upsweep). Pure CPU reads
+    // from the extra buffer — no GPU ops, no ProfilingSignal risk. Every launch
+    // logs (was previously gated to a single sort's worth of passes, which was
+    // hiding the crashing Downsweep's state).
     if (name.contains("RadixSortDownsweepKernel") || name.contains("RadixSortUpsweepKernel"))
         && !extra.is_null()
     {
@@ -9742,42 +12040,59 @@ pub(crate) fn launch_kernel(
             let extra_arr = std::slice::from_raw_parts(extra, 5);
             if extra_arr[0] == (0x1usize as *mut _) && !extra_arr[1].is_null() {
                 let buf = extra_arr[1] as *const u8;
-                let kernel_type = if name.contains("Downsweep") {
-                    "DS"
-                } else {
-                    "US"
-                };
-                // params 0..4 are u64 pointers. Verified from the capture infra:
-                // Downsweep = (d_keys_in, d_keys_out, d_values_in, d_values_out,
-                // d_spine). Upsweep is (d_keys, d_spine, d_values) — its buffer
-                // is shorter but offsets 0..40 still hold pointers so reading
-                // 5 is safe; ptrs[3..5] for Upsweep are unused/padding bytes
-                // from the shared struct and should be treated as garbage.
-                let ptrs: [u64; 5] = [
-                    std::ptr::read_unaligned(buf.add(0)  as *const u64),
-                    std::ptr::read_unaligned(buf.add(8)  as *const u64),
-                    std::ptr::read_unaligned(buf.add(16) as *const u64),
-                    std::ptr::read_unaligned(buf.add(24) as *const u64),
-                    std::ptr::read_unaligned(buf.add(32) as *const u64),
-                ];
-                let n_items = std::ptr::read_unaligned(buf.add(40) as *const u32);
-                let begin_bit = std::ptr::read_unaligned(buf.add(44) as *const u32);
-                let is_first = *buf.add(48);
-                let is_last = *buf.add(49);
-                let overwrite = *buf.add(50);
-                let ges_i32: Vec<i32> = (0..9)
-                    .map(|i| std::ptr::read_unaligned(buf.add(52 + i * 4) as *const i32))
-                    .collect();
                 // Per-call sequence counter so we can align this with the
                 // kernel-launch history dump at crash time.
                 static SORT_SEQ: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 let seq = SORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                super::driver::zluda_log_err(&format!(
-                    "SORT_ARGS#{} {} n={} bit={} first={} last={} ow={} GES={:?} grid={} stream={:?} ptrs=[0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
-                    seq, kernel_type, n_items, begin_bit, is_first, is_last, overwrite,
-                    ges_i32, grid_dim_x, stream,
-                    ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4]));
+                if name.contains("RadixSortDownsweepKernel") {
+                    // Downsweep packed extra args:
+                    //   [0..40):  5 x u64 pointers
+                    //   [40..44): n_items
+                    //   [44..48): begin_bit
+                    //   [48..51): is_first / is_last / overwrite
+                    //   [52..88): GridEvenShare (9 x i32)
+                    let ptrs: [u64; 5] = [
+                        std::ptr::read_unaligned(buf.add(0) as *const u64),
+                        std::ptr::read_unaligned(buf.add(8) as *const u64),
+                        std::ptr::read_unaligned(buf.add(16) as *const u64),
+                        std::ptr::read_unaligned(buf.add(24) as *const u64),
+                        std::ptr::read_unaligned(buf.add(32) as *const u64),
+                    ];
+                    let n_items = std::ptr::read_unaligned(buf.add(40) as *const u32);
+                    let begin_bit = std::ptr::read_unaligned(buf.add(44) as *const u32);
+                    let is_first = *buf.add(48);
+                    let is_last = *buf.add(49);
+                    let overwrite = *buf.add(50);
+                    let ges_i32: Vec<i32> = (0..9)
+                        .map(|i| std::ptr::read_unaligned(buf.add(52 + i * 4) as *const i32))
+                        .collect();
+                    super::driver::zluda_log_err(&format!(
+                        "SORT_ARGS#{} DS n={} bit={} first={} last={} ow={} GES={:?} grid={} stream={:?} ptrs=[0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
+                        seq, n_items, begin_bit, is_first, is_last, overwrite, ges_i32, grid_dim_x, stream,
+                        ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4]
+                    ));
+                } else {
+                    // Upsweep packed extra args (from PTX signature):
+                    //   [0..16):  pointers (d_keys, d_spine)
+                    //   [16..20): n_items
+                    //   [20..24): begin_bit
+                    //   [24..26): 2 x u8 flags
+                    //   [28..64): GridEvenShare (9 x i32)
+                    let d_keys = std::ptr::read_unaligned(buf.add(0) as *const u64);
+                    let d_spine = std::ptr::read_unaligned(buf.add(8) as *const u64);
+                    let n_items = std::ptr::read_unaligned(buf.add(16) as *const u32);
+                    let begin_bit = std::ptr::read_unaligned(buf.add(20) as *const u32);
+                    let flag0 = *buf.add(24);
+                    let flag1 = *buf.add(25);
+                    let ges_i32: Vec<i32> = (0..9)
+                        .map(|i| std::ptr::read_unaligned(buf.add(28 + i * 4) as *const i32))
+                        .collect();
+                    super::driver::zluda_log_err(&format!(
+                        "SORT_ARGS#{} US n={} bit={} f0={} f1={} GES={:?} grid={} stream={:?} ptrs=[0x{:x}, 0x{:x}]",
+                        seq, n_items, begin_bit, flag0, flag1, ges_i32, grid_dim_x, stream, d_keys, d_spine
+                    ));
+                }
             }
         }
     }
@@ -9807,9 +12122,9 @@ pub(crate) fn launch_kernel(
     if name == "MemCopyBatchedAsync" {
         unsafe {
             static MEMCPY_SRC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *MEMCPY_SRC_TRACE.get_or_init(|| {
-                std::env::var("ZLUDA_MEMCPY_SRC_TRACE").map_or(false, |v| v == "1")
-            }) {
+            if *MEMCPY_SRC_TRACE
+                .get_or_init(|| std::env::var("ZLUDA_MEMCPY_SRC_TRACE").map_or(false, |v| v == "1"))
+            {
                 // Decoded descriptor format (from MEMCPY_RAW_DATA observation,
                 // 2026-05-17): 32 bytes per descriptor:
                 //   +0  : src u64  (device pointer)
@@ -9865,9 +12180,9 @@ pub(crate) fn launch_kernel(
                                         if (d_src as usize) >= dev && (d_src as usize) < dev_end {
                                             let off = (d_src as usize) - dev;
                                             if off + 4 <= size {
-                                                src_value = Some(
-                                                    std::ptr::read_volatile((host + off) as *const u32)
-                                                );
+                                                src_value = Some(std::ptr::read_volatile(
+                                                    (host + off) as *const u32,
+                                                ));
                                             }
                                             break;
                                         }
@@ -9876,9 +12191,78 @@ pub(crate) fn launch_kernel(
                                         "MEMCPY_SRC #{} i={}/{} dst_off={} \
                                          src=0x{:x} src_u32={:?} dst=0x{:x} \
                                          dst_host=0x{:x} size={}",
-                                        call_n, i, num_descs, dst_off, d_src,
-                                        src_value, d_dst, dst_host, d_size
+                                        call_n,
+                                        i,
+                                        num_descs,
+                                        dst_off,
+                                        d_src,
+                                        src_value,
+                                        d_dst,
+                                        dst_host,
+                                        d_size
                                     ));
+                                }
+                            }
+                        }
+                        static MCB_RD5_TRACE: std::sync::OnceLock<bool> =
+                            std::sync::OnceLock::new();
+                        if *MCB_RD5_TRACE.get_or_init(|| {
+                            std::env::var("ZLUDA_MCB_RD5_TRACE").map_or(false, |v| v == "1")
+                        }) {
+                            let tracked_rd5: Vec<u64> = match TRACKED_RD5_PTRS.lock() {
+                                Ok(g) => g.clone(),
+                                Err(p) => p.into_inner().clone(),
+                            };
+                            let desc_ptr: u64 =
+                                read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+                            let num_descs = grid_dim_y.max(1) as usize;
+                            if desc_ptr != 0 && !tracked_rd5.is_empty() {
+                                if let Ok(table) = super::memory::SMALL_HOST_ALLOCS.lock() {
+                                    let mut desc_host: Option<usize> = None;
+                                    for &(host, dev, size) in table.iter() {
+                                        let dev_end = dev.wrapping_add(size);
+                                        if (desc_ptr as usize) >= dev
+                                            && (desc_ptr as usize) < dev_end
+                                        {
+                                            let off = (desc_ptr as usize) - dev;
+                                            desc_host = Some(host + off);
+                                            break;
+                                        }
+                                    }
+                                    if let Some(dh) = desc_host {
+                                        static MCB_RD5_CALL_N: std::sync::atomic::AtomicU32 =
+                                            std::sync::atomic::AtomicU32::new(0);
+                                        let call_n = MCB_RD5_CALL_N
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        for i in 0..num_descs.min(64) {
+                                            let base = (dh + i * 32) as *const u64;
+                                            let d_src = std::ptr::read_volatile(base);
+                                            let d_dst = std::ptr::read_volatile(base.add(1));
+                                            let d_size = std::ptr::read_volatile(base.add(2));
+                                            let d_flags = std::ptr::read_volatile(base.add(3));
+                                            if let Some(rd5) = mcb_descriptor_hits_rd5_reset_window(
+                                                d_dst,
+                                                d_size,
+                                                &tracked_rd5,
+                                            ) {
+                                                let watch_start = rd5 + F6_OFFSET_IN_RD5 as u64;
+                                                let dst_off = d_dst.saturating_sub(watch_start);
+                                                super::driver::zluda_log_err(&format!(
+                                                    "MCB_RD5_TRACE #{} i={}/{} rd5=0x{:x} watch=0x{:x} dst=0x{:x} dst_off={} src=0x{:x} size={} flags=0x{:x}",
+                                                    call_n,
+                                                    i,
+                                                    num_descs,
+                                                    rd5,
+                                                    watch_start,
+                                                    d_dst,
+                                                    dst_off,
+                                                    d_src,
+                                                    d_size,
+                                                    d_flags
+                                                ));
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -9905,10 +12289,45 @@ pub(crate) fn launch_kernel(
             let p7: u64 = read_kernel_arg(kernel_params, extra, 56, 7).unwrap_or(0);
             static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if ms4_pointer_validation_enabled() {
+                validate_ms4_pointer_ranges(call_n, n, p2, p4, p5, p6, p7);
+            }
             super::driver::zluda_log_err(&format!(
                 "MS4_ARGS #{} n={} p2=0x{:x} p4=0x{:x} p5=0x{:x} p6=0x{:x} p7=0x{:x}",
                 call_n, n, p2, p4, p5, p6, p7
             ));
+            // Defensive reset (gated): mark MS_4's p4 (= rd5 of this entry's
+            // active MS-chain cycle) for zeroing of *(rd5+22176) at the next
+            // MS_1 launch. PhysX should be calling `RemoveParticleShapes`
+            // here but doesn't on Batman; the prior cycle's stale counter
+            // value leaks into the next cycle's MS_1 → MS_2_Batched chain
+            // and drives the -2 cascade. See feedback note for the
+            // single-memset-per-cycle throttling rationale.
+            mark_rd5_reset_pending(p4);
+            // Concurrency-test probe (gated): drain all pending GPU work
+            // after MS_4 to test whether the missing counter-reset is
+            // actually a GPU-side ordering issue (some kernel/op meant
+            // to fire after MS_4 completes its writes is racing the next
+            // MS_1 read). Non-value-manipulating — pure sync.
+            //
+            // Mode '1': hipDeviceSynchronize (drains all streams). Original
+            //   blunt-instrument fix.
+            // Mode '2': hipStreamSynchronize on MS_4's stream. Lighter; only
+            //   drains this stream's queue. If this also fixes the crash,
+            //   the bug is per-stream memory visibility (GL2 cache flush
+            //   on stream barrier), not cross-stream ordering.
+            static MS4_POST_SYNC: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+            let post_sync_mode = *MS4_POST_SYNC.get_or_init(|| {
+                std::env::var("ZLUDA_MS4_POST_SYNC")
+                    .ok()
+                    .and_then(|v| v.parse::<u8>().ok())
+                    .unwrap_or(0)
+            });
+            match post_sync_mode {
+                1 => { let _ = hipDeviceSynchronize(); }
+                2 => { let _ = hipStreamSynchronize(stream); }
+                _ => {}
+            }
             // Plan v22 Phase B.1: record DEV5 (p5) addresses for the IOFX
             // per-launch kernarg probe to cross-reference against. Bounded
             // size — only the most recent ~64 distinct values matter.
@@ -9929,8 +12348,7 @@ pub(crate) fn launch_kernel(
             // drain pass. Gated on ZLUDA_DEV5_DUMP=1. Drop-oldest at 64
             // entries; queue lock held only across the push itself, NEVER
             // across a HIP call.
-            static DEV5_DUMP_ENABLED: std::sync::OnceLock<bool> =
-                std::sync::OnceLock::new();
+            static DEV5_DUMP_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if *DEV5_DUMP_ENABLED
                 .get_or_init(|| std::env::var("ZLUDA_DEV5_DUMP").map_or(false, |v| v == "1"))
                 && p5 != 0
@@ -9980,8 +12398,7 @@ pub(crate) fn launch_kernel(
             // Different MS_4 launches use different actor flag ptrs, so we
             // latch the most recent one; post-MS_1 probe uses this to look
             // at the buffer that MS_4 will read in the next dispatch.
-            MS4_FLAGS_PTR_LATCHED
-                .store(p2, std::sync::atomic::Ordering::Release);
+            MS4_FLAGS_PTR_LATCHED.store(p2, std::sync::atomic::Ordering::Release);
             MS4_N_LATCHED.store(n, std::sync::atomic::Ordering::Release);
             // p2=flags is just logged (no buffer read — avoid D2H from launch
             // path per feedback_no_d2d_from_launch_kernel). The address itself
@@ -9994,69 +12411,76 @@ pub(crate) fn launch_kernel(
             // that masqueraded as "GPU fault likely" through the
             // 2026-05-18 D-series. Default OFF for production; turn on
             // only when actively debugging MS_4 pre-launch state.
-            static MS4_HOST_DUMP_ENABLED: std::sync::OnceLock<bool> =
-                std::sync::OnceLock::new();
-            let ms4_host_dump_on = *MS4_HOST_DUMP_ENABLED.get_or_init(|| {
-                std::env::var("ZLUDA_MS4_HOST_DUMP").map_or(false, |v| v == "1")
-            });
+            static MS4_HOST_DUMP_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let ms4_host_dump_on = *MS4_HOST_DUMP_ENABLED
+                .get_or_init(|| std::env::var("ZLUDA_MS4_HOST_DUMP").map_or(false, |v| v == "1"));
             if let Ok(table) = super::memory::SMALL_HOST_ALLOCS.lock() {
                 if ms4_host_dump_on {
-                // Legacy dump: first 16 u32s of every tracked buffer (unchanged
-                // behavior for small host counters we've been relying on).
-                for &(host, dev, size) in table.iter() {
-                    let words = (size / 4).min(16);
-                    let mut dump = String::new();
-                    for i in 0..words {
-                        let w = std::ptr::read_volatile((host as *const u32).add(i));
-                        if i > 0 {
-                            dump.push(' ');
-                        }
-                        dump.push_str(&format!("{:08x}", w));
-                    }
-                    super::driver::zluda_log_err(&format!(
-                        "MS4_HOST_COUNTERS #{} n={} host=0x{:x} dev=0x{:x} size={} u32=[{}]",
-                        call_n, n, host, dev, size, dump
-                    ));
-                }
-                // Arg resolution: for each of Arg4 (pool table), Arg6 (pool
-                // idx array), Arg7 (counter array), find the tracked buffer
-                // whose device range contains the arg pointer. Dump the 64
-                // u32s starting at the arg offset.
-                let args = [(4u8, p4), (5, p5), (6, p6), (7, p7)];
-                for &(arg_idx, arg_ptr) in args.iter() {
-                    if arg_ptr == 0 {
-                        continue;
-                    }
+                    // Legacy dump: first 16 u32s of every tracked buffer (unchanged
+                    // behavior for small host counters we've been relying on).
                     for &(host, dev, size) in table.iter() {
-                        let dev_end = dev.wrapping_add(size);
-                        if (arg_ptr as usize) >= dev && (arg_ptr as usize) < dev_end {
-                            let offset = (arg_ptr as usize) - dev;
-                            let remaining = size - offset;
-                            let words = (remaining / 4).min(64);
-                            let mut dump = String::new();
-                            let base = (host + offset) as *const u32;
-                            for i in 0..words {
-                                let w = std::ptr::read_volatile(base.add(i));
-                                if i > 0 {
-                                    dump.push(' ');
-                                }
-                                dump.push_str(&format!("{:08x}", w));
+                        let words = (size / 4).min(16);
+                        let mut dump = String::new();
+                        for i in 0..words {
+                            let w = std::ptr::read_volatile((host as *const u32).add(i));
+                            if i > 0 {
+                                dump.push(' ');
                             }
-                            super::driver::zluda_log_err(&format!(
-                                "MS4_ARG_DUMP #{} n={} arg{}=0x{:x} host=0x{:x} dev=0x{:x} \
+                            dump.push_str(&format!("{:08x}", w));
+                        }
+                        super::driver::zluda_log_err(&format!(
+                            "MS4_HOST_COUNTERS #{} n={} host=0x{:x} dev=0x{:x} size={} u32=[{}]",
+                            call_n, n, host, dev, size, dump
+                        ));
+                    }
+                    // Arg resolution: for each of Arg4 (pool table), Arg6 (pool
+                    // idx array), Arg7 (counter array), find the tracked buffer
+                    // whose device range contains the arg pointer. Dump the 64
+                    // u32s starting at the arg offset.
+                    let args = [(4u8, p4), (5, p5), (6, p6), (7, p7)];
+                    for &(arg_idx, arg_ptr) in args.iter() {
+                        if arg_ptr == 0 {
+                            continue;
+                        }
+                        for &(host, dev, size) in table.iter() {
+                            let dev_end = dev.wrapping_add(size);
+                            if (arg_ptr as usize) >= dev && (arg_ptr as usize) < dev_end {
+                                let offset = (arg_ptr as usize) - dev;
+                                let remaining = size - offset;
+                                let words = (remaining / 4).min(64);
+                                let mut dump = String::new();
+                                let base = (host + offset) as *const u32;
+                                for i in 0..words {
+                                    let w = std::ptr::read_volatile(base.add(i));
+                                    if i > 0 {
+                                        dump.push(' ');
+                                    }
+                                    dump.push_str(&format!("{:08x}", w));
+                                }
+                                super::driver::zluda_log_err(&format!(
+                                    "MS4_ARG_DUMP #{} n={} arg{}=0x{:x} host=0x{:x} dev=0x{:x} \
                                  size={} offset={} u32[0..{}]=[{}]",
-                                call_n, n, arg_idx, arg_ptr, host, dev, size, offset, words, dump
-                            ));
-                            break;
+                                    call_n,
+                                    n,
+                                    arg_idx,
+                                    arg_ptr,
+                                    host,
+                                    dev,
+                                    size,
+                                    offset,
+                                    words,
+                                    dump
+                                ));
+                                break;
+                            }
                         }
                     }
-                }
                 } // end if ms4_host_dump_on
-                // NOTE: full-buffer sentinel scan removed — 6MB × 200 launches
-                // = 1.2 GB of CPU reads during init was correlated with
-                // triggering the ProfilingSignal libstdc++ race (p9, p10
-                // both aborted early). ARG_DUMP above is cheap enough to
-                // keep. For device-only buffers we need rocgdb, not scans.
+                  // NOTE: full-buffer sentinel scan removed — 6MB × 200 launches
+                  // = 1.2 GB of CPU reads during init was correlated with
+                  // triggering the ProfilingSignal libstdc++ race (p9, p10
+                  // both aborted early). ARG_DUMP above is cheap enough to
+                  // keep. For device-only buffers we need rocgdb, not scans.
 
                 // 2026-05-17 evening: Plan v18 Step 7 — counter-array sum
                 // probe. MS_4 atom-decrements per-shape counters at p7. The
@@ -10066,8 +12490,7 @@ pub(crate) fn launch_kernel(
                 // nonzero stats) at each MS_4 launch so the gap is visible
                 // directly rather than inferred. Read-only single-buffer
                 // scan; n_threads ≤ ~32k → ≤128 KB per launch.
-                static COUNTER_SUM_ENABLED: std::sync::OnceLock<bool> =
-                    std::sync::OnceLock::new();
+                static COUNTER_SUM_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 if *COUNTER_SUM_ENABLED.get_or_init(|| {
                     std::env::var("ZLUDA_COUNTER_SUM_PROBE").map_or(false, |v| v == "1")
                 }) && p7 != 0
@@ -10100,8 +12523,17 @@ pub(crate) fn launch_kernel(
                                 "MS4_COUNTER_SUM #{} n={} sum_first_n={} sum_full={} \
                                  gap={} nonzero={} last_nz={} total_words={} \
                                  host=0x{:x} p7=0x{:x} offset={}",
-                                call_n, n, sum_first_n, sum_full, gap, nonzero,
-                                last_nz, total_words, host, p7, offset
+                                call_n,
+                                n,
+                                sum_first_n,
+                                sum_full,
+                                gap,
+                                nonzero,
+                                last_nz,
+                                total_words,
+                                host,
+                                p7,
+                                offset
                             ));
                             break;
                         }
@@ -10118,9 +12550,9 @@ pub(crate) fn launch_kernel(
             // Gated on ZLUDA_ACTOR_ENTRY_PROBE=1 (default OFF). Cheap: at
             // most a few u32 reads per MS_4 launch.
             static ACTOR_PROBE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *ACTOR_PROBE_ENABLED
-                .get_or_init(|| std::env::var("ZLUDA_ACTOR_ENTRY_PROBE").map_or(false, |v| v == "1"))
-            {
+            if *ACTOR_PROBE_ENABLED.get_or_init(|| {
+                std::env::var("ZLUDA_ACTOR_ENTRY_PROBE").map_or(false, |v| v == "1")
+            }) {
                 if let Ok(table) = super::memory::SMALL_HOST_ALLOCS.lock() {
                     // Per-entry stride and slot offsets discovered offline.
                     const ENTRY_BASE: usize = 663552;
@@ -10142,15 +12574,12 @@ pub(crate) fn launch_kernel(
                             if base + 23000 > size {
                                 break;
                             }
-                            let cnt = std::ptr::read_volatile(
-                                (host + base + COUNT_REL) as *const u32,
-                            );
-                            let dstr = std::ptr::read_volatile(
-                                (host + base + DSTR_REL) as *const u32,
-                            );
-                            let crea = std::ptr::read_volatile(
-                                (host + base + CREA_REL) as *const u32,
-                            );
+                            let cnt =
+                                std::ptr::read_volatile((host + base + COUNT_REL) as *const u32);
+                            let dstr =
+                                std::ptr::read_volatile((host + base + DSTR_REL) as *const u32);
+                            let crea =
+                                std::ptr::read_volatile((host + base + CREA_REL) as *const u32);
                             if cnt != 0 || dstr != 0 || crea != 0 {
                                 any_nonzero = true;
                             }
@@ -10208,6 +12637,53 @@ pub(crate) fn launch_kernel(
         }
     }
 
+    // actorRange root-cause probe: track which buffer actorRange's param_4
+    // actually IS by comparing pointers with remapKernel's param_9 (sorted
+    // keys input, has bit-31 tags) and param_10 (remapped output, clean).
+    // Gated on ZLUDA_AR_PTR_TRACE=1.
+    {
+        static AR_PTR_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *AR_PTR_TRACE.get_or_init(|| {
+            std::env::var("ZLUDA_AR_PTR_TRACE").map_or(false, |v| v == "1")
+        }) {
+            static REMAP_P9: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static REMAP_P10: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+            if name.contains("IOFX_remapKernel") {
+                let p9: u64 = unsafe { read_kernel_arg(kernel_params, extra, 48, 9).unwrap_or(0) };
+                let p10: u64 = unsafe { read_kernel_arg(kernel_params, extra, 56, 10).unwrap_or(0) };
+                let prev9 = REMAP_P9.swap(p9, std::sync::atomic::Ordering::Relaxed);
+                let prev10 = REMAP_P10.swap(p10, std::sync::atomic::Ordering::Relaxed);
+                if p9 != prev9 || p10 != prev10 {
+                    super::driver::zluda_log_err(&format!(
+                        "[AR_PTR] remap '{}' p9(sorted_keys)=0x{:x} p10(output)=0x{:x}",
+                        name, p9, p10
+                    ));
+                }
+            }
+            if name == "IOFX_actorRangeKernel" {
+                let p4: u64 = unsafe { read_kernel_arg(kernel_params, extra, 24, 4).unwrap_or(0) };
+                let rp9 = REMAP_P9.load(std::sync::atomic::Ordering::Relaxed);
+                let rp10 = REMAP_P10.load(std::sync::atomic::Ordering::Relaxed);
+                let match_label = if p4 == rp9 {
+                    "== remap_p9 (SORTED KEYS — has bit-31!)"
+                } else if p4 == rp10 {
+                    "== remap_p10 (remap output — should be clean)"
+                } else {
+                    "NEITHER remap p9 nor p10"
+                };
+                static AR_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let seq = AR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if seq < 20 || seq % 500 == 0 {
+                    super::driver::zluda_log_err(&format!(
+                        "[AR_PTR] actorRange #{} p4=0x{:x} {} (rp9=0x{:x} rp10=0x{:x})",
+                        seq, p4, match_label, rp9, rp10
+                    ));
+                }
+            }
+        }
+    }
+
     // Plan v26 Phase B.3: IOFX_actorRangeKernel param_4 dump producer.
     // Pushes (param_4_ptr, call_n) onto IOFX_AR_DUMP_QUEUE so cuEventRecord /
     // cuEventSynchronize can drain it later. param_4 is the suspected wild
@@ -10221,8 +12697,7 @@ pub(crate) fn launch_kernel(
     //
     // Gated on ZLUDA_ACTORRANGE_DUMP=1, default OFF.
     if name.contains("IOFX_actorRange") {
-        static AR_DUMP_ENABLED: std::sync::OnceLock<bool> =
-            std::sync::OnceLock::new();
+        static AR_DUMP_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *AR_DUMP_ENABLED
             .get_or_init(|| std::env::var("ZLUDA_ACTORRANGE_DUMP").map_or(false, |v| v == "1"))
         {
@@ -10290,9 +12765,16 @@ pub(crate) fn launch_kernel(
                 let call_n = MS1_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 super::driver::zluda_log_err(&format!(
                     "MS1_ARGS #{} n={} p6_pool=0x{:x} p7=0x{:x} grid=[{},{},{}] block=[{},{},{}]",
-                    call_n, p4_n, p6_pool, p7,
-                    grid_dim_x, grid_dim_y, grid_dim_z,
-                    block_dim_x, block_dim_y, block_dim_z
+                    call_n,
+                    p4_n,
+                    p6_pool,
+                    p7,
+                    grid_dim_x,
+                    grid_dim_y,
+                    grid_dim_z,
+                    block_dim_x,
+                    block_dim_y,
+                    block_dim_z
                 ));
                 // v10 Step 1: probe the [+22176] pool allocation counter BEFORE
                 // MS_1 increments it. Should be 0 each frame if reset works.
@@ -10330,8 +12812,7 @@ pub(crate) fn launch_kernel(
                 let n_threads = grid_dim_x.saturating_mul(block_dim_x);
                 static INITCOLL_CALL_N: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
-                let call_n =
-                    INITCOLL_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let call_n = INITCOLL_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 super::driver::zluda_log_err(&format!(
                     "INITCOLL_ARGS #{} p3_flags=0x{:x} n_threads={} grid=[{},{},{}] block=[{},{},{}]",
                     call_n, p3_flags, n_threads,
@@ -10352,18 +12833,15 @@ pub(crate) fn launch_kernel(
         // param_1) + 40 = 56.
         if name == "ParticleCollisionStaticBox" {
             unsafe {
-                let flags_ptr: u64 =
-                    read_kernel_arg(kernel_params, extra, 56, 2).unwrap_or(0);
+                let flags_ptr: u64 = read_kernel_arg(kernel_params, extra, 56, 2).unwrap_or(0);
                 // param_6 (u32 at offset 16 + 64 = 80 + 8 = 88) is n_particles
                 // actually: param_4 u32 at 80, param_5 u64 at 88, param_6 u32 at 96.
                 // Let's read param_6 = u32 at offset 96 (post param_5 u64).
-                let n_particles: u32 =
-                    read_kernel_arg(kernel_params, extra, 96, 6).unwrap_or(0);
+                let n_particles: u32 = read_kernel_arg(kernel_params, extra, 96, 6).unwrap_or(0);
                 let n_threads_kernel = grid_dim_x.saturating_mul(block_dim_x);
                 static PCSB_CALL_N: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
-                let call_n =
-                    PCSB_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let call_n = PCSB_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 super::driver::zluda_log_err(&format!(
                     "PCSB_ARGS #{} flags=0x{:x} n_particles={} n_threads={} grid=[{},{},{}] block=[{},{},{}]",
                     call_n, flags_ptr, n_particles, n_threads_kernel,
@@ -10376,23 +12854,57 @@ pub(crate) fn launch_kernel(
                 snapshot_flag_bit4_at("PRE_PCSB", flags_ptr, probe_n);
             }
         }
-        if name.contains("CreateParticleShapesIncremental_MultiStage_2_Batched") {
-            unsafe {
-                // MS_2_Batched has only 3 params: 0..u64 (0), 1..u16 (8 pad to 16),
-                // 2..u64 (16) = per-CTA struct array. Reading higher indices
-                // walks past the kernel_params array and segfaults — DON'T.
-                // Just log the per-CTA struct ptr; shape_table is loaded from
-                // offset +72 within each 88-byte CTA struct.
-                let p2_ctas: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
-                static MS2B_CALL_N: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let call_n = MS2B_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                super::driver::zluda_log_err(&format!(
-                    "MS2B_ARGS #{} p2_ctas=0x{:x} grid=[{},{},{}] block=[{},{},{}]",
-                    call_n, p2_ctas,
-                    grid_dim_x, grid_dim_y, grid_dim_z,
-                    block_dim_x, block_dim_y, block_dim_z
-                ));
+    }
+
+    if name.contains("CreateParticleShapesIncremental_MultiStage_2_Batched") {
+        unsafe {
+            // MS_2_Batched has only 3 params: 0..u64 (0), 1..u16 (8 pad to 16),
+            // 2..u64 (16) = per-CTA struct array. Reading higher indices walks
+            // past the kernel_params array and segfaults — DON'T.
+            //
+            // This probe must stay OUTSIDE ZLUDA_SHAPE_PIPELINE_LOG gating:
+            // shape-pipeline logging is usually off in live runs, while
+            // ZLUDA_MS2_CAPTURE is intentionally independent.
+            let p2_ctas: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+            static MS2B_CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let call_n = MS2B_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::driver::zluda_log_err(&format!(
+                "MS2B_ARGS #{} p2_ctas=0x{:x} grid=[{},{},{}] block=[{},{},{}]",
+                call_n,
+                p2_ctas,
+                grid_dim_x,
+                grid_dim_y,
+                grid_dim_z,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z
+            ));
+            static MS2_CAPTURE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *MS2_CAPTURE_ENABLED
+                .get_or_init(|| std::env::var("ZLUDA_MS2_CAPTURE").map_or(false, |v| v == "1"))
+            {
+                const PTR_LO: u64 = 0x1000;
+                const PTR_HI: u64 = 0x0000_8000_0000_0000;
+                let total_ctas = grid_dim_x
+                    .saturating_mul(grid_dim_y)
+                    .saturating_mul(grid_dim_z);
+                let plausible = p2_ctas >= PTR_LO && p2_ctas < PTR_HI;
+                if plausible && total_ctas > 0 {
+                    let queue = MS2_BATCH_DUMP_QUEUE.get_or_init(|| {
+                        std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))
+                    });
+                    if let Ok(mut q) = queue.lock() {
+                        while q.len() >= 64 {
+                            q.pop_front();
+                        }
+                        q.push_back((p2_ctas, grid_dim_x, grid_dim_y, grid_dim_z, call_n));
+                    }
+                } else {
+                    super::driver::zluda_log_err(&format!(
+                        "[MS2_CAPTURE_PUSH #{}] p2_ctas=0x{:x} plausible={} total_ctas={} — skipping push",
+                        call_n, p2_ctas, plausible, total_ctas
+                    ));
+                }
             }
         }
     }
@@ -10424,22 +12936,25 @@ pub(crate) fn launch_kernel(
     // keep appearing in the same early-SIGSEGV window. Cheap (no GPU ops, no
     // sync). Captures into a 64-slot pinned ring dumped from the SIGABRT
     // handler to /tmp/tfs_captures.bin for post-mortem replay.
-    if let Some(tfs_kernel_id) = classify_tfs_kernel(&name) {
+    let tfs_atomic_to_tex_slot = if let Some(tfs_kernel_id) = classify_tfs_kernel(&name) {
         unsafe {
             capture_tfs_launch(
                 &name,
                 tfs_kernel_id,
                 kernel_params,
                 extra,
+                stream,
                 grid_dim_x,
                 grid_dim_y,
                 grid_dim_z,
                 block_dim_x,
                 block_dim_y,
                 block_dim_z,
-            );
+            )
         }
-    }
+    } else {
+        None
+    };
     let iofx_actor_range_slot = if name == "IOFX_actorRangeKernel" {
         unsafe {
             capture_iofx_actor_range_inputs(
@@ -10471,6 +12986,7 @@ pub(crate) fn launch_kernel(
         unsafe {
             capture_cub_downsweep_inputs(
                 extra,
+                global_launch_n.unwrap_or(0),
                 grid_dim_x,
                 grid_dim_y,
                 grid_dim_z,
@@ -10488,6 +13004,7 @@ pub(crate) fn launch_kernel(
             capture_cub_scan_inputs(
                 kernel_params,
                 extra,
+                global_launch_n.unwrap_or(0),
                 grid_dim_x,
                 grid_dim_y,
                 grid_dim_z,
@@ -10778,10 +13295,8 @@ pub(crate) fn launch_kernel(
         unsafe {
             let _ = hip_runtime_sys::hipDeviceSynchronize();
         }
-        static REFRESH_SEQ: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let refresh_seq =
-            REFRESH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        static REFRESH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let refresh_seq = REFRESH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         super::memory::mapped_write_refresh_pre(refresh_seq);
     }
 
@@ -10796,9 +13311,9 @@ pub(crate) fn launch_kernel(
     // Costs one stream sync per MS_4 launch (hundreds per second at peak).
     if name == "CreateParticleShapesIncremental_MultiStage_4" {
         static MS4_HARD_SYNC_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *MS4_HARD_SYNC_ENABLED.get_or_init(|| {
-            std::env::var("ZLUDA_MS4_HARD_SYNC").map_or(false, |v| v == "1")
-        }) {
+        if *MS4_HARD_SYNC_ENABLED
+            .get_or_init(|| std::env::var("ZLUDA_MS4_HARD_SYNC").map_or(false, |v| v == "1"))
+        {
             unsafe {
                 let _ = hip_runtime_sys::hipStreamSynchronize(stream);
             }
@@ -10876,8 +13391,10 @@ pub(crate) fn launch_kernel(
     // cuStreamQuery(NULL) stops returning the startup-mask NotReady and
     // starts passing through real hipStreamQuery results.
     if result.is_ok() {
-        super::stream::FIRST_REAL_LAUNCH_SEEN
-            .store(true, std::sync::atomic::Ordering::Release);
+        super::stream::FIRST_REAL_LAUNCH_SEEN.store(true, std::sync::atomic::Ordering::Release);
+        if !stream.0.is_null() {
+            super::stream::mark_non_default_stream_dirty();
+        }
     }
     // Translate HIP error 719 (LaunchFailure) → LaunchOutOfResources.
     // On NVIDIA, launching with too many threads returns CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES (701),
@@ -10890,6 +13407,11 @@ pub(crate) fn launch_kernel(
     if let Some(slot_index) = iofx_actor_range_slot.filter(|_| result.is_ok()) {
         unsafe {
             capture_iofx_actor_range_post(slot_index, stream);
+        }
+    }
+    if let Some(slot_index) = tfs_atomic_to_tex_slot.filter(|_| result.is_ok()) {
+        unsafe {
+            capture_tfs_atomic_to_tex_post(slot_index, stream);
         }
     }
     if let Some(slot_index) = iofx_bbox_slot.filter(|_| result.is_ok()) {
@@ -11068,10 +13590,7 @@ pub(crate) fn launch_kernel(
     // after 38 launches). Specific capture intercepts (actor_range, bbox,
     // downsweep, etc.) already record structured pointer ranges through
     // their own per-kernel paths.
-    if !name.is_empty() {
-        static LAUNCH_COUNTER: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let n = LAUNCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(n) = global_launch_n {
         super::driver::record_kernel_launch(n, &name, &[], None);
     }
     // Log launch failures with full context for diagnosis
@@ -11168,6 +13687,9 @@ pub(crate) fn launch_kernel(
             // F.6: also snapshot *(rd5+22176) per tracked rd5 to find which
             // operation normally resets it (and which fails to on bug frames).
             check_rd5_22176_mutation(&name);
+            // Track mutations of the watched MS2 rd6[*12+8] source word and
+            // attribute changes to the current kernel launch.
+            check_ms2_rd6_mutation(&name, global_launch_n);
             // Plan step 4: snapshot the latched MS_4 counter buffer and
             // log if any kernel mutates it. Independent of MS4_CAPTURE /
             // F.6 gates — uses ZLUDA_COUNTER_SNAPSHOT=1.
@@ -11180,18 +13702,15 @@ pub(crate) fn launch_kernel(
             // each MS_4 n_threads slot at {host+663552, +663640, +663728}.
             static MAPPED_WRITE_SEQ: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
-            let seq = MAPPED_WRITE_SEQ
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let seq = MAPPED_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             super::memory::mapped_write_diff_post(seq, &name);
             // v8 Step 2: POST_PCSB flag probe — after ParticleCollisionStaticBox
             // returns, count bit 4 (0x10) distribution. NOTE: PCSB writes to a
             // DIFFERENT buffer than MS_4's flags (verified run #19), so this
             // probe is informational; bit-4 changes here don't affect MS_4.
             if name == "ParticleCollisionStaticBox" {
-                let flags_ptr: u64 =
-                    read_kernel_arg(kernel_params, extra, 56, 2).unwrap_or(0);
-                let n_particles: u32 =
-                    read_kernel_arg(kernel_params, extra, 96, 6).unwrap_or(0);
+                let flags_ptr: u64 = read_kernel_arg(kernel_params, extra, 56, 2).unwrap_or(0);
+                let n_particles: u32 = read_kernel_arg(kernel_params, extra, 96, 6).unwrap_or(0);
                 let probe_n = n_particles.min(256);
                 snapshot_flag_bit4_at("POST_PCSB", flags_ptr, probe_n);
             }
@@ -11200,10 +13719,8 @@ pub(crate) fn launch_kernel(
             // at module_10:1001 has the bit-4-set site we suspect fails on
             // ZLUDA. If bit-4-set stays ~0% after MS_1, this site is the bug.
             if name.contains("CreateParticleShapesIncremental_MultiStage_1") {
-                let flags_ptr =
-                    MS4_FLAGS_PTR_LATCHED.load(std::sync::atomic::Ordering::Acquire);
-                let n =
-                    MS4_N_LATCHED.load(std::sync::atomic::Ordering::Acquire);
+                let flags_ptr = MS4_FLAGS_PTR_LATCHED.load(std::sync::atomic::Ordering::Acquire);
+                let n = MS4_N_LATCHED.load(std::sync::atomic::Ordering::Acquire);
                 if flags_ptr != 0 && n != 0 {
                     let probe_n = n.min(1024);
                     snapshot_flag_bit4_at("POST_MS1", flags_ptr, probe_n);
@@ -11840,6 +14357,90 @@ unsafe fn read_kernel_arg<T: Copy>(
     }
 }
 
+fn ms4_pointer_validation_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_MS4_PTR_VALIDATE").map_or(false, |v| v == "1"))
+}
+
+unsafe fn query_device_pointer_range(ptr: u64) -> Option<(u64, usize, usize)> {
+    if ptr == 0 {
+        return None;
+    }
+    let mut base = hip_runtime_sys::hipDeviceptr_t(std::ptr::null_mut());
+    let mut size = 0usize;
+    let status = super::memory::get_address_range_v2(
+        &mut base,
+        &mut size,
+        hip_runtime_sys::hipDeviceptr_t(ptr as *mut std::ffi::c_void),
+    );
+    if status.is_err() {
+        return None;
+    }
+    let base_u = base.0 as usize;
+    let ptr_u = ptr as usize;
+    if ptr_u < base_u {
+        return None;
+    }
+    Some((base.0 as u64, size, ptr_u - base_u))
+}
+
+unsafe fn validate_ms4_pointer_ranges(
+    call_n: u32,
+    n: u32,
+    p2: u64,
+    p4: u64,
+    p5: u64,
+    p6: u64,
+    p7: u64,
+) {
+    let required_linear_bytes = (n as usize).saturating_mul(4);
+    let mut problems: Vec<String> = Vec::new();
+    let mut details: Vec<String> = Vec::new();
+    for &(label, ptr, min_size) in &[
+        ("p2(flags)", p2, required_linear_bytes),
+        ("p6(shape_idx)", p6, required_linear_bytes),
+        ("p5(scatter)", p5, required_linear_bytes),
+        ("p4(struct)", p4, 12usize),
+        ("p7(counter)", p7, 4usize),
+    ] {
+        match query_device_pointer_range(ptr) {
+            Some((base, size, offset)) => {
+                let available = size.saturating_sub(offset);
+                if min_size > 0 && available < min_size {
+                    problems.push(format!(
+                        "{}: available={} < need={} (base=0x{:x} size={} off={})",
+                        label, available, min_size, base, size, offset
+                    ));
+                } else {
+                    details.push(format!(
+                        "{}=ok(base=0x{:x} size={} off={} avail={})",
+                        label, base, size, offset, available
+                    ));
+                }
+            }
+            None => {
+                problems.push(format!("{}: unresolved ptr=0x{:x}", label, ptr));
+            }
+        }
+    }
+    if problems.is_empty() {
+        super::driver::zluda_log_err(&format!(
+            "[MS4_PTR_VALIDATE #{}] n={} {}",
+            call_n,
+            n,
+            details.join(" ")
+        ));
+    } else {
+        super::driver::zluda_log_err(&format!(
+            "*** [MS4_PTR_VALIDATE #{}] n={} problems=[{}] {}",
+            call_n,
+            n,
+            problems.join(" | "),
+            details.join(" ")
+        ));
+    }
+}
+
 /// Dispatcher: validate inputs for known crash-prone kernels before launching them.
 /// Active when either `ZLUDA_SYNC_LAUNCHES=1` or `ZLUDA_LAUNCH_MUTEX=2` — both
 /// imply the caller wants full per-launch serialization + diagnostics.
@@ -12239,6 +14840,36 @@ mod tests {
             };
             *g = snapshot;
         }
+    }
+
+    #[test]
+    fn mcb_descriptor_hits_rd5_reset_window_matches_only_overlaps() {
+        let rd5_a = 0x1000u64;
+        let rd5_b = 0x4000u64;
+        let tracked = [rd5_a, rd5_b];
+        let watch_a = rd5_a + F6_OFFSET_IN_RD5 as u64;
+        let watch_b = rd5_b + F6_OFFSET_IN_RD5 as u64;
+
+        assert_eq!(
+            mcb_descriptor_hits_rd5_reset_window(watch_a, 4, &tracked),
+            Some(rd5_a)
+        );
+        assert_eq!(
+            mcb_descriptor_hits_rd5_reset_window(watch_a.saturating_sub(2), 8, &tracked),
+            Some(rd5_a)
+        );
+        assert_eq!(
+            mcb_descriptor_hits_rd5_reset_window(watch_b.saturating_add(1), 2, &tracked),
+            Some(rd5_b)
+        );
+        assert_eq!(
+            mcb_descriptor_hits_rd5_reset_window(watch_a.saturating_add(4), 4, &tracked),
+            None
+        );
+        assert_eq!(
+            mcb_descriptor_hits_rd5_reset_window(watch_b.saturating_sub(8), 4, &tracked),
+            None
+        );
     }
 
     #[test]
@@ -13405,6 +16036,18 @@ mod tests {
             Some(TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED)
         );
         assert_eq!(
+            classify_tfs_kernel("CreateParticleShapesIncremental_MultiStage_2"),
+            Some(TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2)
+        );
+        assert_eq!(
+            classify_tfs_kernel("CreateParticleShapesIncremental_MultiStage_3"),
+            Some(TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS3)
+        );
+        assert_eq!(
+            classify_tfs_kernel("CreateParticleShapesIncremental_MultiStage_4"),
+            Some(TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS4)
+        );
+        assert_eq!(
             classify_tfs_kernel("InitCollDataAndApplyConstraints"),
             Some(TFS_KERNEL_ID_INIT_COLL_DATA_AND_APPLY_CONSTRAINTS)
         );
@@ -13797,7 +16440,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, kernel_kind), 24);
         assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, kernel_name), 72);
         assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, ptr_params), 136);
-        assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, ptr_buffer_bytes), 200);
+        assert_eq!(
+            std::mem::offset_of!(IofxChainCaptureSlot, ptr_buffer_bytes),
+            200
+        );
         assert_eq!(std::mem::offset_of!(IofxChainCaptureSlot, raw_args), 208);
         assert_eq!(
             std::mem::offset_of!(IofxChainCaptureSlot, pre_ptr_buffers),
@@ -13833,6 +16479,15 @@ mod tests {
         assert!(should_skip_tfs_raw_arg_dump(
             "CreateParticleShapesIncremental_MultiStage_2_Batched"
         ));
+        assert!(!should_skip_tfs_raw_arg_dump(
+            "CreateParticleShapesIncremental_MultiStage_2"
+        ));
+        assert!(should_skip_tfs_raw_arg_dump(
+            "CreateParticleShapesIncremental_MultiStage_3"
+        ));
+        assert!(should_skip_tfs_raw_arg_dump(
+            "CreateParticleShapesIncremental_MultiStage_4"
+        ));
         assert!(should_skip_tfs_raw_arg_dump(
             "InitCollDataAndApplyConstraints"
         ));
@@ -13841,6 +16496,795 @@ mod tests {
         assert!(!should_skip_tfs_raw_arg_dump(
             "TurbulenceFS_dynamicGridClearKernel"
         ));
+    }
+
+    #[test]
+    fn tfs_ms4_args_capture_v1_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMs4ArgsCaptureV1>(), 56);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV1, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV1, version), 4);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV1, n), 8);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV1, p2), 16);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV1, p4), 24);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV1, p5), 32);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV1, p6), 40);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV1, p7), 48);
+    }
+
+    #[test]
+    fn tfs_ms4_args_capture_v2_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMs4ArgsCaptureV2>(), 488);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, version), 4);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, n), 8);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p2), 16);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p4), 24);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p5), 32);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p6), 40);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p7), 48);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p2_words), 56);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p4_words), 60);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p6_words), 64);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p7_words), 68);
+        assert_eq!(std::mem::offset_of!(TfsMs4ArgsCaptureV2, p2_words_data), 72);
+        assert_eq!(
+            std::mem::offset_of!(TfsMs4ArgsCaptureV2, p4_words_data),
+            200
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs4ArgsCaptureV2, p6_words_data),
+            232
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs4ArgsCaptureV2, p7_words_data),
+            360
+        );
+    }
+
+    #[test]
+    fn dump_tfs_ms4_args_v2_encodes_header_with_bounded_snapshot_counts() {
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let mut kernel_params = [std::ptr::null_mut::<::core::ffi::c_void>(); 8];
+        let p2: u64 = 0;
+        let n: u32 = 1234;
+        let p4: u64 = 0;
+        let p5: u64 = 0x7f00_3333_0000;
+        let p6: u64 = 0;
+        let p7: u64 = 0;
+        kernel_params[2] = (&p2 as *const u64).cast_mut().cast();
+        kernel_params[3] = (&n as *const u32).cast_mut().cast();
+        kernel_params[4] = (&p4 as *const u64).cast_mut().cast();
+        kernel_params[5] = (&p5 as *const u64).cast_mut().cast();
+        kernel_params[6] = (&p6 as *const u64).cast_mut().cast();
+        kernel_params[7] = (&p7 as *const u64).cast_mut().cast();
+
+        let written = unsafe {
+            dump_tfs_ms4_args_v2(
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsMs4ArgsCaptureV2>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsMs4ArgsCaptureV2) };
+        assert_eq!(encoded.magic, TFS_MS4_ARGS_CAPTURE_MAGIC);
+        assert_eq!(encoded.version, TFS_MS4_ARGS_CAPTURE_VERSION_V2);
+        assert_eq!(encoded.n, n);
+        assert_eq!(encoded.p2, p2);
+        assert_eq!(encoded.p4, p4);
+        assert_eq!(encoded.p5, p5);
+        assert_eq!(encoded.p6, p6);
+        assert_eq!(encoded.p7, p7);
+        assert_eq!(encoded.p2_words, 0);
+        assert_eq!(encoded.p4_words, 0);
+        assert_eq!(encoded.p6_words, 0);
+        assert_eq!(encoded.p7_words, 0);
+    }
+
+    #[test]
+    fn tfs_ms2b_args_capture_v1_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMs2BatchedArgsCaptureV1>(), 16);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV1, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV1, version), 4);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV1, p2), 8);
+    }
+
+    #[test]
+    fn tfs_ms2b_args_capture_v2_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMs2BatchedArgsCaptureV2>(), 296);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV2, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV2, version), 4);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV2, p2), 8);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV2, grid_x), 16);
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV2, block_x),
+            20
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV2, packet_sample_bytes),
+            24
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV2, packet_sample),
+            32
+        );
+    }
+
+    #[test]
+    fn tfs_ms2b_args_capture_v3_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMs2BatchedArgsCaptureV3>(), 408);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, version), 4);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, p2), 8);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, grid_x), 16);
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, block_x),
+            20
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, packet_sample_bytes),
+            24
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, packet_sample),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, rd5_words),
+            296
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, rd5_words_data),
+            312
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, rd6_words_data),
+            344
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV3, rd7_words_data),
+            376
+        );
+    }
+
+    #[test]
+    fn tfs_ms2b_args_capture_v4_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMs2BatchedArgsCaptureV4>(), 480);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, version), 4);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, p2), 8);
+        assert_eq!(std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, grid_x), 16);
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, block_x),
+            20
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, packet_sample_bytes),
+            24
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, packet_sample),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, rd5_words),
+            296
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, rd5_words_data),
+            312
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, rd6_words_data),
+            344
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, rd7_words_data),
+            376
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, requested_entry),
+            408
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, effective_entry),
+            412
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, slot_probe_words),
+            416
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, slot_probe_slots),
+            432
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, slot_probe_rd5_p4),
+            448
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsMs2BatchedArgsCaptureV4, slot_probe_r38),
+            464
+        );
+    }
+
+    #[test]
+    fn tfs_ms3_args_capture_v1_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMs3ArgsCaptureV1>(), 24);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV1, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV1, version), 4);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV1, p2), 8);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV1, p3), 16);
+    }
+
+    #[test]
+    fn tfs_ms3_args_capture_v2_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMs3ArgsCaptureV2>(), 96);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV2, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV2, version), 4);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV2, p2), 8);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV2, p3), 16);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV2, p2_words), 24);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV2, p3_words), 28);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV2, p2_words_data), 32);
+        assert_eq!(std::mem::offset_of!(TfsMs3ArgsCaptureV2, p3_words_data), 64);
+    }
+
+    #[test]
+    fn dump_tfs_ms2_batched_args_encodes_expected_fixed_fields() {
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let mut kernel_params = [std::ptr::null_mut::<::core::ffi::c_void>(); 3];
+        let p2: u64 = 0x7f00_1111_0000;
+        kernel_params[2] = (&p2 as *const u64).cast_mut().cast();
+
+        let written = unsafe {
+            dump_tfs_ms2_batched_args(
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsMs2BatchedArgsCaptureV1>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsMs2BatchedArgsCaptureV1) };
+        assert_eq!(
+            encoded,
+            TfsMs2BatchedArgsCaptureV1 {
+                magic: TFS_MS2B_ARGS_CAPTURE_MAGIC,
+                version: TFS_MS2B_ARGS_CAPTURE_VERSION,
+                p2,
+            }
+        );
+    }
+
+    #[test]
+    fn dump_tfs_ms2_batched_args_v2_encodes_header_and_zero_sample_when_unmapped() {
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let mut kernel_params = [std::ptr::null_mut::<::core::ffi::c_void>(); 3];
+        let p2: u64 = 0;
+        kernel_params[2] = (&p2 as *const u64).cast_mut().cast();
+
+        let written = unsafe {
+            dump_tfs_ms2_batched_args_v2(
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                3,
+                256,
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsMs2BatchedArgsCaptureV2>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsMs2BatchedArgsCaptureV2) };
+        assert_eq!(encoded.magic, TFS_MS2B_ARGS_CAPTURE_MAGIC);
+        assert_eq!(encoded.version, TFS_MS2B_ARGS_CAPTURE_VERSION_V2);
+        assert_eq!(encoded.p2, p2);
+        assert_eq!(encoded.grid_x, 3);
+        assert_eq!(encoded.block_x, 256);
+        assert_eq!(encoded.packet_sample_bytes, 0);
+    }
+
+    #[test]
+    fn dump_tfs_ms2_batched_args_v3_encodes_header_and_zero_samples_when_unmapped() {
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let mut kernel_params = [std::ptr::null_mut::<::core::ffi::c_void>(); 3];
+        let p2: u64 = 0;
+        kernel_params[2] = (&p2 as *const u64).cast_mut().cast();
+
+        let written = unsafe {
+            dump_tfs_ms2_batched_args_v3(
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                123,
+                3,
+                256,
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsMs2BatchedArgsCaptureV3>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsMs2BatchedArgsCaptureV3) };
+        assert_eq!(encoded.magic, TFS_MS2B_ARGS_CAPTURE_MAGIC);
+        assert_eq!(encoded.version, TFS_MS2B_ARGS_CAPTURE_VERSION_V3);
+        assert_eq!(encoded.p2, p2);
+        assert_eq!(encoded.grid_x, 3);
+        assert_eq!(encoded.block_x, 256);
+        assert_eq!(encoded.packet_sample_bytes, 0);
+        assert_eq!(encoded.rd5_words, 0);
+        assert_eq!(encoded.rd6_words, 0);
+        assert_eq!(encoded.rd7_words, 0);
+    }
+
+    #[test]
+    fn dump_tfs_ms2_batched_args_v4_encodes_header_and_zero_samples_when_unmapped() {
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let mut kernel_params = [std::ptr::null_mut::<::core::ffi::c_void>(); 3];
+        let p2: u64 = 0;
+        kernel_params[2] = (&p2 as *const u64).cast_mut().cast();
+
+        let written = unsafe {
+            dump_tfs_ms2_batched_args_v4(
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                123,
+                3,
+                256,
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsMs2BatchedArgsCaptureV4>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsMs2BatchedArgsCaptureV4) };
+        assert_eq!(encoded.magic, TFS_MS2B_ARGS_CAPTURE_MAGIC);
+        assert_eq!(encoded.version, TFS_MS2B_ARGS_CAPTURE_VERSION_V4);
+        assert_eq!(encoded.p2, p2);
+        assert_eq!(encoded.grid_x, 3);
+        assert_eq!(encoded.block_x, 256);
+        assert_eq!(encoded.packet_sample_bytes, 0);
+        assert_eq!(encoded.rd5_words, 0);
+        assert_eq!(encoded.rd6_words, 0);
+        assert_eq!(encoded.rd7_words, 0);
+        assert_eq!(encoded.requested_entry, 0);
+        assert_eq!(encoded.effective_entry, 0);
+        assert_eq!(encoded.slot_probe_words, 0);
+        assert_eq!(encoded.slot_probe_rd5_mask, 0);
+        assert_eq!(encoded.slot_probe_r38_mask, 0);
+    }
+
+    #[test]
+    fn parse_tfs_mut_p47_entry_index_clamps_and_defaults() {
+        assert_eq!(parse_tfs_mut_p47_entry_index(None), 0);
+        assert_eq!(parse_tfs_mut_p47_entry_index(Some(String::from("bad"))), 0);
+        assert_eq!(parse_tfs_mut_p47_entry_index(Some(String::from("2"))), 2);
+        assert_eq!(parse_tfs_mut_p47_entry_index(Some(String::from("99"))), 2);
+    }
+
+    #[test]
+    fn tfs_ms2b_entry_ptr_reads_requested_packet_entry() {
+        let mut packet = [0u8; TFS_MS2B_PACKET_SAMPLE_BYTES];
+        let e0 = 0x1111_2222_3333_4444u64;
+        let e1 = 0x5555_6666_7777_8888u64;
+        let e2 = 0x9999_aaaa_bbbb_ccccu64;
+        packet[32..40].copy_from_slice(&e0.to_le_bytes());
+        packet[TFS_MS2B_PACKET_ENTRY_BYTES + 32..TFS_MS2B_PACKET_ENTRY_BYTES + 40]
+            .copy_from_slice(&e1.to_le_bytes());
+        packet[TFS_MS2B_PACKET_ENTRY_BYTES * 2 + 32..TFS_MS2B_PACKET_ENTRY_BYTES * 2 + 40]
+            .copy_from_slice(&e2.to_le_bytes());
+
+        assert_eq!(
+            unsafe { tfs_ms2b_entry_ptr((TFS_MS2B_PACKET_ENTRY_BYTES * 3) as u32, &packet, 0, 32) },
+            e0
+        );
+        assert_eq!(
+            unsafe { tfs_ms2b_entry_ptr((TFS_MS2B_PACKET_ENTRY_BYTES * 3) as u32, &packet, 1, 32) },
+            e1
+        );
+        assert_eq!(
+            unsafe { tfs_ms2b_entry_ptr((TFS_MS2B_PACKET_ENTRY_BYTES * 3) as u32, &packet, 2, 32) },
+            e2
+        );
+        assert_eq!(
+            unsafe { tfs_ms2b_entry_ptr((TFS_MS2B_PACKET_ENTRY_BYTES * 2) as u32, &packet, 2, 32) },
+            0
+        );
+    }
+
+    #[test]
+    fn dump_tfs_ms3_args_encodes_expected_fixed_fields() {
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let mut kernel_params = [std::ptr::null_mut::<::core::ffi::c_void>(); 4];
+        let p2: u64 = 0x7f00_2222_0000;
+        let p3: u64 = 0x7f00_3333_0000;
+        kernel_params[2] = (&p2 as *const u64).cast_mut().cast();
+        kernel_params[3] = (&p3 as *const u64).cast_mut().cast();
+
+        let written = unsafe {
+            dump_tfs_ms3_args(
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsMs3ArgsCaptureV1>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsMs3ArgsCaptureV1) };
+        assert_eq!(
+            encoded,
+            TfsMs3ArgsCaptureV1 {
+                magic: TFS_MS3_ARGS_CAPTURE_MAGIC,
+                version: TFS_MS3_ARGS_CAPTURE_VERSION,
+                p2,
+                p3,
+            }
+        );
+    }
+
+    #[test]
+    fn dump_tfs_ms3_args_v2_encodes_header_and_zero_samples_when_unmapped() {
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let mut kernel_params = [std::ptr::null_mut::<::core::ffi::c_void>(); 4];
+        let p2: u64 = 0;
+        let p3: u64 = 0;
+        kernel_params[2] = (&p2 as *const u64).cast_mut().cast();
+        kernel_params[3] = (&p3 as *const u64).cast_mut().cast();
+
+        let written = unsafe {
+            dump_tfs_ms3_args_v2(
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsMs3ArgsCaptureV2>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsMs3ArgsCaptureV2) };
+        assert_eq!(encoded.magic, TFS_MS3_ARGS_CAPTURE_MAGIC);
+        assert_eq!(encoded.version, TFS_MS3_ARGS_CAPTURE_VERSION_V2);
+        assert_eq!(encoded.p2, p2);
+        assert_eq!(encoded.p3, p3);
+        assert_eq!(encoded.p2_words, 0);
+        assert_eq!(encoded.p3_words, 0);
+    }
+
+    #[test]
+    fn tfs_mut_p47_capture_v1_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMutP47CaptureV1>(), 104);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV1, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV1, version), 4);
+        assert_eq!(
+            std::mem::offset_of!(TfsMutP47CaptureV1, source_ms2_launch_n),
+            8
+        );
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV1, rd5), 16);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV1, rd7), 24);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV1, rd5_words), 32);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV1, rd7_words), 36);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV1, rd5_words_data), 40);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV1, rd7_words_data), 72);
+    }
+
+    #[test]
+    fn tfs_mut_p47_capture_v2_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMutP47CaptureV2>(), 176);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, version), 4);
+        assert_eq!(
+            std::mem::offset_of!(TfsMutP47CaptureV2, source_ms2_launch_n),
+            8
+        );
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, rd5), 16);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, rd7), 24);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, rd5_words), 32);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, rd7_words), 36);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, rd5_words_data), 40);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, rd7_words_data), 72);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, arg_words), 104);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV2, arg_mode), 108);
+        assert_eq!(
+            std::mem::offset_of!(TfsMutP47CaptureV2, arg_words_data),
+            112
+        );
+    }
+
+    #[test]
+    fn tfs_mut_p47_capture_v4_layout_is_stable() {
+        // V4 reuses V3's _pad0 slot at offset 60 for the rd5_off_22176 probe;
+        // size therefore matches V3 (224 bytes) so the dump path swap is a
+        // no-op for ring-slot accounting.
+        assert_eq!(std::mem::size_of::<TfsMutP47CaptureV4>(), 224);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, version), 4);
+        assert_eq!(
+            std::mem::offset_of!(TfsMutP47CaptureV4, source_ms2_launch_n),
+            8
+        );
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, rd5), 16);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, rd6), 24);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, rd7), 32);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, rd5_words), 40);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, rd6_words), 44);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, rd7_words), 48);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, arg_words), 52);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, arg_mode), 56);
+        assert_eq!(
+            std::mem::offset_of!(TfsMutP47CaptureV4, rd5_off_22176),
+            60
+        );
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, rd5_words_data), 64);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, rd6_words_data), 96);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV4, rd7_words_data), 128);
+        assert_eq!(
+            std::mem::offset_of!(TfsMutP47CaptureV4, arg_words_data),
+            160
+        );
+    }
+
+    #[test]
+    fn tfs_mut_p47_capture_v3_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsMutP47CaptureV3>(), 224);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, version), 4);
+        assert_eq!(
+            std::mem::offset_of!(TfsMutP47CaptureV3, source_ms2_launch_n),
+            8
+        );
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, rd5), 16);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, rd6), 24);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, rd7), 32);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, rd5_words), 40);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, rd6_words), 44);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, rd7_words), 48);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, arg_words), 52);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, arg_mode), 56);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, rd5_words_data), 64);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, rd6_words_data), 96);
+        assert_eq!(std::mem::offset_of!(TfsMutP47CaptureV3, rd7_words_data), 128);
+        assert_eq!(
+            std::mem::offset_of!(TfsMutP47CaptureV3, arg_words_data),
+            160
+        );
+    }
+
+    #[test]
+    fn tfs_atomic_to_tex_capture_v1_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<TfsAtomicToTexCaptureV1>(), 368);
+        assert_eq!(std::mem::offset_of!(TfsAtomicToTexCaptureV1, magic), 0);
+        assert_eq!(std::mem::offset_of!(TfsAtomicToTexCaptureV1, version), 4);
+        assert_eq!(
+            std::mem::offset_of!(TfsAtomicToTexCaptureV1, source_ms2_launch_n),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsAtomicToTexCaptureV1, source_ptr),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsAtomicToTexCaptureV1, surface_handle),
+            40
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsAtomicToTexCaptureV1, output_base),
+            56
+        );
+        assert_eq!(std::mem::offset_of!(TfsAtomicToTexCaptureV1, dim_x), 64);
+        assert_eq!(std::mem::offset_of!(TfsAtomicToTexCaptureV1, rd5_words), 80);
+        assert_eq!(std::mem::offset_of!(TfsAtomicToTexCaptureV1, arg_words), 88);
+        assert_eq!(
+            std::mem::offset_of!(TfsAtomicToTexCaptureV1, rd5_words_data),
+            112
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsAtomicToTexCaptureV1, arg_words_data),
+            176
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsAtomicToTexCaptureV1, surface_desc_words_data),
+            240
+        );
+        assert_eq!(
+            std::mem::offset_of!(TfsAtomicToTexCaptureV1, output_post_words_data),
+            336
+        );
+    }
+
+    #[test]
+    fn tfs_atomic_to_tex_surface_desc_base_combines_descriptor_words() {
+        assert_eq!(
+            tfs_atomic_to_tex_surface_desc_base(&[0x1122_3344, 0x5566_7788, 0, 0, 0, 0, 0, 0]),
+            0x0077_8811_2233_4400
+        );
+    }
+
+    #[test]
+    fn dump_tfs_atomic_to_tex_capture_encodes_header_and_zero_samples_when_unmapped() {
+        tfs_mut_p47_track(0x1111, 0xbeef, 0x2222, 333);
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let mut flat = [0u8; 488];
+        flat[24 + 28..24 + 32].copy_from_slice(&64u32.to_le_bytes());
+        flat[24 + 32..24 + 36].copy_from_slice(&48u32.to_le_bytes());
+        flat[24 + 36..24 + 40].copy_from_slice(&8u32.to_le_bytes());
+        flat[480..488].copy_from_slice(&0u64.to_le_bytes());
+        let flat_size = flat.len();
+        let mut extra = [
+            0x1usize as *mut ::core::ffi::c_void,
+            flat.as_mut_ptr().cast(),
+            0x2usize as *mut ::core::ffi::c_void,
+            (&flat_size as *const usize).cast_mut().cast(),
+            std::ptr::null_mut(),
+        ];
+
+        let written = unsafe {
+            dump_tfs_atomic_to_tex_capture(
+                std::ptr::null_mut(),
+                extra.as_mut_ptr(),
+                std::ptr::null_mut(),
+                hipStream_t(std::ptr::null_mut()),
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsAtomicToTexCaptureV1>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsAtomicToTexCaptureV1) };
+        assert_eq!(encoded.magic, TFS_ATOMIC_TO_TEX_CAPTURE_MAGIC);
+        assert_eq!(encoded.version, TFS_ATOMIC_TO_TEX_CAPTURE_VERSION);
+        assert_eq!(encoded.source_ms2_launch_n, 333);
+        assert_eq!(encoded.rd5, 0x1111);
+        assert_eq!(encoded.rd7, 0x2222);
+        assert_eq!(encoded.dim_x, 64);
+        assert_eq!(encoded.dim_y, 48);
+        assert_eq!(encoded.dim_z, 8);
+        assert_eq!(encoded.source_ptr, 0);
+        assert_eq!(encoded.surface_handle, 0);
+        assert_eq!(encoded.surface_desc_ptr, 0);
+        assert_eq!(encoded.output_base, 0);
+        assert_eq!(encoded.rd5_words, 0);
+        assert_eq!(encoded.rd7_words, 0);
+        assert_eq!(encoded.source_words, 0);
+        assert_eq!(encoded.output_pre_words, 0);
+        assert_eq!(encoded.output_post_words, 0);
+        assert_eq!(encoded.arg_mode, 1);
+        assert_eq!(encoded.arg_words, 16);
+        assert!(encoded.arg_words_data.contains(&64));
+        assert!(encoded.arg_words_data.contains(&48));
+        assert!(encoded.arg_words_data.contains(&8));
+    }
+
+    #[test]
+    fn dump_tfs_mut_p47_capture_encodes_zero_when_untracked() {
+        tfs_mut_p47_track(0, 0, 0, 0);
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let written = unsafe {
+            dump_tfs_mut_p47_capture(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsMutP47CaptureV4>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsMutP47CaptureV4) };
+        assert_eq!(encoded.magic, TFS_MUT_P47_CAPTURE_MAGIC);
+        assert_eq!(encoded.version, TFS_MUT_P47_CAPTURE_VERSION);
+        assert_eq!(encoded.source_ms2_launch_n, 0);
+        assert_eq!(encoded.rd5, 0);
+        assert_eq!(encoded.rd6, 0);
+        assert_eq!(encoded.rd7, 0);
+        assert_eq!(encoded.rd5_words, 0);
+        assert_eq!(encoded.rd6_words, 0);
+        assert_eq!(encoded.rd7_words, 0);
+        assert_eq!(encoded.arg_words, 0);
+        assert_eq!(encoded.arg_mode, 0);
+        assert_eq!(encoded.rd5_off_22176, 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn ms1_rd5_reset_pending_drains_dedup_and_skipped_when_disabled() {
+        // Without env enabled, mark is a no-op.
+        // (We can't easily set env here without affecting other tests, so
+        //  we just exercise the take_* path on the static; rely on
+        //  the env-gated branch in ms1_rd5_reset_enabled being false
+        //  in test mode unless ZLUDA_MS1_RD5_RESET=1 is set externally.)
+        // Drain leftover state first.
+        let _ = take_pending_rd5_resets();
+        // mark_rd5_reset_pending checks the env gate via OnceLock; in
+        // a default test environment the gate is false so the mark is
+        // a no-op and the drain returns empty. This guards against
+        // accidental cross-test interference.
+        mark_rd5_reset_pending(0xdeadbeef);
+        let drained = take_pending_rd5_resets();
+        assert_eq!(drained, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn ms2_rd6_watch_tracks_latest_launch_for_pointer() {
+        let watch =
+            MS2_RD6_WATCH.get_or_init(|| Mutex::new(std::collections::VecDeque::with_capacity(64)));
+        {
+            let mut q = watch.lock().unwrap();
+            q.clear();
+        }
+
+        ms2_rd6_watch_track(0x7000, 11);
+        ms2_rd6_watch_track(0x9000, 12);
+        ms2_rd6_watch_track(0x7000, 42);
+
+        let snapshot = ms2_rd6_watch_snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0], (0x9000, 12));
+        assert_eq!(snapshot[1], (0x7000, 42));
+    }
+
+    #[test]
+    fn ms2_rd6_watch_candidates_prefers_newest_unique_plausible_pointers() {
+        let watch = vec![
+            (0x800, 1), // implausible low
+            (0x7000, 10),
+            (0x9000, 11),
+            (0x7000, 42),                // same ptr, newer launch
+            (0x0000_9000_0000_0000, 99), // implausible high
+        ];
+        let picked = ms2_rd6_watch_candidates(&watch, 2);
+        assert_eq!(picked, vec![(0x9000, 11), (0x7000, 42)]);
+    }
+
+    #[test]
+    fn dump_tfs_ms4_args_encodes_expected_fixed_fields() {
+        let mut raw = [0u8; TFS_RAW_ARGS_BYTES];
+        let mut kernel_params = [std::ptr::null_mut::<::core::ffi::c_void>(); 8];
+        let p2: u64 = 0x7f00_1111_0000;
+        let n: u32 = 51864;
+        let p4: u64 = 0x7f00_2222_0000;
+        let p5: u64 = 0x7f00_3333_0000;
+        let p6: u64 = 0x7f00_4444_0000;
+        let p7: u64 = 0x7f00_5555_0000;
+        kernel_params[2] = (&p2 as *const u64).cast_mut().cast();
+        kernel_params[3] = (&n as *const u32).cast_mut().cast();
+        kernel_params[4] = (&p4 as *const u64).cast_mut().cast();
+        kernel_params[5] = (&p5 as *const u64).cast_mut().cast();
+        kernel_params[6] = (&p6 as *const u64).cast_mut().cast();
+        kernel_params[7] = (&p7 as *const u64).cast_mut().cast();
+
+        let written = unsafe {
+            dump_tfs_ms4_args(
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(),
+                raw.as_mut_ptr(),
+                raw.len(),
+            )
+        };
+        assert_eq!(written, std::mem::size_of::<TfsMs4ArgsCaptureV1>());
+        let encoded =
+            unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const TfsMs4ArgsCaptureV1) };
+        assert_eq!(
+            encoded,
+            TfsMs4ArgsCaptureV1 {
+                magic: TFS_MS4_ARGS_CAPTURE_MAGIC,
+                version: TFS_MS4_ARGS_CAPTURE_VERSION,
+                n,
+                _pad0: 0,
+                p2,
+                p4,
+                p5,
+                p6,
+                p7,
+            }
+        );
     }
 
     #[test]
@@ -13864,6 +17308,171 @@ mod tests {
         assert!(!should_capture_ms2b(
             "TurbulenceFS_dynamicGridClearKernel",
             3
+        ));
+    }
+
+    #[test]
+    fn should_capture_mut_p47_probe_only_for_tail_window_kernels() {
+        assert!(should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_MIGRATE,
+            false
+        ));
+        assert!(should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_ADVECT,
+            false
+        ));
+        assert!(should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_COUPLE_FROM_PARTICLES,
+            false
+        ));
+        assert!(should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX,
+            false
+        ));
+        assert!(should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_PARTICLE_DENSITY_SMOOTH,
+            false
+        ));
+        assert!(!should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED,
+            false
+        ));
+        assert!(!should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS3,
+            false
+        ));
+        assert!(!should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS4,
+            false
+        ));
+        assert!(!should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_CLEAR,
+            false
+        ));
+        assert!(!should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_OTHER,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_capture_mut_p47_probe_broad_mode_adds_ms3_and_window_kernels() {
+        assert!(should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_CLEAR,
+            true
+        ));
+        assert!(should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_OTHER,
+            true
+        ));
+        assert!(should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS3,
+            true
+        ));
+        assert!(should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS1,
+            true
+        ));
+        assert!(!should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS1,
+            false
+        ));
+        assert!(!should_capture_mut_p47_probe_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS4,
+            true
+        ));
+    }
+
+    #[test]
+    fn parse_tfs_mut_p47_broad_probe_defaults_off() {
+        assert!(!parse_tfs_mut_p47_broad_probe(None));
+        assert!(!parse_tfs_mut_p47_broad_probe(Some(String::from("0"))));
+        assert!(!parse_tfs_mut_p47_broad_probe(Some(String::from("yes"))));
+        assert!(parse_tfs_mut_p47_broad_probe(Some(String::from("1"))));
+    }
+
+    #[test]
+    fn parse_tfs_capture_only_atomic_to_tex_defaults_off() {
+        assert!(!parse_tfs_capture_only_atomic_to_tex(None));
+        assert!(!parse_tfs_capture_only_atomic_to_tex(Some(String::from(
+            "0"
+        ))));
+        assert!(!parse_tfs_capture_only_atomic_to_tex(Some(String::from(
+            "yes"
+        ))));
+        assert!(parse_tfs_capture_only_atomic_to_tex(Some(String::from(
+            "1"
+        ))));
+    }
+
+    #[test]
+    fn parse_tfs_capture_only_ms_chain_defaults_off() {
+        assert!(!parse_tfs_capture_only_ms_chain(None));
+        assert!(!parse_tfs_capture_only_ms_chain(Some(String::from("0"))));
+        assert!(!parse_tfs_capture_only_ms_chain(Some(String::from("yes"))));
+        assert!(parse_tfs_capture_only_ms_chain(Some(String::from("1"))));
+    }
+
+    #[test]
+    fn should_capture_tfs_kernel_atomic_focus_only_keeps_atomic_to_tex() {
+        assert!(should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX,
+            true,
+            false
+        ));
+        assert!(!should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED,
+            true,
+            false
+        ));
+        assert!(!should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS4,
+            true,
+            false
+        ));
+        assert!(!should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_CLEAR,
+            true,
+            false
+        ));
+        assert!(should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_CLEAR,
+            false,
+            false
+        ));
+        assert!(should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_capture_tfs_kernel_ms_chain_focus_only_keeps_ms2_ms3_ms4() {
+        assert!(should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS2_BATCHED,
+            false,
+            true
+        ));
+        assert!(should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS3,
+            false,
+            true
+        ));
+        assert!(should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_CREATE_PARTICLE_SHAPES_MS4,
+            false,
+            true
+        ));
+        assert!(!should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_PARTICLE_DENSITY_ATOMIC_TO_TEX,
+            false,
+            true
+        ));
+        assert!(!should_capture_tfs_kernel_for_mode(
+            TFS_KERNEL_ID_CLEAR,
+            false,
+            true
         ));
     }
 
