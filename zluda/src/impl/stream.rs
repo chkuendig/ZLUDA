@@ -18,7 +18,7 @@ use std::sync::Mutex;
 /// (memory.rs) so that ALL NULL-stream operations serialize with each other.
 pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
 
-/// Cross-kernel L1 visibility fix ("Bug A") — env-gated, default OFF.
+/// Cross-kernel L1 visibility fix ("Bug A") — default ON.
 ///
 /// On gfx10 RDNA, rocclr's default AQL `release_fence_scope = AGENT` does NOT
 /// trigger the Command Processor's inter-dispatch L1 invalidation. A reader
@@ -34,11 +34,16 @@ pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
 /// dependency points (`cuEventRecord` producer-release, `cuStreamWaitEvent`
 /// consumer-acquire) so PhysX's producer→consumer hand-offs become coherent.
 ///
-/// Gate: `ZLUDA_XKERNEL_SYSTEM_SCOPE=1`. Off by default until validated in-game.
+/// Validated by a decisive same-session A/B (2026-05-28): fix OFF crashed with
+/// 10 GPU page faults; fix ON ran 3/3 clean (~1.5M kernels, 0 faults).
+///
+/// Default ON. Set `ZLUDA_XKERNEL_SYSTEM_SCOPE=0` to disable (e.g. for A/B).
+/// NOTE: the D2D-to-force-SYSTEM-scope is a pragmatic mechanism; see the active
+/// plan for a less hacky replacement (direct AQL fence scope / cache invalidate).
 fn xkernel_system_scope_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("ZLUDA_XKERNEL_SYSTEM_SCOPE").map_or(false, |v| v == "1")
+        std::env::var("ZLUDA_XKERNEL_SYSTEM_SCOPE").map_or(true, |v| v != "0")
     })
 }
 
@@ -59,7 +64,7 @@ fn system_scope_scratch() -> Option<hipDeviceptr_t> {
 
 /// Force the next AQL packet on `stream` to SYSTEM fence scope via a 4-byte
 /// device-to-device copy (routes through rocblit → `gpu().addSystemScope()`).
-/// No-op unless `ZLUDA_XKERNEL_SYSTEM_SCOPE=1`. See `xkernel_system_scope_enabled`.
+/// Active by default; no-op if `ZLUDA_XKERNEL_SYSTEM_SCOPE=0`. See `xkernel_system_scope_enabled`.
 pub(crate) fn force_system_scope(stream: hipStream_t) {
     if !xkernel_system_scope_enabled() {
         return;
