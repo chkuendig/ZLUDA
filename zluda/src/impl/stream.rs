@@ -18,6 +18,58 @@ use std::sync::Mutex;
 /// (memory.rs) so that ALL NULL-stream operations serialize with each other.
 pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
 
+/// Cross-kernel L1 visibility fix ("Bug A") — env-gated, default OFF.
+///
+/// On gfx10 RDNA, rocclr's default AQL `release_fence_scope = AGENT` does NOT
+/// trigger the Command Processor's inter-dispatch L1 invalidation. A reader
+/// kernel on a different CU can therefore read STALE L1 lines for data a writer
+/// kernel stored on another stream — reproduced by `bug_a_xkernel_coherency`
+/// (5/50k stale reads). In PhysX this surfaces as wild indices/counters →
+/// `(u32)-N × 4` wild VA → GPU page fault.
+///
+/// The CP inter-dispatch L1 invalidation only runs at `HSA_FENCE_SCOPE_SYSTEM`,
+/// which rocclr sets after memcpy/image ops (`gpu().addSystemScope()` in
+/// rocblit.cpp). So a tiny `hipMemcpyDtoDAsync` on a stream forces the NEXT AQL
+/// packet on that stream to SYSTEM scope. We inject it at the cross-stream
+/// dependency points (`cuEventRecord` producer-release, `cuStreamWaitEvent`
+/// consumer-acquire) so PhysX's producer→consumer hand-offs become coherent.
+///
+/// Gate: `ZLUDA_XKERNEL_SYSTEM_SCOPE=1`. Off by default until validated in-game.
+fn xkernel_system_scope_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZLUDA_XKERNEL_SYSTEM_SCOPE").map_or(false, |v| v == "1")
+    })
+}
+
+/// Lazily-allocated 8-byte device scratch for the system-scope D2D.
+/// Stored as usize so the OnceLock is Send+Sync.
+fn system_scope_scratch() -> Option<hipDeviceptr_t> {
+    static SCRATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let p = *SCRATCH.get_or_init(|| {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe { hipMalloc(&mut ptr, 8) }.is_ok() {
+            ptr as usize
+        } else {
+            0
+        }
+    });
+    (p != 0).then(|| hipDeviceptr_t(p as *mut std::ffi::c_void))
+}
+
+/// Force the next AQL packet on `stream` to SYSTEM fence scope via a 4-byte
+/// device-to-device copy (routes through rocblit → `gpu().addSystemScope()`).
+/// No-op unless `ZLUDA_XKERNEL_SYSTEM_SCOPE=1`. See `xkernel_system_scope_enabled`.
+pub(crate) fn force_system_scope(stream: hipStream_t) {
+    if !xkernel_system_scope_enabled() {
+        return;
+    }
+    if let Some(scratch) = system_scope_scratch() {
+        let dst = hipDeviceptr_t((scratch.0 as usize + 4) as *mut std::ffi::c_void);
+        let _ = unsafe { hipMemcpyDtoDAsync(dst, scratch, 4, stream) };
+    }
+}
+
 /// Dirty flag: set when a kernel launches on a non-default stream.
 /// Cleared after hipDeviceSynchronize in null_stream_sync.
 /// When false, null-stream memops skip the expensive device sync
@@ -318,12 +370,18 @@ pub(crate) fn wait_event(
     // HIP doesn't enforce the pre-action global barrier. Use null_stream_sync
     // (env-disable via ZLUDA_NULL_STREAM_BARRIER=0).
     let _guard = null_stream_sync_for_event(stream);
-    let r = unsafe { hipStreamWaitEvent(stream, event, flags) };
+    let result = unsafe { hipStreamWaitEvent(stream, event, flags) };
     super::driver::zluda_log_err(&format!(
         "cuStreamWaitEvent(stream={:?}, event={:?}, flags={:#x}) -> {:?}",
-        stream, event, flags, r
+        stream, event, flags, result
     ));
-    r
+    // Consumer-acquire side of the Bug A fix (cherry-picked from 49414873):
+    // after waiting on a producer stream's event, force SYSTEM scope so the
+    // consumer's next kernel invalidates stale L1 lines and sees the
+    // producer's stores. Env-gated ZLUDA_XKERNEL_SYSTEM_SCOPE (default-ON
+    // per a9427b04 — fixes the IOFX_actorRange / TFS wild-VA TCP faults).
+    force_system_scope(stream);
+    result
 }
 
 #[cfg(test)]
