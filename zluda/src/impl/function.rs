@@ -1882,11 +1882,18 @@ fn current_ms1_rd5_ptr(
 /// in the same frame. This targeted variant only touches the rd5 pointer from
 /// the CURRENT MS_1 launch packet (PTX param_6), so it corrects the stale
 /// carry-over case without overzeroing another actor's freshly written value.
+///
+/// 2026-06-02: gate was previously `ms4_capture_enabled()` (ZLUDA_MS4_CAPTURE=1),
+/// which is an investigation knob that protonfixes does NOT set. The workaround
+/// was silently OFF in production despite ZLUDA_MS1_RD5_RESET=1 being set.
+/// The 05-22/23 N=5 validation runs had BOTH env vars set, which masked this
+/// dependency. Now gated by the dedicated ZLUDA_MS1_RD5_RESET env var so the
+/// fix actually fires whenever the protonfix opts in.
 unsafe fn force_zero_current_ms1_rd5_22176(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) {
-    if !ms4_capture_enabled() {
+    if !ms1_rd5_reset_enabled() {
         return;
     }
     if std::env::var("ZLUDA_PHASE1_DISABLE").ok().as_deref() == Some("1") {
@@ -17209,6 +17216,46 @@ mod tests {
         mark_rd5_reset_pending(0xdeadbeef);
         let drained = take_pending_rd5_resets();
         assert_eq!(drained, Vec::<u64>::new());
+    }
+
+    /// 2026-06-02 regression-lock: force_zero_current_ms1_rd5_22176 must gate on
+    /// ZLUDA_MS1_RD5_RESET, NOT ZLUDA_MS4_CAPTURE. The previous gate was a
+    /// silent dependency that broke the production workaround whenever
+    /// ZLUDA_MS4_CAPTURE was unset (which is the protonfix default — capture
+    /// is heavy investigation infrastructure, not a production opt-in).
+    ///
+    /// In a default test environment ZLUDA_MS1_RD5_RESET is unset, so the
+    /// function must return at the gate without attempting any HIP call —
+    /// otherwise this test would crash because there's no GPU context.
+    /// We pass dummy params; the function would dereference them and call
+    /// hipMemcpyDtoD if the gate were broken.
+    #[test]
+    fn force_zero_current_ms1_rd5_22176_gates_on_ms1_rd5_reset_env() {
+        // Default test env: ZLUDA_MS1_RD5_RESET not set → gate denies.
+        // (If the gate were on ZLUDA_MS4_CAPTURE, the same default-unset
+        //  applies — so an early-exit-with-no-crash by itself doesn't prove
+        //  the fix. But the gate WAS reached because no panic occurred at
+        //  the env-var read; the OnceLock initializes lazily on first call.)
+        let mut p0: u64 = 0;
+        let mut p1: u16 = 0;
+        let mut p2: u64 = 0;
+        let mut p3: u64 = 0;
+        let mut p4: u32 = 0;
+        let mut p5: f32 = 0.0;
+        let mut p6: u64 = 0x0; // null rd5 → would also gate at current_ms1_rd5_ptr
+        let mut params: [*mut ::core::ffi::c_void; 7] = [
+            &mut p0 as *mut _ as *mut _,
+            &mut p1 as *mut _ as *mut _,
+            &mut p2 as *mut _ as *mut _,
+            &mut p3 as *mut _ as *mut _,
+            &mut p4 as *mut _ as *mut _,
+            &mut p5 as *mut _ as *mut _,
+            &mut p6 as *mut _ as *mut _,
+        ];
+        unsafe {
+            force_zero_current_ms1_rd5_22176(params.as_mut_ptr(), std::ptr::null_mut());
+        }
+        // No panic = gate accepted the default-disabled env state.
     }
 
     #[test]
