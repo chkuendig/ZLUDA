@@ -1089,8 +1089,10 @@ fn is_bra_predicate_warp_divergent(
         return false;
     }
 
-    // Scan backward up to 200 lines for the setp that defined this predicate.
-    let lower = kernel_start_idx.max(bra_idx.saturating_sub(200));
+    // 2026-06-02: scan all the way back to kernel_start_idx for the setp
+    // (was bounded to 200 lines, but predicate def can be far from the bra
+    // in CUB-style kernels — see is_register_bound_to_tid_x comment).
+    let lower = kernel_start_idx;
     let mut i = bra_idx;
     while i > lower {
         i -= 1;
@@ -1148,7 +1150,11 @@ fn is_operand_warp_id_derived(
     if !operand.starts_with('%') {
         return false;
     }
-    let lower = kernel_start_idx.max(setp_idx.saturating_sub(200));
+    // 2026-06-02: scan all the way back to kernel_start_idx — the 200-line
+    // cap was missing the NRSS BB20_201 shr.u32 chain whose %tid.x mov
+    // lives 1500+ lines before its use. See is_register_bound_to_tid_x
+    // for the full mechanism.
+    let lower = kernel_start_idx;
     let mut i = setp_idx;
     while i > lower {
         i -= 1;
@@ -1196,6 +1202,18 @@ fn is_operand_warp_id_derived(
 /// transitively `mov`s from `%tid.x` (bounded depth ~10 to keep cost flat).
 /// NRSS uses `mov.u32 %r1, %tid.x;` once near kernel entry then uses `%r1`
 /// in `shr.u32 _, %r1, 5;` for warp-id, so we must chase the mov chain.
+///
+/// 2026-06-02: scan all the way back to kernel_start_idx (no 200-line cap).
+/// `%tid.x` is captured into a virtual register exactly once per kernel,
+/// typically right after the entry's `.reg` directives — that's hundreds
+/// to thousands of lines before the actual use in CUB-style code. NRSS in
+/// particular has `mov.u32 %r1, %tid.x;` at relative line 36 of the kernel
+/// but `shr.u32 %r983, %r1, 5;` at relative line ~1683 (1500+ lines later),
+/// so a 200-line cap caused this discriminator to silently misclassify the
+/// BB20_201 bra as non-divergent, blocking patch_divergent_lds_merge_sync
+/// from firing at the canonical CUB BlockScan underflow site. NRSS kernels
+/// run ~1850 lines; scanning to start is O(lines) per call (a few ms per
+/// module at compile time, not per launch).
 fn is_register_bound_to_tid_x(
     lines: &[&str],
     from_idx: usize,
@@ -1208,12 +1226,9 @@ fn is_register_bound_to_tid_x(
     if !op.starts_with('%') {
         return false;
     }
-    // Walk back up to ~200 lines from from_idx; chase mov chains up to
-    // 10 levels deep (defensive against arithmetic chains that aren't
-    // really tid.x).
     let mut current = op.to_string();
     let mut depth = 0;
-    let lower = kernel_start_idx.max(from_idx.saturating_sub(200));
+    let lower = kernel_start_idx;
     let mut i = from_idx;
     while depth < 10 && i > lower {
         i -= 1;
@@ -2507,6 +2522,27 @@ ret;
     }
 
     #[test]
+    #[ignore = "writes /tmp/module_23_divergent_patched.ptx from /tmp/zluda_ptx_dump/module_23.ptx"]
+    fn patch_produce_divergent_patched_module_23() {
+        let src = std::fs::read_to_string("/tmp/zluda_ptx_dump/module_23.ptx").unwrap();
+        let patched = patch_divergent_lds_merge_sync(&src);
+        match patched {
+            Some(p) => {
+                std::fs::write("/tmp/module_23_divergent_patched.ptx", &p).unwrap();
+                eprintln!(
+                    "PATCHED: wrote {} bytes (was {} bytes) to /tmp/module_23_divergent_patched.ptx",
+                    p.len(),
+                    src.len()
+                );
+            }
+            None => {
+                eprintln!("NOT PATCHED (patch_divergent_lds_merge_sync returned None)");
+                panic!("expected module_23.ptx to match divergent_lds_merge_sync pattern");
+            }
+        }
+    }
+
+    #[test]
     fn patch_leaves_unrelated_bb_labels_alone() {
         // A BBLabel with no matching setp/bra pair following must not be touched.
         let ptx = r#"
@@ -2871,6 +2907,37 @@ ret;
 "#;
         let patched = patch_divergent_lds_merge_sync(ptx)
             .expect("shr source via mov-chain from %tid.x must still patch (NRSS pattern)");
+        assert!(patched.contains("bar.sync 0;\nld.shared"));
+    }
+
+    #[test]
+    fn divergent_sync_fires_when_tid_x_mov_is_far_from_use() {
+        ensure_default_on();
+        // Regression for 2026-06-02 bug found via iter15d NRSS crash analysis.
+        // Real NRSS has `mov.u32 %r1, %tid.x;` right after kernel-entry
+        // `.reg` directives, then USES `%r1` in `shr.u32 _, %r1, 5;` >1500
+        // lines later inside the per-pass BlockScan code at BB20_201. The
+        // old 200-line back-scan cap in is_register_bound_to_tid_x silently
+        // failed to find the mov, the discriminator returned false, and
+        // patch_divergent_lds_merge_sync skipped the BB20_201 merge site —
+        // letting the BlockScan underflow → bit-31 → +8-10 GB wild store
+        // ship to production. Fix removes the cap; this test ensures the
+        // fix stays in place.
+        let mut ptx = String::from(".visible .entry test_k() {\n");
+        ptx.push_str("mov.u32 %r1, %tid.x;\n");
+        // Pad with 500 unrelated instructions to defeat any cap below 500.
+        for k in 0..500 {
+            ptx.push_str(&format!("mov.u32 %r{}, 0;\n", k + 100));
+        }
+        ptx.push_str("shr.u32 %r983, %r1, 5;\n");
+        ptx.push_str("setp.lt.u32 %p6, %r983, %r984;\n");
+        ptx.push_str("@!%p6 bra L_MERGE;\n");
+        ptx.push_str("st.shared.u32 [%r1], %r2;\n");
+        ptx.push_str("L_MERGE:\n");
+        ptx.push_str("ld.shared.u32 %r3, [%r4];\n");
+        ptx.push_str("ret;\n}\n");
+        let patched = patch_divergent_lds_merge_sync(&ptx)
+            .expect("NRSS far-mov pattern must still patch (>500 lines between mov and use)");
         assert!(patched.contains("bar.sync 0;\nld.shared"));
     }
 
