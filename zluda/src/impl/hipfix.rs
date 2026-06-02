@@ -17,6 +17,75 @@ pub(crate) unsafe fn array_3d_create(descriptor: &mut hip_runtime_sys::HIP_ARRAY
     descriptor.Flags &= !hip_runtime_sys::hipArraySurfaceLoadStore;
 }
 
+/// Re-bind a texref to force HIP to regenerate its internal texture object.
+/// Matches upstream `vosen/texrefs` branch organization. Our version keeps the
+/// `sync_synthetic_texref` call and null-textureObject early return that
+/// upstream doesn't need.
+pub(crate) unsafe fn refresh_texref(
+    raw_texref: *mut hip_runtime_sys::textureReference,
+) -> cuda_types::cuda::CUresult {
+    use hip_runtime_sys::*;
+    const TRSA_OVERRIDE_FORMAT: u32 = cuda_types::cuda::CU_TRSA_OVERRIDE_FORMAT;
+    if raw_texref.is_null() {
+        return Err(cuda_types::cuda::CUerror::INVALID_VALUE);
+    }
+    let texref = &*raw_texref;
+    // If no texture object has been created yet (e.g., synthetic texref with
+    // no array bound), there's nothing to refresh -- just return success.
+    if texref.textureObject.is_null() {
+        return Ok(());
+    }
+    let mut res_desc: HIP_RESOURCE_DESC = std::mem::zeroed();
+    hipTexObjectGetResourceDesc(&mut res_desc, texref.textureObject)?;
+    match res_desc.resType {
+        HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY => {
+            let array = res_desc.res.array.hArray;
+            if !array.is_null() {
+                hipTexRefSetArray(raw_texref, array, TRSA_OVERRIDE_FORMAT)?;
+            }
+        }
+        HIPresourcetype::HIP_RESOURCE_TYPE_MIPMAPPED_ARRAY => {
+            hipTexRefSetMipmappedArray(
+                raw_texref,
+                res_desc.res.mipmap.hMipmappedArray,
+                TRSA_OVERRIDE_FORMAT,
+            )?;
+        }
+        HIPresourcetype::HIP_RESOURCE_TYPE_LINEAR => {
+            let linear = res_desc.res.linear;
+            if !linear.devPtr.0.is_null() && linear.sizeInBytes != 0 {
+                let mut unused = 0usize;
+                hipTexRefSetAddress(
+                    &mut unused,
+                    raw_texref,
+                    linear.devPtr,
+                    linear.sizeInBytes,
+                )?;
+            }
+        }
+        HIPresourcetype::HIP_RESOURCE_TYPE_PITCH2D => {
+            let pitch_2d = res_desc.res.pitch2D;
+            let desc = HIP_ARRAY_DESCRIPTOR {
+                Width: pitch_2d.width,
+                Height: pitch_2d.height,
+                Format: pitch_2d.format,
+                NumChannels: pitch_2d.numChannels,
+            };
+            hipTexRefSetAddress2D(
+                raw_texref,
+                &desc,
+                pitch_2d.devPtr,
+                pitch_2d.pitchInBytes,
+            )?;
+        }
+        _ => return Err(cuda_types::cuda::CUerror::INVALID_VALUE),
+    }
+    // After rebinding, sync the texture object to device global if this is a
+    // synthetic texref
+    super::tex::sync_synthetic_texref(raw_texref);
+    Ok(())
+}
+
 // ============================================================================
 // Format inverse-transform machinery (ported from lshqqytiger/master hipfix.rs)
 // ============================================================================

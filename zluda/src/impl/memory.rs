@@ -1047,7 +1047,11 @@ pub(crate) fn set_d8_async(
         ));
     }
     let _guard = super::stream::null_stream_sync(stream);
-    unsafe { hipMemsetD8Async(dst, value, n, stream) }
+    let result = unsafe { hipMemsetD8Async(dst, value, n, stream) };
+    if result.is_ok() && !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
+    result
 }
 
 pub(crate) fn set_d16_v2(
@@ -1084,7 +1088,11 @@ pub(crate) fn set_d16_async(
         ));
     }
     let _guard = super::stream::null_stream_sync(stream);
-    unsafe { hipMemsetD16Async(dst, value, n, stream) }
+    let result = unsafe { hipMemsetD16Async(dst, value, n, stream) };
+    if result.is_ok() && !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
+    result
 }
 
 pub(crate) fn set_d32_v2(dst: hipDeviceptr_t, value: ::core::ffi::c_uint, n: usize) -> hipError_t {
@@ -1117,7 +1125,11 @@ pub(crate) fn set_d32_async(
         ));
     }
     let _guard = super::stream::null_stream_sync(stream);
-    unsafe { hipMemsetD32Async(dst, value as _, n, stream) }
+    let result = unsafe { hipMemsetD32Async(dst, value as _, n, stream) };
+    if result.is_ok() && !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
+    result
 }
 
 pub(crate) fn get_info_v2(free: *mut usize, total: *mut usize) -> hipError_t {
@@ -1332,6 +1344,9 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
             stream,
         )?;
     }
+    if !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
     Ok(())
 }
 
@@ -1360,6 +1375,9 @@ pub(crate) unsafe fn copy_dto_h_async_v2(
         // pay the sync cost when trace is actually on AND size is in range.
         let _ = hipStreamSynchronize(stream);
         log_dtoh_trace("async", dst_host, src_device, byte_count);
+    }
+    if result.is_ok() && !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
     }
     result
 }
@@ -1428,7 +1446,11 @@ pub(crate) unsafe fn copy_dto_d_async_v2(
         ));
     }
     let _guard = super::stream::null_stream_sync(stream);
-    hipMemcpyDtoDAsync(dst_device, src_device, byte_count, stream)
+    let result = hipMemcpyDtoDAsync(dst_device, src_device, byte_count, stream);
+    if result.is_ok() && !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
+    result
 }
 
 /// Plan v14.next.next.next: `cuMemcpy` un-typed sync entry. Not present in
@@ -1964,13 +1986,17 @@ pub(crate) unsafe fn copy_async(
         ));
     }
     let _guard = super::stream::null_stream_sync(stream);
-    hipMemcpyAsync(
+    let result = hipMemcpyAsync(
         dst.0,
         src.0,
         byte_count,
         hipMemcpyKind::hipMemcpyDefault,
         stream,
-    )
+    );
+    if result.is_ok() && !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
+    result
 }
 
 pub(crate) fn get_allocation_granularity(
@@ -2029,6 +2055,9 @@ pub(crate) unsafe fn copy_2d_async_v2(memcpy: hip_Memcpy2D, stream: hipStream_t)
     log_memcpy_sentinel_2d("cuMemcpy2DAsync_v2", &memcpy);
     let memcpy = rewrite_2d_for_sentinel(memcpy);
     hipMemcpyParam2DAsync(&memcpy, stream)?;
+    if !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
     Ok(())
 }
 
@@ -2193,6 +2222,9 @@ pub(crate) unsafe fn copy_ato_h_async_v2(
             byte_count,
             stream,
         )?;
+        if !stream.0.is_null() {
+            super::stream::mark_non_default_stream_dirty();
+        }
         return Ok(());
     }
     hipMemcpyAtoHAsync(
@@ -2202,6 +2234,9 @@ pub(crate) unsafe fn copy_ato_h_async_v2(
         byte_count,
         stream,
     )?;
+    if !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
     Ok(())
 }
 
@@ -2255,6 +2290,9 @@ pub(crate) unsafe fn copy_hto_a_async_v2(
             byte_count,
             stream,
         )?;
+        if !stream.0.is_null() {
+            super::stream::mark_non_default_stream_dirty();
+        }
         return Ok(());
     }
     hipMemcpyHtoAAsync(
@@ -2264,6 +2302,9 @@ pub(crate) unsafe fn copy_hto_a_async_v2(
         byte_count,
         stream,
     )?;
+    if !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
     Ok(())
 }
 
@@ -2401,6 +2442,9 @@ pub(crate) unsafe fn copy_3d_async_v2(memcpy: HIP_MEMCPY3D, stream: hipStream_t)
     log_memcpy_sentinel_3d("cuMemcpy3DAsync_v2", &memcpy);
     let memcpy = rewrite_3d_for_sentinel(memcpy);
     hipDrvMemcpy3DAsync(&memcpy, stream)?;
+    if !stream.0.is_null() {
+        super::stream::mark_non_default_stream_dirty();
+    }
     Ok(())
 }
 
