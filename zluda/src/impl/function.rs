@@ -1016,6 +1016,41 @@ pub(crate) fn ms1_rd5_reset_enabled() -> bool {
 /// Called at MS_4 launch (end of MS-chain cycle). Adds the rd5 pointer
 /// (= MS_4's p4) to the pending-reset set. Per-cycle, called once per
 /// active entry's MS_4.
+///
+/// ## Open root-cause investigation (2026-06-03)
+///
+/// The bug this fix patches is **NOT** in our code — it's a missing
+/// PhysX side-effect on AMDGPU. PhysX's intended path to zero
+/// `*(rd5+22176)` ("particleShapesCounter") between MS-chain cycles is
+/// the `RemoveParticleShapes` kernel, which contains the only literal
+/// `st.u32 [..., 0]` at offset 22176 across all 168 loaded PTX modules.
+/// **`RemoveParticleShapes` registers but NEVER launches** on Batman's
+/// APEX configuration (verified by grep across `cuLaunchKernel` log).
+///
+/// PhysX nonetheless gets clean counter resets in *pass* cycles on
+/// NVIDIA via a side-effect: `TurbulenceFS_dynamicGridClearKernel`'s
+/// single-op `sust.b.3d.b32.zero` surface store **happens to alias
+/// `rd5+22176`** in pass cycles. The alias breaks in fail cycles
+/// (extent or binding shifts) → counter is never reset → MS_2_Batched's
+/// `r38 = rd6[r37*12+8]` reads garbage → MS_4 `-2 as i32` cascade →
+/// wild VA scatter → TCP page fault.
+///
+/// This kernel-name-specific fix supplies the explicit zero, making
+/// the alias side-effect redundant. The fix structure is generic (host-
+/// thread drain queue mirrors `drain_dev5_dump_queue` pattern) — only
+/// the producer/consumer name match is per-kernel, and that match is
+/// intrinsic to the bug (PhysX-internal state expected at MS_4/MS_1
+/// boundary specifically).
+///
+/// **Open investigation**: figure out why `RemoveParticleShapes`
+/// registers but never dispatches on Batman's APEX path. If we can
+/// force it to launch (or supply a CUDA-side reset that PhysX issues
+/// on NVIDIA), the explicit `hipMemsetD32` would become unnecessary.
+///
+/// References:
+/// - `~/.claude/projects/-home-deck-Desktop-zluda-zluda/memory/project_clearkernel_aliases_rd5_22176_2026_05_22.md`
+/// - `project_ms1_rd5_reset_fixes_ms4_cascade_2026_05_22.md` (N=5 validation)
+/// - `project_ms1_rd5_reset_structural_fix_2026_06_03.md` (drain-queue refactor)
 fn mark_rd5_reset_pending(rd5_ptr: u64) {
     if rd5_ptr == 0 || !ms1_rd5_reset_enabled() {
         return;
@@ -13553,37 +13588,26 @@ pub(crate) fn launch_kernel(
         }
     }
 
-    // 2026-06-03 Fix C (experimental): host-side hipMemcpy3DAsync replacement
-    // for TurbulenceFS_dynamicGridClearKernel. Tests the surface-alias
-    // hypothesis (project_clearkernel_aliases_rd5_22176_2026_05_22): the
-    // kernel's sust.b.3d.b32.zero store has been hypothesized to alias rd5's
-    // linear buffer, side-effect-zeroing rd5+22176 in pass cycles only. The
-    // MS1_RD5_RESET fix (8b53ca00) already zeros rd5+22176 explicitly, so
-    // the alias side-effect is no longer load-bearing. This intercept
-    // replaces the dispatch with hipMemcpy3DAsync from a zero source buffer
-    // to the target hipArray, preserving the surface-clear semantics while
-    // eliminating the alias. If iter23 with env=1 produces FEWER faults vs
-    // env=0, alias-write was contributing harm. Default OFF to enable A/B.
-    if name == "TurbulenceFS_dynamicGridClearKernel" {
-        static CLEAR_HOST_MEMSET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let enabled = *CLEAR_HOST_MEMSET.get_or_init(|| {
-            let on = std::env::var("ZLUDA_CLEARKERNEL_HOST_MEMSET").map_or(false, |v| v == "1");
-            super::driver::zluda_log_err(&format!(
-                "[ZLUDA] ZLUDA_CLEARKERNEL_HOST_MEMSET={} (TFS_dynamicGridClear intercept)",
-                if on { "1" } else { "0" }
-            ));
-            on
-        });
-        if enabled && !extra.is_null() && kernel_params.is_null() {
-            // Read param_5 (surf_obj u64 @ offset 24) + param_6 (fill u32 @ offset 32)
-            // from the extra buffer. Kernel signature:
-            //   .param .u64 _0   @ 0..8
-            //   .param .u16 _1   @ 8..10
-            //   .param .u32 _2   @ 12..16  (aligned 4)
-            //   .param .u32 _3   @ 16..20
-            //   .param .u32 _4   @ 20..24
-            //   .param .u64 _5   @ 24..32  (aligned 8) ← surface obj
-            //   .param .u32 _6   @ 32..36              ← fill value
+    // 2026-06-03 Step 2: generic single-op-memset kernel intercept.
+    //
+    // At cuModuleLoadDataEx, module.rs::detect_simple_memset_kernels walks
+    // the parsed AST and records kernels whose body matches the strict
+    // SimpleMemset signature (one `sust.b.3d.*` op, surf+fill come from
+    // ld.param, no LDS, no global reads, no barriers). Here we look up the
+    // current kernel; if it's a registered memset and the env gate is on,
+    // we read the surf/fill values from the kernel arg buffer at the
+    // recorded byte offsets and run the host hipMemcpy3DAsync swap path.
+    //
+    // No kernel names are matched here — `lookup_simple_memset_sig(name)`
+    // is just a dictionary lookup keyed on whatever the AST detector saw.
+    // Default OFF (`ZLUDA_INTERCEPT_SIMPLE_MEMSET=1` enables). Replaces
+    // the Fix C name-keyed TurbulenceFS_dynamicGridClearKernel block.
+    if let Some(sig) = super::module::lookup_simple_memset_sig(&name) {
+        if super::module::simple_memset_intercept_enabled()
+            && sig.is_sust_3d
+            && !extra.is_null()
+            && kernel_params.is_null()
+        {
             let extra_arr = unsafe { std::slice::from_raw_parts(extra, 5) };
             let cu_launch_param_buffer_pointer_local =
                 0x1usize as *mut ::core::ffi::c_void;
@@ -13595,17 +13619,36 @@ pub(crate) fn launch_kernel(
                 let size_ptr = extra_arr[3] as *const usize;
                 if !buffer.is_null() && !size_ptr.is_null() {
                     let size = unsafe { *size_ptr };
-                    if size >= 36 {
+                    let need = (sig.surf_param_offset as usize)
+                        .max(sig.fill_param_offset as usize)
+                        + (sig.surf_param_width.max(sig.fill_param_width) as usize);
+                    if size >= need && sig.surf_param_width == 8 {
                         let surf_obj_u64 = unsafe {
-                            std::ptr::read_unaligned(buffer.add(24) as *const u64)
+                            std::ptr::read_unaligned(
+                                buffer.add(sig.surf_param_offset as usize) as *const u64,
+                            )
                         };
-                        let fill_value = unsafe {
-                            std::ptr::read_unaligned(buffer.add(32) as *const u32)
+                        // Read fill value at the recorded scalar width and
+                        // accept the launch only if every byte is zero
+                        // (the host swap is a memcpy-from-zero-buffer).
+                        let fill_off = sig.fill_param_offset as usize;
+                        let fill_w = sig.fill_param_width as usize;
+                        let all_zero = if fill_w <= size.saturating_sub(fill_off) {
+                            let mut z = true;
+                            for off in 0..fill_w {
+                                let b = unsafe { *buffer.add(fill_off + off) };
+                                if b != 0 {
+                                    z = false;
+                                    break;
+                                }
+                            }
+                            z
+                        } else {
+                            false
                         };
-                        if fill_value == 0 {
-                            // Only zero-fills supported (the typical Clear case).
-                            // Non-zero fills fall through to the kernel.
-                            if let Some(arr) = super::surf::surf_obj_to_array(surf_obj_u64 as usize)
+                        if all_zero {
+                            if let Some(arr) =
+                                super::surf::surf_obj_to_array(surf_obj_u64 as usize)
                             {
                                 let intercepted = unsafe {
                                     try_host_clear_3d_array(arr, surf_obj_u64, stream)
