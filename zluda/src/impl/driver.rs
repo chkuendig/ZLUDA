@@ -1381,6 +1381,21 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         let mut _ctx: CUcontext;
         if cu_ctx.0 == ptr::null_mut() {
             _ctx = context::get_current_context()?;
+            // 2026-06-03: surface the NULL-ctx fallback once per process.
+            // PhysX calls this 256+ times per run with ctx=0x0. If
+            // get_current_context() returns a stale CUcontext (e.g.
+            // a destroyed context still on the thread-local stack), the
+            // subsequent FromCuda::from_cuda dereferences it — possible
+            // host-side SIGSEGV source. One log line is enough to
+            // confirm/deny this is the bench-time path; suppress repeats.
+            static LOGGED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            LOGGED.get_or_init(|| {
+                zluda_log_err(&format!(
+                    "[ZLUDA] context_local_storage_get: NULL ctx fallback resolved to {:p} (subsequent NULL-ctx calls suppressed)",
+                    _ctx.0
+                ));
+                true
+            });
         } else {
             _ctx = cu_ctx
         };

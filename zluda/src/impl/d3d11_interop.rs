@@ -332,14 +332,35 @@ pub fn is_d3d11_resource(cuda_res: CUgraphicsResource) -> bool {
         .unwrap_or(false)
 }
 
-/// Borrow the state for a D3D11 resource. Returns None if not a D3D11
-/// resource we registered. Caller MUST treat the result as borrowed for the
-/// duration of the call — do NOT free.
-pub unsafe fn state_for(cuda_res: CUgraphicsResource) -> Option<&'static D3D11ResourceState> {
-    if !is_d3d11_resource(cuda_res) {
+/// Borrow the state for a D3D11 resource under the resource-table lock.
+/// Returns `None` if `cuda_res` isn't a registered D3D11 resource OR the
+/// lock is poisoned. The closure runs with the `D3D11_RESOURCE_TABLE`
+/// mutex held, so a concurrent `unregister` cannot free the underlying
+/// `Box<D3D11ResourceState>` while `f` is running.
+///
+/// This replaces the prior `state_for` API which returned a raw
+/// `&'static D3D11ResourceState` without holding the lock — a UaF
+/// vulnerability if `unregister` ran between the table-membership check
+/// and the caller's dereference. (2026-06-03 fix.)
+///
+/// Trade-off: holds the table mutex across the closure, including any
+/// HIP runtime calls inside. `unregister` and `register` calls serialize
+/// behind in-flight maps. PhysX's call pattern doesn't intermix these
+/// concurrently in practice; if a future game does, restructure to
+/// per-resource Arc<RwLock>.
+pub unsafe fn with_state_for<R>(
+    cuda_res: CUgraphicsResource,
+    f: impl FnOnce(&D3D11ResourceState) -> R,
+) -> Option<R> {
+    if cuda_res.is_null() {
         return None;
     }
-    Some(&*(cuda_res as *const D3D11ResourceState))
+    let guard = D3D11_RESOURCE_TABLE.lock().ok()?;
+    if !guard.contains(&(cuda_res as usize)) {
+        return None;
+    }
+    let state: &D3D11ResourceState = &*(cuda_res as *const D3D11ResourceState);
+    Some(f(state))
 }
 
 /// New ABI symbol exported to nvcuda.c. After nvcuda.c has done the COM
@@ -473,12 +494,13 @@ pub unsafe fn get_mapped_pointer(
     p_dev_ptr: &mut hipDeviceptr_t,
     p_size: &mut usize,
 ) -> CUresult {
-    let state = match state_for(cuda_res) {
-        Some(s) => s,
+    let snapshot = with_state_for(cuda_res, |state| (state.dev_ptr, state.size));
+    let (dev_ptr, size) = match snapshot {
+        Some(v) => v,
         None => return Err(CUerror::INVALID_VALUE),
     };
-    *p_dev_ptr = hipDeviceptr_t(state.dev_ptr);
-    *p_size = state.size as usize;
+    *p_dev_ptr = hipDeviceptr_t(dev_ptr);
+    *p_size = size as usize;
     Ok(())
 }
 
@@ -637,10 +659,6 @@ pub unsafe fn get_mapped_array(
     {
         return Err(CUerror::NOT_SUPPORTED);
     }
-    let state = match state_for(cuda_res) {
-        Some(s) => s,
-        None => return Err(CUerror::INVALID_VALUE),
-    };
     if array_index != 0 || mip_level != 0 {
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] D3D11 get_mapped_array: array_index={} mip_level={} unsupported (only 0/0)",
@@ -648,24 +666,35 @@ pub unsafe fn get_mapped_array(
         ));
         return Err(CUerror::NOT_SUPPORTED);
     }
-    refresh_array_from_buffer(state)?;
-    let arr = state.hip_array.lock().map(|g| *g).unwrap_or(std::ptr::null_mut());
-    if arr.is_null() {
-        return Err(CUerror::UNKNOWN);
-    }
-    // Phase A.1 canary (2026-05-08): read back first 16 u32s; flag if
-    // anything diverges from 0xDEADBEEF (a kernel wrote to our array).
-    if std::env::var("ZLUDA_D3D11_CANARY").ok().as_deref() == Some("1") {
-        let mut buf = [0u32; 16];
-        if hipMemcpyAtoH(buf.as_mut_ptr() as *mut std::ffi::c_void, arr, 0, 64).is_ok() {
-            let changed = buf.iter().any(|&w| w != 0xDEADBEEFu32);
-            super::driver::zluda_log_err(&format!(
-                "[ZLUDA] D3D11 canary readback arr={:p} changed={} cuda_res={:p} buf=[{:08x} {:08x} {:08x} {:08x}]",
-                arr, changed, cuda_res, buf[0], buf[1], buf[2], buf[3]
-            ));
+    let outcome: Option<Result<hipArray_t, CUerror>> = with_state_for(cuda_res, |state| {
+        refresh_array_from_buffer(state)?;
+        let arr = state
+            .hip_array
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(std::ptr::null_mut());
+        if arr.is_null() {
+            return Err(CUerror::UNKNOWN);
         }
+        // Phase A.1 canary (2026-05-08): read back first 16 u32s; flag if
+        // anything diverges from 0xDEADBEEF (a kernel wrote to our array).
+        if std::env::var("ZLUDA_D3D11_CANARY").ok().as_deref() == Some("1") {
+            let mut buf = [0u32; 16];
+            if hipMemcpyAtoH(buf.as_mut_ptr() as *mut std::ffi::c_void, arr, 0, 64).is_ok() {
+                let changed = buf.iter().any(|&w| w != 0xDEADBEEFu32);
+                super::driver::zluda_log_err(&format!(
+                    "[ZLUDA] D3D11 canary readback arr={:p} changed={} cuda_res={:p} buf=[{:08x} {:08x} {:08x} {:08x}]",
+                    arr, changed, cuda_res, buf[0], buf[1], buf[2], buf[3]
+                ));
+            }
+        }
+        Ok(arr)
+    });
+    match outcome {
+        Some(Ok(arr)) => Ok(arr),
+        Some(Err(e)) => Err(e),
+        None => Err(CUerror::INVALID_VALUE),
     }
-    Ok(arr)
 }
 
 /// Implementation of cuGraphicsMapResources for D3D11 resources.
@@ -677,12 +706,13 @@ pub unsafe fn get_mapped_array(
 /// pixels, so we just need to hipDeviceSynchronize so any outstanding
 /// HIP work touching that memory completes before the kernel runs.
 pub unsafe fn map_resources(cuda_res: CUgraphicsResource) -> CUresult {
-    let state = match state_for(cuda_res) {
-        Some(s) => s,
-        None => return Err(CUerror::INVALID_VALUE),
-    };
-    let _ = hipDeviceSynchronize();
-    maybe_dump_post_blit_dev_ptr(cuda_res, state);
+    let visited = with_state_for(cuda_res, |state| {
+        let _ = hipDeviceSynchronize();
+        maybe_dump_post_blit_dev_ptr(cuda_res, state);
+    });
+    if visited.is_none() {
+        return Err(CUerror::INVALID_VALUE);
+    }
     Ok(())
 }
 
@@ -792,7 +822,10 @@ unsafe fn maybe_dump_post_blit_dev_ptr(
 /// HIP reads of the imported memory complete before the application
 /// resumes Vulkan work on the source image.
 pub unsafe fn unmap_resources(cuda_res: CUgraphicsResource) -> CUresult {
-    if state_for(cuda_res).is_none() {
+    // No state dereference required here — only the existence check. Use
+    // `is_d3d11_resource` which acquires + releases the table lock for the
+    // membership test (safe: we never touch the state pointer).
+    if !is_d3d11_resource(cuda_res) {
         return Err(CUerror::INVALID_VALUE);
     }
     let _ = hipDeviceSynchronize();
@@ -845,4 +878,84 @@ pub unsafe fn unregister(cuda_res: CUgraphicsResource) -> CUresult {
         cuda_res, state.desc.width, state.desc.height
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Construct a `D3D11ResourceState` with all-zero/null fields. Safe for
+    /// tests that never invoke HIP runtime calls on it.
+    fn stub_state() -> D3D11ResourceState {
+        D3D11ResourceState {
+            ext_mem: std::ptr::null_mut(),
+            dev_ptr: std::ptr::null_mut(),
+            size: 0,
+            desc: ZludaD3D11ImportedDesc {
+                fd: -1,
+                size: 0,
+                width: 0,
+                height: 0,
+                pitch: 0,
+                dxgi_format: 0,
+                register_flags: 0,
+                bind_flags: 0,
+                d3d_resource: std::ptr::null_mut(),
+            },
+            hip_array: Mutex::new(std::ptr::null_mut()),
+        }
+    }
+
+    /// Verifies that `with_state_for` returns `Some` exactly while the
+    /// resource is registered in `D3D11_RESOURCE_TABLE`, and `None` after
+    /// it is removed. Pre-2026-06-03 the prior `state_for` API would have
+    /// dereferenced freed memory in this exact scenario (race between
+    /// table-membership check and the consumer's deref).
+    #[test]
+    fn with_state_for_returns_none_after_unregister() {
+        // Box::into_raw gives us a stable identity pointer to use as the
+        // CUgraphicsResource key, mirroring `register_imported`.
+        let state_box: Box<D3D11ResourceState> = Box::new(stub_state());
+        let raw: *mut D3D11ResourceState = Box::into_raw(state_box);
+        let cuda_res = raw as CUgraphicsResource;
+
+        // Register
+        D3D11_RESOURCE_TABLE
+            .lock()
+            .expect("table lock")
+            .insert(cuda_res as usize);
+
+        // Closure fires while registered
+        let mut fired = false;
+        let r = unsafe { with_state_for(cuda_res, |_state| fired = true) };
+        assert!(r.is_some(), "with_state_for returned None for registered resource");
+        assert!(fired, "closure did not fire");
+
+        // Unregister (manual, without invoking HIP teardown)
+        D3D11_RESOURCE_TABLE
+            .lock()
+            .expect("table lock")
+            .remove(&(cuda_res as usize));
+        let _ = unsafe { Box::from_raw(raw) }; // free the Box
+
+        // Closure must NOT fire after unregister
+        let mut fired_after = false;
+        let r2 = unsafe { with_state_for(cuda_res, |_state| fired_after = true) };
+        assert!(r2.is_none(), "with_state_for returned Some after unregister");
+        assert!(!fired_after, "closure fired after unregister");
+    }
+
+    /// Null `cuda_res` must short-circuit to `None` without touching the
+    /// lock or dereferencing.
+    #[test]
+    fn with_state_for_rejects_null() {
+        let mut fired = false;
+        let r = unsafe {
+            with_state_for(std::ptr::null_mut() as CUgraphicsResource, |_state| {
+                fired = true
+            })
+        };
+        assert!(r.is_none(), "with_state_for accepted null cuda_res");
+        assert!(!fired, "closure fired on null cuda_res");
+    }
 }
