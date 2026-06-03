@@ -505,7 +505,12 @@ pub fn patch_iofx_remap_membar_before_texread(ptx: &str) -> Option<String> {
     if patched == 0 {
         None
     } else {
-        super::driver::zluda_log(&format!(
+        // 2026-06-03: use zluda_log_err (unconditional) instead of zluda_log
+        // which is gated by ZLUDA_DEBUG (off in the protonfix default).
+        // iter22 confirmed the patch fires in production (TCP faults halved
+        // 4→2 on the fresh session) but no log line appeared — silenced
+        // by the debug gate. Switch to the always-written channel.
+        super::driver::zluda_log_err(&format!(
             "[ZLUDA] patch_iofx_remap_membar_before_texread: inserted {} membar.sys",
             patched
         ));
