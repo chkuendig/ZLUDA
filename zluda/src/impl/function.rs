@@ -1172,23 +1172,22 @@ unsafe fn probe_rd5_counter_cpu_vs_gpu(rd5: u64) -> (u32, u32, bool) {
     (cpu_value, gpu_value, cpu_value == gpu_value)
 }
 
-/// At MS_1 launch, consume any pending reset markers and enqueue them
-/// onto `MS1_RD5_RESET_DRAIN_QUEUE` for host-thread-side `hipMemsetD32`
-/// processing. The actual `hipMemsetD32` happens in
-/// `memory.rs::drain_ms1_rd5_reset_queue`, called from `event::record`,
-/// `event::synchronize`, and `stream::synchronize`.
+/// At MS_1 launch, consume any pending reset markers. Behavior depends on
+/// `ZLUDA_MS1_RD5_RESET_SYNC`:
 ///
-/// Prior to 2026-06-03 this function issued `hipMemsetD32` synchronously
-/// here, violating the no-D2D-from-launch_kernel rule
-/// (`feedback_no_d2d_from_launch_kernel.md`). On Wine 10.0 + ROCm 6.2.4
-/// that triggers the ProfilingSignal vector OOB race. Deferring to a
-/// host-thread drain keeps the workaround active while respecting the
-/// rule.
+/// - **=1 (legacy, pre-8b53ca00 behavior)**: issue `hipMemsetD32`
+///   synchronously here, inside `launch_kernel`. Violates the
+///   no-D2D-from-launch_kernel rule (`feedback_no_d2d_from_launch_kernel.md`)
+///   but matches the 2026-05-23 N=5 baseline that hit 839k peak.
+/// - **=0 (default, post-8b53ca00 refactor)**: enqueue onto
+///   `MS1_RD5_RESET_DRAIN_QUEUE`; the actual `hipMemsetD32` runs in
+///   `drain_ms1_rd5_reset_queue` from `event::record/synchronize` and
+///   `stream::synchronize`. Respects the rule but defers the zero by
+///   one event-sync hop, which may explain the 839k→160k regression
+///   in iter26 vs the 05-23 baseline.
 ///
-/// Called from `capture_tfs_launch` (TFS_CAPTURE=1 path) and from the
-/// standalone MS_1 branch in `launch_kernel` (TFS_CAPTURE=0 path). The
-/// `take_pending_rd5_resets` drain makes the two callers mutually
-/// exclusive per MS_1 launch.
+/// Env-gated A/B for the 2026-06-03 investigation: did the drain-queue
+/// refactor cost us 5x bench depth?
 unsafe fn ms1_consume_rd5_resets() {
     let pending = take_pending_rd5_resets();
     if pending.is_empty() {
@@ -1196,6 +1195,27 @@ unsafe fn ms1_consume_rd5_resets() {
     }
     static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static SYNC_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let sync_mode = *SYNC_MODE.get_or_init(|| {
+        let on = std::env::var("ZLUDA_MS1_RD5_RESET_SYNC").map_or(false, |v| v == "1");
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] ZLUDA_MS1_RD5_RESET_SYNC={} (sync hipMemsetD32 vs host-thread drain)",
+            if on { "1" } else { "0" }
+        ));
+        on
+    });
+    if sync_mode {
+        for rd5 in pending {
+            let dst = (rd5 + F6_OFFSET_IN_RD5 as u64) as *mut std::ffi::c_void;
+            let r = hipMemsetD32(hipDeviceptr_t(dst), 0, 1);
+            let ok = !r.is_err();
+            super::driver::zluda_log_err(&format!(
+                "MS1_RD5_RESET #{} rd5=0x{:x} target=0x{:x} hipMemsetD32 SYNC ok={}",
+                call_n, rd5, dst as u64, ok
+            ));
+        }
+        return;
+    }
     let queue = MS1_RD5_RESET_DRAIN_QUEUE.get_or_init(|| {
         std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))
     });
@@ -13419,29 +13439,49 @@ pub(crate) fn launch_kernel(
             // `take_pending_rd5_resets`, so per MS_1 launch only one of
             // them gets a non-empty result (no double-firing).
             //
-            // Enqueue only — never call hipMemsetD32 here. The drain runs
-            // in `drain_ms1_rd5_reset_queue` from event/stream sync sites.
+            // SYNC mode (ZLUDA_MS1_RD5_RESET_SYNC=1) issues hipMemsetD32
+            // immediately. DEFERRED (default, =0) enqueues onto the
+            // host-thread drain queue. See ms1_consume_rd5_resets above
+            // for the same A/B logic.
             if ms1_rd5_reset_enabled() {
                 let pending = take_pending_rd5_resets();
                 if !pending.is_empty() {
                     static CALL_N: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
                     let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let queue = MS1_RD5_RESET_DRAIN_QUEUE.get_or_init(|| {
-                        std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))
+                    static SYNC_MODE: std::sync::OnceLock<bool> =
+                        std::sync::OnceLock::new();
+                    let sync_mode = *SYNC_MODE.get_or_init(|| {
+                        std::env::var("ZLUDA_MS1_RD5_RESET_SYNC")
+                            .map_or(false, |v| v == "1")
                     });
-                    if let Ok(mut q) = queue.lock() {
+                    if sync_mode {
                         for rd5 in pending {
-                            while q.len() >= 64 {
-                                q.pop_front();
-                            }
-                            q.push_back(rd5);
+                            let dst = (rd5 + F6_OFFSET_IN_RD5 as u64)
+                                as *mut std::ffi::c_void;
+                            let r = hipMemsetD32(hipDeviceptr_t(dst), 0, 1);
                             super::driver::zluda_log_err(&format!(
-                                "MS1_RD5_RESET_MS1BRANCH #{} rd5=0x{:x} target=0x{:x} enqueued for host-thread drain",
-                                call_n,
-                                rd5,
-                                rd5 + F6_OFFSET_IN_RD5 as u64
+                                "MS1_RD5_RESET_MS1BRANCH #{} rd5=0x{:x} target=0x{:x} hipMemsetD32 SYNC ok={}",
+                                call_n, rd5, dst as u64, !r.is_err()
                             ));
+                        }
+                    } else {
+                        let queue = MS1_RD5_RESET_DRAIN_QUEUE.get_or_init(|| {
+                            std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))
+                        });
+                        if let Ok(mut q) = queue.lock() {
+                            for rd5 in pending {
+                                while q.len() >= 64 {
+                                    q.pop_front();
+                                }
+                                q.push_back(rd5);
+                                super::driver::zluda_log_err(&format!(
+                                    "MS1_RD5_RESET_MS1BRANCH #{} rd5=0x{:x} target=0x{:x} enqueued for host-thread drain",
+                                    call_n,
+                                    rd5,
+                                    rd5 + F6_OFFSET_IN_RD5 as u64
+                                ));
+                            }
                         }
                     }
                 }
