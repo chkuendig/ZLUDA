@@ -412,6 +412,106 @@ pub fn patch_iofx_actor_range_membar(ptx: &str) -> Option<String> {
     }
 }
 
+/// 2026-06-03 EXPERIMENT: insert `membar.sys;` immediately before every
+/// `tex.1d.v4.u32.s32 ... IOFX_texRef*` instruction in `IOFX_remapKernel`.
+///
+/// **Hypothesis being tested.** PhysX runs the sequence
+/// `IOFX_newRadixSortBlockKernel → IOFX_remapKernel → ... → IOFX_actorRangeKernel`
+/// on the same stream with no `cuEventRecord` between launches, so the Bug A
+/// SYSTEM_SCOPE producer-release/consumer-acquire path at `cuEventRecord` /
+/// `cuStreamWaitEvent` (which forces rocclr's `addSystemScope` and an AQL
+/// SYSTEM-scope acquire fence) never fires for these adjacent kernels. The
+/// two `tex.1d.v4.u32.s32` reads in `IOFX_remapKernel`'s main loop
+/// (texRefRemapInStateToInput, texRefRemapActorIDs) may therefore see L1
+/// data that's stale relative to the upstream radix-sort writes to the
+/// underlying texref source buffer, producing wild remap output that
+/// downstream `IOFX_actorRangeKernel` scatters with — generating the
+/// canonical TCP + CB/DB GPU page faults observed in iter19/iter20.
+///
+/// **What this patch emits.** `membar.sys;` lowers (per `emit.rs::get_scope_membar`
+/// → empty scope string → LLVM AMDGPU SEQ_CST fence) to:
+///   - `s_waitcnt vmcnt(0) lgkmcnt(0)` — drain in-flight memory ops
+///   - `buffer_gl0_inv` + `buffer_gl1_inv` — invalidate L0 + L1
+///
+/// **Caveats (do NOT assume this fixes the symptom).** On gfx10, the
+/// texture cache (TCP) is technically a separate cache from L0/L1. Per
+/// AMD GPU docs, `s_dcache_wb_vol` is needed to flush+invalidate the
+/// scalar data cache, and CP-level acquire is required for full TCP
+/// invalidation. `membar.sys` may therefore NOT fully address literal
+/// TCP-line staleness. It WILL address upstream-write visibility through
+/// L1 if the texref-source buffer is read via the general load path
+/// (e.g., underlying VMEM loads behind the texref). Frame this as an
+/// experiment: if iter22 shows 0 amdgpu page faults across 2+ of 3 fresh
+/// runs, ship; if TCP faults persist at iter19 frequency, abandon and
+/// consider IR-level inline-asm or a host-side `force_system_scope` at
+/// `IOFX_remapKernel` launch entry.
+///
+/// **Env-gate** `ZLUDA_IOFX_REMAP_MEMBAR` — **default ON** (set to "0" to
+/// disable). Opposite default from `IOFX_ACTOR_MEMBAR` because this is
+/// the primary in-flight fix attempt for Class A.
+pub fn patch_iofx_remap_membar_before_texread(ptx: &str) -> Option<String> {
+    let env_on = std::env::var("ZLUDA_IOFX_REMAP_MEMBAR").map_or(true, |v| v != "0");
+    if !env_on {
+        return None;
+    }
+    if !ptx.contains("IOFX_remapKernel") {
+        return None;
+    }
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut out = String::with_capacity(ptx.len() + 256);
+    let mut in_kernel = false;
+    let mut brace_depth: i32 = 0;
+    let mut patched = 0usize;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(".visible .entry IOFX_remapKernel")
+            || trimmed.starts_with(".entry IOFX_remapKernel")
+            // _Z22IOFX_remapKernel_templI* mangled variants
+            || (trimmed.starts_with(".visible .entry ")
+                && trimmed.contains("IOFX_remapKernel"))
+            || (trimmed.starts_with(".entry ") && trimmed.contains("IOFX_remapKernel"))
+        {
+            in_kernel = true;
+            brace_depth = 0;
+        }
+        if in_kernel {
+            for c in line.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_kernel = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if in_kernel
+            && brace_depth >= 1
+            && trimmed.starts_with("tex.1d.v4.u32.s32")
+            && trimmed.contains("IOFX_texRef")
+        {
+            out.push_str("// ZLUDA IOFX_remap tex.1d cache-invalidate fence\n");
+            out.push_str("membar.sys;\n");
+            patched += 1;
+        }
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+    if patched == 0 {
+        None
+    } else {
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] patch_iofx_remap_membar_before_texread: inserted {} membar.sys",
+            patched
+        ));
+        Some(out)
+    }
+}
 
 /// 2026-04-29: convert `ld.shared.<T>` → `ld.volatile.shared.<T>` across
 /// PhysX/FleX/TFS/IOFX/ParticleIOS kernels affected by the cross-wave LDS
@@ -1480,10 +1580,15 @@ fn get_best_ptx_and_compile(
                             Some(p) => Cow::Owned(p),
                             None => after_bbox,
                         };
-                    let after_volatile: Cow<str> =
-                        match patch_broad_volatile_lds(after_actor.as_ref()) {
+                    let after_remap: Cow<str> =
+                        match patch_iofx_remap_membar_before_texread(after_actor.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_actor,
+                        };
+                    let after_volatile: Cow<str> =
+                        match patch_broad_volatile_lds(after_remap.as_ref()) {
+                            Some(p) => Cow::Owned(p),
+                            None => after_remap,
                         };
                     let after_membar: Cow<str> =
                         match patch_broad_membar_before_bar_sync(after_volatile.as_ref()) {
@@ -2444,6 +2549,99 @@ ret;
         assert_eq!(insertions, 2, "expected 2 patches, got:\n{}", patched);
         assert!(patched.contains("@%p_zluda_bbox_lane0_0 bra BB1_2;"));
         assert!(patched.contains("@%p_zluda_bbox_lane0_1 bra BB1_3;"));
+    }
+
+    /// 2026-06-03 Class A experiment: validate that
+    /// `patch_iofx_remap_membar_before_texread` inserts `membar.sys;`
+    /// immediately before each `tex.1d.v4.u32.s32 ... IOFX_texRef*`
+    /// instruction inside `IOFX_remapKernel`.
+    #[test]
+    fn test_remap_membar_inserts_before_tex1d() {
+        let ptx = r#"
+.visible .entry _Z22IOFX_remapKernel_templILb0EEvPi(
+    .param .b64 _Z22IOFX_remapKernel_templILb0EEvPi_param_0
+) {
+    .reg .b32 %r<40>;
+    BB10_2:
+    ld.u32 %r25, [%rd9];
+    and.b32 %r24, %r25, 2147483647;
+    tex.1d.v4.u32.s32 {%r20, %r21, %r22, %r23}, [IOFX_texRefRemapInStateToInput, {%r24}];
+    and.b32 %r7, %r20, 2147483647;
+    setp.ge.u32 %p2, %r7, %r13;
+    @%p2 bra BB10_5;
+    tex.1d.v4.u32.s32 {%r26, %r27, %r28, %r29}, [IOFX_texRefRemapActorIDs, {%r7}];
+    BB10_5:
+    ret;
+}
+"#;
+        let patched = patch_iofx_remap_membar_before_texread(ptx)
+            .expect("expected IOFX_remapKernel match to produce a patch");
+        // Both tex.1d call sites must be preceded by membar.sys;
+        let in_state_idx = patched
+            .find("tex.1d.v4.u32.s32 {%r20")
+            .expect("missing first tex.1d in patched output");
+        let actor_id_idx = patched
+            .find("tex.1d.v4.u32.s32 {%r26")
+            .expect("missing second tex.1d in patched output");
+        // Find the nearest preceding `membar.sys;` for each.
+        let pre_in_state = &patched[..in_state_idx];
+        let pre_actor_id = &patched[..actor_id_idx];
+        assert!(
+            pre_in_state.rfind("membar.sys;").is_some(),
+            "no membar.sys; before first tex.1d (texRefRemapInStateToInput):\n{}",
+            patched
+        );
+        // The membar.sys for the SECOND tex.1d must come AFTER the first one
+        // (i.e., between the two tex.1d calls), not be the same one we matched
+        // for the first.
+        let first_membar = pre_in_state
+            .rfind("membar.sys;")
+            .expect("no first membar.sys");
+        let second_membar = pre_actor_id
+            .rfind("membar.sys;")
+            .expect("no second membar.sys");
+        assert!(
+            second_membar > first_membar,
+            "second membar.sys is not after first; only one membar inserted?\n{}",
+            patched
+        );
+        // Marker comment present
+        assert!(
+            patched.contains("ZLUDA IOFX_remap tex.1d cache-invalidate fence"),
+            "marker comment missing"
+        );
+    }
+
+    /// 2026-06-03 Class A experiment: env var `ZLUDA_IOFX_REMAP_MEMBAR=0`
+    /// disables the patch.
+    #[test]
+    fn test_remap_membar_env_off_disables() {
+        std::env::set_var("ZLUDA_IOFX_REMAP_MEMBAR", "0");
+        let ptx = r#"
+.visible .entry IOFX_remapKernel() {
+    tex.1d.v4.u32.s32 {%r20, %r21, %r22, %r23}, [IOFX_texRefRemapInStateToInput, {%r24}];
+    ret;
+}
+"#;
+        let patched = patch_iofx_remap_membar_before_texread(ptx);
+        std::env::remove_var("ZLUDA_IOFX_REMAP_MEMBAR");
+        assert!(patched.is_none(), "env=0 must disable the patch");
+    }
+
+    /// 2026-06-03 Class A experiment: PTX without IOFX_remapKernel is a
+    /// no-op (returns None to chain through the patch pipeline).
+    #[test]
+    fn test_remap_membar_skips_non_remap_kernel() {
+        let ptx = r#"
+.visible .entry SomeOtherKernel() {
+    tex.1d.v4.u32.s32 {%r20, %r21, %r22, %r23}, [IOFX_texRefRemapInStateToInput, {%r24}];
+    ret;
+}
+"#;
+        assert!(
+            patch_iofx_remap_membar_before_texread(ptx).is_none(),
+            "patch must skip kernels other than IOFX_remapKernel"
+        );
     }
 
     #[test]
