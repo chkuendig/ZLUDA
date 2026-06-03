@@ -188,7 +188,7 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
     if patch_count == 0 {
         None
     } else {
-        super::driver::zluda_log(&format!(
+        super::driver::zluda_log_err(&format!(
             "[ZLUDA] patch_iofx_bbox_tail_merge: applied {} guard(s)",
             patch_count
         ));
@@ -332,192 +332,6 @@ fn match_setp_eq_s64_zero_pair(setp_line: &str, bra_line: &str) -> Option<(Strin
     Some((pred_name.to_string(), target.to_string()))
 }
 
-/// 2026-04-28 Phase 3a probe — A/B test for the LLVM-codegen LDS-publish
-/// hypothesis on IOFX_actorRangeKernel.
-///
-/// IOFX_actorRangeKernel does:
-///   - All threads write `st.shared.u32 [sdata + tid*4], r40`
-///   - Thread 0 ALSO writes `st.shared.u32 [sdata + ntid*4], r42`
-///     (extra slots at the end, for the "boundary" actor of the chunk)
-///   - bar.sync 0
-///   - All threads ld.shared from those slots, including the ones thread 0 wrote
-///
-/// Hypothesis: thread 0's writes to the "end" LDS slots may not propagate
-/// to other lanes/warps across the bar.sync on AMDGPU under specific
-/// conditions, despite the explicit s_waitcnt+s_barrier sequence emitted
-/// by our bar_sync wrapper. This kernel was the LAST kernel before crashes
-/// in Phase 2 run 1 (Mode A SIGABRT with TCP fault) and is upstream of
-/// the data PhysX iterates in Mode B SIGSEGV crashes.
-///
-/// This patch inserts `membar.cta;` immediately before EVERY `bar.sync 0;`
-/// inside IOFX_actorRangeKernel. PTX `membar.cta` lowers to a CTA-scope
-/// fence on AMDGPU. If this fixes the crash distribution, we've found that
-/// PR #161638's fix is incomplete for some access pattern. If it doesn't,
-/// we know to look elsewhere.
-///
-/// Env-gate `ZLUDA_IOFX_ACTOR_MEMBAR=1` (default OFF).
-pub fn patch_iofx_actor_range_membar(ptx: &str) -> Option<String> {
-    let env_on = std::env::var("ZLUDA_IOFX_ACTOR_MEMBAR").map_or(false, |v| v == "1");
-    if !env_on {
-        return None;
-    }
-    if !ptx.contains("IOFX_actorRangeKernel") {
-        return None;
-    }
-    let lines: Vec<&str> = ptx.lines().collect();
-    let mut out = String::with_capacity(ptx.len() + 256);
-    let mut in_kernel = false;
-    let mut brace_depth: i32 = 0;
-    let mut patched = 0usize;
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(".visible .entry IOFX_actorRangeKernel")
-            || trimmed.starts_with(".entry IOFX_actorRangeKernel")
-        {
-            in_kernel = true;
-            brace_depth = 0;
-        }
-        if in_kernel {
-            for c in line.chars() {
-                if c == '{' {
-                    brace_depth += 1;
-                } else if c == '}' {
-                    brace_depth -= 1;
-                    if brace_depth <= 0 {
-                        in_kernel = false;
-                        break;
-                    }
-                }
-            }
-        }
-        if in_kernel && brace_depth >= 1 && trimmed == "bar.sync 0;" {
-            out.push_str("// ZLUDA IOFX_actorRange membar A/B probe\n");
-            out.push_str("membar.cta;\n");
-            patched += 1;
-        }
-        out.push_str(line);
-        out.push('\n');
-        i += 1;
-    }
-    if patched == 0 {
-        None
-    } else {
-        super::driver::zluda_log(&format!(
-            "[ZLUDA] patch_iofx_actor_range_membar: inserted {} membar.cta",
-            patched
-        ));
-        Some(out)
-    }
-}
-
-/// 2026-06-03 EXPERIMENT: insert `membar.sys;` immediately before every
-/// `tex.1d.v4.u32.s32 ... IOFX_texRef*` instruction in `IOFX_remapKernel`.
-///
-/// **Hypothesis being tested.** PhysX runs the sequence
-/// `IOFX_newRadixSortBlockKernel → IOFX_remapKernel → ... → IOFX_actorRangeKernel`
-/// on the same stream with no `cuEventRecord` between launches, so the Bug A
-/// SYSTEM_SCOPE producer-release/consumer-acquire path at `cuEventRecord` /
-/// `cuStreamWaitEvent` (which forces rocclr's `addSystemScope` and an AQL
-/// SYSTEM-scope acquire fence) never fires for these adjacent kernels. The
-/// two `tex.1d.v4.u32.s32` reads in `IOFX_remapKernel`'s main loop
-/// (texRefRemapInStateToInput, texRefRemapActorIDs) may therefore see L1
-/// data that's stale relative to the upstream radix-sort writes to the
-/// underlying texref source buffer, producing wild remap output that
-/// downstream `IOFX_actorRangeKernel` scatters with — generating the
-/// canonical TCP + CB/DB GPU page faults observed in iter19/iter20.
-///
-/// **What this patch emits.** `membar.sys;` lowers (per `emit.rs::get_scope_membar`
-/// → empty scope string → LLVM AMDGPU SEQ_CST fence) to:
-///   - `s_waitcnt vmcnt(0) lgkmcnt(0)` — drain in-flight memory ops
-///   - `buffer_gl0_inv` + `buffer_gl1_inv` — invalidate L0 + L1
-///
-/// **Caveats (do NOT assume this fixes the symptom).** On gfx10, the
-/// texture cache (TCP) is technically a separate cache from L0/L1. Per
-/// AMD GPU docs, `s_dcache_wb_vol` is needed to flush+invalidate the
-/// scalar data cache, and CP-level acquire is required for full TCP
-/// invalidation. `membar.sys` may therefore NOT fully address literal
-/// TCP-line staleness. It WILL address upstream-write visibility through
-/// L1 if the texref-source buffer is read via the general load path
-/// (e.g., underlying VMEM loads behind the texref). Frame this as an
-/// experiment: if iter22 shows 0 amdgpu page faults across 2+ of 3 fresh
-/// runs, ship; if TCP faults persist at iter19 frequency, abandon and
-/// consider IR-level inline-asm or a host-side `force_system_scope` at
-/// `IOFX_remapKernel` launch entry.
-///
-/// **Env-gate** `ZLUDA_IOFX_REMAP_MEMBAR` — **default ON** (set to "0" to
-/// disable). Opposite default from `IOFX_ACTOR_MEMBAR` because this is
-/// the primary in-flight fix attempt for Class A.
-pub fn patch_iofx_remap_membar_before_texread(ptx: &str) -> Option<String> {
-    let env_on = std::env::var("ZLUDA_IOFX_REMAP_MEMBAR").map_or(true, |v| v != "0");
-    if !env_on {
-        return None;
-    }
-    if !ptx.contains("IOFX_remapKernel") {
-        return None;
-    }
-    let lines: Vec<&str> = ptx.lines().collect();
-    let mut out = String::with_capacity(ptx.len() + 256);
-    let mut in_kernel = false;
-    let mut brace_depth: i32 = 0;
-    let mut patched = 0usize;
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(".visible .entry IOFX_remapKernel")
-            || trimmed.starts_with(".entry IOFX_remapKernel")
-            // _Z22IOFX_remapKernel_templI* mangled variants
-            || (trimmed.starts_with(".visible .entry ")
-                && trimmed.contains("IOFX_remapKernel"))
-            || (trimmed.starts_with(".entry ") && trimmed.contains("IOFX_remapKernel"))
-        {
-            in_kernel = true;
-            brace_depth = 0;
-        }
-        if in_kernel {
-            for c in line.chars() {
-                if c == '{' {
-                    brace_depth += 1;
-                } else if c == '}' {
-                    brace_depth -= 1;
-                    if brace_depth <= 0 {
-                        in_kernel = false;
-                        break;
-                    }
-                }
-            }
-        }
-        if in_kernel
-            && brace_depth >= 1
-            && trimmed.starts_with("tex.1d.v4.u32.s32")
-            && trimmed.contains("IOFX_texRef")
-        {
-            out.push_str("// ZLUDA IOFX_remap tex.1d cache-invalidate fence\n");
-            out.push_str("membar.sys;\n");
-            patched += 1;
-        }
-        out.push_str(line);
-        out.push('\n');
-        i += 1;
-    }
-    if patched == 0 {
-        None
-    } else {
-        // 2026-06-03: use zluda_log_err (unconditional) instead of zluda_log
-        // which is gated by ZLUDA_DEBUG (off in the protonfix default).
-        // iter22 confirmed the patch fires in production (TCP faults halved
-        // 4→2 on the fresh session) but no log line appeared — silenced
-        // by the debug gate. Switch to the always-written channel.
-        super::driver::zluda_log_err(&format!(
-            "[ZLUDA] patch_iofx_remap_membar_before_texread: inserted {} membar.sys",
-            patched
-        ));
-        Some(out)
-    }
-}
-
 /// 2026-04-29: convert `ld.shared.<T>` → `ld.volatile.shared.<T>` across
 /// PhysX/FleX/TFS/IOFX/ParticleIOS kernels affected by the cross-wave LDS
 /// visibility class. The membar.cta + s_waitcnt fixes target HW-level
@@ -617,7 +431,7 @@ pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
     if total_patches == 0 {
         None
     } else {
-        super::driver::zluda_log(&format!(
+        super::driver::zluda_log_err(&format!(
             "[ZLUDA] patch_broad_volatile_lds: converted {} ld.shared → ld.volatile.shared across {} kernels",
             total_patches,
             patched_kernels.len()
@@ -626,10 +440,11 @@ pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
     }
 }
 
-/// Broader version of patch_iofx_actor_range_membar that applies to ALL
-/// kernels whose name matches PhysX/FleX/TFS/IOFX prefixes. The narrow
-/// patch only helped a single kernel; the bug class likely exists in
-/// many kernels with thread-0-only stores + bar.sync visibility patterns.
+/// 2026-04-29: insert `membar.cta;` immediately before EVERY `bar.sync 0;`
+/// in EVERY kernel. PTX `membar.cta` lowers to a CTA-scope fence on AMDGPU.
+/// Supersedes the previous IOFX_actorRange-only and family-prefix variants
+/// (removed 2026-06-03) — applies broadly to address thread-0-store +
+/// bar.sync LDS visibility patterns wherever they appear.
 ///
 /// Skip CUB / cub-prefixed kernels (`_ZN3cub`) — those have their own
 /// micro-optimized barrier patterns we don't want to perturb. PR #161638
@@ -693,7 +508,7 @@ pub fn patch_broad_membar_before_bar_sync(ptx: &str) -> Option<String> {
     if total_patches == 0 {
         None
     } else {
-        super::driver::zluda_log(&format!(
+        super::driver::zluda_log_err(&format!(
             "[ZLUDA] patch_broad_membar_before_bar_sync: inserted {} membar.cta across {} kernels",
             total_patches,
             patched_kernels.len()
@@ -773,7 +588,7 @@ pub fn patch_scan_kernel_reader_acquire(ptx: &str) -> Option<String> {
     if applied == 0 {
         return None;
     }
-    super::driver::zluda_log(&format!(
+    super::driver::zluda_log_err(&format!(
         "[ZLUDA] patch_scan_kernel_reader_acquire: injected membar.cta after {} bar.sync 0 site(s) in RadixSortScanKernel",
         applied
     ));
@@ -906,7 +721,7 @@ pub fn patch_divergent_lds_merge_sync(ptx: &str) -> Option<String> {
     if patched == 0 {
         None
     } else {
-        super::driver::zluda_log(&format!(
+        super::driver::zluda_log_err(&format!(
             "[ZLUDA] patch_divergent_lds_merge_sync: inserted {} bar.sync at merge points across {} kernel(s)",
             patched,
             patched_kernels.len()
@@ -1078,6 +893,359 @@ pub fn patch_ms1_gate_trace(ptx: &str, trace_dev_ptr: u64) -> Option<String> {
         absolute_insert_idx, trace_dev_ptr
     ));
     Some(out)
+}
+
+// ============================================================================
+// 2026-06-03 Step 2: Generic single-op memset kernel detection
+// ============================================================================
+//
+// Replaces the kernel-name-specific Fix C (TurbulenceFS_dynamicGridClearKernel
+// intercept) with an AST-based pattern detector that runs once per module
+// load. A kernel is recognized as a "simple memset" iff its body matches
+// the strict signature:
+//
+//   - body has exactly one global side-effect: `sust.b.<geom>.<width>.<mode>`
+//     OR `st.global.<scalar>`
+//   - body has zero `bar.sync`, zero `ld.shared`, zero `st.shared`,
+//     zero `ld.global`
+//   - the surface/address operand of the sust/st.global comes from
+//     a single ld.param.<u64|s64|b64> reading a kernel param
+//   - the value operand of the sust/st.global comes from a single
+//     ld.param.<scalar> reading a kernel param
+//
+// If matched, the detector records `(kernel_name → SimpleMemsetSig)` keyed
+// on the kernel's name. `launch_kernel` looks up by name; on hit it reads
+// the surface and fill values from the kernel arg buffer at the recorded
+// byte offsets (NVCC ABI: natural alignment, tight packing) and runs the
+// existing `try_host_clear_3d_array` host-side path.
+//
+// Strict matching is intentional. False positives (a non-memset kernel
+// swapped out by mistake) would silently produce wrong results, so the
+// signature rejects anything with LDS traffic, branches more than one
+// early-out, or fills sourced from non-param registers. The TurbulenceFS_*
+// family's grid-clear kernels match cleanly (see
+// `/tmp/zluda_ptx_042.ptx:8637-8676` for a reference body).
+
+/// Recorded signature for a kernel that can be intercepted with a host-side
+/// memset. Populated by `detect_simple_memset_kernels` at module load,
+/// consumed by `function.rs::launch_kernel`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SimpleMemsetSig {
+    /// Index of the surface/address kernel param (0-based in input_arguments).
+    pub surf_param_idx: u16,
+    /// Byte offset of the surf param in the launch arg buffer.
+    pub surf_param_offset: u32,
+    /// Width of the surf param in bytes (must be 8 — u64 surface handle or pointer).
+    pub surf_param_width: u8,
+    /// Index of the fill-value kernel param.
+    pub fill_param_idx: u16,
+    /// Byte offset of the fill param in the launch arg buffer.
+    pub fill_param_offset: u32,
+    /// Width of the fill scalar in bytes (1/2/4/8).
+    pub fill_param_width: u8,
+    /// `true` if the side-effect is `sust.b.3d.*` (host swap is hipMemcpy3DAsync
+    /// into a hipArray). `false` if `st.global.*` (host swap would be linear
+    /// hipMemset — not yet implemented; intercept skips this case).
+    pub is_sust_3d: bool,
+}
+
+/// Reverse-table from kernel name → memset signature. Populated by
+/// `detect_simple_memset_kernels` during `cuModuleLoadDataEx` processing.
+pub(crate) static SIMPLE_MEMSET_TABLE: std::sync::LazyLock<Mutex<HashMap<String, SimpleMemsetSig>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Env-gated master switch. Default OFF — the intercept replaces an actual
+/// kernel dispatch with a host-side memcpy3D, which has slightly different
+/// memory access patterns than the kernel's `sust.b` store. Enable per
+/// game via `ZLUDA_INTERCEPT_SIMPLE_MEMSET=1` in protonfix.
+pub(crate) fn simple_memset_intercept_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = std::env::var("ZLUDA_INTERCEPT_SIMPLE_MEMSET").map_or(false, |v| v == "1");
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] ZLUDA_INTERCEPT_SIMPLE_MEMSET={} (generic simple-memset kernel intercept)",
+            if on { "1" } else { "0" }
+        ));
+        on
+    })
+}
+
+/// Lookup helper for `function.rs::launch_kernel`. Returns the recorded
+/// signature if the kernel name was registered as a simple memset at module
+/// load time.
+pub(crate) fn lookup_simple_memset_sig(name: &str) -> Option<SimpleMemsetSig> {
+    SIMPLE_MEMSET_TABLE
+        .lock()
+        .ok()
+        .and_then(|tbl| tbl.get(name).copied())
+}
+
+/// Walk a parsed PTX module, identify kernels whose body matches the
+/// SimpleMemset signature, and insert them into `SIMPLE_MEMSET_TABLE`.
+/// Idempotent — re-registering the same name overwrites with the latest
+/// signature (matches the ptx_parser AST's view of the same module).
+pub(crate) fn detect_simple_memset_kernels(module: &ptx_parser::Module<'_>) {
+    let mut newly_detected: Vec<(String, SimpleMemsetSig)> = Vec::new();
+    for directive in &module.directives {
+        if let ptx_parser::Directive::Method(_, function) = directive {
+            let name = match function.func_directive.name {
+                ptx_parser::MethodName::Kernel(n) => n,
+                _ => continue,
+            };
+            if let Some(sig) = analyze_kernel_for_simple_memset(function) {
+                newly_detected.push((name.to_string(), sig));
+            }
+        }
+    }
+    if newly_detected.is_empty() {
+        return;
+    }
+    if let Ok(mut tbl) = SIMPLE_MEMSET_TABLE.lock() {
+        for (name, sig) in &newly_detected {
+            tbl.insert(name.clone(), *sig);
+        }
+    }
+    let names: Vec<&str> = newly_detected.iter().map(|(n, _)| n.as_str()).collect();
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] SimpleMemset detector: registered {} kernel(s) for potential intercept: {:?}",
+        newly_detected.len(),
+        names
+    ));
+}
+
+/// Compute byte offsets (per NVCC kernel-arg ABI: natural alignment, tight
+/// packing) for each entry in `params`. Returns Vec of (offset, size) tuples
+/// indexed parallel to `params`.
+fn compute_param_offsets<ID>(
+    params: &[ptx_parser::Variable<ID>],
+) -> Vec<(u32, u8)> {
+    let mut offsets = Vec::with_capacity(params.len());
+    let mut cursor: u32 = 0;
+    for var in params {
+        let layout = var.info.v_type.layout();
+        let size = layout.size() as u32;
+        let align = layout.align() as u32;
+        if align > 0 {
+            let misalignment = cursor % align;
+            if misalignment != 0 {
+                cursor += align - misalignment;
+            }
+        }
+        offsets.push((cursor, size.min(u8::MAX as u32) as u8));
+        cursor = cursor.saturating_add(size);
+    }
+    offsets
+}
+
+/// Inspect a kernel function's body for the SimpleMemset signature.
+/// Returns `Some(sig)` if matched, `None` otherwise.
+///
+/// Single-pass scan: for each statement, classify, reject on any
+/// disqualifying instruction, track ld.param-to-param-index mapping.
+/// At the end, if exactly one sust or st.global was seen and its operands
+/// map back to known kernel params, build the signature.
+fn analyze_kernel_for_simple_memset<'a>(
+    function: &ptx_parser::Function<
+        'a,
+        &'a str,
+        ptx_parser::Statement<ptx_parser::ParsedOperand<&'a str>>,
+    >,
+) -> Option<SimpleMemsetSig> {
+    let body = function.body.as_ref()?;
+
+    // Map register-name → kernel-param-index, populated by ld.param.* ops.
+    let mut param_reg_map: HashMap<&str, u16> = HashMap::new();
+    // Build the kernel's param-name → param-index reverse map for fast
+    // lookup when we encounter `ld.param ... [name_param_N]`.
+    let mut param_name_to_idx: HashMap<&str, u16> = HashMap::new();
+    for (idx, var) in function.func_directive.input_arguments.iter().enumerate() {
+        param_name_to_idx.insert(var.name, idx as u16);
+    }
+
+    let mut sust_count: u32 = 0;
+    let mut st_global_count: u32 = 0;
+    let mut sust_surf_reg: Option<&str> = None;
+    let mut sust_fill_reg: Option<&str> = None;
+    let mut sust_geom_is_3d = false;
+    let mut sust_fill_width_bytes: u8 = 0;
+    let mut st_global_addr_reg: Option<&str> = None;
+    let mut st_global_val_reg: Option<&str> = None;
+    let mut st_global_val_width: u8 = 0;
+    let mut early_exit_brs: u32 = 0;
+
+    for stmt in body {
+        match stmt {
+            ptx_parser::Statement::Instruction(_, instr) => match instr {
+                // Disqualifiers — any of these means NOT a simple memset.
+                ptx_parser::Instruction::Bar { .. }
+                | ptx_parser::Instruction::BarRed { .. }
+                | ptx_parser::Instruction::BarWarp { .. } => return None,
+
+                // ld.* — record param mappings; reject ld.global/ld.shared.
+                ptx_parser::Instruction::Ld { data, arguments } => {
+                    match data.state_space {
+                        ptx_parser::StateSpace::Param => {
+                            // dst is a register; src is the param name.
+                            let dst_reg = parsed_operand_reg(&arguments.dst)?;
+                            let src_param = parsed_operand_reg(&arguments.src)?;
+                            if let Some(&idx) = param_name_to_idx.get(src_param) {
+                                param_reg_map.insert(dst_reg, idx);
+                            }
+                        }
+                        ptx_parser::StateSpace::Global
+                        | ptx_parser::StateSpace::Shared => return None,
+                        // Const/Local/Reg loads are unusual in a strict
+                        // memset kernel; reject to keep the signature
+                        // conservative.
+                        _ => return None,
+                    }
+                }
+
+                // st.* — disqualify shared; count st.global; reject local etc.
+                ptx_parser::Instruction::St { data, arguments } => {
+                    match data.state_space {
+                        ptx_parser::StateSpace::Shared => return None,
+                        ptx_parser::StateSpace::Global => {
+                            st_global_count += 1;
+                            st_global_addr_reg = parsed_operand_reg(&arguments.src1);
+                            st_global_val_reg = parsed_operand_reg(&arguments.src2);
+                            // Type width = scalar size in bytes.
+                            if let ptx_parser::Type::Scalar(scalar) = &data.typ {
+                                st_global_val_width = scalar.layout().size() as u8;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+
+                // sust — count + capture operands; require 3D geometry
+                // for the host hipMemcpy3DAsync swap path.
+                ptx_parser::Instruction::Sust { data, arguments } => {
+                    sust_count += 1;
+                    sust_surf_reg = parsed_operand_reg(&arguments.src_surface);
+                    sust_fill_reg = parsed_operand_reg(&arguments.src_val);
+                    sust_geom_is_3d = matches!(
+                        data.geometry,
+                        ptx_parser::TextureGeometry::Dim3d
+                    );
+                    sust_fill_width_bytes = match data.data_type {
+                        ptx_parser::ScalarType::B8 | ptx_parser::ScalarType::U8
+                        | ptx_parser::ScalarType::S8 => 1,
+                        ptx_parser::ScalarType::B16 | ptx_parser::ScalarType::U16
+                        | ptx_parser::ScalarType::S16 | ptx_parser::ScalarType::F16 => 2,
+                        ptx_parser::ScalarType::B32 | ptx_parser::ScalarType::U32
+                        | ptx_parser::ScalarType::S32 | ptx_parser::ScalarType::F32 => 4,
+                        ptx_parser::ScalarType::B64 | ptx_parser::ScalarType::U64
+                        | ptx_parser::ScalarType::S64 | ptx_parser::ScalarType::F64 => 8,
+                        _ => 0,
+                    };
+                }
+
+                // Address-compute ops are fine (mov, mad, mul, shl, add,
+                // cvt, and.b32 masks, setp for the optional early-exit
+                // predicate). We don't track their dataflow; the rule is
+                // "no LDS / no global reads / no barriers / one sust",
+                // so anything else that doesn't touch memory is harmless.
+
+                // Branches: count predicate-guarded `bra` (early-exit
+                // pattern). Unconditional bra to label is fine; backward
+                // bra would be a loop, but we don't detect that explicitly.
+                ptx_parser::Instruction::Bra { .. } => {
+                    early_exit_brs += 1;
+                    if early_exit_brs > 2 {
+                        // Two-bra cap: one optional bounds-check + one
+                        // optional skip to ret. More than that suggests
+                        // a real control-flow graph; reject.
+                        return None;
+                    }
+                }
+
+                // Surface-load is the opposite direction — definitely
+                // not a memset.
+                ptx_parser::Instruction::Suld { .. } => return None,
+
+                // Atomic ops, texture reads, etc. — disqualify.
+                ptx_parser::Instruction::Atom { .. }
+                | ptx_parser::Instruction::AtomCas { .. }
+                | ptx_parser::Instruction::Tex { .. } => return None,
+
+                // Everything else (mov, cvt, setp, mad, shl, shr, add,
+                // sub, and, or, xor, ret, etc.) — silently allowed.
+                _ => {}
+            },
+            // Labels, variable declarations, nested blocks — allowed.
+            ptx_parser::Statement::Label(_)
+            | ptx_parser::Statement::Variable(_) => {}
+            ptx_parser::Statement::Block(_) => {
+                // We don't traverse nested blocks (very rare in entry
+                // kernels). Conservatively reject to keep correctness.
+                return None;
+            }
+        }
+    }
+
+    // Need exactly one global side-effect.
+    if sust_count + st_global_count != 1 {
+        return None;
+    }
+
+    let param_offsets =
+        compute_param_offsets(&function.func_directive.input_arguments);
+
+    if sust_count == 1 {
+        let surf_reg = sust_surf_reg?;
+        let fill_reg = sust_fill_reg?;
+        let surf_idx = *param_reg_map.get(surf_reg)?;
+        let fill_idx = *param_reg_map.get(fill_reg)?;
+        let (surf_off, surf_sz) = *param_offsets.get(surf_idx as usize)?;
+        let (fill_off, _fill_sz) = *param_offsets.get(fill_idx as usize)?;
+        if surf_sz != 8 || sust_fill_width_bytes == 0 {
+            return None;
+        }
+        return Some(SimpleMemsetSig {
+            surf_param_idx: surf_idx,
+            surf_param_offset: surf_off,
+            surf_param_width: surf_sz,
+            fill_param_idx: fill_idx,
+            fill_param_offset: fill_off,
+            fill_param_width: sust_fill_width_bytes,
+            is_sust_3d: sust_geom_is_3d,
+        });
+    }
+
+    // st.global single-op path — not currently used by the host swap
+    // (needs hipMemset on a linear range; the current host path expects a
+    // hipArray-backed surface). Keep detection but skip registering for
+    // now by returning None — extends cleanly when we add linear support.
+    if st_global_count == 1 {
+        let _ = (st_global_addr_reg, st_global_val_reg, st_global_val_width);
+        return None;
+    }
+
+    None
+}
+
+/// Helper: extract the register identifier from `ParsedOperand::Reg(_)` or
+/// a single-element `VecPack([Reg(_)])` (PTX renders single-channel sust
+/// fill values as `{%r4}`). Returns None for empty/multi/imm operands —
+/// the SimpleMemset signature requires single-register address and value.
+fn parsed_operand_reg<'a>(
+    op: &ptx_parser::ParsedOperand<&'a str>,
+) -> Option<&'a str> {
+    match op {
+        ptx_parser::ParsedOperand::Reg(id) => Some(*id),
+        ptx_parser::ParsedOperand::VecPack(elems) => {
+            if elems.len() == 1 {
+                match &elems[0] {
+                    ptx_parser::RegOrImmediate::Reg(id) => Some(*id),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Extract the label name from a line that's just `LABEL:` or `LABEL: comment`.
@@ -1580,20 +1748,10 @@ fn get_best_ptx_and_compile(
                         Some(patched) => Cow::Owned(patched),
                         None => Cow::Borrowed(ptx),
                     };
-                    let after_actor: Cow<str> =
-                        match patch_iofx_actor_range_membar(after_bbox.as_ref()) {
+                    let after_volatile: Cow<str> =
+                        match patch_broad_volatile_lds(after_bbox.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_bbox,
-                        };
-                    let after_remap: Cow<str> =
-                        match patch_iofx_remap_membar_before_texread(after_actor.as_ref()) {
-                            Some(p) => Cow::Owned(p),
-                            None => after_actor,
-                        };
-                    let after_volatile: Cow<str> =
-                        match patch_broad_volatile_lds(after_remap.as_ref()) {
-                            Some(p) => Cow::Owned(p),
-                            None => after_remap,
                         };
                     let after_membar: Cow<str> =
                         match patch_broad_membar_before_bar_sync(after_volatile.as_ref()) {
@@ -1659,15 +1817,10 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => text,
                                         };
-                                    let after_actor: Cow<str> =
-                                        match patch_iofx_actor_range_membar(after_bbox.as_ref()) {
+                                    let after_volatile: Cow<str> =
+                                        match patch_broad_volatile_lds(after_bbox.as_ref()) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_bbox,
-                                        };
-                                    let after_volatile: Cow<str> =
-                                        match patch_broad_volatile_lds(after_actor.as_ref()) {
-                                            Some(p) => Cow::Owned(p),
-                                            None => after_actor,
                                         };
                                     let after_membar: Cow<str> =
                                         match patch_broad_membar_before_bar_sync(
@@ -1752,6 +1905,13 @@ fn get_best_ptx_and_compile(
                             ast.invalid_directives,
                             ast.directives.len()
                         ));
+                        // 2026-06-03 Step 2: scan parsed AST for kernels
+                        // matching the SimpleMemset signature and register
+                        // them in SIMPLE_MEMSET_TABLE. Cheap traversal,
+                        // amortized to module load. Runs on the first
+                        // accepted AST in this fold pass — the same AST
+                        // that becomes the load winner.
+                        detect_simple_memset_kernels(&ast);
                         if ast.invalid_directives == 0 {
                             return ControlFlow::Break((src, ast));
                         } else {
@@ -2556,96 +2716,175 @@ ret;
         assert!(patched.contains("@%p_zluda_bbox_lane0_1 bra BB1_3;"));
     }
 
-    /// 2026-06-03 Class A experiment: validate that
-    /// `patch_iofx_remap_membar_before_texread` inserts `membar.sys;`
-    /// immediately before each `tex.1d.v4.u32.s32 ... IOFX_texRef*`
-    /// instruction inside `IOFX_remapKernel`.
+    // ----------------------------------------------------------------
+    // 2026-06-03 Step 2: SimpleMemset AST detector tests
+    // ----------------------------------------------------------------
+
+    fn simple_memset_clear_clean_table() {
+        if let Ok(mut tbl) = super::SIMPLE_MEMSET_TABLE.lock() {
+            tbl.clear();
+        }
+    }
+
+    fn parse_and_detect(ptx: &str) {
+        let module = ptx_parser::parse_module_checked(ptx)
+            .expect("test PTX must parse");
+        super::detect_simple_memset_kernels(&module);
+    }
+
+    /// Real PhysX TFS_dynamicGridClearKernel body (taken from
+    /// /tmp/zluda_ptx_042.ptx:8637-8676) must be recognized as a
+    /// SimpleMemset and registered with the correct (surf=5, fill=6)
+    /// param indices.
     #[test]
-    fn test_remap_membar_inserts_before_tex1d() {
-        let ptx = r#"
-.visible .entry _Z22IOFX_remapKernel_templILb0EEvPi(
-    .param .b64 _Z22IOFX_remapKernel_templILb0EEvPi_param_0
-) {
-    .reg .b32 %r<40>;
-    BB10_2:
-    ld.u32 %r25, [%rd9];
-    and.b32 %r24, %r25, 2147483647;
-    tex.1d.v4.u32.s32 {%r20, %r21, %r22, %r23}, [IOFX_texRefRemapInStateToInput, {%r24}];
-    and.b32 %r7, %r20, 2147483647;
-    setp.ge.u32 %p2, %r7, %r13;
-    @%p2 bra BB10_5;
-    tex.1d.v4.u32.s32 {%r26, %r27, %r28, %r29}, [IOFX_texRefRemapActorIDs, {%r7}];
-    BB10_5:
+    fn simple_memset_detects_real_tfs_dynamic_grid_clear() {
+        simple_memset_clear_clean_table();
+        let ptx = r#".version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry TurbulenceFS_dynamicGridClearKernel(
+    .param .u64 TurbulenceFS_dynamicGridClearKernel_param_0,
+    .param .u16 TurbulenceFS_dynamicGridClearKernel_param_1,
+    .param .u32 TurbulenceFS_dynamicGridClearKernel_param_2,
+    .param .u32 TurbulenceFS_dynamicGridClearKernel_param_3,
+    .param .u32 TurbulenceFS_dynamicGridClearKernel_param_4,
+    .param .u64 TurbulenceFS_dynamicGridClearKernel_param_5,
+    .param .u32 TurbulenceFS_dynamicGridClearKernel_param_6
+)
+{
+    .reg .s32 %r<15>;
+    .reg .s64 %rd<2>;
+
+    ld.param.u64 %rd1, [TurbulenceFS_dynamicGridClearKernel_param_5];
+    ld.param.u32 %r4, [TurbulenceFS_dynamicGridClearKernel_param_6];
+    mov.u32 %r5, %ctaid.z;
+    mov.u32 %r6, %ctaid.y;
+    mov.u32 %r7, %ctaid.x;
+    mov.u32 %r8, %ntid.x;
+    mov.u32 %r9, %tid.x;
+    mad.lo.s32 %r10, %r8, %r7, %r9;
+    mov.u32 %r11, %ntid.y;
+    mov.u32 %r12, %tid.y;
+    mad.lo.s32 %r2, %r11, %r6, %r12;
+    mov.u32 %r13, %ntid.z;
+    mov.u32 %r14, %tid.z;
+    mad.lo.s32 %r3, %r13, %r5, %r14;
+    shl.b32 %r1, %r10, 2;
+    sust.b.3d.b32.zero [%rd1, {%r1, %r2, %r3, %r3}], {%r4};
     ret;
 }
 "#;
-        let patched = patch_iofx_remap_membar_before_texread(ptx)
-            .expect("expected IOFX_remapKernel match to produce a patch");
-        // Both tex.1d call sites must be preceded by membar.sys;
-        let in_state_idx = patched
-            .find("tex.1d.v4.u32.s32 {%r20")
-            .expect("missing first tex.1d in patched output");
-        let actor_id_idx = patched
-            .find("tex.1d.v4.u32.s32 {%r26")
-            .expect("missing second tex.1d in patched output");
-        // Find the nearest preceding `membar.sys;` for each.
-        let pre_in_state = &patched[..in_state_idx];
-        let pre_actor_id = &patched[..actor_id_idx];
+        parse_and_detect(ptx);
+        let sig = super::lookup_simple_memset_sig("TurbulenceFS_dynamicGridClearKernel")
+            .expect("clear kernel should be registered");
+        assert_eq!(sig.surf_param_idx, 5, "expected surf=param_5");
+        assert_eq!(sig.fill_param_idx, 6, "expected fill=param_6");
+        assert!(sig.is_sust_3d, "expected sust.b.3d");
+        assert_eq!(sig.surf_param_width, 8, "u64 surface handle");
+        assert_eq!(sig.fill_param_width, 4, "b32 fill value");
+        // NVCC ABI offsets:
+        //   _0 u64 @0..8;  _1 u16 @8..10;  _2 u32 @12..16 (align 4);
+        //   _3 u32 @16..20; _4 u32 @20..24; _5 u64 @24..32 (align 8);
+        //   _6 u32 @32..36
+        assert_eq!(sig.surf_param_offset, 24);
+        assert_eq!(sig.fill_param_offset, 32);
+    }
+
+    /// A kernel with a `bar.sync` in its body must NOT be flagged as
+    /// a SimpleMemset — barriers indicate the kernel relies on lane
+    /// coordination and is not a trivial fill.
+    #[test]
+    fn simple_memset_rejects_kernels_with_bar_sync() {
+        simple_memset_clear_clean_table();
+        let ptx = r#".version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry KernelWithBar(
+    .param .u64 KernelWithBar_param_0,
+    .param .u32 KernelWithBar_param_1
+)
+{
+    .reg .s32 %r<5>;
+    .reg .s64 %rd<2>;
+    ld.param.u64 %rd1, [KernelWithBar_param_0];
+    ld.param.u32 %r1, [KernelWithBar_param_1];
+    mov.u32 %r2, %tid.x;
+    bar.sync 0;
+    sust.b.3d.b32.zero [%rd1, {%r2, %r2, %r2, %r2}], {%r1};
+    ret;
+}
+"#;
+        parse_and_detect(ptx);
         assert!(
-            pre_in_state.rfind("membar.sys;").is_some(),
-            "no membar.sys; before first tex.1d (texRefRemapInStateToInput):\n{}",
-            patched
-        );
-        // The membar.sys for the SECOND tex.1d must come AFTER the first one
-        // (i.e., between the two tex.1d calls), not be the same one we matched
-        // for the first.
-        let first_membar = pre_in_state
-            .rfind("membar.sys;")
-            .expect("no first membar.sys");
-        let second_membar = pre_actor_id
-            .rfind("membar.sys;")
-            .expect("no second membar.sys");
-        assert!(
-            second_membar > first_membar,
-            "second membar.sys is not after first; only one membar inserted?\n{}",
-            patched
-        );
-        // Marker comment present
-        assert!(
-            patched.contains("ZLUDA IOFX_remap tex.1d cache-invalidate fence"),
-            "marker comment missing"
+            super::lookup_simple_memset_sig("KernelWithBar").is_none(),
+            "kernel with bar.sync must not be registered"
         );
     }
 
-    /// 2026-06-03 Class A experiment: env var `ZLUDA_IOFX_REMAP_MEMBAR=0`
-    /// disables the patch.
+    /// A kernel that reads from `ld.global` (i.e., its address or fill
+    /// depends on values fetched from device memory) is NOT a simple
+    /// memset — its semantic depends on memory state. Reject.
     #[test]
-    fn test_remap_membar_env_off_disables() {
-        std::env::set_var("ZLUDA_IOFX_REMAP_MEMBAR", "0");
-        let ptx = r#"
-.visible .entry IOFX_remapKernel() {
-    tex.1d.v4.u32.s32 {%r20, %r21, %r22, %r23}, [IOFX_texRefRemapInStateToInput, {%r24}];
+    fn simple_memset_rejects_kernels_with_ld_global() {
+        simple_memset_clear_clean_table();
+        let ptx = r#".version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry KernelWithGlobalLoad(
+    .param .u64 KernelWithGlobalLoad_param_0,
+    .param .u64 KernelWithGlobalLoad_param_1
+)
+{
+    .reg .s32 %r<5>;
+    .reg .s64 %rd<3>;
+    ld.param.u64 %rd1, [KernelWithGlobalLoad_param_0];
+    ld.param.u64 %rd2, [KernelWithGlobalLoad_param_1];
+    ld.global.u32 %r1, [%rd2];
+    mov.u32 %r2, %tid.x;
+    sust.b.3d.b32.zero [%rd1, {%r2, %r2, %r2, %r2}], {%r1};
     ret;
 }
 "#;
-        let patched = patch_iofx_remap_membar_before_texread(ptx);
-        std::env::remove_var("ZLUDA_IOFX_REMAP_MEMBAR");
-        assert!(patched.is_none(), "env=0 must disable the patch");
+        parse_and_detect(ptx);
+        assert!(
+            super::lookup_simple_memset_sig("KernelWithGlobalLoad").is_none(),
+            "kernel with ld.global must not be registered"
+        );
     }
 
-    /// 2026-06-03 Class A experiment: PTX without IOFX_remapKernel is a
-    /// no-op (returns None to chain through the patch pipeline).
+    /// A kernel with TWO `sust` ops (or a `sust` plus an `st.global`)
+    /// is more than a trivial fill — reject.
     #[test]
-    fn test_remap_membar_skips_non_remap_kernel() {
-        let ptx = r#"
-.visible .entry SomeOtherKernel() {
-    tex.1d.v4.u32.s32 {%r20, %r21, %r22, %r23}, [IOFX_texRefRemapInStateToInput, {%r24}];
+    fn simple_memset_rejects_kernels_with_two_sust_ops() {
+        simple_memset_clear_clean_table();
+        let ptx = r#".version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry TwoSustKernel(
+    .param .u64 TwoSustKernel_param_0,
+    .param .u64 TwoSustKernel_param_1,
+    .param .u32 TwoSustKernel_param_2
+)
+{
+    .reg .s32 %r<3>;
+    .reg .s64 %rd<3>;
+    ld.param.u64 %rd1, [TwoSustKernel_param_0];
+    ld.param.u64 %rd2, [TwoSustKernel_param_1];
+    ld.param.u32 %r1, [TwoSustKernel_param_2];
+    mov.u32 %r2, %tid.x;
+    sust.b.3d.b32.zero [%rd1, {%r2, %r2, %r2, %r2}], {%r1};
+    sust.b.3d.b32.zero [%rd2, {%r2, %r2, %r2, %r2}], {%r1};
     ret;
 }
 "#;
+        parse_and_detect(ptx);
         assert!(
-            patch_iofx_remap_membar_before_texread(ptx).is_none(),
-            "patch must skip kernels other than IOFX_remapKernel"
+            super::lookup_simple_memset_sig("TwoSustKernel").is_none(),
+            "kernel with two sust ops must not be registered"
         );
     }
 
