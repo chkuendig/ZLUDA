@@ -1,9 +1,54 @@
 use cuda_types::cuda::*;
 use hip_runtime_sys::*;
+use std::collections::HashMap;
 use std::mem;
+use std::sync::{LazyLock, Mutex};
 
 // Same as in zluda_ptx_impl.cpp
 const IMAGE_RESERVED_TOP_BITS: u32 = 3;
+
+/// 2026-06-03: reverse-lookup table from user-visible surface handle
+/// (the encoded `CUsurfObject` we hand back to the app) to the backing
+/// `hipArray_t`. Used by the Fix C experimental
+/// `TurbulenceFS_dynamicGridClearKernel` host-memset intercept in
+/// `function.rs::launch_kernel`: when the env-gated intercept fires, we
+/// need to derive a `hipArray_t` from the kernel's param_5 (the surface
+/// object handle) to drive `hipMemcpy3DAsync` against the array.
+///
+/// Key is the FULL encoded surface handle (with pixel-shift top-bits set)
+/// — the value PhysX passes as a kernel param. Value is the raw
+/// `hipArray_t` cast to `usize` (the raw pointer itself isn't `Sync`,
+/// matching the existing `D3D11_RESOURCE_TABLE` storage convention).
+/// Both `object_create` branches (real surface and D3D11 HSA bypass)
+/// populate this; `object_destroy` removes from it.
+pub(crate) static SURF_OBJ_TO_ARRAY: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Insert a surface object → array mapping into [`SURF_OBJ_TO_ARRAY`].
+/// Called from both `object_create` paths after the encoded handle is
+/// computed.
+fn track_surf_obj(encoded_handle: usize, array: hipArray_t) {
+    if let Ok(mut tbl) = SURF_OBJ_TO_ARRAY.lock() {
+        tbl.insert(encoded_handle, array as usize);
+    }
+}
+
+/// Remove a surface object from [`SURF_OBJ_TO_ARRAY`]. Called from
+/// `object_destroy`.
+fn untrack_surf_obj(encoded_handle: usize) {
+    if let Ok(mut tbl) = SURF_OBJ_TO_ARRAY.lock() {
+        tbl.remove(&encoded_handle);
+    }
+}
+
+/// Lookup helper used by `function.rs::launch_kernel` Fix C intercept.
+pub(crate) fn surf_obj_to_array(encoded_handle: usize) -> Option<hipArray_t> {
+    SURF_OBJ_TO_ARRAY
+        .lock()
+        .ok()
+        .and_then(|tbl| tbl.get(&encoded_handle).copied())
+        .map(|v| v as hipArray_t)
+}
 
 pub(crate) unsafe fn object_create(
     p_surf_object: &mut CUsurfObject,
@@ -52,6 +97,9 @@ pub(crate) unsafe fn object_create(
              shift={} encoded=0x{:x} array={:?}",
             hsa_image_handle, pixel_size_bytes, shift_bits, encoded, array_in
         ));
+        // 2026-06-03: track surf_obj → array for the Fix C
+        // TurbulenceFS_dynamicGridClearKernel host-memset intercept.
+        track_surf_obj(encoded, array_in);
         *p_surf_object = encoded as CUsurfObject;
         return Ok(());
     }
@@ -89,11 +137,19 @@ pub(crate) unsafe fn object_create(
     ));
     let shift_amount = shift_bits << (usize::BITS - IMAGE_RESERVED_TOP_BITS);
     surf_obj = (surf_obj as usize | shift_amount) as _;
+    // 2026-06-03: track surf_obj → array for Fix C ClearKernel intercept.
+    track_surf_obj(surf_obj as usize, array);
     *p_surf_object = surf_obj as CUsurfObject;
     Ok(())
 }
 
 pub(crate) unsafe fn object_destroy(surf_object: CUsurfObject) -> CUresult {
+    let encoded = surf_object as usize;
+    // 2026-06-03: drop the surf_obj → array mapping BEFORE the underlying
+    // HIP destroy, so any in-flight Fix C intercept sees an invalid handle
+    // and falls back to the normal kernel launch rather than dereferencing
+    // a stale array.
+    untrack_surf_obj(encoded);
     let surf_obj = surf_object as hipSurfaceObject_t;
     hipDestroySurfaceObject(
         (((surf_obj as usize) << IMAGE_RESERVED_TOP_BITS) >> IMAGE_RESERVED_TOP_BITS) as _,
@@ -542,5 +598,34 @@ mod tests {
             hipDestroySurfaceObject(surf_obj).unwrap();
             hipFreeArray(array).unwrap();
         }
+    }
+
+    /// 2026-06-03 Fix C: round-trip the surf_obj → hipArray_t side table
+    /// without involving the HIP runtime. Pure synchronization-correctness
+    /// test for `track_surf_obj` / `untrack_surf_obj` / `surf_obj_to_array`.
+    #[test]
+    fn surf_obj_to_array_roundtrip() {
+        use hip_runtime_sys::hipArray_t;
+        // Use a deliberately encoded fake handle (non-zero top bits to look
+        // like a post-shift CUsurfObject) and a fake hipArray_t (just a
+        // non-null pointer cast).
+        let fake_handle: usize = 0x6000_0000_dead_beef;
+        let fake_array = 0x1234_5678usize as hipArray_t;
+
+        // Not yet inserted → None.
+        assert!(super::surf_obj_to_array(fake_handle).is_none());
+
+        // Insert via the same helper object_create uses.
+        super::track_surf_obj(fake_handle, fake_array);
+        let got = super::surf_obj_to_array(fake_handle)
+            .expect("after track_surf_obj, lookup should succeed");
+        assert_eq!(got, fake_array, "lookup must return the stored array");
+
+        // Untrack drops the mapping.
+        super::untrack_surf_obj(fake_handle);
+        assert!(
+            super::surf_obj_to_array(fake_handle).is_none(),
+            "after untrack_surf_obj, lookup must return None"
+        );
     }
 }

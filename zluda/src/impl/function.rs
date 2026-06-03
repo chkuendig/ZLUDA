@@ -2149,6 +2149,145 @@ fn launch_mutex(lock_mode: u8) -> Option<&'static Mutex<()>> {
     }
 }
 
+/// 2026-06-03 Fix C helper: lazy-grown device-side zero buffer for the
+/// `TurbulenceFS_dynamicGridClearKernel` intercept. Allocated once on
+/// first use and grown if a larger array shows up. Holding a single
+/// global keeps allocator pressure low across the hundreds of clear
+/// dispatches per bench frame.
+static CLEAR_ZERO_BUF: std::sync::OnceLock<Mutex<(hipDeviceptr_t, usize)>> =
+    std::sync::OnceLock::new();
+
+/// Ensure `CLEAR_ZERO_BUF` is at least `need_bytes` large and points to
+/// all-zero device memory. Returns the device pointer on success, None
+/// on any HIP error. Called from `try_host_clear_3d_array` only.
+unsafe fn ensure_clear_zero_buf(need_bytes: usize) -> Option<hipDeviceptr_t> {
+    let cell = CLEAR_ZERO_BUF.get_or_init(|| {
+        Mutex::new((hipDeviceptr_t(std::ptr::null_mut()), 0usize))
+    });
+    let mut guard = cell.lock().ok()?;
+    let (ref mut ptr, ref mut size) = *guard;
+    if *size >= need_bytes && !ptr.0.is_null() {
+        return Some(*ptr);
+    }
+    // (Re)allocate to at least need_bytes, doubling current capacity for
+    // amortized growth.
+    let new_size = need_bytes.max(*size * 2).max(64 * 1024);
+    if !ptr.0.is_null() {
+        let _ = hipFree(ptr.0);
+    }
+    let mut new_dev: *mut std::ffi::c_void = std::ptr::null_mut();
+    if hipMalloc(&mut new_dev, new_size).is_err() || new_dev.is_null() {
+        *ptr = hipDeviceptr_t(std::ptr::null_mut());
+        *size = 0;
+        return None;
+    }
+    if hipMemset(new_dev, 0, new_size).is_err() {
+        let _ = hipFree(new_dev);
+        *ptr = hipDeviceptr_t(std::ptr::null_mut());
+        *size = 0;
+        return None;
+    }
+    *ptr = hipDeviceptr_t(new_dev);
+    *size = new_size;
+    Some(*ptr)
+}
+
+/// 2026-06-03 Fix C: try to replace a `TurbulenceFS_dynamicGridClearKernel`
+/// launch with a host-side `hipMemcpy3DAsync` from a zero buffer into the
+/// 3D `hipArray_t` the surface object backs. Returns `true` if the
+/// intercept succeeded and the caller should skip the actual kernel
+/// dispatch; returns `false` if anything went wrong (caller falls through
+/// to the normal `hipModuleLaunchKernel` path).
+///
+/// All HIP errors are non-fatal — they trigger fallback to the kernel
+/// launch, never a crash. The intercept is intentionally conservative.
+unsafe fn try_host_clear_3d_array(
+    arr: hipArray_t,
+    surf_obj_u64: u64,
+    stream: hipStream_t,
+) -> bool {
+    let mut desc: HIP_ARRAY3D_DESCRIPTOR = std::mem::zeroed();
+    if hipArray3DGetDescriptor(&mut desc, arr).is_err() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] TFS_dynamicGridClear intercept: hipArray3DGetDescriptor failed surf=0x{:x} arr={:?} — falling back",
+            surf_obj_u64, arr
+        ));
+        return false;
+    }
+    let chans = if desc.NumChannels == 0 { 1 } else { desc.NumChannels as usize };
+    let fmt_size = match desc.Format {
+        hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT8
+        | hipArray_Format::HIP_AD_FORMAT_SIGNED_INT8 => 1,
+        hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT16
+        | hipArray_Format::HIP_AD_FORMAT_SIGNED_INT16
+        | hipArray_Format::HIP_AD_FORMAT_HALF => 2,
+        hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32
+        | hipArray_Format::HIP_AD_FORMAT_SIGNED_INT32
+        | hipArray_Format::HIP_AD_FORMAT_FLOAT => 4,
+        _ => 0,
+    };
+    if fmt_size == 0 || desc.Width == 0 || desc.Height == 0 || desc.Depth == 0 {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] TFS_dynamicGridClear intercept: bad descriptor (fmt={:?} ch={} {}x{}x{}) — falling back",
+            desc.Format, desc.NumChannels, desc.Width, desc.Height, desc.Depth
+        ));
+        return false;
+    }
+    let row_bytes = desc.Width * chans * fmt_size;
+    let slice_bytes = row_bytes * desc.Height;
+    let total_bytes = slice_bytes * desc.Depth;
+    let zero_dev = match ensure_clear_zero_buf(total_bytes) {
+        Some(p) => p,
+        None => {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] TFS_dynamicGridClear intercept: zero-buf alloc failed need={} — falling back",
+                total_bytes
+            ));
+            return false;
+        }
+    };
+    let mut params: hipMemcpy3DParms = std::mem::zeroed();
+    params.srcArray = std::ptr::null_mut();
+    params.srcPtr = hipPitchedPtr {
+        ptr: zero_dev.0,
+        pitch: row_bytes,
+        xsize: row_bytes,
+        ysize: desc.Height,
+    };
+    params.srcPos = hipPos { x: 0, y: 0, z: 0 };
+    params.dstArray = arr;
+    params.dstPos = hipPos { x: 0, y: 0, z: 0 };
+    params.dstPtr = hipPitchedPtr {
+        ptr: std::ptr::null_mut(),
+        pitch: 0,
+        xsize: 0,
+        ysize: 0,
+    };
+    params.extent = hipExtent {
+        width: row_bytes,
+        height: desc.Height,
+        depth: desc.Depth,
+    };
+    params.kind = hipMemcpyKind::hipMemcpyDeviceToDevice;
+    let r = hipMemcpy3DAsync(&params, stream);
+    if r.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] TFS_dynamicGridClear intercept: hipMemcpy3DAsync err={:?} — falling back",
+            r
+        ));
+        return false;
+    }
+    static FIRST_HIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    FIRST_HIT.get_or_init(|| {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] TFS_dynamicGridClear intercept ACTIVE: surf=0x{:x} arr={:?} {}x{}x{} fmt={:?} ch={} (subsequent intercepts silent)",
+            surf_obj_u64, arr, desc.Width, desc.Height, desc.Depth, desc.Format, desc.NumChannels
+        ));
+        true
+    });
+    true
+}
+
 // ============================================================================
 // F.5: Safe CreateGrid sortedKeys validator
 // ============================================================================
@@ -13410,6 +13549,75 @@ pub(crate) fn launch_kernel(
         {
             unsafe {
                 let _ = hip_runtime_sys::hipStreamSynchronize(stream);
+            }
+        }
+    }
+
+    // 2026-06-03 Fix C (experimental): host-side hipMemcpy3DAsync replacement
+    // for TurbulenceFS_dynamicGridClearKernel. Tests the surface-alias
+    // hypothesis (project_clearkernel_aliases_rd5_22176_2026_05_22): the
+    // kernel's sust.b.3d.b32.zero store has been hypothesized to alias rd5's
+    // linear buffer, side-effect-zeroing rd5+22176 in pass cycles only. The
+    // MS1_RD5_RESET fix (8b53ca00) already zeros rd5+22176 explicitly, so
+    // the alias side-effect is no longer load-bearing. This intercept
+    // replaces the dispatch with hipMemcpy3DAsync from a zero source buffer
+    // to the target hipArray, preserving the surface-clear semantics while
+    // eliminating the alias. If iter23 with env=1 produces FEWER faults vs
+    // env=0, alias-write was contributing harm. Default OFF to enable A/B.
+    if name == "TurbulenceFS_dynamicGridClearKernel" {
+        static CLEAR_HOST_MEMSET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *CLEAR_HOST_MEMSET.get_or_init(|| {
+            let on = std::env::var("ZLUDA_CLEARKERNEL_HOST_MEMSET").map_or(false, |v| v == "1");
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] ZLUDA_CLEARKERNEL_HOST_MEMSET={} (TFS_dynamicGridClear intercept)",
+                if on { "1" } else { "0" }
+            ));
+            on
+        });
+        if enabled && !extra.is_null() && kernel_params.is_null() {
+            // Read param_5 (surf_obj u64 @ offset 24) + param_6 (fill u32 @ offset 32)
+            // from the extra buffer. Kernel signature:
+            //   .param .u64 _0   @ 0..8
+            //   .param .u16 _1   @ 8..10
+            //   .param .u32 _2   @ 12..16  (aligned 4)
+            //   .param .u32 _3   @ 16..20
+            //   .param .u32 _4   @ 20..24
+            //   .param .u64 _5   @ 24..32  (aligned 8) ← surface obj
+            //   .param .u32 _6   @ 32..36              ← fill value
+            let extra_arr = unsafe { std::slice::from_raw_parts(extra, 5) };
+            let cu_launch_param_buffer_pointer_local =
+                0x1usize as *mut ::core::ffi::c_void;
+            let cu_launch_param_buffer_size_local = 0x2usize as *mut ::core::ffi::c_void;
+            if extra_arr[0] == cu_launch_param_buffer_pointer_local
+                && extra_arr[2] == cu_launch_param_buffer_size_local
+            {
+                let buffer = extra_arr[1] as *const u8;
+                let size_ptr = extra_arr[3] as *const usize;
+                if !buffer.is_null() && !size_ptr.is_null() {
+                    let size = unsafe { *size_ptr };
+                    if size >= 36 {
+                        let surf_obj_u64 = unsafe {
+                            std::ptr::read_unaligned(buffer.add(24) as *const u64)
+                        };
+                        let fill_value = unsafe {
+                            std::ptr::read_unaligned(buffer.add(32) as *const u32)
+                        };
+                        if fill_value == 0 {
+                            // Only zero-fills supported (the typical Clear case).
+                            // Non-zero fills fall through to the kernel.
+                            if let Some(arr) = super::surf::surf_obj_to_array(surf_obj_u64 as usize)
+                            {
+                                let intercepted = unsafe {
+                                    try_host_clear_3d_array(arr, surf_obj_u64, stream)
+                                };
+                                if intercepted {
+                                    drop(launch_guard);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
