@@ -1658,6 +1658,59 @@ pub(crate) fn drain_dev5_dump_queue() {
     }
 }
 
+/// 2026-06-03: drain `MS1_RD5_RESET_DRAIN_QUEUE`. For each `rd5` pushed
+/// by the MS_1 launch hook, issue a single 4-byte `hipMemsetD32` to zero
+/// `*(rd5 + F6_OFFSET_IN_RD5)` (= particleShapesCounter at offset 22176).
+/// Called from host-thread contexts where DtoH/DtoD is safe:
+/// `event::record`, `event::synchronize`, `stream::synchronize`.
+///
+/// Prior to this refactor (2026-06-02 audit), the equivalent
+/// `hipMemsetD32` ran synchronously from inside `launch_kernel` (via
+/// `function.rs::ms1_consume_rd5_resets` called from `capture_tfs_launch`).
+/// That violates the "no D2D/memops from launch_kernel hook" rule
+/// (`feedback_no_d2d_from_launch_kernel.md`) — on Wine 10.0 + ROCm 6.2.4
+/// the implicit ProfilingSignal pool growth races and asserts on a
+/// std::vector OOB at `libamdhip64.so.6+0x33ca86`. Deferring to here
+/// keeps the workaround active while respecting the rule.
+///
+/// Gated on `ZLUDA_MS1_RD5_RESET=1` (same env var as the producer side).
+/// Logs `[ZLUDA] MS1_RD5_RESET drained=N rd5[0]=0x... ok=true/false`
+/// so we can confirm cadence in `/tmp/zluda_tex.log`.
+pub(crate) fn drain_ms1_rd5_reset_queue() {
+    if !super::function::ms1_rd5_reset_enabled() {
+        return;
+    }
+    let items: Vec<u64> = match super::function::MS1_RD5_RESET_DRAIN_QUEUE.get() {
+        Some(m) => match m.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => return,
+        },
+        None => return,
+    };
+    if items.is_empty() {
+        return;
+    }
+    static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let drained_n = items.len();
+    let first_rd5 = items[0];
+    let mut ok_count: usize = 0;
+    let mut last_err: Option<hipError_t> = None;
+    for rd5 in items {
+        let dst = (rd5 + super::function::F6_OFFSET_IN_RD5 as u64) as *mut std::ffi::c_void;
+        let r = unsafe { hipMemsetD32(hipDeviceptr_t(dst), 0, 1) };
+        if r.is_err() {
+            last_err = Some(r);
+        } else {
+            ok_count += 1;
+        }
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] MS1_RD5_RESET drained=#{} count={} ok={}/{} rd5[0]=0x{:x} last_err={:?}",
+        call_n, drained_n, ok_count, drained_n, first_rd5, last_err
+    ));
+}
+
 /// Plan v26 Phase B.3: drain `IOFX_AR_DUMP_QUEUE`. Same pattern as
 /// `drain_dev5_dump_queue`. For each (param_4_ptr, launch_n), do a
 /// `hipDeviceSynchronize` + `hipMemcpyDtoH` of up to 4096 u32s

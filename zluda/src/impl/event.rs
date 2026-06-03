@@ -94,6 +94,11 @@ pub(crate) unsafe fn record(event: hipEvent_t, stream: hipStream_t) -> hipError_
     // Plan v26 Phase B.3: drain IOFX_actorRange param_4 dump queue. Same
     // safety properties as the DEV5 drain; no-op when ZLUDA_ACTORRANGE_DUMP=0.
     super::memory::drain_iofx_ar_dump_queue();
+    // 2026-06-03: drain MS1_RD5_RESET queue. Defers the per-cycle
+    // hipMemsetD32(rd5+22176, 0, 1) out of launch_kernel (where it
+    // races with the ROCm 6.2.4 ProfilingSignal pool on Wine 10.0) onto
+    // this host-thread call site. No-op when ZLUDA_MS1_RD5_RESET=0.
+    super::memory::drain_ms1_rd5_reset_queue();
     // Producer-release side of the Bug A fix (cherry-picked from 49414873):
     // force SYSTEM scope before recording the event so the producer stream's
     // stores are flushed to the system-visible level before downstream
@@ -137,6 +142,8 @@ pub(crate) unsafe fn synchronize(event: hipEvent_t) -> hipError_t {
     super::memory::drain_ms2_dump_queue();
     // Plan v26 Phase B.3: drain IOFX_actorRange dump queue (sibling).
     super::memory::drain_iofx_ar_dump_queue();
+    // 2026-06-03: MS_1 rd5+22176 reset drain (sibling).
+    super::memory::drain_ms1_rd5_reset_queue();
     let result = hipEventSynchronize(event);
     super::driver::zluda_log_err(&format!(
         "cuEventSynchronize(event={:?}) -> {:?}",

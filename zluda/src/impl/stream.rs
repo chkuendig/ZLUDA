@@ -190,6 +190,11 @@ pub(crate) fn null_stream_sync_for_event(stream: hipStream_t) -> NullStreamGuard
 
 pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
     super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize({:?})", stream));
+    // 2026-06-03: MS_1 rd5+22176 reset drain. Host-thread safe DtoD;
+    // no-op when ZLUDA_MS1_RD5_RESET=0. Placed before the actual
+    // hipStreamSynchronize so deferred resets land before downstream
+    // launches see the "synchronized" state.
+    super::memory::drain_ms1_rd5_reset_queue();
     let result = unsafe { hipStreamSynchronize(stream) };
     // 2026-04-29 Phase 3g: HDP flush hypothesis test. Mode B SIGSEGVs continue
     // even after our LDS-visibility patches eliminated all GPU page faults.

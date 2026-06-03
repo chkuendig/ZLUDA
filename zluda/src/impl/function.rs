@@ -999,7 +999,7 @@ fn mcb_descriptor_hits_rd5_reset_window(
 /// `feedback_no_d2d_from_launch_kernel.md`.
 static MS1_RD5_RESET_PENDING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-fn ms1_rd5_reset_enabled() -> bool {
+pub(crate) fn ms1_rd5_reset_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled =
@@ -1024,8 +1024,24 @@ fn mark_rd5_reset_pending(rd5_ptr: u64) {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    if !guard.contains(&rd5_ptr) && guard.len() < 16 {
-        guard.push(rd5_ptr);
+    if !guard.contains(&rd5_ptr) {
+        if guard.len() < 16 {
+            guard.push(rd5_ptr);
+        } else {
+            // 2026-06-03: Surface cap saturation. If drains lag MS_4
+            // launches, this caps the pending Vec at 16 and MS_4 silently
+            // stops marking new entries → MS_4 -2 cascade recurs.
+            // Throttle the log to once per 64 drops to avoid spam.
+            static DROP_N: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = DROP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 64 == 0 {
+                super::driver::zluda_log_err(&format!(
+                    "[ZLUDA] MS_1 reset PENDING DROPPED rd5=0x{:x} cap=16 dropped_n={}",
+                    rd5_ptr, n
+                ));
+            }
+        }
     }
 }
 
@@ -1121,9 +1137,23 @@ unsafe fn probe_rd5_counter_cpu_vs_gpu(rd5: u64) -> (u32, u32, bool) {
     (cpu_value, gpu_value, cpu_value == gpu_value)
 }
 
-/// At MS_1 launch, consume any pending reset markers and zero
-/// `*(rd5+22176)` for each. Issues `hipMemsetD32` synchronously so
-/// completion-handler signals back-pressure rather than pool the queue.
+/// At MS_1 launch, consume any pending reset markers and enqueue them
+/// onto `MS1_RD5_RESET_DRAIN_QUEUE` for host-thread-side `hipMemsetD32`
+/// processing. The actual `hipMemsetD32` happens in
+/// `memory.rs::drain_ms1_rd5_reset_queue`, called from `event::record`,
+/// `event::synchronize`, and `stream::synchronize`.
+///
+/// Prior to 2026-06-03 this function issued `hipMemsetD32` synchronously
+/// here, violating the no-D2D-from-launch_kernel rule
+/// (`feedback_no_d2d_from_launch_kernel.md`). On Wine 10.0 + ROCm 6.2.4
+/// that triggers the ProfilingSignal vector OOB race. Deferring to a
+/// host-thread drain keeps the workaround active while respecting the
+/// rule.
+///
+/// Called from `capture_tfs_launch` (TFS_CAPTURE=1 path) and from the
+/// standalone MS_1 branch in `launch_kernel` (TFS_CAPTURE=0 path). The
+/// `take_pending_rd5_resets` drain makes the two callers mutually
+/// exclusive per MS_1 launch.
 unsafe fn ms1_consume_rd5_resets() {
     let pending = take_pending_rd5_resets();
     if pending.is_empty() {
@@ -1131,14 +1161,22 @@ unsafe fn ms1_consume_rd5_resets() {
     }
     static CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    for rd5 in pending {
-        let dst = (rd5 + F6_OFFSET_IN_RD5 as u64) as *mut std::ffi::c_void;
-        let r = hipMemsetD32(hipDeviceptr_t(dst), 0, 1);
-        let ok = !r.is_err();
-        super::driver::zluda_log_err(&format!(
-            "MS1_RD5_RESET #{} rd5=0x{:x} target=0x{:x} hipMemsetD32 ok={}",
-            call_n, rd5, dst as u64, ok
-        ));
+    let queue = MS1_RD5_RESET_DRAIN_QUEUE.get_or_init(|| {
+        std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))
+    });
+    if let Ok(mut q) = queue.lock() {
+        for rd5 in pending {
+            while q.len() >= 64 {
+                q.pop_front();
+            }
+            q.push_back(rd5);
+            super::driver::zluda_log_err(&format!(
+                "MS1_RD5_RESET #{} rd5=0x{:x} target=0x{:x} enqueued for host-thread drain",
+                call_n,
+                rd5,
+                rd5 + F6_OFFSET_IN_RD5 as u64
+            ));
+        }
     }
 }
 
@@ -1547,7 +1585,7 @@ unsafe fn check_counter_mutation(current_kernel: &str) {
 const F6_MAX_RD5: usize = MS3_MAX_TRACKED_COUNTERS;
 const F6_BYTES_PER: usize = 4; // single u32 read of *(rd5+22176)
 const F6_SCRATCH_BYTES: usize = F6_MAX_RD5 * F6_BYTES_PER;
-const F6_OFFSET_IN_RD5: usize = 22176;
+pub(crate) const F6_OFFSET_IN_RD5: usize = 22176;
 
 struct Rd5Tracker {
     /// Pinned host-mapped scratch (8 × u32 = 32 bytes total).
@@ -2049,6 +2087,20 @@ static MS4_DEV5_ADDRS: std::sync::OnceLock<Mutex<std::collections::HashSet<u64>>
 /// HIP calls) to avoid the UAF class of 2026-05-18.
 pub(crate) static MS4_DEV5_DUMP_QUEUE: std::sync::OnceLock<
     Mutex<std::collections::VecDeque<(u64, u64, u64, u64, u32, u32)>>,
+> = std::sync::OnceLock::new();
+
+/// 2026-06-03: queue of `rd5` base pointers awaiting a defensive
+/// `hipMemsetD32` zero of their `+22176` slot, drained from host-thread
+/// contexts (`event::record`, `event::synchronize`, `stream::synchronize`)
+/// per `feedback_no_d2d_from_launch_kernel.md`. Producer is the MS_1
+/// launch hook (which calls `take_pending_rd5_resets` and enqueues here
+/// rather than issuing `hipMemsetD32` synchronously from `launch_kernel`).
+///
+/// Cap 64 entries; drop-oldest on overflow. Lock held only across the
+/// push itself; HIP calls happen outside the critical section in the
+/// drain function.
+pub(crate) static MS1_RD5_RESET_DRAIN_QUEUE: std::sync::OnceLock<
+    Mutex<std::collections::VecDeque<u64>>,
 > = std::sync::OnceLock::new();
 
 /// Plan v27 Phase B.3 (extended 2026-05-19): queue of
@@ -13185,6 +13237,41 @@ pub(crate) fn launch_kernel(
     if name == "CreateParticleShapesIncremental_MultiStage_1" {
         unsafe {
             force_zero_current_ms1_rd5_22176(kernel_params, extra);
+            // 2026-06-03: capture-independent consumer for
+            // MS1_RD5_RESET_PENDING. Mirrors the work that
+            // `ms1_consume_rd5_resets` does from inside `capture_tfs_launch`,
+            // but runs whenever ZLUDA_MS1_RD5_RESET=1 — without requiring
+            // ZLUDA_TFS_CAPTURE=1. Both callers drain the same Vec via
+            // `take_pending_rd5_resets`, so per MS_1 launch only one of
+            // them gets a non-empty result (no double-firing).
+            //
+            // Enqueue only — never call hipMemsetD32 here. The drain runs
+            // in `drain_ms1_rd5_reset_queue` from event/stream sync sites.
+            if ms1_rd5_reset_enabled() {
+                let pending = take_pending_rd5_resets();
+                if !pending.is_empty() {
+                    static CALL_N: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let call_n = CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let queue = MS1_RD5_RESET_DRAIN_QUEUE.get_or_init(|| {
+                        std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))
+                    });
+                    if let Ok(mut q) = queue.lock() {
+                        for rd5 in pending {
+                            while q.len() >= 64 {
+                                q.pop_front();
+                            }
+                            q.push_back(rd5);
+                            super::driver::zluda_log_err(&format!(
+                                "MS1_RD5_RESET_MS1BRANCH #{} rd5=0x{:x} target=0x{:x} enqueued for host-thread drain",
+                                call_n,
+                                rd5,
+                                rd5 + F6_OFFSET_IN_RD5 as u64
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
     // Phase 1.5 Item A: dump the MemCopyBatchedAsync Arg2 scratch buffer
