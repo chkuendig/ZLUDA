@@ -145,6 +145,32 @@ pub(crate) unsafe fn synchronize(event: hipEvent_t) -> hipError_t {
     // 2026-06-03: MS_1 rd5+22176 reset drain (sibling).
     super::memory::drain_ms1_rd5_reset_queue();
     let result = hipEventSynchronize(event);
+    // 2026-06-03: Class B PhysX-host vtable-iteration crash hardening.
+    // Ghidra-decoded crash at PhysX3_x64.dll RVA 0x20ced9 is `MOV RAX,[RCX]`
+    // first deref of a pointer pulled from a paired-iterator output array
+    // returned by `[obj+0x60].vmethod[2]()`. Three callers iterate the
+    // canonical PhysX `[+0xa0]=ptr_array,[+0xa8]=count` Ps::Array<T*>.
+    // The crash is deterministic at ~158k–160k launches with capture probes
+    // (project_class_b_physx_vtable_crash_decoded_2026_06_03.md).
+    //
+    // Working hypothesis: cuEventSynchronize returns once the GPU event
+    // fires, but GPU writes destined for zero-copy/host-pinned memory may
+    // still sit in the AMD HDP write buffer (not yet visible to CPU reads).
+    // PhysX then iterates a snapshot of an actor/shape array that still
+    // holds stale pointers and dereferences a freed entry. The symmetric
+    // workaround in cuStreamSynchronize (ZLUDA_HDP_FLUSH_ON_SYNC, default-ON)
+    // already does hipDeviceSynchronize + dirty-flag clear; cuEventSynchronize
+    // did NOT, leaving the event-based completion path uncovered.
+    //
+    // Env-gate ZLUDA_EVENT_HDP_FLUSH=1. Default OFF until N=5 A/B confirms.
+    static HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let hdp_flush = *HDP_FLUSH
+        .get_or_init(|| std::env::var("ZLUDA_EVENT_HDP_FLUSH").map_or(false, |v| v == "1"));
+    if hdp_flush {
+        let _ = hipDeviceSynchronize();
+        super::stream::clear_dirty_flag_after_device_sync();
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
     super::driver::zluda_log_err(&format!(
         "cuEventSynchronize(event={:?}) -> {:?}",
         event, result
