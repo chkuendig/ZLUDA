@@ -82,6 +82,39 @@ fn texref_log_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_TEXREF_LOG").map_or(false, |v| v == "1"))
 }
 
+/// 2026-06-05 Class A experiment: drain all in-flight kernels BEFORE changing
+/// a texref binding (hipTexRefSetAddress / hipTexRefSetArray /
+/// hipTexRefSetAddress2D / hipTexRefSetMipmappedArray).
+///
+/// CUDA snapshots texref bindings at kernel-launch time, so an in-flight
+/// kernel on stream B reading `texref_T` is guaranteed to read the bytes
+/// at the address `T` held when B's launch happened — even if the host
+/// calls cuTexRefSetAddress(T, new_addr) on stream A while B is running.
+///
+/// HIP doesn't make this guarantee: `hipTexRefSetAddress` flips global
+/// texref state immediately. In-flight kernels can therefore read mid-
+/// transition state (e.g. partial header with new ptr / old size), then
+/// `tex.1d.v4.u32.s32` returns a value computed from the wrong buffer.
+/// Downstream IOFX_actorRangeKernel scatters using that wild index →
+/// canonical CB/DB+TCP page fault (Class A).
+///
+/// `ZLUDA_TEXREF_SYNC=1` forces a `hipDeviceSynchronize` before the
+/// texref-changing call, matching the CUDA snapshot semantic. Cost: one
+/// device sync per binding change. Worth measuring; PhysX issues
+/// thousands per frame, so the cost ceiling is "one device sync per
+/// hipTexRefSet*" and not "free".
+fn texref_sync_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_TEXREF_SYNC").map_or(false, |v| v == "1"))
+}
+
+unsafe fn texref_pre_sync_if_enabled() {
+    if texref_sync_enabled() {
+        let _ = hipDeviceSynchronize();
+        super::stream::clear_dirty_flag_after_device_sync();
+    }
+}
+
 pub(crate) unsafe fn ref_set_address_v2(
     byte_offset: *mut usize,
     h_tex_ref: CUtexref,
@@ -105,6 +138,7 @@ pub(crate) unsafe fn ref_set_address_v2(
         }
         return Ok(());
     }
+    texref_pre_sync_if_enabled();
     let mut unused = 0;
     hipTexRefSetAddress(
         if byte_offset.is_null() {
@@ -129,6 +163,7 @@ pub(crate) unsafe fn ref_set_address_2d_v3(
     pitch: usize,
 ) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
+    texref_pre_sync_if_enabled();
     hipTexRefSetAddress2D(
         tex_ref,
         desc as *const CUDA_ARRAY_DESCRIPTOR as *const HIP_ARRAY_DESCRIPTOR,
@@ -186,6 +221,7 @@ pub(crate) unsafe fn ref_set_array(h_tex_ref: CUtexref, h_array: CUarray, flags:
         ));
     }
     set_fmt_res?;
+    texref_pre_sync_if_enabled();
     hipTexRefSetArray(tex_ref, h_array as hipArray_t, CU_TRSA_OVERRIDE_FORMAT)?;
     // Sync the newly created texture object to device global if synthetic
     sync_synthetic_texref(tex_ref);
@@ -198,6 +234,7 @@ pub(crate) unsafe fn ref_set_mipmapped_array(
     flags: u32,
 ) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
+    texref_pre_sync_if_enabled();
     hipTexRefSetMipmappedArray(tex_ref, h_mipmapped_array as hipMipmappedArray_t, flags)?;
     Ok(())
 }
