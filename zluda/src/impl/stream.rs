@@ -363,6 +363,30 @@ pub(crate) fn query(stream: hipStream_t) -> hipError_t {
     } else {
         hip_result
     };
+    // 2026-06-05 Class B residual investigation: PhysX uses cuStreamQuery as
+    // an UN-SYNCED "is this kernel done?" poll. Live evidence: 6,015 query
+    // calls per Class B bench run, vs 51k cuEventSync calls. When the query
+    // returns SUCCESS, PhysX reads mapped-host memory directly without an
+    // explicit sync — but on AMD, HDP write-combine can still be holding
+    // the kernel's writes. CPU sees stale data → inner_array[0]=NULL →
+    // canonical Class B host crash. NVIDIA has no HDP equivalent, so this
+    // works there. Mirror the Phase 2 / MEMCPY_HDP_FLUSH pattern: when the
+    // query returns SUCCESS (stream is idle), trigger HDP flush via
+    // hipDeviceSynchronize. On an idle stream this is fast — just an AQL
+    // barrier-AND packet round-trip whose release fence does the flush.
+    // Env-gate ZLUDA_QUERY_HDP_FLUSH default-ON, opt-out with =0.
+    if returned == Ok(()) {
+        static QUERY_HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *QUERY_HDP_FLUSH
+            .get_or_init(|| std::env::var("ZLUDA_QUERY_HDP_FLUSH").map_or(true, |v| v != "0"))
+        {
+            unsafe {
+                let _ = hipDeviceSynchronize();
+                clear_dirty_flag_after_device_sync();
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     let count = QUERY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Log first 200, then every 100th, or always when ZLUDA_LOG_ALL is set
     if count < 200 || count % 100 == 0 || crate::is_log_all_enabled() {
