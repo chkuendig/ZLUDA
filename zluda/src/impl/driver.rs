@@ -186,6 +186,52 @@ pub(crate) fn zluda_log_err(msg: &str) {
     }
 }
 
+/// 2026-06-04 Class B null-deref investigation: per-call timeline of
+/// cu{Stream,Event,Ctx}Synchronize calls written to /tmp/zluda_sync_timeline.log.
+/// Goal: correlate sync cadence with the deterministic PhysX3_x64.dll+0x20ced9
+/// SIGSEGV (RCX=0 first-iteration NULL deref). Off by default; enable with
+/// `ZLUDA_SYNC_TIMELINE=1`.
+static SYNC_TIMELINE_FILE: std::sync::LazyLock<Mutex<Option<std::fs::File>>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/zluda_sync_timeline.log")
+                .ok(),
+        )
+    });
+
+static SYNC_CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn sync_timeline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_SYNC_TIMELINE").map_or(false, |v| v == "1"))
+}
+
+/// Log a single sync-call event. `kind` is the API name ("stream", "event",
+/// "ctx"), `handle` is the user-facing handle value (NULL stream = 0). Cheap
+/// when the gate is off (one OnceLock read + atomic load).
+pub(crate) fn sync_timeline_log(kind: &str, handle: usize) {
+    if !sync_timeline_enabled() {
+        return;
+    }
+    use std::io::Write;
+    let seq = SYNC_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ms = crate::elapsed_ms();
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    let line = format!(
+        "[{}ms] seq={} kind={} handle=0x{:x} tid={}\n",
+        ms, seq, kind, handle, tid
+    );
+    if let Ok(mut guard) = SYNC_TIMELINE_FILE.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
 /// Ring buffer of last N kernel launches — the SIGABRT handler dumps all of them
 /// so we see the crash context, not just the racy "last" slot. The fault is
 /// asynchronous on Van Gogh APU, so the actually-faulting kernel is usually
@@ -302,9 +348,20 @@ fn elapsed_ns() -> u64 {
 
 /// SIGABRT/SIGSEGV handler — fires when HSA runtime kills the process on GPU fault.
 /// Dumps the last N kernel launches to the log so we can see the crash context.
+///
+/// 2026-06-04: Switched from `libc::signal()` to `libc::sigaction(SA_SIGINFO)`
+/// so the handler receives `ucontext_t` and can probe register state at the
+/// fault site. For canonical Class B SIGSEGV at PhysX3_x64.dll+0x20ced9 we
+/// dump the NULL-deref iterator state (R14, OUT struct, inner_array contents)
+/// directly from the live process — these regions live in Wine PE-private
+/// file-backed mappings that systemd-coredump can't recover post-process-exit.
 #[cfg(not(windows))]
 fn install_fault_signal_handler() {
-    unsafe extern "C" fn sigabrt_handler(sig: i32) {
+    unsafe extern "C" fn sigabrt_handler(
+        sig: i32,
+        _info: *mut libc::siginfo_t,
+        ctx: *mut libc::c_void,
+    ) {
         // Minimal async-signal-safe operations only.
         // Write directly to the log file.
         use std::io::Write;
@@ -313,6 +370,44 @@ fn install_fault_signal_handler() {
             11 => "SIGSEGV",
             _ => "signal",
         };
+
+        // 2026-06-04 Class B live probe: when SIGSEGV fires at the canonical
+        // PhysX3_x64.dll+0x20ced9 NULL deref, dump the iterator state.
+        // Wine PE heap regions disappear from coredumps so this is the only
+        // way to see what `inner_array[0]` actually contained.
+        let mut class_b_rip = 0u64;
+        let mut class_b_r14 = 0u64;
+        let mut class_b_rsp = 0u64;
+        let mut class_b_r8 = 0u64;
+        if sig == 11 && !ctx.is_null() {
+            let uctx = ctx as *const libc::ucontext_t;
+            let gregs = &(*uctx).uc_mcontext.gregs;
+            // Linux x86_64 register indices (from libc::REG_*)
+            class_b_rip = gregs[libc::REG_RIP as usize] as u64;
+            class_b_r14 = gregs[libc::REG_R14 as usize] as u64;
+            class_b_rsp = gregs[libc::REG_RSP as usize] as u64;
+            class_b_r8 = gregs[libc::REG_R8 as usize] as u64;
+        }
+        // Match by Wine-PE-region + low-16-bit function-offset + RCX=NULL.
+        // PhysX3_x64.dll is ASLR-relocated by Wine — observed bases include
+        // 0x6ffffc6f0000 and 0x6ffffc5e0000 in different sessions. The RVA
+        // 0x20ced9 is the same across bases, but its LOW 24 BITS in absolute
+        // VA shift with the base (0x8fced9 vs 0x7eced9). Only the low 16 bits
+        // (0xced9 — the function-internal offset) are guaranteed stable across
+        // 4KB-aligned reloc. We tighten the check by also requiring RCX=NULL
+        // (the canonical Class B has RCX=0 in 4 of 4 captured coredumps).
+        let class_b_rcx = if !ctx.is_null() {
+            let uctx = ctx as *const libc::ucontext_t;
+            (*uctx).uc_mcontext.gregs[libc::REG_RCX as usize] as u64
+        } else {
+            !0u64
+        };
+        // Wine-PE high addresses live in the 0x6XXX_XXXX_XXXX range
+        // (12-digit hex). Shifting RIP right by 44 yields the top nibble: 0x6.
+        let is_canonical_class_b =
+            (class_b_rip & 0xFFFF) == 0xced9
+                && (class_b_rip >> 44) == 0x6
+                && class_b_rcx == 0;
 
         // Dump the MS_4 and MS_2_Batched capture ring buffers to
         // /tmp/ms4_captures.bin and /tmp/ms2b_captures.bin if capture was
@@ -445,6 +540,87 @@ fn install_fault_signal_handler() {
                 "\n*** {} (signal {}) — GPU fault likely ***\n",
                 sig_name, sig
             );
+            // 2026-06-04 Class B live probe — fires only on canonical NULL
+            // deref at PhysX3_x64.dll+0x20ced9. Reads register state from the
+            // signal-time ucontext_t and dereferences pointers that are alive
+            // RIGHT NOW (Wine PE heap is mapped). Each deref is wrapped in a
+            // "safe" range check (only addresses in the Wine PE arena 0x00000000_40000000
+            // .. 0x00000001_00000000 are read).
+            if is_canonical_class_b {
+                let _ = write!(
+                    f,
+                    "*** Class B canonical NULL deref at RIP=0x{:x} R14=0x{:x} RSP=0x{:x} R8=0x{:x}\n",
+                    class_b_rip, class_b_r14, class_b_rsp, class_b_r8
+                );
+                // Safe-deref helper: read if addr is in any of the known
+                // Wine-managed ranges. After the 2026-06-04 first capture we
+                // widened this from [0x4000_0000, 0x1_0000_0000] to include
+                // (a) Wine PE-private stack at ~0x3f00_0000 (RSP=0x3f56fdf0)
+                // and (b) Wine PE-loaded DLL text/data at ~0x6ffff_8000_0000
+                // (sub-object vtable was 0x6ffff8a75760).
+                let safe_read_q = |addr: u64| -> Option<u64> {
+                    let in_wine_pe_arena = addr >= 0x1000_0000 && addr <= 0x1_0000_0000;
+                    let in_wine_pe_dlls = addr >= 0x6_0000_0000_0000 && addr <= 0x8_0000_0000_0000;
+                    if !(in_wine_pe_arena || in_wine_pe_dlls) {
+                        return None;
+                    }
+                    // SAFETY: we restrict to known-mapped ranges and accept a
+                    // tail-of-handler nested SEGV if we're wrong. The original
+                    // SEGV is already fatal; losing the rest of the dump in the
+                    // worst case is acceptable.
+                    Some(unsafe { std::ptr::read_volatile(addr as *const u64) })
+                };
+                // OUT struct lives at RSP+0x38 .. RSP+0x58 (4 qwords).
+                // Layout: [ptr1, count1, ptr2, count2]
+                let ptr1 = safe_read_q(class_b_rsp.wrapping_add(0x38));
+                let count1 = safe_read_q(class_b_rsp.wrapping_add(0x40));
+                let ptr2 = safe_read_q(class_b_rsp.wrapping_add(0x48));
+                let count2 = safe_read_q(class_b_rsp.wrapping_add(0x50));
+                let _ = write!(
+                    f,
+                    "*** Class B OUT struct: ptr1=0x{:x?} count1=0x{:x?} ptr2=0x{:x?} count2=0x{:x?}\n",
+                    ptr1, count1, ptr2, count2
+                );
+                // Read 8 qwords starting at OUT.ptr2 — the failing inner_array.
+                if let Some(p) = ptr2 {
+                    let _ = write!(f, "*** Class B inner_array @ 0x{:x}:\n", p);
+                    for i in 0..8 {
+                        let v = safe_read_q(p.wrapping_add(i * 8));
+                        let _ = write!(f, "***   [{}]=0x{:x?}\n", i, v);
+                    }
+                }
+                // Read 8 qwords starting at OUT.ptr1 (the other paired array).
+                if let Some(p) = ptr1 {
+                    let _ = write!(f, "*** Class B paired_array @ 0x{:x}:\n", p);
+                    for i in 0..8 {
+                        let v = safe_read_q(p.wrapping_add(i * 8));
+                        let _ = write!(f, "***   [{}]=0x{:x?}\n", i, v);
+                    }
+                }
+                // R14 = iterator `this`. Dump first 8 qwords + the sub-vtable
+                // pointer at +0x60 (which populated the inner_array).
+                if class_b_r14 != 0 {
+                    let _ = write!(f, "*** Class B R14 (iterator this) @ 0x{:x}:\n", class_b_r14);
+                    for i in 0..8 {
+                        let v = safe_read_q(class_b_r14.wrapping_add(i * 8));
+                        let _ = write!(f, "***   [+0x{:x}]=0x{:x?}\n", i * 8, v);
+                    }
+                    let sub_obj = safe_read_q(class_b_r14.wrapping_add(0x60));
+                    let _ = write!(
+                        f,
+                        "*** Class B R14+0x60 sub-object pointer = 0x{:x?}\n",
+                        sub_obj
+                    );
+                    if let Some(s) = sub_obj {
+                        let sub_vtable = safe_read_q(s);
+                        let _ = write!(
+                            f,
+                            "*** Class B sub-object vtable = 0x{:x?}\n",
+                            sub_vtable
+                        );
+                    }
+                }
+            }
             if ms4_host_ptr != 0 && ms4_total_bytes != 0 {
                 let _ = write!(
                     f,
@@ -567,15 +743,32 @@ fn install_fault_signal_handler() {
                         let _ = writeln!(f, "***   {}", line);
                     }
                 }
+                // 2026-06-04 also dump 0x6f region (Wine PE-loaded DLLs).
+                // PhysX3_x64.dll / PhysX3Gpu_x64.dll / PhysX3Common live here.
+                let _ = write!(f, "*** Process memory maps (0x6 region — Wine PE DLLs):\n");
+                for line in maps.lines() {
+                    if line.starts_with("6f") || line.starts_with("60") || line.starts_with("70") {
+                        let _ = writeln!(f, "***   {}", line);
+                    }
+                }
             }
         }
-        // Re-raise with default handler to actually die
+        // Re-raise with default handler to actually die.
+        // (signal() works fine for setting SIG_DFL even when the original
+        // install was via sigaction — they share the same kernel disposition.)
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
     }
     unsafe {
-        libc::signal(libc::SIGABRT, sigabrt_handler as libc::sighandler_t);
-        libc::signal(libc::SIGSEGV, sigabrt_handler as libc::sighandler_t);
+        // Switched from libc::signal to libc::sigaction with SA_SIGINFO so
+        // the handler receives ucontext_t and can probe registers at the
+        // fault site (needed for the Class B live-probe at PhysX3_x64.dll+0x20ced9).
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigabrt_handler as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGABRT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
         // Also dump capture rings on normal (non-crash) process exit so
         // clean-bench runs still produce harvestable data.
         extern "C" fn dump_rings_atexit() {
@@ -1089,6 +1282,20 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     // hipDeviceSynchronize error check doesn't run in time.
     #[cfg(not(windows))]
     install_fault_signal_handler();
+    // 2026-06-04 Class B coredump enrichment: by default the kernel's
+    // /proc/self/coredump_filter is 0x33 which omits file-backed mappings
+    // (private+shared). Wine PE-loaded heap and PE-mapped DLL data live
+    // there, so the canonical Class B SIGSEGV (PhysX3_x64.dll+0x20ced9)
+    // produces a coredump where gdb returns "Cannot access memory" at the
+    // failing iterator's inner_array pointer. Set filter to 0xff to also
+    // capture file-backed (private+shared), DAX, and the rest — at the
+    // cost of a larger dump file. Gated on ZLUDA_FULL_COREDUMP=1.
+    #[cfg(not(windows))]
+    if std::env::var("ZLUDA_FULL_COREDUMP").map_or(false, |v| v == "1") {
+        if let Ok(()) = std::fs::write("/proc/self/coredump_filter", "0xff") {
+            zluda_log_err("[ZLUDA] coredump_filter set to 0xff (full process memory in next core)");
+        }
+    }
     // Load ROCm debug agent if requested. Must happen after hipInit() so that
     // libhsa-runtime64.so.1 and other ROCm deps are already in the process,
     // allowing dlopen to resolve the agent's transitive dependencies.

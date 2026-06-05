@@ -161,10 +161,12 @@ pub(crate) fn set_limit(limit: hipLimit_t, value: usize) -> hipError_t {
 }
 
 pub(crate) fn synchronize() -> hipError_t {
+    super::driver::sync_timeline_log("ctx", 0);
     unsafe { hipDeviceSynchronize() }
 }
 
 pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {
+    super::driver::sync_timeline_log("ctx_v2", ctx.device as usize);
     let mut current_device = 0;
     unsafe { hipGetDevice(&mut current_device)? };
     let _dev_drop = if current_device != ctx.device {

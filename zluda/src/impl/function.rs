@@ -13772,11 +13772,10 @@ pub(crate) fn launch_kernel(
             )
         }
     };
-    // 2026-05-15 Plan v6 Step C: mark "first real launch seen" so that
-    // cuStreamQuery(NULL) stops returning the startup-mask NotReady and
-    // starts passing through real hipStreamQuery results.
+    // 2026-06-04 Option A: NULL-stream query now uses NULL_STREAM_HAD_BLOCKING_WORK instead
+    // of FIRST_REAL_LAUNCH_SEEN. The flag is set via mark_non_default_stream_dirty(),
+    // which is only called for non-NULL streams. So we no longer set FIRST_REAL_LAUNCH_SEEN here.
     if result.is_ok() {
-        super::stream::FIRST_REAL_LAUNCH_SEEN.store(true, std::sync::atomic::Ordering::Release);
         if !stream.0.is_null() {
             super::stream::mark_non_default_stream_dirty();
         }

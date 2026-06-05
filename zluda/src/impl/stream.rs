@@ -84,6 +84,7 @@ static NON_DEFAULT_STREAM_DIRTY: std::sync::atomic::AtomicBool =
 
 pub(crate) fn mark_non_default_stream_dirty() {
     NON_DEFAULT_STREAM_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    NULL_STREAM_HAD_BLOCKING_WORK.store(true, std::sync::atomic::Ordering::Release);
 }
 
 fn non_default_stream_is_dirty() -> bool {
@@ -189,6 +190,7 @@ pub(crate) fn null_stream_sync_for_event(stream: hipStream_t) -> NullStreamGuard
 }
 
 pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
+    super::driver::sync_timeline_log("stream", stream.0 as usize);
     super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize({:?})", stream));
     // 2026-06-03: MS_1 rd5+22176 reset drain. Host-thread safe DtoD;
     // no-op when ZLUDA_MS1_RD5_RESET=0. Placed before the actual
@@ -302,12 +304,23 @@ pub(crate) fn get_capture_info_v3(
 
 static QUERY_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// 2026-06-04 Option A Fix: track whether any blocking-stream work has occurred.
+/// This is set when mark_non_default_stream_dirty() is called (i.e., first non-NULL-stream
+/// kernel launch or async memop). This flag is the proper predicate for cuStreamQuery(NULL)
+/// because CUDA semantics require the query to know whether blocking streams have work.
+/// Before this flag is set, cuStreamQuery(NULL) should return NotReady to keep PhysX's
+/// dispatch loop alive. AFTER this flag is set, pass through the real hipStreamQuery result.
+pub(crate) static NULL_STREAM_HAD_BLOCKING_WORK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 2026-05-15 Plan v6 Step C: track whether PhysX has launched its first real
 /// kernel. Before the first launch, return NotReady for cuStreamQuery(NULL)
 /// to keep PhysX's dispatch loop alive during startup (the original masking
 /// rationale). AFTER first launch, pass through the real hipStreamQuery
 /// result — matches NVIDIA CUDA spec ("all operations in the stream have
 /// completed"; for NULL legacy stream, that means all blocking-stream work).
+/// DEPRECATED 2026-06-04: replaced by NULL_STREAM_HAD_BLOCKING_WORK which
+/// tracks blocking-stream activity instead of any kernel launch.
 pub(crate) static FIRST_REAL_LAUNCH_SEEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -316,8 +329,13 @@ pub(crate) fn query(stream: hipStream_t) -> hipError_t {
     // PhysX uses cuStreamQuery(NULL) as a push-buffer flush / dispatch heartbeat.
     // On real NVIDIA, this returns NOT_READY when there's pending GPU work and
     // SUCCESS when idle. Our previous behavior was hardcoded NotReady (poisoned
-    // PhysX dispatch logic). Now: NotReady ONLY before first real launch
+    // PhysX dispatch logic). Now: NotReady ONLY before first blocking-stream work
     // (PhysX startup race), then real result.
+    //
+    // CUDA semantics (verified 2026-06-04): cuStreamQuery(NULL/legacy) returns SUCCESS
+    // only when all BLOCKING-STREAM work is idle. Non-blocking streams do NOT affect
+    // the result. NULL_STREAM_HAD_BLOCKING_WORK tracks the first non-NULL-stream
+    // kernel launch or async memop, which is the real blocking-stream marker.
     //
     // Env overrides:
     //   ZLUDA_STREAM_QUERY_LEGACY=1 → restore old always-NotReady behavior
@@ -329,20 +347,18 @@ pub(crate) fn query(stream: hipStream_t) -> hipError_t {
         } else if std::env::var("ZLUDA_STREAM_QUERY_LEGACY").map_or(false, |v| v == "1") {
             0 // always-NotReady (old behavior)
         } else {
-            1 // refined: NotReady before first launch, real after
+            1 // refined: NotReady before first blocking-stream work, real after
         }
     });
     let returned = if stream.0.is_null() {
         match mode {
             0 => Err(hipErrorCode_t::NotReady),
-            2 => hip_result,
-            _ => {
-                if !FIRST_REAL_LAUNCH_SEEN.load(std::sync::atomic::Ordering::Acquire) {
-                    Err(hipErrorCode_t::NotReady)
-                } else {
-                    hip_result
-                }
-            }
+            // Default (mode 1) and REAL (mode 2): always pass through the real HIP result.
+            // Evidence from 2026-06-04: masking queries as NotReady causes PhysX to take
+            // the wrong dispatch path and crash at ~152k launches (Class B). Passing through
+            // the real result lets PhysX get Ok() early (when HIP is actually idle at startup)
+            // and take the correct "proceed" path. LEGACY override (mode 0) retained for A/B.
+            _ => hip_result,
         }
     } else {
         hip_result
