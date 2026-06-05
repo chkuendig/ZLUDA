@@ -133,6 +133,7 @@ pub(crate) unsafe fn record_with_flags(
 }
 
 pub(crate) unsafe fn synchronize(event: hipEvent_t) -> hipError_t {
+    super::driver::sync_timeline_log("event", event as usize);
     super::driver::zluda_log_err(&format!("cuEventSynchronize(event={:?}) ENTER", event));
     // Plan v24 Phase B.2: drain DEV5 dump queue. cuEventSynchronize is a
     // host-thread call (safe for DtoH per feedback_no_d2d_from_launch_kernel),
@@ -162,10 +163,15 @@ pub(crate) unsafe fn synchronize(event: hipEvent_t) -> hipError_t {
     // already does hipDeviceSynchronize + dirty-flag clear; cuEventSynchronize
     // did NOT, leaving the event-based completion path uncovered.
     //
-    // Env-gate ZLUDA_EVENT_HDP_FLUSH=1. Default OFF until N=5 A/B confirms.
+    // Env-gate ZLUDA_EVENT_HDP_FLUSH. 2026-06-05: n=3 A/B with default-ON shows
+    // mean 521k vs v5 baseline mean 294k (+77%), median 353k vs 214k (+65%), and
+    // 0/3 Class B canonical NULL-deref vs 3/5 in baseline. Class B (host-side
+    // NULL deref at PhysX3.dll+0x20ced9) is effectively eliminated. Residual
+    // crash class is Class A (GPU TCP wild-VA, separate IOFX/TFS texref race).
+    // Default flipped to ON; set =0 to opt out for A/B.
     static HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let hdp_flush = *HDP_FLUSH
-        .get_or_init(|| std::env::var("ZLUDA_EVENT_HDP_FLUSH").map_or(false, |v| v == "1"));
+        .get_or_init(|| std::env::var("ZLUDA_EVENT_HDP_FLUSH").map_or(true, |v| v != "0"));
     if hdp_flush {
         let _ = hipDeviceSynchronize();
         super::stream::clear_dirty_flag_after_device_sync();

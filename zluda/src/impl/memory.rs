@@ -124,6 +124,20 @@ fn dtoh_log_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_DTOH_LOG").map_or(false, |v| v == "1"))
 }
 
+/// 2026-06-05 Phase 1 — host-coherent A/B for Class B residual after v5
+/// (Gpu→system scope) fix. Forces every `cuMemAllocHost` /
+/// `cuMemHostAlloc` into the fine-grained HSA pool. Fine-grained pool
+/// bypasses HDP write-combining, making GPU stores visible to host CPU
+/// without depending on a downstream cuStream/cuEvent sync.
+/// CUDA-pinned-memory is implicitly fine-grained; PhysX expects this. On
+/// AMD with `flags=0`, HIP gives coarse-grained → HDP-buffered GPU writes
+/// to mapped buffers may not reach host memory before PhysX's CPU-side
+/// callback reads them. See plan partitioned-mapping-newell.md.
+fn host_coherent_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLUDA_HOST_COHERENT").map_or(false, |v| v == "1"))
+}
+
 /// Plan v13 Step 1C scan: at MS_4 launch, locate which `cuMemHostAlloc`
 /// (zero-copy mapped host memory) buffer carries the `n_threads` value.
 ///
@@ -1188,7 +1202,16 @@ pub(crate) unsafe fn host_alloc(
     // suspect for the TurbulenceFS-zeros-counter cross-allocation corruption.
     // If PhysX truly needs mapping for spinWait it will pass the flag itself
     // (or fail with a clear error pointing back here).
-    let hip_flags = flags;
+    //
+    // 2026-06-05: When `ZLUDA_HOST_COHERENT=1`, OR-in `hipHostMallocCoherent`
+    // (0x40000000) to force fine-grained pool. This is the Phase 1 A/B
+    // experiment for the Class B PhysX NULL-deref residual after the v5
+    // Gpu→system-scope fix.
+    let incoming_flags = flags;
+    let mut hip_flags = flags;
+    if host_coherent_enabled() {
+        hip_flags |= hipHostMallocCoherent;
+    }
     // Round up for vectorized over-read headroom (same as alloc_v2 — 16 bytes
     // covers one ld.global.v4.u32 over-read; reduced from 256 bytes as part of
     // plan B.2 bisection).
@@ -1200,11 +1223,13 @@ pub(crate) unsafe fn host_alloc(
     let mut dev_ptr: *mut ::core::ffi::c_void = ptr::null_mut();
     let _ = hipHostGetDevicePointer(&mut dev_ptr, *pp, 0);
     super::driver::zluda_log_err(&format!(
-        "cuMemHostAlloc size={} host={:p} dev={:p} same={}",
+        "cuMemHostAlloc size={} host={:p} dev={:p} same={} flags_in=0x{:x} flags_out=0x{:x}",
         bytesize,
         *pp,
         dev_ptr,
-        *pp == dev_ptr
+        *pp == dev_ptr,
+        incoming_flags,
+        hip_flags
     ));
     track_host_alloc(*pp, dev_ptr, bytesize);
     track_hostbuf(*pp, bytesize);
