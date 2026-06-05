@@ -3993,10 +3993,28 @@ fn get_pointer_type<'ctx>(
 }
 
 // https://llvm.org/docs/AMDGPUUsage.html#memory-scopes
+//
+// 2026-06-05 Class B fix: PTX `atom.global` without explicit scope defaults
+// to MemScope::Gpu in the parser. On NVIDIA, "device" / "gpu" scope atomics
+// are L2-coherent and effectively host-visible because NVIDIA's L2 is
+// unified with host coherency. On AMD gfx10 RDNA, the "agent" scope is
+// GPU-only: writes from the GPU are visible to other GPU work-items but
+// can sit in the HDP write-combining buffer indefinitely from the host's
+// perspective. PhysX 3.3's CreateParticleShapesIncremental_MultiStage_3
+// (see project_multistage_3_producer_race_2026_06_05.md) exploits the
+// NVIDIA L2 coherency by atomically incrementing a counter in
+// mapped-host memory, then writing 4 u16 entry fields that the host
+// reads through the actor-shape iterator. On AMD with agent-scope, the
+// host sees the count update before the 4 entry stores drain → slot[0]
+// is NULL → the Class B NULL-deref at PhysX3_x64.dll+0x20ced9.
+//
+// Mapping `Gpu` to `"one-as"` (system scope, no scope qualifier on AMDGPU
+// LLVM) makes ZLUDA emit full HDP-flushing atomics. Cost is a heavier
+// AQL atomic for every device-scope PTX atom; correctness is the win.
 fn get_scope(scope: ast::MemScope) -> Result<*const i8, TranslateError> {
     Ok(match scope {
         ast::MemScope::Cta => c"workgroup-one-as",
-        ast::MemScope::Gpu => c"agent-one-as",
+        ast::MemScope::Gpu => c"one-as",
         ast::MemScope::Sys => c"one-as",
         ast::MemScope::Cluster => return Err(error_todo()),
     }

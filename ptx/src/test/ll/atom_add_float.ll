@@ -28,7 +28,7 @@ define amdgpu_kernel void @atom_add_float(ptr addrspace(4) byref(i64) %"45", ptr
   %8 = load float, ptr addrspace(5) %"49", align 4
   store float %8, ptr addrspace(3) @shared_mem, align 4
   %9 = load float, ptr addrspace(5) %"50", align 4
-  %10 = atomicrmw fadd ptr addrspace(3) @shared_mem, float %9 syncscope("agent-one-as") acq_rel, align 4
+  %10 = atomicrmw fadd ptr addrspace(3) @shared_mem, float %9 syncscope("one-as") acq_rel, align 4
   store float %10, ptr addrspace(5) %"49", align 4
   %11 = load volatile float, ptr addrspace(3) @shared_mem, align 4
   store float %11, ptr addrspace(5) %"50", align 4

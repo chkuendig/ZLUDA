@@ -28,7 +28,7 @@ define amdgpu_kernel void @atom_add(ptr addrspace(4) byref(i64) %"45", ptr addrs
   %8 = load i32, ptr addrspace(5) %"49", align 4
   store i32 %8, ptr addrspace(3) @shared_mem, align 4
   %9 = load i32, ptr addrspace(5) %"50", align 4
-  %10 = atomicrmw add ptr addrspace(3) @shared_mem, i32 %9 syncscope("agent-one-as") acq_rel, align 4
+  %10 = atomicrmw add ptr addrspace(3) @shared_mem, i32 %9 syncscope("one-as") acq_rel, align 4
   store i32 %10, ptr addrspace(5) %"49", align 4
   %11 = load volatile i32, ptr addrspace(3) @shared_mem, align 4
   store i32 %11, ptr addrspace(5) %"50", align 4

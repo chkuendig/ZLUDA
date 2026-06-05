@@ -22,7 +22,7 @@ define amdgpu_kernel void @atom_cas(ptr addrspace(4) byref(i64) %"47", ptr addrs
   %"67" = inttoptr i64 %6 to ptr
   %"40" = getelementptr inbounds i8, ptr %"67", i64 4
   %7 = load i32, ptr addrspace(5) %"51", align 4
-  %8 = cmpxchg ptr %"40", i32 %7, i32 100 syncscope("agent-one-as") acq_rel acquire, align 4
+  %8 = cmpxchg ptr %"40", i32 %7, i32 100 syncscope("one-as") acq_rel acquire, align 4
   %"68" = extractvalue { i32, i1 } %8, 0
   store i32 %"68", ptr addrspace(5) %"51", align 4
   %9 = load i64, ptr addrspace(5) %"49", align 8
