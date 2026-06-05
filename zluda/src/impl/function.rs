@@ -12260,6 +12260,37 @@ pub(crate) fn launch_kernel(
     //   bytes 24..31 = type/flags (32-bit `setp.eq.s32 r,3` check at offset 24)
     // Cross-reference logged ptr_a/ptr_b against DtoH-zero buffers to find
     // the FleX initial-data path.
+    // 2026-06-05 Class B residual: PhysX's actor-shape iterator reads from a
+    // host-mapped buffer that is populated by MemCopyBatchedAsync (the kernel
+    // appears 3-5 launches before every captured Class B crash). The kernel's
+    // SC system-scope kernel-exit fence flushes GPU L2 to DRAM but NOT the
+    // HDP write-combine buffer between DRAM and CPU memory. If PhysX skips
+    // cuEventSync (covered by Phase 2 ZLUDA_EVENT_HDP_FLUSH default-ON) and
+    // reads via mapped pointer directly, the host can see NULL where the
+    // kernel wrote a valid pointer (canonical inner_array[0]=NULL).
+    //
+    // ZLUDA_MEMCPY_HDP_FLUSH=1 issues hipDeviceSynchronize right after the
+    // MemCopyBatchedAsync launch hooks. HIP's hipDeviceSynchronize wraps an
+    // HSA queue barrier-AND packet whose release fence triggers the HDP
+    // flush MMIO. Cost: one device-wide drain per MemCopyBatchedAsync (PhysX
+    // issues a few per frame, so ceiling is ~30 syncs/sec — bearable).
+    if name == "MemCopyBatchedAsync" {
+        // 2026-06-05 n=2 validation: default-OFF baseline mean 429k vs
+        // default-ON mean 1.10M (~2.6×). Run1: 1.06M, 0 Class B (ended Class
+        // A GPU fault). Run2: 1.146M, 1 Class B (much later than baseline).
+        // Class B not fully eliminated but heavily delayed. Default flipped
+        // to ON; set =0 to opt out.
+        static MEMCPY_HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MEMCPY_HDP_FLUSH
+            .get_or_init(|| std::env::var("ZLUDA_MEMCPY_HDP_FLUSH").map_or(true, |v| v != "0"))
+        {
+            unsafe {
+                let _ = hipDeviceSynchronize();
+                super::stream::clear_dirty_flag_after_device_sync();
+            }
+        }
+    }
+
     if (name == "MemCopyAsync" || name == "MemCopyBatchedAsync") && !kernel_params.is_null() {
         unsafe {
             // kernel_params[2] -> &param_2 (the 32-byte struct)
