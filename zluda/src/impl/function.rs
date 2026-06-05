@@ -13403,6 +13403,41 @@ pub(crate) fn launch_kernel(
     // the -2 MS_4 reads. Returns the slot index to thread into the post-capture.
     // MS_3 capture — disabled (does D2D)
     let ms3_slot: Option<usize> = None;
+    // 2026-06-05 Class A experiment: MS_4 is the documented wild-scatter
+    // producer (atom.global.add.u32 [..], -1 in PTX BB13). If the counter at
+    // `param_6[r6*4]` is 0 when MS_4 reads it, the atomic decrements to
+    // 0xFFFFFFFF (unsigned wrap) → r9 = first_slot + 0 → r10 = first_slot - 1
+    // → out-of-bounds store. The corrupted output then propagates downstream
+    // to IOFX_remapKernel (texref read of param_4) → IOFX_actorRangeKernel
+    // (wild scatter) → canonical CB/DB+TCP page fault.
+    //
+    // The counter pool is written by MS_2_Batched (BB11_9 decrements
+    // group_base[bucket].field_8) AND the filter buffer is written by MS_1.
+    // The PTX-level emit_ret SC system-scope fence is supposed to make these
+    // visible, but Class A still fires ~75% of crashes under Phase 2.
+    // Strongest residual hypothesis: producer→consumer ordering between
+    // MS_2_Batched's counter write and MS_4's read leaks across the gfx10
+    // WGP boundary (different wavefronts on different WGPs).
+    //
+    // ZLUDA_MS4_PRE_SYNC drains all in-flight kernels on this stream BEFORE
+    // MS_4 launches, ensuring MS_1/MS_2_B/MS_3 outputs are fully visible.
+    //   mode '1' → hipDeviceSynchronize (cross-stream drain)
+    //   mode '2' → hipStreamSynchronize (this stream only)
+    // Default 0 (off). A/B candidate for Class A.
+    if name == "CreateParticleShapesIncremental_MultiStage_4" {
+        static MS4_PRE_SYNC: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let pre_sync_mode = *MS4_PRE_SYNC.get_or_init(|| {
+            std::env::var("ZLUDA_MS4_PRE_SYNC")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(0)
+        });
+        match pre_sync_mode {
+            1 => unsafe { let _ = hipDeviceSynchronize(); },
+            2 => unsafe { let _ = hipStreamSynchronize(stream); },
+            _ => {}
+        }
+    }
     // Phase 1 fix for Bug A: defensively force-zero `*(rd5+22176)` for every
     // tracked rd5 BEFORE MS_1 reads it. PhysX's per-frame MemCopyBatchedAsync
     // reset batch occasionally excludes the rd5 buffer that MS_1 is about to
