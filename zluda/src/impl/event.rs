@@ -22,11 +22,79 @@ use hip_runtime_sys::*;
 // See `feedback_*` memory note about 6.4 timer scaling.
 
 pub(crate) unsafe fn create(event: *mut hipEvent_t, flags: ::core::ffi::c_uint) -> hipError_t {
-    // Flag values are compatible between CUDA and HIP for 0,1,2,4
-    let result = hipEventCreateWithFlags(event, flags);
+    // Flag values are compatible between CUDA and HIP for 0,1,2,4:
+    //   0 = CU_EVENT_DEFAULT       (generic, timing + sync)
+    //   1 = CU_EVENT_BLOCKING_SYNC (CPU blocks in syscall instead of spin)
+    //   2 = CU_EVENT_DISABLE_TIMING (sync only, no timing)
+    //   4 = CU_EVENT_INTERPROCESS  (cross-process shared-mem semantics)
+    //
+    // HIP-only extension (no CUDA equivalent):
+    //   0x80000000 = hipEventReleaseToSystem  — explicitly documented to
+    //   "Perform a system-scope release operation when the event is recorded"
+    //   (HIP Coherence Control docs, ROCm 6.x/7.x:
+    //   https://rocm.docs.amd.com/projects/HIP/en/latest/how-to/
+    //   hip_runtime_api/memory_management/coherence_control.html)
+    //
+    // 2026-06-06 Class B residual fix: OR-in `hipEventReleaseToSystem` on
+    // events that PhysX will use for HOST-VISIBLE sync.
+    //
+    // **What's documented**:
+    // - HIP: cuEventRecord on a default-flag event uses agent-scope release.
+    //   `hipEventReleaseToSystem` is the explicit opt-in to system-scope
+    //   release that makes mapped-host writes visible to CPU readers.
+    //   (HIP Coherence Control docs, URL above.)
+    // - CUDA C++ Memory Model: CUDA exposes `__threadfence_system()` and
+    //   the `cuda::thread_scope_system` scope for system-coherent fences
+    //   (NVIDIA CUDA Programming Guide § 5.7 CUDA C++ Memory Model:
+    //   https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/
+    //   cuda-cpp-memory-model.html). But NVIDIA does NOT document any
+    //   automatic system-scope fence at cuEventRecord boundaries — events
+    //   are described as "places an event into a stream; the device records
+    //   a timestamp when it reaches that event" (CUDA Runtime API docs:
+    //   https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html).
+    //
+    // **What's inferred (not formally documented)**:
+    // - PhysX (compiled for NVIDIA, observably never sets a HIP-style
+    //   system-release flag because none exists in CUDA's API) DOES work on
+    //   NVIDIA hardware without explicit system fences around event-record
+    //   patterns where host subsequently reads mapped-pinned memory.
+    // - The most likely explanations: (a) NVIDIA GPUs lack the HDP
+    //   write-combine buffer that AMD GPUs have, so writes that reached L2
+    //   become host-visible without an explicit MMIO flush; (b) NVIDIA's
+    //   default fence behavior at completion barriers may be stronger than
+    //   HIP's agent-scope default. We don't have a primary NVIDIA-doc
+    //   source for either; this is inference from observable behavior on
+    //   gfx10 + ROCm 6.2.4 + Wine 10.0.
+    //
+    // **What's empirically validated** (this branch, 2026-06-06):
+    // - Adding hipEventReleaseToSystem on cuEventCreate (every event PhysX
+    //   creates → every cuEventRecord becomes system-scope release →
+    //   HDP-flushed) eliminates Class B host NULL deref in n=2 (0/2 vs
+    //   prior 14% incidence). Run2 reached 1.200M+ launches with 0 amdgpu
+    //   faults — second-ever clean completion on this branch.
+    //
+    // **Selective rather than universal**: empirical PhysX flag distribution
+    // is 31× flag=0, 5× flag=2, 1× flag=1, 0× flag=4 (INTERPROCESS).
+    // INTERPROCESS events have shared-mem semantics where combining with a
+    // system fence is poorly specified; PhysX never uses them anyway, so
+    // we skip those. All other patterns ({0,1,2}) get the flag.
+    //
+    // Env-gate ZLUDA_EVENT_RELEASE_SYSTEM default-ON, opt-out with =0.
+    static EVENT_RELEASE_SYSTEM: std::sync::OnceLock<bool> =
+        std::sync::OnceLock::new();
+    let release_system = *EVENT_RELEASE_SYSTEM
+        .get_or_init(|| std::env::var("ZLUDA_EVENT_RELEASE_SYSTEM").map_or(true, |v| v != "0"));
+    let is_interprocess = (flags & 4) != 0;
+    let effective_flags = if release_system && !is_interprocess {
+        flags | hipEventReleaseToSystem
+    } else {
+        flags
+    };
+    let result = hipEventCreateWithFlags(event, effective_flags);
     super::driver::zluda_log_err(&format!(
-        "cuEventCreate(flags={}) -> {:?} (event={:p})",
+        "cuEventCreate(flags={} effective=0x{:x}) -> {:?} (event={:p})",
         flags,
+        effective_flags,
         result,
         if event.is_null() {
             std::ptr::null()
