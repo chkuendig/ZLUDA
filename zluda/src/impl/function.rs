@@ -6,6 +6,15 @@ use std::io::Write as IoWrite;
 use std::mem;
 use std::sync::Mutex;
 
+/// Device-allocation bases observed as the SOURCE of MemCopyBatchedAsync
+/// descriptors writing into mapped-host near the upstream relay struct
+/// (off ≈ 1 MiB). Each entry is `(base, size)` of a device allocation.
+/// Populated lazily as MemCopyBatchedAsync descriptors arrive; read by the
+/// per-launch writer probe (`ZLUDA_MEMCPY_SRC_WRITER=1`) which logs any
+/// kernel-arg pointer falling within a tracked alloc. Pure diagnostic.
+static TRACKED_MEMCPY_SRC_ALLOCS: std::sync::Mutex<Vec<(u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
 static FUNC_NAMES: std::sync::LazyLock<Mutex<HashMap<usize, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -12040,6 +12049,76 @@ pub(crate) fn launch_kernel(
         ));
     }
 
+    // 2026-06-06 Class A upstream-writer hunt — pure diagnostic, gated on
+    // ZLUDA_MEMCPY_SRC_WRITER=1.
+    //
+    // The MS_4 wild-scatter at +16 GiB is downstream of a monotonically
+    // growing "shape count" relayed via MemCopyBatchedAsync into mapped-host
+    // off=1056768 (per project_n_threads_slot_identified_2026_05_17). Phase C
+    // identified the descriptors but the upstream COMPUTE KERNEL writing the
+    // device-only source buffer remains unknown.
+    //
+    // This probe runs on EVERY launch (no kernel-name branch — kernel-name
+    // matching is allowed for diagnostics per feedback_no_per_kernel_branching).
+    // For each arg pointer 0..8 that falls within a previously-tracked
+    // upstream-relay src allocation, log:
+    //   [SRC_WRITER] kernel='X' arg=N ptr=0x... in_alloc=(0x..., size)
+    //
+    // The tracked-src-alloc set is populated by the MemCopyBatchedAsync
+    // descriptor decode block below: when a descriptor copies u32 (or
+    // 16-byte struct) to mapped-host near offset 1MB, we resolve the src
+    // pointer to its containing device allocation and add it to the set.
+    //
+    // Filter on the first N occurrences per kernel to avoid log explosion.
+    {
+        static WRITER_PROBE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let writer_probe_on = *WRITER_PROBE_ENABLED.get_or_init(|| {
+            std::env::var("ZLUDA_MEMCPY_SRC_WRITER").map_or(false, |v| v == "1")
+        });
+        if writer_probe_on && name != "MemCopyBatchedAsync" && name != "MemCopyAsync" {
+            // Snapshot the tracked-src-allocs once; on cold start it's empty,
+            // so the probe is silent until MemCopyBatchedAsync runs.
+            let tracked: Vec<(u64, u64)> = match TRACKED_MEMCPY_SRC_ALLOCS.lock() {
+                Ok(g) => g.iter().copied().collect(),
+                Err(p) => p.into_inner().iter().copied().collect(),
+            };
+            if !tracked.is_empty() {
+                static PROBE_SEEN: std::sync::OnceLock<
+                    std::sync::Mutex<std::collections::HashMap<String, u32>>,
+                > = std::sync::OnceLock::new();
+                let seen = PROBE_SEEN.get_or_init(|| {
+                    std::sync::Mutex::new(std::collections::HashMap::new())
+                });
+                let log_this = {
+                    let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = g.entry(name.to_string()).or_insert(0);
+                    *n += 1;
+                    *n <= 3
+                };
+                if log_this {
+                    for arg_idx in 0..8usize {
+                        let off = arg_idx * 8;
+                        if let Some(p) =
+                            unsafe { read_kernel_arg::<u64>(kernel_params, extra, off, arg_idx) }
+                        {
+                            for &(base, size) in tracked.iter() {
+                                if p >= base && p < base + size {
+                                    let in_off = p - base;
+                                    super::driver::zluda_log_err(&format!(
+                                        "[SRC_WRITER] kernel='{}' arg={} ptr=0x{:x} \
+                                         in_alloc=(0x{:x}, {}) off_in_alloc={}",
+                                        name, arg_idx, p, base, size, in_off
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Phase 3a Path 1b: periodically sample first-qword of each tracked
     // 1040000-byte cuMemHostAlloc'd buffer. We only fire every Nth launch
     // to avoid log explosion (game does ~400k launches per benchmark cycle).
@@ -12447,14 +12526,33 @@ pub(crate) fn launch_kernel(
                                 }
                             }
                             if let Some((dst_host, dst_off)) = matched_dst {
-                                // Filter by SIZE: only 4-byte writes catch
-                                // single-u32 counter relays (the relevant
-                                // pattern for shape-count propagation).
-                                // The relay slot offset varies per run, so
-                                // can't filter by offset. Size filter limits
-                                // events to ~tens per second instead of
-                                // thousands.
-                                let interesting = d_size == 4;
+                                // 2026-06-06 Class A investigation: widen filter
+                                // to catch the upstream n_threads struct writer.
+                                // The struct is 16 bytes at off~1048576 in a 2 MiB
+                                // mapped buffer (per
+                                // project_class_a_n_threads_chain_decoded_2026_06_06.md).
+                                // Original filter `d_size == 4` missed this.
+                                // New filter: any size, dst_off in the 1 MiB ± 4 KiB
+                                // window where the struct lives.
+                                let near_upstream_struct =
+                                    dst_off >= 1044480 && dst_off < 1052672;
+                                let interesting = d_size == 4 || near_upstream_struct;
+                                // Class A upstream-writer hunt: when this
+                                // descriptor copies into the relay struct
+                                // region, record the src's containing dev
+                                // alloc so the per-launch SRC_WRITER probe
+                                // can match kernel-arg pointers against it.
+                                if near_upstream_struct {
+                                    if let Some((base, size)) =
+                                        super::memory::find_dev_alloc_containing(d_src)
+                                    {
+                                        if let Ok(mut t) = TRACKED_MEMCPY_SRC_ALLOCS.lock() {
+                                            if !t.iter().any(|&(b, _)| b == base) {
+                                                t.push((base, size));
+                                            }
+                                        }
+                                    }
+                                }
                                 if interesting {
                                     // Try to read the source u32 value too —
                                     // resolve src to a tracked buffer first.
@@ -12556,6 +12654,85 @@ pub(crate) fn launch_kernel(
         }
     }
 
+    // ============================================================================
+    // CLASS A WILD-SCATTER MECHANISM (PARKED — Rocksteady PhysX 3.3 internal bug)
+    // ============================================================================
+    //
+    // MS_4 PTX (`/tmp/zluda_ptx_003.ptx`, ~line 2972 in CreateParticleShapesIncremental_MultiStage_4):
+    //   ld.param.u32 %r2, [param_3];      // r2 = n_threads (host-passed)
+    //   ...
+    //   ld.global.u16 %rs1, [%rd9];       // rs1 = filter[r1*4] low u16
+    //   and.b16 %rs2, %rs1, 17;
+    //   setp.ne.s16 %p2, %rs2, 1;
+    //   @%p2 bra BB13_3;                  // skip if filter bit not set
+    //   ...
+    //   atom.global.add.u32 %r8, [%rd19], -1;   // r8 = OLD counter, decrement
+    //   add.s32 %r9, %r7, %r8;            // r9 = first_slot + old_counter
+    //   add.s32 %r10, %r9, -1;            // r10 = first_slot + old_counter - 1
+    //   mul.wide.u32 %rd20, %r10, 4;      // **UNSIGNED widen!** if r10 signed-negative
+    //                                      // (i.e. r10 = -1 as s32 = 0xFFFFFFFF as u32),
+    //                                      // rd20 = 0x3FFFFFFFC (~16 GiB)
+    //   add.s64 %rd21, %rd10, %rd20;      // store target = param_5 + ~16 GiB FORWARD
+    //   st.global.u32 [%rd21], %r1;       // WILD SCATTER
+    //
+    // **The bug** (root cause investigated 2026-06-06, see
+    // `memory/project_class_a_writer_identified_2026_06_06.md`):
+    //   - PhysX 3.3 (Rocksteady-customized, build path `e:\w\d9cc1c962e607cee\sw\
+    //     physx\physxsdk\3.3\special\rocksteady\source\physxgpu\src\cuda\UB\`) has
+    //     a particle-shape relay struct {u32 removed_count, u32 active_count,
+    //     float active_count_f, float multiplier=1.0} at offset 0x800 of each
+    //     per-actor 2 MiB ctx buffer.
+    //   - MS-chain kernels (MS_1, MS_2_Batched, MS_3) write `active_count` correctly
+    //     but NEVER write `removed_count` — that's PhysX's standalone-particle
+    //     `RemoveParticleShapes` kernel's job, and Batman:AK's APEX 1.4 bypasses
+    //     PhysX's particle-lifecycle CPU API entirely (uses ParticleIOS_* instead).
+    //   - PhysX C++ reads `n_threads = active_count - removed_count = active_count`,
+    //     which grows toward a 65000 cap as particles accumulate.
+    //   - When MS_4 is launched with n_threads > sum-of-filter-matches, the excess
+    //     threads `atom.global.add.u32 [counter], -1` past zero. The atom returns
+    //     the OLD value: 0 → next call wraps counter to 0xFFFFFFFF.
+    //   - First-underflow thread: r8=0, r9=first_slot, r10=first_slot-1. If
+    //     `first_slot == 0` (typical for actor 0 / first shape group), r10 = -1
+    //     and the wild scatter lands `param_5 + ~16 GiB FORWARD`.
+    //   - That target falls in a dma_buf-imported D3D11 texture region (per
+    //     `zluda_d3d11_register_imported`, 45 imports/run, base addresses in
+    //     0x7fa6c0900000–0x7fa6d8380000 range), corrupting it. Next frame DXVK
+    //     samples the corrupted texture, GPU TCP cache reads cross unmapped
+    //     page boundaries → page fault on dxvk-submit thread → SIGABRT.
+    //
+    // **NVIDIA also has this bug** (per Steam Community Guide 2433732129): Batman:AK
+    // with PhysX particles enabled crashes on NVIDIA driver ≥461.09; users must
+    // downgrade to 456.55 (~Aug 2020). The pre-460 driver likely placed the wild
+    // scatter's +16 GiB target in unallocated memory (graceful kernel-side fault),
+    // and 460+ removed that implicit protection.
+    //
+    // **PhysX 3.4 open source** (NVIDIAGameWorks/PhysX-3.4) does NOT contain
+    // `RemoveParticleShapes` or `CreateParticleShapesIncremental_MultiStage_*` —
+    // those kernels are Rocksteady-bespoke. PhysX particles were deprecated in 3.4
+    // (April 2017) and removed in 4.x.
+    //
+    // **Fix paths considered, all rejected**:
+    // - Host-side cap of n_threads in this hook: requires reading the counter sum
+    //   from param_7 via D2H from launch_kernel → forbidden (see
+    //   feedback_no_d2d_from_launch_kernel.md, kills bench via ProfilingSignal race).
+    // - PTX patch to add `if r10 > some_bound: skip`: per-kernel value-mutating
+    //   PTX patch, disallowed by session constraints.
+    // - Pre-buffer cuMemAlloc guard pages (2026-06-06 experiment): would have
+    //   helped if scatter went backward, but `mul.wide.u32` math means it goes
+    //   **+16 GiB FORWARD** → guards are wrong direction. Tried 64 KiB (no
+    //   improvement) and 1 MiB (regression via memory pressure / Class B at
+    //   startup). Reverted same-session.
+    // - Synthetic RemoveParticleShapes dispatcher in ZLUDA: would mimic the
+    //   missing cleanup PhysX intends. Multi-session reverse-engineering of the
+    //   kernel's data structures required. Open option for future work.
+    //
+    // **Current state**: Class A is parked. The `patch_iofx_bbox_tail_merge` PTX
+    // patch (in `module.rs`) catches some wild writes at the IOFX_actorRange site
+    // (a band-aid one step downstream of the actual scatter). The existing
+    // `MS1_RD5_RESET` defensive zero of `ctx+22176` handles the OTHER stale-counter
+    // pattern. Beyond that, Class A is upstream of ZLUDA's intercept points.
+    //
+    // ============================================================================
     // Host-side zero-copy counter dump — runs for every MS_4 launch.
     // Pure CPU reads, no DtoH, no GPU ops — safe from the ProfilingSignal
     // race. The widened HOST_ALLOCS tracker now records (host, dev, size)

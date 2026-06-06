@@ -20,6 +20,41 @@ pub(crate) static ALLOC_MAX: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SMALL_HOST_ALLOCS: std::sync::Mutex<Vec<(usize, usize, usize)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Table of device allocations created via `cuMemAlloc_v2`. Each entry is
+/// `(base, size)`. Used by the upstream-writer hunt (Class A) to identify
+/// which device-only allocation a MemCopyBatchedAsync source pointer falls
+/// in; subsequent kernel launches whose args land in the same allocation
+/// are candidate writers of that buffer.
+pub(crate) static DEV_ALLOCS: std::sync::Mutex<Vec<(u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn track_dev_alloc(base: u64, size: u64) {
+    if size == 0 {
+        return;
+    }
+    if let Ok(mut t) = DEV_ALLOCS.lock() {
+        t.push((base, size));
+    }
+}
+
+pub(crate) fn untrack_dev_alloc(base: u64) {
+    if let Ok(mut t) = DEV_ALLOCS.lock() {
+        t.retain(|(b, _)| *b != base);
+    }
+}
+
+/// Returns the (base, size) of the device allocation containing `ptr`, or None.
+pub(crate) fn find_dev_alloc_containing(ptr: u64) -> Option<(u64, u64)> {
+    if let Ok(t) = DEV_ALLOCS.lock() {
+        for &(base, size) in t.iter() {
+            if ptr >= base && ptr < base + size {
+                return Some((base, size));
+            }
+        }
+    }
+    None
+}
+
 /// Tracker for the specific 1040000-byte cuMemHostAlloc'd buffers we believe
 /// PhysX/FleX use as actor lists. Plan Phase 3a Path 1b: log first 32 bytes
 /// at allocation time and periodically thereafter, then diff PASS vs FAIL
@@ -826,6 +861,7 @@ unsafe fn fill_with_zero_and_register(
     super::driver::zluda_log(&format!("[ZLUDA] cuMemAlloc_v2 -> {:?} OK", dptr.0));
     super::driver::zluda_log_err(&format!("ALLOC {:?} size={}", dptr.0, bytesize));
     update_alloc_range(dptr.0 as u64, bytesize as u64);
+    track_dev_alloc(dptr.0 as u64, bytesize as u64);
     add_allocation(dptr.0, bytesize, cu_context)?;
     mem::forget(drop_guard);
     Ok(())
@@ -835,6 +871,7 @@ pub(crate) unsafe fn free_v2(dptr: hipDeviceptr_t) -> CUresult {
     super::driver::zluda_log(&format!("[ZLUDA] cuMemFree_v2({:?})", dptr.0));
     super::driver::zluda_log_err(&format!("FREE {:?}", dptr.0));
     let hip_result = hipFree(dptr.0);
+    untrack_dev_alloc(dptr.0 as u64);
     remove_allocation(dptr.0)?;
     Ok(hip_result?)
 }
