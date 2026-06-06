@@ -332,6 +332,184 @@ fn match_setp_eq_s64_zero_pair(setp_line: &str, bra_line: &str) -> Option<(Strin
     Some((pred_name.to_string(), target.to_string()))
 }
 
+/// 2026-06-06: MS_4 counter-underflow scatter guard.
+///
+/// PhysX's `CreateParticleShapesIncremental_MultiStage_4` ends with:
+///   atom.global.add.u32 %r8, [%rd19], -1;   ; %r8 = OLD counter
+///   add.s32 %r9, %r7, %r8;                  ; first_slot + old_counter
+///   add.s32 %r10, %r9, -1;                  ; first_slot + old_counter - 1
+///   mul.wide.u32 %rd20, %r10, 4;            ; * 4, widened UNSIGNED to u64
+///   add.s64 %rd21, %rd10, %rd20;
+///   st.global.u32 [%rd21], %r1;
+///
+/// MS_4 is dispatched with grid_x = "shape count" relayed from a host-mapped
+/// buffer. APEX's ParticleIOS bypasses the PhysX particle CPU API and grows
+/// this counter monotonically (RemoveParticleShapes never dispatches in
+/// Batman's APEX configuration — see `project_why_remove_particle_shapes_not_called_2026_05_23`).
+/// Eventually MS_4 over-dispatches: more threads launched than valid
+/// particles. Phantom threads pass the (flags & 0x11) == 1 filter (the
+/// flags buffer holds stale `1`s), then hit the atom.add(-1). When a
+/// group's `counter[r6]` reaches 0, the next thread's atom.add returns
+/// 0xFFFFFFFF; with first_slot small enough, the subsequent multiply
+/// widens to ~16 GiB, scattering into a dma_buf-imported D3D11 texture
+/// region. The TCP page fault is canonical: 0x8 client, single CB/DB neighbor.
+///
+/// Fix: predicate the wild store. Drop the write when the atom.add saw a
+/// zero counter (the underflow case). The counter is already polluted by
+/// the atom op itself; subsequent threads of the same group skip too.
+/// MS_2_Batched resets the counter each cycle, so pollution is transient.
+/// Particles that would have scattered to phantom slots are simply lost —
+/// they were over-dispatched ghosts to begin with.
+///
+/// This is a band-aid at the scatter site (same shape as
+/// `patch_iofx_bbox_tail_merge` — a known-bad write the kernel author
+/// did not guard against). The upstream root cause (APEX bypassing
+/// `releaseParticles`) lives in PhysX 3.3 Rocksteady-customized binary;
+/// there is no CPU-side hook into the particle lifecycle to fix.
+///
+/// Env-gate: `ZLUDA_MS4_UNDERFLOW_GUARD=0` to disable (default ON).
+pub fn patch_ms4_underflow_guard(ptx: &str) -> Option<String> {
+    let env_off = std::env::var("ZLUDA_MS4_UNDERFLOW_GUARD").map_or(false, |v| v == "0");
+    if env_off {
+        return None;
+    }
+    if !ptx.contains("CreateParticleShapesIncremental_MultiStage_4") {
+        return None;
+    }
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut out = String::with_capacity(ptx.len() + 512);
+    let mut in_ms4 = false;
+    let mut brace_depth: i32 = 0;
+    let mut guard_uid: usize = 0;
+    // When Some(pred_name), the next `st.global.u32 [%rd<...>], %r<...>;`
+    // inside the kernel gets predicated with @!<pred_name>.
+    let mut pending_predicate: Option<String> = None;
+    let mut patch_count = 0usize;
+    for line in lines.iter() {
+        let trimmed = line.trim_start();
+        // Enter MS_4 kernel body. PhysX emits one MS_4 per module; kernel
+        // bodies are `{ ... }` delimited at file scope.
+        if trimmed.starts_with(".visible .entry CreateParticleShapesIncremental_MultiStage_4")
+            || trimmed.starts_with(".entry CreateParticleShapesIncremental_MultiStage_4")
+        {
+            in_ms4 = true;
+            brace_depth = 0;
+            pending_predicate = None;
+        }
+
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+
+        // Step 1: if we have a pending predicate AND this line is the target
+        // st.global.u32, prepend @!<pred>. Do this BEFORE pushing the line so
+        // we emit the predicated form.
+        let mut consumed = false;
+        if in_ms4 && brace_depth >= 1 {
+            if let Some(ref pred) = pending_predicate.clone() {
+                let stripped = trimmed.trim_end();
+                if is_st_global_u32_indexed(stripped) {
+                    out.push_str(indent);
+                    out.push_str("@!");
+                    out.push_str(pred);
+                    out.push(' ');
+                    out.push_str(stripped);
+                    out.push('\n');
+                    pending_predicate = None;
+                    patch_count += 1;
+                    consumed = true;
+                }
+            }
+        }
+        if !consumed {
+            out.push_str(line);
+            out.push('\n');
+        }
+
+        // Track braces AFTER emitting so the line containing `{` still counts
+        // as part of the kernel header for predicate matching.
+        if in_ms4 {
+            for c in line.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_ms4 = false;
+                        pending_predicate = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Step 2: detect atom.global.add.u32 %r<N>, [%rd<M>], -1; — set up the
+        // predicate to apply to the next st.global.u32 in this kernel.
+        if in_ms4 && brace_depth >= 1 && pending_predicate.is_none() {
+            if let Some(reg) = parse_atom_global_add_minus_one(trimmed) {
+                let pred_name = format!("%p_zluda_ms4_underflow_{}", guard_uid);
+                guard_uid += 1;
+                out.push_str(indent);
+                out.push_str(".reg .pred ");
+                out.push_str(&pred_name);
+                out.push_str(";\n");
+                out.push_str(indent);
+                out.push_str("setp.eq.u32 ");
+                out.push_str(&pred_name);
+                out.push_str(", ");
+                out.push_str(&reg);
+                out.push_str(", 0;\n");
+                pending_predicate = Some(pred_name);
+            }
+        }
+    }
+    if patch_count == 0 {
+        None
+    } else {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] patch_ms4_underflow_guard: applied {} guard(s)",
+            patch_count
+        ));
+        Some(out)
+    }
+}
+
+/// Matches `atom.global.add.u32 %r<digits>, [%rd<digits>], -1;` and returns
+/// the destination register name (e.g. `%r8`).
+fn parse_atom_global_add_minus_one(line: &str) -> Option<String> {
+    let line = line.trim_end();
+    let rest = line.strip_prefix("atom.global.add.u32")?.trim_start();
+    let mut parts = rest.splitn(3, ',');
+    let dst = parts.next()?.trim();
+    let mem = parts.next()?.trim();
+    let val = parts.next()?.trim().trim_end_matches(';').trim();
+    // dst must be %r<digits> (not %rd<...>)
+    if !dst.starts_with("%r") || dst.starts_with("%rd") {
+        return None;
+    }
+    if !mem.starts_with("[%rd") {
+        return None;
+    }
+    if val != "-1" {
+        return None;
+    }
+    Some(dst.to_string())
+}
+
+/// Matches `st.global.u32 [%rd<digits>], %r<digits>;` (with optional whitespace).
+/// This is the MS_4 scatter form — exactly one such store per kernel body.
+fn is_st_global_u32_indexed(line: &str) -> bool {
+    let line = line.trim_end();
+    let rest = match line.strip_prefix("st.global.u32") {
+        Some(r) => r.trim_start(),
+        None => return false,
+    };
+    // Expect "[%rd<...>], %r<...>;"
+    if !rest.starts_with('[') {
+        return false;
+    }
+    rest.contains("], %r")
+}
+
 /// 2026-04-29: convert `ld.shared.<T>` → `ld.volatile.shared.<T>` across
 /// PhysX/FleX/TFS/IOFX/ParticleIOS kernels affected by the cross-wave LDS
 /// visibility class. The membar.cta + s_waitcnt fixes target HW-level
@@ -1748,10 +1926,15 @@ fn get_best_ptx_and_compile(
                         Some(patched) => Cow::Owned(patched),
                         None => Cow::Borrowed(ptx),
                     };
+                    let after_ms4: Cow<str> = match patch_ms4_underflow_guard(after_bbox.as_ref())
+                    {
+                        Some(p) => Cow::Owned(p),
+                        None => after_bbox,
+                    };
                     let after_volatile: Cow<str> =
-                        match patch_broad_volatile_lds(after_bbox.as_ref()) {
+                        match patch_broad_volatile_lds(after_ms4.as_ref()) {
                             Some(p) => Cow::Owned(p),
-                            None => after_bbox,
+                            None => after_ms4,
                         };
                     let after_membar: Cow<str> =
                         match patch_broad_membar_before_bar_sync(after_volatile.as_ref()) {
@@ -1817,10 +2000,15 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => text,
                                         };
-                                    let after_volatile: Cow<str> =
-                                        match patch_broad_volatile_lds(after_bbox.as_ref()) {
+                                    let after_ms4: Cow<str> =
+                                        match patch_ms4_underflow_guard(after_bbox.as_ref()) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_bbox,
+                                        };
+                                    let after_volatile: Cow<str> =
+                                        match patch_broad_volatile_lds(after_ms4.as_ref()) {
+                                            Some(p) => Cow::Owned(p),
+                                            None => after_ms4,
                                         };
                                     let after_membar: Cow<str> =
                                         match patch_broad_membar_before_bar_sync(
@@ -2532,6 +2720,145 @@ ret;
         assert!(patched.contains("@%p122 bra BB10_186;"));
         assert!(patched.contains("setp.ne.s32 %p_zluda_bbox_lane0_0, %r_zluda_bbox_tid_0, 0;"));
         assert!(patched.contains("@%p_zluda_bbox_lane0_0 bra BB10_186;"));
+    }
+
+    // ===== patch_ms4_underflow_guard tests =====
+
+    #[test]
+    fn patch_ms4_skips_non_ms4_ptx() {
+        let ptx = "// not MS_4\n.visible .entry foo() { ret; }\n";
+        assert!(patch_ms4_underflow_guard(ptx).is_none());
+    }
+
+    #[test]
+    fn patch_ms4_inserts_predicate_before_scatter_store() {
+        // Minimal MS_4 body matching the Batman AK shape:
+        //   atom.add.u32 ..., -1; add; add; mul.wide.u32; add.s64; st.global.u32 [...]
+        let ptx = r#".visible .entry CreateParticleShapesIncremental_MultiStage_4() {
+.reg .pred %p<3>;
+.reg .s32 %r<11>;
+.reg .s64 %rd<22>;
+atom.global.add.u32 %r8, [%rd19], -1;
+add.s32 %r9, %r7, %r8;
+add.s32 %r10, %r9, -1;
+mul.wide.u32 %rd20, %r10, 4;
+add.s64 %rd21, %rd10, %rd20;
+st.global.u32 [%rd21], %r1;
+ret;
+}
+"#;
+        let patched = patch_ms4_underflow_guard(ptx).expect("should patch");
+        // New predicate declared.
+        assert!(
+            patched.contains(".reg .pred %p_zluda_ms4_underflow_0;"),
+            "missing pred decl in patched output:\n{}",
+            patched
+        );
+        // setp.eq.u32 against %r8 (atom dst).
+        assert!(
+            patched.contains("setp.eq.u32 %p_zluda_ms4_underflow_0, %r8, 0;"),
+            "missing setp in patched output:\n{}",
+            patched
+        );
+        // The original store is replaced with the predicated form.
+        assert!(
+            patched.contains("@!%p_zluda_ms4_underflow_0 st.global.u32 [%rd21], %r1;"),
+            "store not predicated in patched output:\n{}",
+            patched
+        );
+        // Original unpredicated store no longer present standalone.
+        let occurrences = patched
+            .lines()
+            .filter(|l| l.trim() == "st.global.u32 [%rd21], %r1;")
+            .count();
+        assert_eq!(occurrences, 0, "unpredicated store still present");
+    }
+
+    #[test]
+    fn patch_ms4_handles_different_register_numbers() {
+        // Same structural pattern, different dst register on the atom and different
+        // pointer/value registers on the store — patcher must follow the chain.
+        let ptx = r#".visible .entry CreateParticleShapesIncremental_MultiStage_4() {
+.reg .pred %p<3>;
+.reg .s32 %r<16>;
+.reg .s64 %rd<32>;
+atom.global.add.u32 %r15, [%rd25], -1;
+add.s32 %r16, %r14, %r15;
+add.s32 %r17, %r16, -1;
+mul.wide.u32 %rd30, %r17, 4;
+add.s64 %rd31, %rd20, %rd30;
+st.global.u32 [%rd31], %r2;
+ret;
+}
+"#;
+        let patched = patch_ms4_underflow_guard(ptx).expect("should patch");
+        assert!(patched.contains("setp.eq.u32 %p_zluda_ms4_underflow_0, %r15, 0;"));
+        assert!(patched.contains("@!%p_zluda_ms4_underflow_0 st.global.u32 [%rd31], %r2;"));
+    }
+
+    #[test]
+    fn patch_ms4_skips_atom_with_non_minus_one_value() {
+        // atom.global.add.u32 ..., +1 should NOT match — only -1 produces underflow scatter.
+        let ptx = r#".visible .entry CreateParticleShapesIncremental_MultiStage_4() {
+.reg .pred %p<3>;
+.reg .s32 %r<5>;
+.reg .s64 %rd<5>;
+atom.global.add.u32 %r1, [%rd1], 1;
+st.global.u32 [%rd2], %r3;
+ret;
+}
+"#;
+        assert!(
+            patch_ms4_underflow_guard(ptx).is_none(),
+            "must not patch non-decrement atom"
+        );
+    }
+
+    #[test]
+    fn patch_ms4_env_var_disables_patch() {
+        std::env::set_var("ZLUDA_MS4_UNDERFLOW_GUARD", "0");
+        let ptx = r#".visible .entry CreateParticleShapesIncremental_MultiStage_4() {
+.reg .pred %p<3>;
+atom.global.add.u32 %r8, [%rd19], -1;
+st.global.u32 [%rd21], %r1;
+ret;
+}
+"#;
+        let result = patch_ms4_underflow_guard(ptx);
+        std::env::remove_var("ZLUDA_MS4_UNDERFLOW_GUARD");
+        assert!(result.is_none(), "env=0 should disable patch");
+    }
+
+    #[test]
+    fn patch_ms4_does_not_touch_other_kernels() {
+        // Other kernels in the module must not be patched even if they have
+        // atom.add(-1) — only the MS_4 kernel.
+        let ptx = r#".visible .entry SomeOtherKernel() {
+.reg .pred %p<3>;
+atom.global.add.u32 %r8, [%rd19], -1;
+st.global.u32 [%rd21], %r1;
+ret;
+}
+.visible .entry CreateParticleShapesIncremental_MultiStage_4() {
+.reg .pred %p<3>;
+atom.global.add.u32 %r10, [%rd20], -1;
+st.global.u32 [%rd22], %r2;
+ret;
+}
+"#;
+        let patched = patch_ms4_underflow_guard(ptx).expect("should patch MS_4");
+        // SomeOtherKernel's store is NOT predicated.
+        assert!(
+            patched.contains("\nst.global.u32 [%rd21], %r1;"),
+            "SomeOtherKernel's store should be left alone:\n{}",
+            patched
+        );
+        // MS_4's store IS predicated.
+        assert!(
+            patched.contains("@!%p_zluda_ms4_underflow_0 st.global.u32 [%rd22], %r2;"),
+            "MS_4's store should be predicated:\n{}",
+            patched
+        );
     }
 
     #[test]
