@@ -13394,11 +13394,16 @@ pub(crate) fn launch_kernel(
             // shape-pipeline logging is usually off in live runs, while
             // ZLUDA_MS2_CAPTURE is intentionally independent.
             let p2_ctas: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
+            // 2026-06-07 Class A writer hunt: also log p0 to see if it
+            // points into the per-actor relay buffer (the source for the
+            // MemCopyBatchedAsync that feeds MS_4's over-dispatched n).
+            let p0: u64 = read_kernel_arg(kernel_params, extra, 0, 0).unwrap_or(0);
             static MS2B_CALL_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let call_n = MS2B_CALL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             super::driver::zluda_log_err(&format!(
-                "MS2B_ARGS #{} p2_ctas=0x{:x} grid=[{},{},{}] block=[{},{},{}]",
+                "MS2B_ARGS #{} p0=0x{:x} p2_ctas=0x{:x} grid=[{},{},{}] block=[{},{},{}]",
                 call_n,
+                p0,
                 p2_ctas,
                 grid_dim_x,
                 grid_dim_y,
