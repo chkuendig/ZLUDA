@@ -15,6 +15,26 @@ use std::sync::Mutex;
 static TRACKED_MEMCPY_SRC_ALLOCS: std::sync::Mutex<Vec<(u64, u64)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Per-allocation launch history for the Class A writer hunt. Keyed by
+/// device allocation BASE. Value is a deque of (timestamp_ms, kernel_name,
+/// arg_idx) tuples capped at the last 8 distinct (kernel_name, arg_idx)
+/// pairs that touched this allocation. When MemCopyBatchedAsync copies
+/// from a known alloc into the relay struct slot, the probe dumps this
+/// history so the upstream WRITER kernel is visible even if it fired
+/// before the MemCopy.
+static ALLOC_TOUCH_HISTORY: std::sync::Mutex<
+    Option<std::collections::HashMap<u64, std::collections::VecDeque<(u64, String, u8)>>>,
+> = std::sync::Mutex::new(None);
+
+const ALLOC_HISTORY_CAP: usize = 8;
+/// Process start time in ms for relative timestamps (set lazily on first probe).
+static PROBE_START_MS: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn probe_now_ms() -> u64 {
+    let start = PROBE_START_MS.get_or_init(std::time::Instant::now);
+    start.elapsed().as_millis() as u64
+}
+
 static FUNC_NAMES: std::sync::LazyLock<Mutex<HashMap<usize, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -12049,68 +12069,89 @@ pub(crate) fn launch_kernel(
         ));
     }
 
-    // 2026-06-06 Class A upstream-writer hunt — pure diagnostic, gated on
+    // 2026-06-06 Class A upstream-writer hunt v2 — pure diagnostic, gated on
     // ZLUDA_MEMCPY_SRC_WRITER=1.
     //
-    // The MS_4 wild-scatter at +16 GiB is downstream of a monotonically
-    // growing "shape count" relayed via MemCopyBatchedAsync into mapped-host
-    // off=1056768 (per project_n_threads_slot_identified_2026_05_17). Phase C
-    // identified the descriptors but the upstream COMPUTE KERNEL writing the
-    // device-only source buffer remains unknown.
+    // v1 (committed 22bacd48) only logged matches AFTER MemCopyBatchedAsync
+    // had populated the tracked set, which missed the upstream writer that
+    // ran BEFORE the MemCopy. v2 fixes this by tracking launch HISTORY per
+    // device allocation: every launch's u64-aligned args are checked against
+    // EVERY known device allocation, and the (timestamp, kernel, arg_idx)
+    // tuple is pushed into a per-alloc history (capped at last 8 distinct
+    // (kernel, arg) pairs). When MemCopyBatchedAsync detects a relay-struct
+    // copy (handled below), it dumps the history for the source alloc.
     //
-    // This probe runs on EVERY launch (no kernel-name branch — kernel-name
-    // matching is allowed for diagnostics per feedback_no_per_kernel_branching).
-    // For each arg pointer 0..8 that falls within a previously-tracked
-    // upstream-relay src allocation, log:
-    //   [SRC_WRITER] kernel='X' arg=N ptr=0x... in_alloc=(0x..., size)
-    //
-    // The tracked-src-alloc set is populated by the MemCopyBatchedAsync
-    // descriptor decode block below: when a descriptor copies u32 (or
-    // 16-byte struct) to mapped-host near offset 1MB, we resolve the src
-    // pointer to its containing device allocation and add it to the set.
-    //
-    // Filter on the first N occurrences per kernel to avoid log explosion.
+    // False-positive filtering: a kernel may declare a .u32 param at index
+    // N; reading 8 bytes there yields (u32_value | next4_bytes << 32) and
+    // can coincidentally land in a real allocation range. Two heuristics
+    // weed those out: ptr % 16 == 0 (most CUDA pointers are 16-byte
+    // aligned; junk reads from .u32 counts rarely are) and ptr in the
+    // device-mapped range (> 0x4000_0000_0000 on amdgpu+HSA).
     {
         static WRITER_PROBE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let writer_probe_on = *WRITER_PROBE_ENABLED.get_or_init(|| {
             std::env::var("ZLUDA_MEMCPY_SRC_WRITER").map_or(false, |v| v == "1")
         });
         if writer_probe_on && name != "MemCopyBatchedAsync" && name != "MemCopyAsync" {
-            // Snapshot the tracked-src-allocs once; on cold start it's empty,
-            // so the probe is silent until MemCopyBatchedAsync runs.
-            let tracked: Vec<(u64, u64)> = match TRACKED_MEMCPY_SRC_ALLOCS.lock() {
-                Ok(g) => g.iter().copied().collect(),
-                Err(p) => p.into_inner().iter().copied().collect(),
+            // v3 light: ONE Mutex acquire per launch. Snapshot only LARGE
+            // allocs (>= 1 MiB) — per-actor relay buffers are typically
+            // 2 MiB; small scratch/control allocs are excluded. Linear scan
+            // of ~20-50 entries is trivial.
+            let large_allocs: Vec<(u64, u64)> = {
+                if let Ok(g) = super::memory::DEV_ALLOCS.lock() {
+                    g.iter()
+                        .filter(|(_, s)| *s >= 1_000_000)
+                        .copied()
+                        .collect()
+                } else {
+                    Vec::new()
+                }
             };
-            if !tracked.is_empty() {
-                static PROBE_SEEN: std::sync::OnceLock<
-                    std::sync::Mutex<std::collections::HashMap<String, u32>>,
-                > = std::sync::OnceLock::new();
-                let seen = PROBE_SEEN.get_or_init(|| {
-                    std::sync::Mutex::new(std::collections::HashMap::new())
-                });
-                let log_this = {
-                    let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
-                    let n = g.entry(name.to_string()).or_insert(0);
-                    *n += 1;
-                    *n <= 3
-                };
-                if log_this {
-                    for arg_idx in 0..8usize {
-                        let off = arg_idx * 8;
-                        if let Some(p) =
-                            unsafe { read_kernel_arg::<u64>(kernel_params, extra, off, arg_idx) }
-                        {
-                            for &(base, size) in tracked.iter() {
-                                if p >= base && p < base + size {
-                                    let in_off = p - base;
-                                    super::driver::zluda_log_err(&format!(
-                                        "[SRC_WRITER] kernel='{}' arg={} ptr=0x{:x} \
-                                         in_alloc=(0x{:x}, {}) off_in_alloc={}",
-                                        name, arg_idx, p, base, size, in_off
-                                    ));
-                                    break;
-                                }
+            if large_allocs.is_empty() {
+                // Nothing tracked yet → skip the probe entirely.
+            } else {
+                let ts_ms = probe_now_ms();
+                // First 8 arg slots — covers most kernels' pointer params.
+                let mut matched: Option<(u64, u8)> = None;
+                for arg_idx in 0..8usize {
+                    let off = arg_idx * 8;
+                    let p = match unsafe {
+                        read_kernel_arg::<u64>(kernel_params, extra, off, arg_idx)
+                    } {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if p & 0xF != 0 {
+                        continue;
+                    }
+                    if p < 0x4000_0000_0000 || p >= 0x8000_0000_0000_0000 {
+                        continue;
+                    }
+                    for &(base, size) in &large_allocs {
+                        if p >= base && p < base + size {
+                            matched = Some((base, arg_idx as u8));
+                            break;
+                        }
+                    }
+                    if matched.is_some() {
+                        break;
+                    }
+                }
+                // Update history only if we got a real match — one Mutex
+                // acquire on the rare path.
+                if let Some((base, arg_idx)) = matched {
+                    if let Ok(mut guard) = ALLOC_TOUCH_HISTORY.lock() {
+                        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+                        let entry =
+                            map.entry(base).or_insert_with(std::collections::VecDeque::new);
+                        let same_as_last = entry
+                            .back()
+                            .map(|(_, k, a)| k.as_str() == name && *a == arg_idx)
+                            .unwrap_or(false);
+                        if !same_as_last {
+                            entry.push_back((ts_ms, name.to_string(), arg_idx));
+                            while entry.len() > ALLOC_HISTORY_CAP {
+                                entry.pop_front();
                             }
                         }
                     }
@@ -12549,6 +12590,32 @@ pub(crate) fn launch_kernel(
                                         if let Ok(mut t) = TRACKED_MEMCPY_SRC_ALLOCS.lock() {
                                             if !t.iter().any(|&(b, _)| b == base) {
                                                 t.push((base, size));
+                                            }
+                                        }
+                                        // v2 history dump: show launches that
+                                        // touched this alloc BEFORE the relay
+                                        // copy. The writer is most likely in
+                                        // the last few entries.
+                                        if let Ok(guard) = ALLOC_TOUCH_HISTORY.lock() {
+                                            if let Some(map) = guard.as_ref() {
+                                                if let Some(history) = map.get(&base) {
+                                                    let entries: Vec<String> = history
+                                                        .iter()
+                                                        .map(|(t, k, a)| {
+                                                            format!("({}ms,{},a{})", t, k, a)
+                                                        })
+                                                        .collect();
+                                                    super::driver::zluda_log_err(&format!(
+                                                        "[RELAY_HIST] memcpy_call={} src_alloc=(0x{:x},{}) \
+                                                         dst_off={} n_entries={} history=[{}]",
+                                                        call_n,
+                                                        base,
+                                                        size,
+                                                        dst_off,
+                                                        history.len(),
+                                                        entries.join(",")
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
