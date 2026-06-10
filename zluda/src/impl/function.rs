@@ -426,7 +426,7 @@ unsafe fn capture_ms4_inputs(
                 || summary.underflow_count > 0;
             if launch_n < 5 || launch_n % 10 == 0 || has_issues {
                 super::driver::zluda_log_err(&format!(
-                    "MS4_SAFE #{} n={} active={} shapes={} max_shape={} out_of_range={} zero_used={} neg_used={} underflows={} exact={} surplus={} max_surplus={}",
+                    "MS4_SAFE #{} n={} active={} shapes={} max_shape={} out_of_range={} zero_used={} neg_used={} underflows={} exact={} surplus={} max_surplus={} sum_ctr={} sum_uses={}",
                     launch_n,
                     num_particles,
                     summary.active_count,
@@ -439,6 +439,8 @@ unsafe fn capture_ms4_inputs(
                     summary.exact_shapes,
                     summary.surplus_shapes,
                     summary.max_surplus,
+                    summary.sum_counter,
+                    summary.sum_uses,
                 ));
             }
             if let Some((particle_idx, shape, flag)) = summary.first_out_of_range_particle {
@@ -4073,6 +4075,12 @@ struct Ms4CaptureSummary {
     exact_shapes: u32,
     surplus_shapes: u32,
     max_surplus: u32,
+    // Sum coherence over USED shapes: sum_counter == sum_uses with per-pool
+    // mismatches ⇒ stale per-pool ASSIGNMENT (same particle total,
+    // different distribution snapshot); sum_counter != sum_uses ⇒ the
+    // refill missed/duplicated particles outright.
+    sum_counter: u64,
+    sum_uses: u64,
     first_out_of_range_particle: Option<(usize, u32, u16)>,
     first_underflow: Option<Ms4ShapeUseSummary>,
 }
@@ -4104,6 +4112,8 @@ fn summarize_ms4_capture(
         exact_shapes: 0,
         surplus_shapes: 0,
         max_surplus: 0,
+        sum_counter: 0,
+        sum_uses: 0,
         first_out_of_range_particle: None,
         first_underflow: None,
     };
@@ -4135,6 +4145,8 @@ fn summarize_ms4_capture(
     summary.unique_shapes = use_count.len();
     for (shape, uses) in use_count {
         let counter = counter_words[shape as usize];
+        summary.sum_counter += counter as u64;
+        summary.sum_uses += uses as u64;
         if counter == 0 {
             summary.zero_used_shapes += 1;
         }
@@ -18606,6 +18618,8 @@ mod tests {
         assert_eq!(summary.surplus_shapes, 1);
         assert_eq!(summary.max_surplus, 3);
         assert_eq!(summary.underflow_count, 1);
+        assert_eq!(summary.sum_counter, 8); // 2 + 5 + 1
+        assert_eq!(summary.sum_uses, 6); // 2 + 2 + 2
     }
 
     #[test]
