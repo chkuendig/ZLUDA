@@ -14443,21 +14443,25 @@ pub(crate) fn launch_kernel(
                         n_items * 4,
                     );
                     let bit31_in = h_in.iter().filter(|&&k| k < 0).count();
-                    if bit31_out > 0 || bit31_in > 0 {
+                    // Read the spine's LIVE region every pass (cheap, already
+                    // synced). Post-scan entries are prefix sums ≤ n; the r6
+                    // (2026-06-10) cub-mode crash scattered at ~16×n with NO
+                    // bit31 keys — spine_max > n is the direct inflation
+                    // signature the bit31-only trigger missed.
+                    let spine_ptr = std::ptr::read_unaligned(buf.add(32) as *const u64);
+                    let spine_n = (grid_dim_x * 16) as usize; // 16 bins for 4-bit, conservative
+                    let mut h_spine = vec![0u32; spine_n.min(256)];
+                    if spine_ptr != 0 {
+                        let _ = hip_runtime_sys::hipMemcpyDtoH(
+                            h_spine.as_mut_ptr() as _,
+                            hip_runtime_sys::hipDeviceptr_t(spine_ptr as _),
+                            h_spine.len() * 4,
+                        );
+                    }
+                    let spine_max = h_spine.iter().copied().max().unwrap_or(0);
+                    let spine_sum: u64 = h_spine.iter().map(|&v| v as u64).sum();
+                    if bit31_out > 0 || bit31_in > 0 || spine_max as usize > n_items {
                         let viol = h_out.windows(2).filter(|w| w[1] < w[0]).count();
-                        // Also read spine at this sync point (already synced, one extra D2H)
-                        let spine_ptr = std::ptr::read_unaligned(buf.add(32) as *const u64);
-                        let spine_n = (grid_dim_x * 16) as usize; // 16 bins for 4-bit, conservative
-                        let mut h_spine = vec![0u32; spine_n.min(256)];
-                        if spine_ptr != 0 {
-                            let _ = hip_runtime_sys::hipMemcpyDtoH(
-                                h_spine.as_mut_ptr() as _,
-                                hip_runtime_sys::hipDeviceptr_t(spine_ptr as _),
-                                h_spine.len() * 4,
-                            );
-                        }
-                        let spine_max = h_spine.iter().copied().max().unwrap_or(0);
-                        let spine_sum: u64 = h_spine.iter().map(|&v| v as u64).sum();
                         super::driver::zluda_log_err(&format!(
                             "*** PASS_CORRUPT bit={} n={} in_bit31={} out_bit31={} viol={} spine_max={} spine_sum={} keys_in=0x{:x} keys_out=0x{:x}",
                             begin_bit, n_items, bit31_in, bit31_out, viol, spine_max, spine_sum, keys_in, keys_out));
