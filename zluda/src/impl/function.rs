@@ -12492,14 +12492,21 @@ pub(crate) fn launch_kernel(
     //   p6..p10 u64, p11 u32, p12 u32
     // Flat-buffer offsets (extra path): 0,8,12,16,20,24,32,40,48,56,64,72,76.
     {
-        static NRSS_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *NRSS_TRACE.get_or_init(|| {
-            std::env::var("ZLUDA_NRSS_ARG_TRACE").map_or(false, |v| v == "1")
+        // Value semantics: "1" = legacy 600-launch cap; any other number =
+        // that cap (r11 lesson: corrupt sorts can appear after sort #300 ≈
+        // launch #7,200 — pair with ZLUDA_NRSS_VALIDATE needs a big cap).
+        static NRSS_TRACE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let cap = *NRSS_TRACE.get_or_init(|| {
+            match std::env::var("ZLUDA_NRSS_ARG_TRACE").ok().as_deref() {
+                None | Some("0") => 0,
+                Some("1") => 600,
+                Some(v) => v.parse().unwrap_or(600),
+            }
         });
-        if on && name == "IOFX_newRadixSortStepKernel" {
+        if cap > 0 && name == "IOFX_newRadixSortStepKernel" {
             static NRSS_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let k = NRSS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if k < 600 {
+            if k < cap {
                 let p0 = unsafe { read_kernel_arg::<u64>(kernel_params, extra, 0, 0) };
                 let p1 = unsafe { read_kernel_arg::<u16>(kernel_params, extra, 8, 1) };
                 let p2 = unsafe { read_kernel_arg::<u32>(kernel_params, extra, 12, 2) };
