@@ -343,7 +343,21 @@ unsafe fn capture_ms4_inputs(
             shape_cap,
         );
     }
-    let _ = (struct_off, struct_bytes); // struct capture remains disabled here
+    // 2026-06-10 divergence-frame forensics: capture the pool table (p4,
+    // 12-byte entries: f0 = cumulative offset, f1 = capacity, f2 = misc) so
+    // anomalous launches can compare counter[i] against capacity f1[i].
+    // counter == f1 while uses differ ⇒ counters are healthy capacities and
+    // the ASSIGNMENT (flags/shape_idx) moved after refill; counter != f1 ⇒
+    // the refill itself wrote divergent values. Third D2D per MS_4 launch —
+    // historically 4 D2Ds triggered the ProfilingSignal race, 2 were safe;
+    // watch for early-crash regression and gate down if it appears.
+    if struct_ptr != 0 {
+        let _ = hipMemcpyDtoD(
+            hipDeviceptr_t(slot_dev_base.add(struct_off) as _),
+            hipDeviceptr_t(struct_ptr as _),
+            struct_bytes,
+        );
+    }
 
     // Track this counter pointer so the MS_3 capture can snapshot it too.
     track_counter_ptr(counter_ptr);
@@ -449,11 +463,29 @@ unsafe fn capture_ms4_inputs(
                     launch_n, particle_idx, flag, shape
                 ));
             }
-            if let Some(issue) = summary.first_underflow {
+            if let Some(issue) = &summary.first_underflow {
                 super::driver::zluda_log_err(&format!(
                     "*** MS4_COUNTER_UNDERFLOW launch_n={} shape={} counter={} uses={}",
                     launch_n, issue.shape, issue.counter, issue.uses
                 ));
+            }
+            // Per-shape anomaly detail vs the pool table: counter == f1
+            // (capacity) ⇒ counters are healthy and the ASSIGNMENT moved;
+            // counter != f1 ⇒ the refill wrote divergent values.
+            if has_issues && !summary.anomalies.is_empty() {
+                let struct_host =
+                    state.host_ptr.add(slot_index * MS4_SLOT_SIZE + struct_off) as *const u32;
+                for a in &summary.anomalies {
+                    let idx = a.shape as usize;
+                    if idx < MS4_CAPTURE_MAX_SHAPES {
+                        let f0 = *struct_host.add(idx * 3);
+                        let f1 = *struct_host.add(idx * 3 + 1);
+                        super::driver::zluda_log_err(&format!(
+                            "MS4_ANOMALY launch_n={} shape={} f0={} f1={} counter={} uses={} ctr_eq_f1={}",
+                            launch_n, a.shape, f0, f1, a.counter, a.uses, a.counter == f1
+                        ));
+                    }
+                }
             }
         }
     }
@@ -4083,6 +4115,9 @@ struct Ms4CaptureSummary {
     sum_uses: u64,
     first_out_of_range_particle: Option<(usize, u32, u16)>,
     first_underflow: Option<Ms4ShapeUseSummary>,
+    // Up to 6 underflow + 2 surplus shapes for per-shape anomaly logging
+    // (cross-referenced against the pool table f0/f1 by the caller).
+    anomalies: Vec<Ms4ShapeUseSummary>,
 }
 
 fn summarize_ms4_capture(
@@ -4116,6 +4151,7 @@ fn summarize_ms4_capture(
         sum_uses: 0,
         first_out_of_range_particle: None,
         first_underflow: None,
+        anomalies: Vec::new(),
     };
     let mut use_count = HashMap::<u32, u32>::new();
     for i in 0..particle_count {
@@ -4158,6 +4194,11 @@ fn summarize_ms4_capture(
         } else if counter > uses && (counter as i32) >= 0 {
             summary.surplus_shapes += 1;
             summary.max_surplus = summary.max_surplus.max(counter - uses);
+            if summary.anomalies.len() < 8
+                && summary.anomalies.iter().filter(|a| a.counter > a.uses).count() < 2
+            {
+                summary.anomalies.push(Ms4ShapeUseSummary { shape, counter, uses });
+            }
         }
         if counter < uses {
             summary.underflow_count += 1;
@@ -4167,6 +4208,9 @@ fn summarize_ms4_capture(
                     counter,
                     uses,
                 });
+            }
+            if summary.anomalies.len() < 8 {
+                summary.anomalies.push(Ms4ShapeUseSummary { shape, counter, uses });
             }
         }
     }
