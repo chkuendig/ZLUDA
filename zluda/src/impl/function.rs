@@ -7250,6 +7250,87 @@ unsafe fn latch_counter_ptr_from_ms4(
     }
 }
 
+/// 2026-06-10 IOFX-mode writer hunt: in-game NRSS output validation.
+/// The lab exonerates IOFX_newRadixSortStepKernel under every reproducible
+/// configuration (solo / NRSS+NRSS / cub+NRSS / degenerate keys), yet the
+/// in-game IOFX-mode wild writes decode to NRSS-buffer-family + ~10.24 GiB
+/// (r4/r8b, ASLR-independent). This checks the kernel's REAL in-game
+/// output: after the final scatter pass (p11==3, p5==28), D2H keys_out
+/// (p8, p4 entries) and verify u32 non-decreasing order (8×4-bit LSB
+/// passes ⇒ fully sorted). A violation = first direct in-game evidence of
+/// NRSS output corruption + its location; persistent cleanliness = NRSS
+/// exonerated in-game too and the writer is elsewhere in the chain.
+/// Caller must have synced the device. Gated ZLUDA_NRSS_VALIDATE=1.
+unsafe fn validate_nrss_output_after_launch(
+    name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_NRSS_VALIDATE").map_or(false, |v| v == "1"))
+    {
+        return;
+    }
+    if name != "IOFX_newRadixSortStepKernel" {
+        return;
+    }
+    let p11: u32 = match read_kernel_arg(kernel_params, extra, 72, 11) {
+        Some(v) => v,
+        None => return,
+    };
+    let p5: u32 = match read_kernel_arg(kernel_params, extra, 24, 5) {
+        Some(v) => v,
+        None => return,
+    };
+    if p11 != 3 || p5 != 28 {
+        return;
+    }
+    let p4: u32 = read_kernel_arg(kernel_params, extra, 20, 4).unwrap_or(0);
+    let p8: u64 = read_kernel_arg(kernel_params, extra, 48, 8).unwrap_or(0);
+    let n = (p4 as usize).min(65536);
+    if n < 2 || p8 == 0 {
+        return;
+    }
+    let mut keys = vec![0u32; n];
+    let copy = hipMemcpyDtoH(
+        keys.as_mut_ptr() as _,
+        hipDeviceptr_t(p8 as _),
+        n * 4,
+    );
+    if copy.is_err() {
+        super::driver::zluda_log_err(&format!(
+            "NRSS_VALIDATE: D2H failed p8=0x{:x} n={}: {:?}",
+            p8, n, copy
+        ));
+        return;
+    }
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let viol = keys.windows(2).filter(|w| w[1] < w[0]).count();
+    if viol > 0 {
+        let first = keys
+            .windows(2)
+            .position(|w| w[1] < w[0])
+            .unwrap_or(0);
+        let lo = first.saturating_sub(3);
+        let hi = (first + 5).min(n);
+        super::driver::zluda_log_err(&format!(
+            "*** NRSS_VALIDATE #{} CORRUPT n={} p8=0x{:x} violations={} first_at={} window={:x?}",
+            seq, n, p8, viol, first, &keys[lo..hi]
+        ));
+    } else if seq < 20 || seq % 200 == 0 {
+        super::driver::zluda_log_err(&format!(
+            "NRSS_VALIDATE #{} ok n={} p8=0x{:x} min=0x{:x} max=0x{:x}",
+            seq,
+            n,
+            p8,
+            keys.first().copied().unwrap_or(0),
+            keys.last().copied().unwrap_or(0)
+        ));
+    }
+}
+
 /// Snapshot the latched counter buffer after a kernel launch. Called from
 /// launch_kernel after a successful hipModuleLaunchKernel + sync. Logs only
 /// when the snapshot changes from the previous one, with the kernel name.
@@ -14605,6 +14686,10 @@ pub(crate) fn launch_kernel(
             // log if any kernel mutates it. Independent of MS4_CAPTURE /
             // F.6 gates — uses ZLUDA_COUNTER_SNAPSHOT=1.
             snapshot_counter_after_launch(&name);
+            // 2026-06-10 IOFX writer hunt: in-game NRSS final-pass output
+            // sortedness check (ZLUDA_NRSS_VALIDATE=1). Device already
+            // synced above.
+            validate_nrss_output_after_launch(&name, kernel_params, extra);
             // Plan v14 Step 1: per-kernel mapped-buffer write tracer.
             // Gated by ZLUDA_MAPPED_WRITE_TRACE=1 (default OFF). Reads each
             // tracked cuMemHostAlloc buffer, diffs vs mirror, emits
