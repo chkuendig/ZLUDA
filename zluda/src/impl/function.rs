@@ -7294,6 +7294,55 @@ unsafe fn latch_counter_ptr_from_ms4(
     }
 }
 
+/// Ring of the last 32 NRSS launch args — pushed on every
+/// IOFX_newRadixSortStepKernel launch when ZLUDA_NRSS_VALIDATE=1, dumped
+/// when validation detects a corrupt sort. Removes the arg-trace-window
+/// lottery (r11-r13: corrupt frames kept landing outside fixed windows).
+/// Entry: (seq, grid, p2, p4, p5, p6, p8, p10, p11, p12).
+static NRSS_ARG_RING: Mutex<Option<std::collections::VecDeque<(u32, u32, u32, u32, u32, u64, u64, u64, u32, u32)>>> =
+    Mutex::new(None);
+
+unsafe fn nrss_ring_push(
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    grid_x: u32,
+) {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let p2: u32 = read_kernel_arg(kernel_params, extra, 12, 2).unwrap_or(0);
+    let p4: u32 = read_kernel_arg(kernel_params, extra, 20, 4).unwrap_or(0);
+    let p5: u32 = read_kernel_arg(kernel_params, extra, 24, 5).unwrap_or(0);
+    let p6: u64 = read_kernel_arg(kernel_params, extra, 32, 6).unwrap_or(0);
+    let p8: u64 = read_kernel_arg(kernel_params, extra, 48, 8).unwrap_or(0);
+    let p10: u64 = read_kernel_arg(kernel_params, extra, 64, 10).unwrap_or(0);
+    let p11: u32 = read_kernel_arg(kernel_params, extra, 72, 11).unwrap_or(0);
+    let p12: u32 = read_kernel_arg(kernel_params, extra, 76, 12).unwrap_or(0);
+    let mut guard = match NRSS_ARG_RING.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let ring = guard.get_or_insert_with(|| std::collections::VecDeque::with_capacity(33));
+    if ring.len() >= 32 {
+        ring.pop_front();
+    }
+    ring.push_back((seq, grid_x, p2, p4, p5, p6, p8, p10, p11, p12));
+}
+
+fn nrss_ring_dump(tag: &str) {
+    let guard = match NRSS_ARG_RING.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(ring) = guard.as_ref() {
+        for (seq, grid, p2, p4, p5, p6, p8, p10, p11, p12) in ring.iter() {
+            super::driver::zluda_log_err(&format!(
+                "NRSS_RING[{}] #{} grid={} p2={} p4={} bit={} p6=0x{:x} p8=0x{:x} p10=0x{:x} phase={} p12={}",
+                tag, seq, grid, p2, p4, p5, p6, p8, p10, p11, p12
+            ));
+        }
+    }
+}
+
 /// 2026-06-10 IOFX-mode writer hunt: in-game NRSS output validation.
 /// The lab exonerates IOFX_newRadixSortStepKernel under every reproducible
 /// configuration (solo / NRSS+NRSS / cub+NRSS / degenerate keys), yet the
@@ -7309,6 +7358,7 @@ unsafe fn validate_nrss_output_after_launch(
     name: &str,
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
+    grid_x: u32,
 ) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ENABLED
@@ -7319,6 +7369,8 @@ unsafe fn validate_nrss_output_after_launch(
     if name != "IOFX_newRadixSortStepKernel" {
         return;
     }
+    // Every NRSS launch goes into the args ring (dumped on corruption).
+    nrss_ring_push(kernel_params, extra, grid_x);
     let p11: u32 = match read_kernel_arg(kernel_params, extra, 72, 11) {
         Some(v) => v,
         None => return,
@@ -7363,6 +7415,9 @@ unsafe fn validate_nrss_output_after_launch(
             "*** NRSS_VALIDATE #{} CORRUPT n={} p8=0x{:x} violations={} first_at={} window={:x?}",
             seq, n, p8, viol, first, &keys[lo..hi]
         ));
+        // Dump the last 32 NRSS launches (the corrupt sort's own 24 + tail
+        // of the previous one) for arg-consistency analysis.
+        nrss_ring_dump(&format!("corrupt#{}", seq));
     } else if seq < 20 || seq % 200 == 0 {
         super::driver::zluda_log_err(&format!(
             "NRSS_VALIDATE #{} ok n={} p8=0x{:x} min=0x{:x} max=0x{:x}",
@@ -14740,7 +14795,7 @@ pub(crate) fn launch_kernel(
             // 2026-06-10 IOFX writer hunt: in-game NRSS final-pass output
             // sortedness check (ZLUDA_NRSS_VALIDATE=1). Device already
             // synced above.
-            validate_nrss_output_after_launch(&name, kernel_params, extra);
+            validate_nrss_output_after_launch(&name, kernel_params, extra, grid_dim_x);
             // Plan v14 Step 1: per-kernel mapped-buffer write tracer.
             // Gated by ZLUDA_MAPPED_WRITE_TRACE=1 (default OFF). Reads each
             // tracked cuMemHostAlloc buffer, diffs vs mirror, emits
