@@ -3357,6 +3357,36 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 const SORT_REPLAY_CAPTURE_MAGIC: u32 = 0x5350_5243;
 const SORT_REPLAY_CAPTURE_VERSION: u32 = 6;
 const SORT_REPLAY_CAPTURE_FLAG_HAS_VALS: u32 = 1 << 0;

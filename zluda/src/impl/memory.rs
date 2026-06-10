@@ -28,6 +28,117 @@ pub(crate) static SMALL_HOST_ALLOCS: std::sync::Mutex<Vec<(usize, usize, usize)>
 pub(crate) static DEV_ALLOCS: std::sync::Mutex<Vec<(u64, u64)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// 2026-06-08 Class A use-after-free hypothesis: a kernel may still be
+/// in-flight with a kernarg pointer when cuMemFree releases that VA.
+/// HIP/driver unmaps the page; the kernel writes through the stale
+/// pointer → TCP wild WRITE at the freed VA. Fault VAs in our Class A
+/// runs frequently end in `_bf000` — consistent with the start of a
+/// 1,040,000-byte particle buffer being addressed wild.
+///
+/// On cuMemFree_v2 we scan `driver::KERNEL_RING` (populated by
+/// per-kernel capture intercepts for MS_4, IOFX_*, downsweep etc.) for
+/// any entry whose ptr_ranges contain the freed VA. The ring keeps the
+/// last 32 launches; if a freed VA still appears, those kernels were
+/// queued recently and may still be in-flight.
+///
+/// Gated on `ZLUDA_FREE_AFTER_LAUNCH_SCAN=1` (default OFF). Scan cost is
+/// O(32 ring slots * 8 ptr_ranges) per free — cheap.
+/// 2026-06-09 Class A bf000 investigation: the VA of the first 1.04 MiB
+/// `_bf000` buffer detected by `fill_with_zero_and_register`. Zero when
+/// no such alloc has fired yet. Consumed by `launch_kernel` to scan
+/// kernel-args for any 8-byte slot equal to this VA — identifying which
+/// kernels actually use the bf000 buffer as a pointer argument.
+pub(crate) static BF000_TARGET_VA: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 2026-06-09 Class A counter-coherency investigation.
+///
+/// `ZLUDA_COUNTER_TRACE=1` logs every cuMemcpyHtoD* / cuMemsetD* with
+/// byte_count <= 256 — the range typical of per-frame counter / control-
+/// struct writes (vs. bulk data which is KB+). Output line:
+///   COUNTER_TRACE op=<kind> dst=0x<va> size=<n> stream=0x<ptr> alloc_base=0x<va> off=<n> dwords=[w0 w1 ...]
+///
+/// Per-frame writes will cluster at specific dst VAs. Cross-reference
+/// with MS_3 counter @ +14788, MS_4 counter @ param_7, MS_1 counter @
+/// rd5+22176 (already covered by RD5_MEMSET tracking).
+///
+/// Hypothesis under test: PhysX writes the per-actor counter from host
+/// via cuMemcpyHtoD/cuMemsetD32 each frame. On AMD, HDP write-combine
+/// may leave the GPU's first `atom.global.add` of the new frame reading
+/// a stale (decremented-to-0) value → instant underflow → wild scatter.
+/// `ZLUDA_MEMCPY_HDP_FLUSH=1` covers `MemCopyBatchedAsync` kernels but
+/// not necessarily small cuMemcpy paths. See plan
+/// `~/.claude/plans/counter-coherency-bf000-2026-06-09.md`.
+pub(crate) fn counter_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = std::env::var("ZLUDA_COUNTER_TRACE").map_or(false, |v| v == "1");
+        super::driver::zluda_log_err(&format!(
+            "*** ZLUDA_COUNTER_TRACE init: enabled={}",
+            on
+        ));
+        on
+    })
+}
+
+/// Log a single small (<=256 byte) host→device transfer that may be a
+/// counter / control-struct write. `src_words` is the first up-to-8
+/// 32-bit words of the source data (for memset, src is the repeated
+/// value); pass an empty slice for unknown.
+pub(crate) unsafe fn counter_trace_log(
+    op: &str,
+    dst: u64,
+    byte_count: usize,
+    stream: u64,
+    src: *const u8,
+    is_memset_value: bool,
+    memset_value: u32,
+) {
+    if !counter_trace_enabled() {
+        return;
+    }
+    if byte_count == 0 || byte_count > 256 {
+        return;
+    }
+    let (alloc_base, alloc_off) = find_dev_alloc_containing(dst)
+        .map(|(base, _size)| (base, dst - base))
+        .unwrap_or((0, 0));
+    let mut words = String::new();
+    if is_memset_value {
+        // For memset: show value, count, and offset within alloc.
+        words.push_str(&format!("value=0x{:08x}", memset_value));
+    } else if !src.is_null() {
+        let n_words = ((byte_count + 3) / 4).min(8);
+        for i in 0..n_words {
+            if i > 0 {
+                words.push(' ');
+            }
+            let v = std::ptr::read_unaligned((src as *const u32).add(i));
+            words.push_str(&format!("0x{:08x}", v));
+        }
+    }
+    super::driver::zluda_log_err(&format!(
+        "COUNTER_TRACE op={} dst=0x{:x} size={} stream=0x{:x} alloc_base=0x{:x} off={} dwords=[{}]",
+        op, dst, byte_count, stream, alloc_base, alloc_off, words
+    ));
+}
+
+pub(crate) fn free_after_launch_scan_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let raw = std::env::var("ZLUDA_FREE_AFTER_LAUNCH_SCAN");
+        let on = match &raw {
+            Ok(v) => v == "1",
+            Err(_) => false,
+        };
+        super::driver::zluda_log_err(&format!(
+            "*** ZLUDA_FREE_AFTER_LAUNCH_SCAN init: env={:?} enabled={}",
+            raw, on
+        ));
+        on
+    })
+}
+
 pub(crate) fn track_dev_alloc(base: u64, size: u64) {
     if size == 0 {
         return;
@@ -860,6 +971,39 @@ unsafe fn fill_with_zero_and_register(
     }
     super::driver::zluda_log(&format!("[ZLUDA] cuMemAlloc_v2 -> {:?} OK", dptr.0));
     super::driver::zluda_log_err(&format!("ALLOC {:?} size={}", dptr.0, bytesize));
+    // 2026-06-09 Class A bf000 investigation. The recurrent single-page
+    // Class A fault VAs all end in `_bf000` (0x____bf000) and prior
+    // allocator analysis showed this is the start of a 1,040,000-byte
+    // particle buffer that the allocator routinely places at the page
+    // boundary right after a 780,000-byte buffer. Mark these two
+    // allocations distinctly in the log so the proximate kernel using
+    // them is identifiable from the kernel_ring dump. Cheap: 2 ptr
+    // comparisons per ALLOC. No env var gate — purely diagnostic logging.
+    // 2026-06-09 corrected mask: page-offset within a 1 MiB region is
+    // bits 12-19 of the VA. Earlier `& 0xFFF000` was bits 12-23 (16 MiB
+    // region) which produced VA-specific values like `0xABF000` /
+    // `0xCBF000` that never matched the constant `0xBF000`.
+    let va_in_1mib = (dptr.0 as u64) & 0xFF000;
+    if va_in_1mib == 0xBF000 && bytesize == 1_040_000 {
+        super::driver::zluda_log_err(&format!(
+            "*** BF000_BUFFER alloc'd at {:?} size=1040000 — candidate Class A fault site",
+            dptr.0
+        ));
+        // Publish the VA so cuLaunchKernel can scan kernel args for it.
+        // Only the FIRST bf000-shaped alloc per process is tracked (most
+        // benches have one); subsequent ones are visible via the log line.
+        BF000_TARGET_VA.compare_exchange(
+            0,
+            dptr.0 as u64,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ).ok();
+    } else if bytesize == 780_000 {
+        super::driver::zluda_log_err(&format!(
+            "*** BF000_PARTNER alloc'd at {:?} size=780000 — preceding 12-byte struct buffer",
+            dptr.0
+        ));
+    }
     update_alloc_range(dptr.0 as u64, bytesize as u64);
     track_dev_alloc(dptr.0 as u64, bytesize as u64);
     add_allocation(dptr.0, bytesize, cu_context)?;
@@ -870,6 +1014,29 @@ unsafe fn fill_with_zero_and_register(
 pub(crate) unsafe fn free_v2(dptr: hipDeviceptr_t) -> CUresult {
     super::driver::zluda_log(&format!("[ZLUDA] cuMemFree_v2({:?})", dptr.0));
     super::driver::zluda_log_err(&format!("FREE {:?}", dptr.0));
+    // 2026-06-08 Class A use-after-free hypothesis check: if this VA is
+    // still in a recent launch's kernargs, we may be freeing a buffer
+    // that an in-flight kernel still writes to → wild scatter at the
+    // freed VA. Gated on ZLUDA_FREE_AFTER_LAUNCH_SCAN=1. See
+    // RECENT_LAUNCH_KERNARGS docs above.
+    if free_after_launch_scan_enabled() {
+        let addr = dptr.0 as u64;
+        let hits = super::driver::scan_kernel_ring_for_ptr(addr);
+        if !hits.is_empty() {
+            let names_summary: Vec<String> = hits
+                .iter()
+                .take(8)
+                .map(|(n, name)| format!("#{}={}", n, name))
+                .collect();
+            super::driver::zluda_log_err(&format!(
+                "*** FREE_USE_AFTER_LAUNCH_WARN addr={:#x} matched_in_recent={} launches: [{}{}]",
+                addr,
+                hits.len(),
+                names_summary.join(", "),
+                if hits.len() > 8 { ", ..." } else { "" }
+            ));
+        }
+    }
     let hip_result = hipFree(dptr.0);
     untrack_dev_alloc(dptr.0 as u64);
     remove_allocation(dptr.0)?;
@@ -919,6 +1086,15 @@ pub(crate) fn copy_hto_d_v2(
             byte_count,
             true,
             "hto_d_v2",
+        );
+        counter_trace_log(
+            "htod",
+            dst_device.0 as u64,
+            byte_count,
+            0,
+            src_host as *const u8,
+            false,
+            0,
         );
     }
     if let Some(rd5) =
@@ -1157,6 +1333,17 @@ pub(crate) fn set_d32_v2(dst: hipDeviceptr_t, value: ::core::ffi::c_uint, n: usi
             dst.0 as u64, value, n, rd5
         ));
     }
+    unsafe {
+        counter_trace_log(
+            "d32",
+            dst.0 as u64,
+            n * 4,
+            0,
+            std::ptr::null(),
+            true,
+            value as u32,
+        );
+    }
     unsafe { hipMemsetD32(dst, value as _, n) }
 }
 
@@ -1175,7 +1362,66 @@ pub(crate) fn set_d32_async(
             dst.0 as u64, value, n, stream.0 as u64, rd5
         ));
     }
+    unsafe {
+        counter_trace_log(
+            "d32a",
+            dst.0 as u64,
+            n * 4,
+            stream.0 as u64,
+            std::ptr::null(),
+            true,
+            value as u32,
+        );
+    }
     let _guard = super::stream::null_stream_sync(stream);
+    // 2026-06-09 Class A counter-coherency fix candidate. n9 trace showed
+    // small `set_d32_async` calls (size 64 = 16 × u32 = a 16-counter
+    // array) hitting the same alloc from 3 different streams over a
+    // bench run. PhysX clears the counter on one stream and consumes it
+    // (via MS_4 atom.add) on another → no cross-stream ordering →
+    // counter underflow → wild-VA scatter (the Class A signature).
+    //
+    // ZLUDA_COUNTER_CLEAR_SYNC modes:
+    //   0 — OFF (default)
+    //   1 — `hipStreamSynchronize(stream)` after every small (n<=64) d32a.
+    //       Drains only the producer stream so writes commit to L2; the
+    //       consumer kernel's entry SeqCst fence then sees them via L1V
+    //       invalidate. Much lighter than mode 2.
+    //   2 — `hipDeviceSynchronize` after every small d32a. Drains ALL
+    //       in-flight work. Tested in n10 — REGRESSED to Class B host
+    //       crash at 3,126 launches (too aggressive — perturbs PhysX
+    //       init timing exactly like n7's TEXREF_POST_SYNC=2).
+    //
+    // See plan ~/.claude/plans/counter-coherency-bf000-2026-06-09.md.
+    {
+        static SYNC_MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let mode = *SYNC_MODE.get_or_init(|| {
+            let raw = std::env::var("ZLUDA_COUNTER_CLEAR_SYNC").ok();
+            let mode = raw
+                .as_deref()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(0)
+                .min(2);
+            super::driver::zluda_log_err(&format!(
+                "*** ZLUDA_COUNTER_CLEAR_SYNC init: env={:?} mode={}",
+                raw, mode
+            ));
+            mode
+        });
+        if mode > 0 && n <= 64 {
+            unsafe {
+                match mode {
+                    1 => {
+                        let _ = hipStreamSynchronize(stream);
+                    }
+                    _ => {
+                        let _ = hipDeviceSynchronize();
+                        super::stream::clear_dirty_flag_after_device_sync();
+                    }
+                }
+            }
+        }
+    }
     let result = unsafe { hipMemsetD32Async(dst, value as _, n, stream) };
     if result.is_ok() && !stream.0.is_null() {
         super::stream::mark_non_default_stream_dirty();
@@ -1346,6 +1592,15 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
         byte_count,
         true,
         "hto_d_async_v2",
+    );
+    counter_trace_log(
+        "htod_async",
+        dst_device.0 as u64,
+        byte_count,
+        stream.0 as u64,
+        src_host as *const u8,
+        false,
+        0,
     );
     if dtoh_log_enabled() {
         let dwords = unsafe { format_dtoh_dwords(src_host as *const u8, byte_count) };

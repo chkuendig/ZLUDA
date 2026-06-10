@@ -338,6 +338,35 @@ pub(crate) fn record_kernel_launch(
     }
 }
 
+/// 2026-06-08 Class A use-after-free instrumentation: scan the kernel
+/// launch ring for entries whose recorded ptr_ranges contain `addr`.
+/// Returns the matching (launch_n, kernel_name) tuples — those kernels
+/// were recently queued with a pointer arg into the buffer being freed
+/// and may still be in-flight at free time. Called from
+/// `memory.rs::free_v2` when ZLUDA_FREE_AFTER_LAUNCH_SCAN=1.
+pub(crate) fn scan_kernel_ring_for_ptr(addr: u64) -> Vec<(u64, String)> {
+    let mut hits = Vec::new();
+    if let Ok(guard) = KERNEL_RING.lock() {
+        let (ref buf, _idx, _total) = *guard;
+        for entry in buf.iter() {
+            if entry.ptr_count == 0 {
+                continue;
+            }
+            for r in 0..entry.ptr_count.min(KERNEL_RING_PTRS as u8) as usize {
+                let (base, size) = entry.ptr_ranges[r];
+                if size == 0 {
+                    continue;
+                }
+                if addr >= base && addr < base + size {
+                    hits.push((entry.launch_n, entry.name_str().to_string()));
+                    break;
+                }
+            }
+        }
+    }
+    hits
+}
+
 fn elapsed_ns() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;

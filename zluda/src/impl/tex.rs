@@ -108,11 +108,77 @@ fn texref_sync_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ZLUDA_TEXREF_SYNC").map_or(false, |v| v == "1"))
 }
 
+/// 2026-06-09 Class A bf000 candidate fix: post-sync the texref binding.
+///
+/// `ZLUDA_TEXREF_SYNC=1` drains in-flight kernels BEFORE changing a
+/// binding. That fixes CUDA's snapshot semantic for the bind transition.
+/// But the bf000 single-page Class A fault (FleX particle position
+/// buffer's slot[0] PERMISSION_FAULTS=0x5 RW=1 on direct st.global write)
+/// suggests that AFTER cuTexRefSetAddress_v2 completes, the AMDGPU TCP /
+/// SRD descriptor cache may still carry the texref's read-only flavor for
+/// the bound buffer's pages. A subsequent kernel writing through that
+/// buffer via direct global store then hits a permission fault on byte 0.
+///
+/// ZLUDA_TEXREF_POST_SYNC modes:
+///   0 — OFF (default)
+///   1 — TARGETED: post-sync only when the bound buffer matches the
+///       bf000 shape (size=1,040,000 AND VA low-20-bits=0xBF000).
+///       Typically 1–2 binds per bench → negligible cost.
+///   2 — ALL: post-sync after EVERY cuTexRefSet*. Heavy — destabilizes
+///       PhysX TurbulenceFS init in practice (bench n7 SIGABRT @2115
+///       launches host-side). Kept for diagnostic comparison only.
+///
+/// See project_bf000_buffer_is_flex_position_2026_06_09.md.
+fn texref_post_sync_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let raw = std::env::var("ZLUDA_TEXREF_POST_SYNC").ok();
+        let mode = raw
+            .as_deref()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0)
+            .min(2);
+        super::driver::zluda_log_err(&format!(
+            "*** ZLUDA_TEXREF_POST_SYNC init: env={:?} mode={}",
+            raw, mode
+        ));
+        mode
+    })
+}
+
 unsafe fn texref_pre_sync_if_enabled() {
     if texref_sync_enabled() {
         let _ = hipDeviceSynchronize();
         super::stream::clear_dirty_flag_after_device_sync();
     }
+}
+
+/// Post-sync after a cuTexRefSet*. `dptr` and `bytes` describe the bound
+/// buffer (or 0/0 for a 2D bind where we don't have the size cheaply).
+/// In TARGETED mode (=1), syncs only when the buffer matches the bf000
+/// shape — that's the candidate fault site, and limiting to it avoids
+/// the n7 PhysX-init timing perturbation.
+unsafe fn texref_post_sync_if_enabled(dptr: u64, bytes: usize) {
+    match texref_post_sync_mode() {
+        0 => return,
+        1 => {
+            // TARGETED: only sync for bf000-shaped binds.
+            let is_bf000_shaped =
+                bytes == 1_040_000 && (dptr & 0xFF000) == 0xBF000;
+            if !is_bf000_shaped {
+                return;
+            }
+            super::driver::zluda_log_err(&format!(
+                "*** TEXREF_POST_SYNC firing for bf000-shaped bind dptr={:#x} size={}",
+                dptr, bytes
+            ));
+        }
+        _ => {
+            // ALL: sync every bind (the n7-rejected behaviour).
+        }
+    }
+    let _ = hipDeviceSynchronize();
+    super::stream::clear_dirty_flag_after_device_sync();
 }
 
 pub(crate) unsafe fn ref_set_address_v2(
@@ -153,6 +219,7 @@ pub(crate) unsafe fn ref_set_address_v2(
     // Sync the texture object to device global if this is a synthetic texref,
     // matching the pattern in ref_set_array()
     sync_synthetic_texref(tex_ref);
+    texref_post_sync_if_enabled(dptr.0 as u64, bytes);
     Ok(())
 }
 
@@ -170,6 +237,10 @@ pub(crate) unsafe fn ref_set_address_2d_v3(
         dptr,
         pitch,
     )?;
+    // 2D binds are never the bf000 shape (FleX uses 1D linear bind for
+    // particle positions); pass 0/0 so TARGETED mode skips. ALL mode
+    // still syncs.
+    texref_post_sync_if_enabled(0, 0);
     Ok(())
 }
 

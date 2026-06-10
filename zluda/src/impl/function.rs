@@ -63,7 +63,10 @@ static FUNC_NAMES: std::sync::LazyLock<Mutex<HashMap<usize, String>>> =
 // been the cause.
 
 const MS4_CAPTURE_SLOTS: usize = 32;
-const MS4_CAPTURE_MAX_PARTICLES: usize = 32 * 1024;
+// 64k: MS_4's n grows toward ~65,000 before the historic underflow crashes
+// (n=62471/64534 observed); at 32k the capture skipped exactly the launches
+// where the counter audit matters most.
+const MS4_CAPTURE_MAX_PARTICLES: usize = 64 * 1024;
 const MS4_CAPTURE_MAX_SHAPES: usize = 256;
 
 /// Size of the flags/shape_idx region per slot (particles × 4 bytes).
@@ -423,7 +426,7 @@ unsafe fn capture_ms4_inputs(
                 || summary.underflow_count > 0;
             if launch_n < 5 || launch_n % 10 == 0 || has_issues {
                 super::driver::zluda_log_err(&format!(
-                    "MS4_SAFE #{} n={} active={} shapes={} max_shape={} out_of_range={} zero_used={} neg_used={} underflows={}",
+                    "MS4_SAFE #{} n={} active={} shapes={} max_shape={} out_of_range={} zero_used={} neg_used={} underflows={} exact={} surplus={} max_surplus={}",
                     launch_n,
                     num_particles,
                     summary.active_count,
@@ -433,6 +436,9 @@ unsafe fn capture_ms4_inputs(
                     summary.zero_used_shapes,
                     summary.negative_used_shapes,
                     summary.underflow_count,
+                    summary.exact_shapes,
+                    summary.surplus_shapes,
+                    summary.max_surplus,
                 ));
             }
             if let Some((particle_idx, shape, flag)) = summary.first_out_of_range_particle {
@@ -4060,6 +4066,13 @@ struct Ms4CaptureSummary {
     zero_used_shapes: u32,
     negative_used_shapes: u32,
     underflow_count: u32,
+    // Counter-vs-real-count audit (2026-06-10 MS_4 guard reinvestigation):
+    // a healthy launch consumes each pool's counter to exactly 0, so
+    // counter == uses for every used shape. Surplus (counter > uses) means
+    // fewer metadata-passing threads than reservations — also anomalous.
+    exact_shapes: u32,
+    surplus_shapes: u32,
+    max_surplus: u32,
     first_out_of_range_particle: Option<(usize, u32, u16)>,
     first_underflow: Option<Ms4ShapeUseSummary>,
 }
@@ -4088,6 +4101,9 @@ fn summarize_ms4_capture(
         zero_used_shapes: 0,
         negative_used_shapes: 0,
         underflow_count: 0,
+        exact_shapes: 0,
+        surplus_shapes: 0,
+        max_surplus: 0,
         first_out_of_range_particle: None,
         first_underflow: None,
     };
@@ -4124,6 +4140,12 @@ fn summarize_ms4_capture(
         }
         if (counter as i32) < 0 {
             summary.negative_used_shapes += 1;
+        }
+        if counter == uses {
+            summary.exact_shapes += 1;
+        } else if counter > uses && (counter as i32) >= 0 {
+            summary.surplus_shapes += 1;
+            summary.max_surplus = summary.max_surplus.max(counter - uses);
         }
         if counter < uses {
             summary.underflow_count += 1;
@@ -11973,6 +11995,61 @@ pub(crate) fn launch_kernel(
         Some(KERNEL_LAUNCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     };
 
+    // 2026-06-09 Class A bf000 investigation. Once a 1.04 MiB buffer at
+    // page-offset 0xBF000 has been detected (by `fill_with_zero_and_register`),
+    // every kernel launch is scanned for that VA in its arg buffer. The
+    // scan only reads the `extra` flat buffer (whose size is declared via
+    // CU_LAUNCH_PARAM_BUFFER_SIZE) — safe; no blind kernel_params reads.
+    // Each unique (kernel_name, byte_offset_in_buffer) hit logs once.
+    // Default behaviour: silent until bf000 alloc fires; thereafter ~one
+    // 64-bit-stride scan per launch. Diagnostic only.
+    {
+        let target = super::memory::BF000_TARGET_VA.load(std::sync::atomic::Ordering::Relaxed);
+        if target != 0 && !name.is_empty() && !extra.is_null() {
+            unsafe {
+                let extra_arr = std::slice::from_raw_parts(extra, 5);
+                let p0 = extra_arr[0] as usize;
+                let p2 = extra_arr[2] as usize;
+                let buf_ptr = extra_arr[1] as *const u8;
+                let size_ptr = extra_arr[3] as *const usize;
+                if p0 == 0x1 && p2 == 0x2 && !buf_ptr.is_null() && !size_ptr.is_null() {
+                    let buf_size = std::ptr::read(size_ptr);
+                    if buf_size <= 4096 {
+                        // 8-byte stride. Walk every aligned 8-byte slot.
+                        let n = buf_size / 8;
+                        for i in 0..n {
+                            let v = std::ptr::read_unaligned(
+                                buf_ptr.add(i * 8) as *const u64,
+                            );
+                            if v == target {
+                                static SEEN: std::sync::OnceLock<
+                                    std::sync::Mutex<
+                                        std::collections::HashSet<(String, usize)>,
+                                    >,
+                                > = std::sync::OnceLock::new();
+                                let seen = SEEN.get_or_init(|| {
+                                    std::sync::Mutex::new(std::collections::HashSet::new())
+                                });
+                                let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+                                let off = i * 8;
+                                if g.insert((name.clone(), off)) {
+                                    drop(g);
+                                    super::driver::zluda_log_err(&format!(
+                                        "*** BF000_USE kernel={} off={} (slot {}) — first observed launch_n={:?}",
+                                        name,
+                                        off,
+                                        i,
+                                        global_launch_n,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 2026-05-18 Plan v20.3: per-launch n_threads slot barrier read.
     //
     // The Batman: Arkham Knight MS_4 wild-VA crash is timing/coherency
@@ -12263,6 +12340,48 @@ pub(crate) fn launch_kernel(
                 block_dim_z,
                 all_args.join(" ")
             ));
+        }
+    }
+    // 2026-06-10 NRSS lab-driver capture — ZLUDA_NRSS_ARG_TRACE=1.
+    //
+    // Log ALL 13 typed args + launch dims for the first 600
+    // IOFX_newRadixSortStepKernel launches. NRSS is a multi-phase
+    // dispatcher (p11 = phase selector, p12 = count); building the
+    // isolated game-shape reproducer (the playbook that cracked the
+    // cub/SDMA bug) requires the real per-burst arg sequences, not just
+    // the first launch (KARG_LOG) or the pointer ranges
+    // (FREE_AFTER_LAUNCH_SCAN). Declared layout from the PTX:
+    //   p0 u64, p1 u16, p2 u32, p3 u32, p4 u32, p5 u32,
+    //   p6..p10 u64, p11 u32, p12 u32
+    // Flat-buffer offsets (extra path): 0,8,12,16,20,24,32,40,48,56,64,72,76.
+    {
+        static NRSS_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *NRSS_TRACE.get_or_init(|| {
+            std::env::var("ZLUDA_NRSS_ARG_TRACE").map_or(false, |v| v == "1")
+        });
+        if on && name == "IOFX_newRadixSortStepKernel" {
+            static NRSS_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let k = NRSS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if k < 600 {
+                let p0 = unsafe { read_kernel_arg::<u64>(kernel_params, extra, 0, 0) };
+                let p1 = unsafe { read_kernel_arg::<u16>(kernel_params, extra, 8, 1) };
+                let p2 = unsafe { read_kernel_arg::<u32>(kernel_params, extra, 12, 2) };
+                let p3 = unsafe { read_kernel_arg::<u32>(kernel_params, extra, 16, 3) };
+                let p4 = unsafe { read_kernel_arg::<u32>(kernel_params, extra, 20, 4) };
+                let p5 = unsafe { read_kernel_arg::<u32>(kernel_params, extra, 24, 5) };
+                let p6 = unsafe { read_kernel_arg::<u64>(kernel_params, extra, 32, 6) };
+                let p7 = unsafe { read_kernel_arg::<u64>(kernel_params, extra, 40, 7) };
+                let p8 = unsafe { read_kernel_arg::<u64>(kernel_params, extra, 48, 8) };
+                let p9 = unsafe { read_kernel_arg::<u64>(kernel_params, extra, 56, 9) };
+                let p10 = unsafe { read_kernel_arg::<u64>(kernel_params, extra, 64, 10) };
+                let p11 = unsafe { read_kernel_arg::<u32>(kernel_params, extra, 72, 11) };
+                let p12 = unsafe { read_kernel_arg::<u32>(kernel_params, extra, 76, 12) };
+                super::driver::zluda_log_err(&format!(
+                    "NRSS_ARGS#{} grid={} block={} sh={} p0={:x?} p1={:?} p2={:?} p3={:?} p4={:?} p5={:?} p6={:x?} p7={:x?} p8={:x?} p9={:x?} p10={:x?} p11={:?} p12={:?}",
+                    k, grid_dim_x, block_dim_x, shared_mem_bytes,
+                    p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12
+                ));
+            }
         }
     }
     // Plan v22 Phase B.1 — per-launch IOFX kernarg probe.
@@ -14095,6 +14214,72 @@ pub(crate) fn launch_kernel(
             super::stream::mark_non_default_stream_dirty();
         }
     }
+    // 2026-06-08 Class A use-after-free hypothesis check: free_v2
+    // scans the existing KERNEL_RING (populated below by
+    // record_kernel_launch via per-kernel capture intercepts) for
+    // entries whose ptr_ranges contain the freed VA. That ring is
+    // safer than reading raw kernel_params (the warning at line 14380
+    // notes generic scanning segfaults for short arg lists). The
+    // recording happens in record_kernel_launch; the scan happens in
+    // memory.rs::free_v2.
+    // 2026-06-08 Class A upper-bound diagnostic: hipDeviceSync after
+    // EVERY successful kernel launch. The hypothesis is that Class A's
+    // GPU TCP wild-write category may be an HDP-coherency issue that
+    // affects MANY kernels, not just MS_3/MS_4/IOFX_actorRange. If
+    // ZLUDA_LAUNCH_HDP_FLUSH=1 eliminates Class A (or pushes it
+    // dramatically deeper), the bug class is HDP. If unchanged, it's
+    // GPU-internal (L2/TCP/cache invalidation logic). HEAVY — turns
+    // every kernel launch into a synchronous device drain.
+    if result.is_ok() {
+        static LAUNCH_HDP_FLUSH: std::sync::OnceLock<bool> =
+            std::sync::OnceLock::new();
+        if *LAUNCH_HDP_FLUSH.get_or_init(|| {
+            std::env::var("ZLUDA_LAUNCH_HDP_FLUSH").map_or(false, |v| v == "1")
+        }) {
+            unsafe {
+                let _ = hipDeviceSynchronize();
+                super::stream::clear_dirty_flag_after_device_sync();
+            }
+        }
+    }
+    // 2026-06-08 Class B at depth: MS_3 producer race
+    // (project_multistage_3_producer_race_2026_06_05.md). MS_3 does
+    // `atom.global.add count` then 4 `st.global.u16` writes of slot
+    // entry data. On NVIDIA the L2 serializes — PhysX reads the new
+    // count and the slot data atomically. On AMD/RDNA the HDP write-
+    // combine buffer between L2 and host DRAM can deliver the count
+    // update before the subsequent slot stores drain. PhysX polls the
+    // mapped-host inner_array, sees count=N+1, reads slot[N] = NULL →
+    // canonical Class B vtable NULL deref at PhysX3_x64.dll+0x20ced9.
+    //
+    // The PTX `emit_ret` SeqCst system-scope fence drains GPU L2 but
+    // NOT HDP. EVENT_RELEASE_SYSTEM=1 covers cuEventRecord boundaries
+    // but PhysX polls BETWEEN events. ZLUDA_MS3_POST_SYNC issues a
+    // hipDeviceSynchronize (HSA queue-barrier-AND release-system →
+    // HDP MMIO flush) immediately after the MS_3 launch returns.
+    //   mode '1' → hipDeviceSynchronize (cross-stream drain + HDP flush)
+    //   mode '2' → hipStreamSynchronize (this stream only)
+    // Default 0 (off). 2026-06-08 first A/B candidate after run 4
+    // (PID 647312) hit Class B at depth 17.84 min / 349,939 launches.
+    if result.is_ok() && name == "CreateParticleShapesIncremental_MultiStage_3" {
+        static MS3_POST_SYNC: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let post_sync_mode = *MS3_POST_SYNC.get_or_init(|| {
+            std::env::var("ZLUDA_MS3_POST_SYNC")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(0)
+        });
+        match post_sync_mode {
+            1 => unsafe {
+                let _ = hipDeviceSynchronize();
+                super::stream::clear_dirty_flag_after_device_sync();
+            },
+            2 => unsafe {
+                let _ = hipStreamSynchronize(stream);
+            },
+            _ => {}
+        }
+    }
     // Translate HIP error 719 (LaunchFailure) → LaunchOutOfResources.
     // On NVIDIA, launching with too many threads returns CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES (701),
     // which CUDA apps handle by reducing block size and retrying. HIP returns 719 (LAUNCH_FAILURE)
@@ -14289,8 +14474,19 @@ pub(crate) fn launch_kernel(
     // after 38 launches). Specific capture intercepts (actor_range, bbox,
     // downsweep, etc.) already record structured pointer ranges through
     // their own per-kernel paths.
+    //
+    // 2026-06-08 widen ptr_ranges coverage for FREE_USE_AFTER_LAUNCH_SCAN:
+    // narrow per-kernel-name capture for kernels we KNOW the param layout
+    // of from their PTX. Reads only declared u64 / pointer slots — safe.
+    // Gated behind the same ZLUDA_FREE_AFTER_LAUNCH_SCAN=1 to avoid any
+    // runtime cost on default-config benches.
     if let Some(n) = global_launch_n {
-        super::driver::record_kernel_launch(n, &name, &[], None);
+        let ranges: Vec<(u64, u64)> = if super::memory::free_after_launch_scan_enabled() {
+            unsafe { collect_narrow_ptr_ranges(&name, kernel_params, extra) }
+        } else {
+            Vec::new()
+        };
+        super::driver::record_kernel_launch(n, &name, &ranges, None);
     }
     // Log launch failures with full context for diagnosis
     if result.is_err() {
@@ -15028,6 +15224,150 @@ unsafe fn validate_create_grid_inputs(
 /// Extract a kernel argument value from either kernel_params or extra format.
 /// For kernel_params: params[i] is a pointer to the arg value.
 /// For extra: args are packed in a flat buffer (extra[1] points to it).
+/// 2026-06-08 narrow per-kernel arg capture for FREE_USE_AFTER_LAUNCH_SCAN.
+/// Reads only DECLARED u64 / pointer kernarg slots based on each kernel's
+/// PTX-visible param signature — safe (no segfault past end of short
+/// arg arrays). For each pointer value that looks like a tracked device
+/// allocation, returns (base, size) — the existing
+/// `driver::scan_kernel_ring_for_ptr` then uses these ranges to detect
+/// freed-while-in-flight VAs.
+///
+/// Kernels covered (from PTX signatures in /tmp/zluda_ptx_*.ptx):
+/// - IOFX_newRadixSortStepKernel — 13 params; u64 slots at idx 0, 6-10
+/// - TurbulenceFS_dynamicGridMG{Smooth,Residual,Restrict,Prolong}Kernel{0-3}
+///   — 6 params, last is a 64-byte struct with u64 ptrs at offsets +0, +8, +24, +48, +56
+/// - IOFX_makeSortKeys / IOFX_remapKernel — single u64 ptr at idx 0
+///
+/// Cap at 8 ranges per launch (KERNEL_RING_PTRS limit).
+unsafe fn collect_narrow_ptr_ranges(
+    name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let alloc_min =
+        super::memory::ALLOC_MIN.load(std::sync::atomic::Ordering::Relaxed);
+    let alloc_max =
+        super::memory::ALLOC_MAX.load(std::sync::atomic::Ordering::Relaxed);
+    let push_if_alloc = |ranges: &mut Vec<(u64, u64)>, ptr: u64| {
+        if ptr < alloc_min || ptr >= alloc_max {
+            return;
+        }
+        if let Some((base, size)) = super::memory::find_dev_alloc_containing(ptr) {
+            if !ranges.iter().any(|&(b, _)| b == base) && ranges.len() < 8 {
+                ranges.push((base, size));
+            }
+        }
+    };
+    if name == "IOFX_newRadixSortStepKernel" {
+        // 13 params: u64 at idx 0, 6, 7, 8, 9, 10. Offsets via extra: same.
+        for &(off, idx) in &[(0usize, 0usize), (32, 6), (40, 7), (48, 8), (56, 9), (64, 10)] {
+            if let Some(p) =
+                unsafe { read_kernel_arg::<u64>(kernel_params, extra, off, idx) }
+            {
+                push_if_alloc(&mut ranges, p);
+            }
+        }
+    } else if name.starts_with("TurbulenceFS_dynamicGridMG") {
+        // 6 params; param_0 is u64 ptr, param_5 is a 64-byte struct with
+        // u64 ptrs at offsets +0, +8, +24, +48, +56 inside the struct.
+        if let Some(p) =
+            unsafe { read_kernel_arg::<u64>(kernel_params, extra, 0, 0) }
+        {
+            push_if_alloc(&mut ranges, p);
+        }
+        // param_5 struct: dereference the slot pointer once more to read
+        // the struct contents. read_kernel_arg returns the slot value (a
+        // u64 for u64 args). For the struct param, we want to read the
+        // struct's bytes at offsets within it.
+        if !kernel_params.is_null() {
+            let slot_ptr = unsafe { *kernel_params.add(5) } as *const u8;
+            if !slot_ptr.is_null() {
+                for &off in &[0usize, 8, 24, 48, 56] {
+                    let p = unsafe {
+                        std::ptr::read_unaligned(slot_ptr.add(off) as *const u64)
+                    };
+                    push_if_alloc(&mut ranges, p);
+                }
+            }
+        } else if !extra.is_null() {
+            // extra buffer holds the kernarg buffer flat; param_5 begins
+            // at offset 16 (param_0 = 8, param_1 = 2, param_2-4 = 4*3,
+            // align to 8 → 16+ padding). Skip generic extra path here —
+            // captured via kernel_params path in practice for these
+            // kernels per PTX dumps.
+            let _ = extra;
+        }
+    } else if name == "IOFX_makeSortKeys_templ$0"
+        || name == "IOFX_makeSortKeys_templ$1"
+        || name == "IOFX_remapKernel_templ$0"
+        || name == "IOFX_remapKernel_templ$1"
+        || name == "IOFX_newRadixSortBlockKernel"
+    {
+        // Single u64 ptr at idx 0 (param_0). Other params are counts/flags.
+        if let Some(p) =
+            unsafe { read_kernel_arg::<u64>(kernel_params, extra, 0, 0) }
+        {
+            push_if_alloc(&mut ranges, p);
+        }
+    } else if name == "IOFX_actorRangeKernel" {
+        // 2026-06-09 Class A bf000 investigation. PTX signature (10 params):
+        //   p0 u64, p1 u16, p2 u32, p3 u32, p4 u64, p5 u32,
+        //   p6 u64, p7 u64, p8 u64, p9 u64
+        // Of these, p4/p6/p7/p8/p9 are device-buffer pointers. p4 = input
+        // first-indices, p6/p7/p8 = output rangemaps, p9 = sort-key bit-31
+        // markers. p0 is likely a small descriptor handle (kept for
+        // completeness). Flat-buffer offsets for the `extra` path account
+        // for natural alignment: p0=0, p4 = 8+2+pad+4+4 = 24 (8-byte
+        // aligned), p5 at 32 (u32), p6 at 40 (u64 aligned), p7 at 48,
+        // p8 at 56, p9 at 64.
+        for &(off, idx) in &[
+            (0usize, 0usize),
+            (24, 4),
+            (40, 6),
+            (48, 7),
+            (56, 8),
+            (64, 9),
+        ] {
+            if let Some(p) =
+                unsafe { read_kernel_arg::<u64>(kernel_params, extra, off, idx) }
+            {
+                push_if_alloc(&mut ranges, p);
+            }
+        }
+    } else if name == "CreateParticleShapesIncremental_MultiStage_4" {
+        // 2026-06-09 Class A bf000 investigation. PTX signature (8 params):
+        //   p0 u64, p1 u16, p2 u64, p3 u32, p4 u64, p5 u64, p6 u64, p7 u64
+        // p2 = particle-metadata buffer (read), p4 = 12-byte struct buffer
+        // (read, partner of bf000-1.04 MiB candidate), p5 = OUTPUT remove-
+        // queue buffer (write, prime bf000 candidate, indexed by r10*4),
+        // p6 = remapping buffer (read), p7 = counter buffer (atom.add -1).
+        // The wild-scatter Class A is MS_4 over-dispatch (counter underflows
+        // → r10 wraps to 0xFFFFFFFE → output write @ base + 0x3FFFFFFF8 ≈
+        // base + 16 GiB). For single-page _bf000 faults, p5 IS the bf000
+        // buffer and the write lands at OUTPUT[0]. Capturing all 6 ptrs
+        // lets FREE_USE_AFTER_LAUNCH_WARN flag a freed buffer used by an
+        // in-flight MS_4 — the UAF angle uniquely missed in earlier scans.
+        // Flat-buffer offsets: p0=0, p2=16 (align 8), p4=32, p5=40, p6=48,
+        // p7=56.
+        for &(off, idx) in &[
+            (0usize, 0usize),
+            (16, 2),
+            (32, 4),
+            (40, 5),
+            (48, 6),
+            (56, 7),
+        ] {
+            if let Some(p) =
+                unsafe { read_kernel_arg::<u64>(kernel_params, extra, off, idx) }
+            {
+                push_if_alloc(&mut ranges, p);
+            }
+        }
+    }
+    ranges
+}
+
 unsafe fn read_kernel_arg<T: Copy>(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
@@ -18251,6 +18591,21 @@ mod tests {
                 uses: 2,
             })
         );
+    }
+
+    #[test]
+    fn summarize_ms4_capture_counts_exact_and_surplus_shapes() {
+        // shape 0: counter 2, uses 2 -> exact (healthy full consumption)
+        // shape 1: counter 5, uses 2 -> surplus 3
+        // shape 2: counter 1, uses 2 -> underflow (not exact, not surplus)
+        let flags = pack_u16_stride4(&[1, 1, 1, 1, 1, 1]);
+        let shape_idx = pack_u32(&[0, 0, 1, 1, 2, 2]);
+        let counters = pack_u32(&[2, 5, 1]);
+        let summary = summarize_ms4_capture(&flags, &shape_idx, &counters, 6).unwrap();
+        assert_eq!(summary.exact_shapes, 1);
+        assert_eq!(summary.surplus_shapes, 1);
+        assert_eq!(summary.max_surplus, 3);
+        assert_eq!(summary.underflow_count, 1);
     }
 
     #[test]

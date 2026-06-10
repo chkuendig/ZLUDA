@@ -723,6 +723,34 @@ impl<'a> MethodEmitContext<'a> {
                     LLVM_UNNAMED.as_ptr(),
                 );
             }
+            // 2026-06-08 SRD cache hypothesis (env-gated, default OFF):
+            // LLVM's SIMemoryLegalizer does NOT emit scalar cache
+            // invalidation for system-scope SeqCst fences on gfx10
+            // (verified via LLVM source). The SeqCst fence above lowers
+            // to BUFFER_GL1_INV + BUFFER_GL0_INV — VECTOR caches only.
+            // The scalar L0/L1 (sK$, used for buffer-descriptor loads
+            // via s_load_dwordx4) is invalidated only of VOLATILE lines
+            // between dispatches per AMDGPU docs. Non-volatile scalar
+            // lines persist, which can serve a STALE buffer descriptor
+            // (V#/T#) if the host freed+realloced the underlying buffer.
+            //
+            // ZLUDA_SCALAR_CACHE_INV=1 emits explicit s_dcache_inv at
+            // kernel entry to force scalar cache invalidation. Heavy on
+            // instruction count (one extra instruction per kernel
+            // start). Diagnostic for the Class A GPU-internal cache
+            // hypothesis (see project_launch_hdp_flush_diagnostic_2026_06_08.md).
+            // Read at compile time of the PTX module; cache key must
+            // include this env var.
+            let scalar_cache_inv = std::env::var("ZLUDA_SCALAR_CACHE_INV")
+                .map_or(false, |v| v == "1");
+            if scalar_cache_inv {
+                self.emit_intrinsic(
+                    c"llvm.amdgcn.s.dcache.inv",
+                    None,
+                    vec![],
+                    vec![],
+                )?;
+            }
             if rounding_mode_f32 != ast::RoundingMode::NearestEven
                 || rounding_mode_f16f64 != ast::RoundingMode::NearestEven
             {
