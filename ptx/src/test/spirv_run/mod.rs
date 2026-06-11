@@ -1058,9 +1058,10 @@ fn shfl_up_lower_half_active_one_warp_amdgpu() -> Result<(), Box<dyn error::Erro
 /// inactive source lane) vs the lockstep-correct 15. This is the NRSS
 /// scatter residual. Un-ignore (and it passes) once the shfl lowering
 /// makes inactive source lanes provide their value (WWM / set.inactive).
+/// PASSES as of the WWM shfl fix (2026-06-11): out[16]=15 (lockstep
+/// register-read via strict-wwm ds_bpermute), no longer 0.
 #[cfg(feature = "has_rocm")]
 #[test]
-#[ignore = "known-failing repro of the shfl inactive-source-lane bug (NRSS residual); passes once WWM fix lands"]
 fn shfl_up_upper_half_active_one_warp_amdgpu() -> Result<(), Box<dyn error::Error>> {
     let ptx = read_test_file!("shfl_up_upper_half_active.ptx");
     let mut output = [0u32; 32];
