@@ -1950,6 +1950,44 @@ fn linked_shfl_helpers_use_physical_laneid() -> Result<(), Box<dyn error::Error>
 /// (the game dies at cold-compile; lab tests for cub/nrss/shfl pass, so
 /// the breakage is a game-only kernel). Re-apply the WWM .bc, run this,
 /// see which module errors. Run: `... --ignored compile_all_game_modules`
+/// 2026-06-11: test whether the WWM backend SIGSEGV on simulateCloths is a
+/// STACK OVERFLOW in a recursive LLVM pass (signal 11 on an 80k-line fn is
+/// classic). Compile zluda_ptx_000 (simulateCloths) on a thread with a
+/// huge stack. If it succeeds, the WWM fix is viable — just needs ZLUDA's
+/// compile thread to have a big stack. Run: `... --ignored compile_simulatecloths_bigstack`
+#[test]
+#[ignore = "diagnostic: compile simulateCloths (000) on a big-stack thread"]
+fn compile_simulatecloths_bigstack() -> Result<(), Box<dyn error::Error>> {
+    let ptx = std::fs::read_to_string("/tmp/zluda_ptx_000.ptx")?;
+    for stack_mb in [2048usize] {
+        eprintln!("=== trying {}MB stack ===", stack_mb);
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+        let ptx = ptx.clone();
+        let handle = std::thread::Builder::new()
+            .stack_size(stack_mb * 1024 * 1024)
+            .spawn(move || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    compile_fixture_artifacts(ptx).map(|m| m.len())
+                }));
+                match r {
+                    Ok(Ok(n)) => eprintln!("BIGSTACK {}MB: simulateCloths COMPILED ok ({} artifacts)", stack_mb, n),
+                    Ok(Err(e)) => eprintln!("BIGSTACK {}MB: compile Err {}", stack_mb, e),
+                    Err(_) => eprintln!("BIGSTACK {}MB: panic", stack_mb),
+                }
+            })
+            .unwrap();
+        let joined = handle.join();
+        if joined.is_err() {
+            eprintln!("BIGSTACK {}MB: thread CRASHED (still SIGSEGV/abort at this stack)", stack_mb);
+        } else {
+            eprintln!("BIGSTACK {}MB: thread returned cleanly -> stack overflow hypothesis CONFIRMED if it compiled", stack_mb);
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "diagnostic: compile every /tmp/zluda_ptx_*.ptx, report failures"]
 fn compile_all_game_modules() -> Result<(), Box<dyn error::Error>> {
