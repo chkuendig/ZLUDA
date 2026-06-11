@@ -1047,6 +1047,39 @@ fn shfl_up_lower_half_active_one_warp_amdgpu() -> Result<(), Box<dyn error::Erro
     )
 }
 
+/// 2026-06-11: the BUG direction — an ACTIVE high lane reads an INACTIVE
+/// low (in-range) lane. Lanes 16..31 active; lane 16 does shfl.up(1) and
+/// reads lane 15 (inactive). Lockstep-correct (what CUB's warp-synchronous
+/// radix scan assumes): out[16] = 15. If AMD `ds_bpermute` returns 0 for
+/// the inactive source lane, out[16] = 0 — the NRSS scatter residual in a
+/// 3-second test. None of the existing shfl divergence tests cover this
+/// direction (they only have active lanes reading other ACTIVE lanes).
+/// CONFIRMED FAILING 2026-06-11: AMD returns out[16]=0 (ds_bpermute on an
+/// inactive source lane) vs the lockstep-correct 15. This is the NRSS
+/// scatter residual. Un-ignore (and it passes) once the shfl lowering
+/// makes inactive source lanes provide their value (WWM / set.inactive).
+#[cfg(feature = "has_rocm")]
+#[test]
+#[ignore = "known-failing repro of the shfl inactive-source-lane bug (NRSS residual); passes once WWM fix lands"]
+fn shfl_up_upper_half_active_one_warp_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("shfl_up_upper_half_active.ptx");
+    let mut output = [0u32; 32];
+    for i in 0..16 {
+        output[i] = i as u32 + 2000; // inactive lanes: thread_id + 2000
+    }
+    output[16] = 15; // reads inactive lane 15 -> lockstep value 15
+    for i in 17..32 {
+        output[i] = i as u32 - 1; // read active lanes 16..30
+    }
+    test_hip_assert(
+        "shfl_up_upper_half_active",
+        &ptx,
+        None::<&[u8]>,
+        &output,
+        32,
+    )
+}
+
 #[cfg(feature = "has_rocm")]
 #[test]
 #[ignore = "diagnostic: can wedge GPU while investigating divergent shuffle behavior"]
