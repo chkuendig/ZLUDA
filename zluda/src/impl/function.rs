@@ -7427,9 +7427,37 @@ unsafe fn validate_nrss_output_after_launch(
                     } else {
                         "came in already broken (upstream of this bit)"
                     };
+                    // Permutation check: is the output the SAME multiset as the
+                    // input (wrong scatter OFFSETS — histogram/scan bad) or does
+                    // it contain FOREIGN values (an external kernel clobbered
+                    // p8)? Decisive internal-vs-external split.
+                    let mut si = inp.clone();
+                    let mut so = outp.clone();
+                    si.sort_unstable();
+                    so.sort_unstable();
+                    let is_perm = si == so;
+                    // Count output values absent from the input multiset.
+                    let in_set: std::collections::HashSet<u32> = inp.iter().copied().collect();
+                    let foreign: Vec<u32> = outp
+                        .iter()
+                        .copied()
+                        .filter(|v| !in_set.contains(v))
+                        .take(6)
+                        .collect();
+                    // Histogram (p10): for bit=0 the scatter offsets come from
+                    // this pass's count+scan. Dump its first 16 entries.
+                    let p10: u64 = read_kernel_arg(kernel_params, extra, 64, 10).unwrap_or(0);
+                    let mut hist = vec![0u32; 16];
+                    if p10 != 0 {
+                        let _ = hipMemcpyDtoH(
+                            hist.as_mut_ptr() as _,
+                            hipDeviceptr_t(p10 as _),
+                            16 * 4,
+                        );
+                    }
                     super::driver::zluda_log_err(&format!(
-                        "*** NRSS_PASS #{} bit={} n={} p6=0x{:x} p8=0x{:x} in_viol={} out_viol={} grid={} => {}",
-                        ps, p5, n, p6, p8, in_viol, out_viol, grid_x, verdict
+                        "*** NRSS_PASS #{} bit={} n={} p6=0x{:x} p8=0x{:x} p10=0x{:x} in_viol={} out_viol={} is_perm={} foreign={:x?} hist16={:?} grid={} => {}",
+                        ps, p5, n, p6, p8, p10, in_viol, out_viol, is_perm, foreign, hist, grid_x, verdict
                     ));
                 }
             }
