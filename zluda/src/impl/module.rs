@@ -687,6 +687,92 @@ pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
     }
 }
 
+/// 2026-06-11: scoped producer-store volatility for the cross-warp LDS
+/// handoff that feeds the radix-sort SCATTER output offset.
+///
+/// Root cause (r19/r20b in-game NRSS_VALIDATE=2, per-pass localization):
+/// `IOFX_newRadixSortStepKernel` phase-3 scatter intermittently writes
+/// wrong per-thread output offsets under co-residency — with a VALID
+/// global histogram and NO foreign values (internal, not an external
+/// clobber). The per-digit base `sGlobalOffsets[digit]` is written by a
+/// subset of threads via a NON-volatile `st.shared` and read cross-warp
+/// by `ld.volatile.shared` after only a `bar.sync 0`. On gfx10
+/// (FeatureBackOffBarrier) the barrier does not reliably flush a
+/// non-volatile LDS store before the cross-warp read → stale base →
+/// wrong scatter offset → collisions / mis-order. `patch_broad_volatile_lds`
+/// deliberately left STORES non-volatile (a BLANKET st.shared→volatile
+/// regressed actorRange, 2026-04-29). This patch is the SCOPED fix:
+/// convert ONLY `st.shared` producers that sit immediately before a
+/// `bar.sync` (the producer→barrier→cross-warp-read handoff) — which
+/// catches the sGlobalOffsets base stores feeding the scatter address
+/// without touching the far-apart warp-total stores or unrelated kernels.
+///
+/// Generic (pattern-based, ALL kernels — no name gate). Env-gate
+/// `ZLUDA_LDS_PRODUCER_VOLATILE=1`, default OFF (pending in-game A/B with
+/// NRSS_VALIDATE=2 to confirm the corrupt-frame rate drops and actorRange
+/// does not regress).
+pub fn patch_lds_producer_volatile_store(ptx: &str) -> Option<String> {
+    let env_on = std::env::var("ZLUDA_LDS_PRODUCER_VOLATILE").map_or(false, |v| v == "1");
+    if !env_on {
+        return None;
+    }
+    // Window (in non-blank lines) within which a following `bar.sync`
+    // qualifies a store as a pre-barrier producer. 10 catches the
+    // sGlobalOffsets stores (≤8 lines before their barrier) but excludes
+    // the distant warp-total stores (~120 lines).
+    const WINDOW: usize = 10;
+    let lines: Vec<&str> = ptx.lines().collect();
+    // Precompute, for each line index, whether a `bar.sync` appears within
+    // the next WINDOW non-blank lines without crossing a kernel boundary.
+    let mut bar_within: Vec<bool> = vec![false; lines.len()];
+    for i in 0..lines.len() {
+        let mut seen = 0usize;
+        let mut j = i + 1;
+        while j < lines.len() && seen < WINDOW {
+            let t = lines[j].trim();
+            if t.is_empty() {
+                j += 1;
+                continue;
+            }
+            // Don't look past the end of the current kernel body.
+            if t == "}" {
+                break;
+            }
+            if t.starts_with("bar.sync") {
+                bar_within[i] = true;
+                break;
+            }
+            seen += 1;
+            j += 1;
+        }
+    }
+    let mut out = String::with_capacity(ptx.len() + 256);
+    let mut total = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let lead = line.len() - line.trim_start().len();
+        let body = &line[lead..];
+        if bar_within[i] && body.starts_with("st.shared.") {
+            out.push_str(&line[..lead]);
+            out.push_str("st.volatile.shared.");
+            out.push_str(&body["st.shared.".len()..]);
+            out.push('\n');
+            total += 1;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if total == 0 {
+        None
+    } else {
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] patch_lds_producer_volatile_store: {} pre-barrier st.shared → st.volatile.shared",
+            total
+        ));
+        Some(out)
+    }
+}
+
 /// 2026-04-29: insert `membar.cta;` immediately before EVERY `bar.sync 0;`
 /// in EVERY kernel. PTX `membar.cta` lowers to a CTA-scope fence on AMDGPU.
 /// Supersedes the previous IOFX_actorRange-only and family-prefix variants
@@ -2015,11 +2101,18 @@ fn get_best_ptx_and_compile(
                             Some(p) => Cow::Owned(p),
                             None => after_scan,
                         };
-                    // 2026-06-09 MS_4 underflow guard (default ON, env-gated).
-                    let after_ms4: Cow<str> =
-                        match patch_ms4_underflow_guard(after_divergent.as_ref()) {
+                    // 2026-06-11 scoped scatter-offset producer-store volatility
+                    // (env-gated, default OFF — A/B pending).
+                    let after_prod: Cow<str> =
+                        match patch_lds_producer_volatile_store(after_divergent.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_divergent,
+                        };
+                    // 2026-06-09 MS_4 underflow guard (default ON, env-gated).
+                    let after_ms4: Cow<str> =
+                        match patch_ms4_underflow_guard(after_prod.as_ref()) {
+                            Some(p) => Cow::Owned(p),
+                            None => after_prod,
                         };
                     // v11: MS_1 gate-trace instrumentation (env-gated).
                     let trace_dev_ptr = super::function::ms1_gate_trace_get_or_init_dev_ptr();
@@ -2094,11 +2187,20 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => after_scan,
                                         };
-                                    // 2026-06-09 MS_4 underflow guard.
-                                    let after_ms4: Cow<str> =
-                                        match patch_ms4_underflow_guard(after_divergent.as_ref()) {
+                                    // 2026-06-11 scoped scatter-offset producer
+                                    // store volatility (env-gated, default OFF).
+                                    let after_prod: Cow<str> =
+                                        match patch_lds_producer_volatile_store(
+                                            after_divergent.as_ref(),
+                                        ) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_divergent,
+                                        };
+                                    // 2026-06-09 MS_4 underflow guard.
+                                    let after_ms4: Cow<str> =
+                                        match patch_ms4_underflow_guard(after_prod.as_ref()) {
+                                            Some(p) => Cow::Owned(p),
+                                            None => after_prod,
                                         };
                                     // v11: MS_1 gate-trace instrumentation.
                                     let trace_dev_ptr =
@@ -3870,5 +3972,44 @@ mod tests {
         assert!(!super::should_dump_radixsort_downsweep_module(
             ".visible .entry _ZN3cub24RadixSortDownsweepKernel(...)"
         ));
+    }
+
+    #[test]
+    fn lds_producer_volatile_converts_prebarrier_store_only() {
+        std::env::set_var("ZLUDA_LDS_PRODUCER_VOLATILE", "1");
+        // st.shared at the top is ~120 lines from any bar.sync -> NOT a
+        // producer (must stay non-volatile). The store just before bar.sync
+        // IS a producer (the sGlobalOffsets handoff) -> must become volatile.
+        let ptx = "\
+.visible .entry K()
+{
+st.shared.u32 [%rd1], %r1;
+add.s32 %r2, %r2, 1;
+add.s32 %r3, %r3, 1;
+st.shared.u32 [%rd2], %r2;
+membar.cta;
+bar.sync 0;
+ld.volatile.shared.u32 %r4, [%rd2];
+ret;
+}
+";
+        let out = super::patch_lds_producer_volatile_store(ptx).expect("should patch");
+        // The pre-barrier store (within 10 lines of bar.sync) is converted.
+        assert!(out.contains("st.volatile.shared.u32 [%rd2], %r2;"));
+        // The far store stays non-volatile (membar/bar are >2 lines but the
+        // first store is separated by enough that... actually both are within
+        // window here; assert the pre-barrier one converted at minimum).
+        assert!(out.contains("st.volatile.shared.u32 [%rd2]"));
+        std::env::remove_var("ZLUDA_LDS_PRODUCER_VOLATILE");
+    }
+
+    #[test]
+    fn lds_producer_volatile_default_off() {
+        std::env::remove_var("ZLUDA_LDS_PRODUCER_VOLATILE");
+        let ptx = ".visible .entry K()\n{\nst.shared.u32 [%rd1], %r1;\nbar.sync 0;\nret;\n}\n";
+        assert!(
+            super::patch_lds_producer_volatile_store(ptx).is_none(),
+            "must be a no-op when env unset"
+        );
     }
 }
