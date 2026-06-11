@@ -1858,6 +1858,47 @@ fn compile_fixture_linked_ll(ptx: String) -> Result<String, Box<dyn error::Error
     Ok(String::from_utf8(linked_ll.into_inner().unwrap())?)
 }
 
+#[test]
+#[ignore = "diagnostic: compile a single /tmp/zluda_ptx_NNN.ptx, dumping linked.ll/opt.ll to disk before the backend runs so a SIGSEGV in codegen leaves the IR behind"]
+fn dump_single_module_ir() -> Result<(), Box<dyn error::Error>> {
+    let idx = std::env::var("ZLUDA_DUMP_MODULE").unwrap_or_else(|_| "000".to_string());
+    let path = format!("/tmp/zluda_ptx_{}.ptx", idx);
+    let ptx = std::fs::read_to_string(&path)?;
+    let outdir = "/tmp/wwm_dbg";
+    std::fs::create_dir_all(outdir).ok();
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(
+        ast,
+        pass::Attributes { clock_rate: 2124000 },
+        |_| {},
+    )
+    .unwrap();
+    let ptx_impl = module.linked_bitcode();
+    let pass::Module { context, llvm_ir, attributes_ir, metadata, .. } = module;
+    eprintln!("DUMP_SINGLE: compiling {} -> {}", path, outdir);
+    let _ = llvm_zluda::compile(
+        &context,
+        "gfx1030",
+        llvm_ir,
+        ptx_impl,
+        attributes_ir,
+        metadata,
+        Some(&|data: &Vec<u8>, file_name: String| {
+            // Write immediately + fsync so the file survives a backend SIGSEGV.
+            let p = format!("{}/{}", outdir, file_name);
+            if let Ok(f) = std::fs::File::create(&p) {
+                use std::io::Write;
+                let mut f = f;
+                let _ = f.write_all(data);
+                let _ = f.sync_all();
+            }
+            eprintln!("DUMP_SINGLE: wrote {} ({} bytes)", p, data.len());
+        }),
+    )?;
+    eprintln!("DUMP_SINGLE: compile completed (no crash)");
+    Ok(())
+}
+
 fn compile_fixture_artifacts(
     ptx: String,
 ) -> Result<HashMap<String, Vec<u8>>, Box<dyn error::Error>> {

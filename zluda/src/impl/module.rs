@@ -2620,85 +2620,155 @@ fn compile_in_subprocess(
     let output_path = format!("/tmp/zluda_compile_{}.elf", std::process::id());
     let ptx_impl = llvm_module.linked_bitcode();
 
-    // Use fork to compile in a child process
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        super::driver::zluda_log("[ZLUDA]   fork() failed");
-        return Err(CUerror::UNKNOWN);
-    }
-    if pid == 0 {
-        // Child process — do the compilation
-        let hook = move |data: &Vec<u8>, name: String| dump_compile_artifact(compile_n, data, name);
-        let result = llvm_zluda::compile(
-            &llvm_module.context,
-            gcn_arch,
-            llvm_module.llvm_ir,
-            ptx_impl,
-            llvm_module.attributes_ir,
-            llvm_module.metadata,
-            Some(&hook),
-        );
-        match result {
-            Ok(elf_module) => {
-                if let Ok(mut f) = std::fs::File::create(&output_path) {
-                    let _ = f.write_all(&elf_module);
-                }
-                unsafe { libc::_exit(0) };
+    // Backend codegen opt levels to try, in order. Normally a single
+    // Aggressive pass suffices. A handful of pathologically large kernels
+    // (Batman:AK _Z14simulateClothsv — 80k PTX lines, hundreds of
+    // strict.wwm shfl regions) trip an LLVM AMDGPU greedy-RA/WWM
+    // MIR-corruption SIGSEGV in SIPreAllocateWWMRegs at -O1+; the same
+    // module codegens correctly at -O0 (fast RA). On a child crash we retry
+    // the SAME module with ZLUDA_CODEGEN_OPT_LEVEL=0 (correct, just
+    // less-optimized codegen). fork() copies the address space, so the
+    // parent's llvm_module stays intact for the retry — the child mutates
+    // only its own copy. This is a generic robustness fallback (no
+    // per-kernel name matching); it fires for ANY module the optimized
+    // backend can't compile.
+    // Ladder tried in order on a crash. None = Aggressive (best perf, the
+    // normal case). "0" = fast RA — avoids the greedy-RA/WWM
+    // SIPreAllocateWWMRegs crash (simulateCloths needs this). "1" = greedy RA
+    // at low opt — safety net for a module that the fast allocator can't
+    // satisfy ("ran out of registers" under heavy WWM pressure) but whose
+    // Aggressive crash was incidental. A module that fails every rung is
+    // genuinely uncompilable and surfaces as a hard error.
+    let codegen_levels: &[Option<&str>] = &[None, Some("0"), Some("1")];
+
+    for (attempt, level) in codegen_levels.iter().enumerate() {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            super::driver::zluda_log("[ZLUDA]   fork() failed");
+            return Err(CUerror::UNKNOWN);
+        }
+        if pid == 0 {
+            // Child process — do the compilation. ptr::read duplicates the
+            // module fields behind the borrow checker's back; sound because
+            // the child _exit()s without ever dropping them, and the
+            // parent's copy lives in a separate address space.
+            //
+            // Reset SIGSEGV/SIGABRT to their default action FIRST. The
+            // process-wide ZLUDA fault-capture handler (installed at init)
+            // would otherwise fire when the LLVM AMDGPU backend crashes
+            // compiling a WWM-heavy module, printing the misleading
+            // "*** SIGSEGV — GPU fault likely ***" banner into the trace log
+            // — a benign, expected, retried event that nonetheless fools
+            // log-scraping harnesses into reporting a game crash. We handle
+            // the child's death via waitpid in the parent, so the child
+            // should just die quietly with the default action.
+            unsafe {
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::signal(libc::SIGABRT, libc::SIG_DFL);
+                libc::signal(libc::SIGBUS, libc::SIG_DFL);
+                libc::signal(libc::SIGILL, libc::SIG_DFL);
+                libc::signal(libc::SIGFPE, libc::SIG_DFL);
             }
-            Err(e) => {
-                let _ = std::fs::write(&output_path, format!("ERROR: {:?}", e));
-                unsafe { libc::_exit(1) };
+            if let Some(lvl) = level {
+                std::env::set_var("ZLUDA_CODEGEN_OPT_LEVEL", lvl);
+            }
+            let m: ptx::Module = unsafe { std::ptr::read(&llvm_module) };
+            let hook =
+                move |data: &Vec<u8>, name: String| dump_compile_artifact(compile_n, data, name);
+            let result = llvm_zluda::compile(
+                &m.context,
+                gcn_arch,
+                m.llvm_ir,
+                ptx_impl,
+                m.attributes_ir,
+                m.metadata,
+                Some(&hook),
+            );
+            match result {
+                Ok(elf_module) => {
+                    if let Ok(mut f) = std::fs::File::create(&output_path) {
+                        let _ = f.write_all(&elf_module);
+                    }
+                    unsafe { libc::_exit(0) };
+                }
+                Err(e) => {
+                    let _ = std::fs::write(&output_path, format!("ERROR: {:?}", e));
+                    unsafe { libc::_exit(1) };
+                }
             }
         }
-    }
-    // Parent process — wait for child
-    super::driver::zluda_log(&format!(
-        "[ZLUDA]   waiting for compile subprocess pid={}",
-        pid
-    ));
-    let mut status: i32 = 0;
-    let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if wait_result < 0 {
-        super::driver::zluda_log("[ZLUDA]   waitpid failed");
-        let _ = std::fs::remove_file(&output_path);
-        return Err(CUerror::UNKNOWN);
-    }
-    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        // Parent process — wait for child
+        super::driver::zluda_log(&format!(
+            "[ZLUDA]   waiting for compile subprocess pid={} (codegen_opt={:?})",
+            pid, level
+        ));
+        let mut status: i32 = 0;
+        let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if wait_result < 0 {
+            super::driver::zluda_log("[ZLUDA]   waitpid failed");
+            let _ = std::fs::remove_file(&output_path);
+            return Err(CUerror::UNKNOWN);
+        }
+        let crashed = libc::WIFSIGNALED(status);
+        let clean_exit = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        if clean_exit {
+            // Read the ELF output
+            let elf_module = std::fs::read(&output_path).map_err(|e| {
+                super::driver::zluda_log(&format!(
+                    "[ZLUDA]   failed to read compiled ELF: {:?}",
+                    e
+                ));
+                CUerror::UNKNOWN
+            })?;
+            let _ = std::fs::remove_file(&output_path);
+            if elf_module.starts_with(b"ERROR:") {
+                super::driver::zluda_log(&format!(
+                    "[ZLUDA]   compile error: {}",
+                    String::from_utf8_lossy(&elf_module)
+                ));
+                return Err(CUerror::UNKNOWN);
+            }
+            if attempt > 0 {
+                super::driver::zluda_log_err(&format!(
+                    "[ZLUDA]   compile #{} SUCCEEDED on fallback codegen_opt={:?} after a crash",
+                    compile_n, level
+                ));
+            }
+            return Ok(elf_module);
+        }
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
             -1
         };
-        let signal = if libc::WIFSIGNALED(status) {
-            libc::WTERMSIG(status)
-        } else {
-            0
-        };
+        let signal = if crashed { libc::WTERMSIG(status) } else { 0 };
         super::driver::zluda_log(&format!(
-            "[ZLUDA]   compile subprocess failed: exit={}, signal={}",
-            exit_code, signal
+            "[ZLUDA]   compile subprocess failed: exit={}, signal={}, codegen_opt={:?}",
+            exit_code, signal, level
         ));
-        // Try to read error message
         if let Ok(msg) = std::fs::read_to_string(&output_path) {
             super::driver::zluda_log(&format!("[ZLUDA]   compile error: {}", msg));
         }
         let _ = std::fs::remove_file(&output_path);
-        return Err(CUerror::UNKNOWN);
-    }
-    // Read the ELF output
-    let elf_module = std::fs::read(&output_path).map_err(|e| {
-        super::driver::zluda_log(&format!("[ZLUDA]   failed to read compiled ELF: {:?}", e));
-        CUerror::UNKNOWN
-    })?;
-    let _ = std::fs::remove_file(&output_path);
-    if elf_module.starts_with(b"ERROR:") {
-        super::driver::zluda_log(&format!(
-            "[ZLUDA]   compile error: {}",
-            String::from_utf8_lossy(&elf_module)
+        // Retry at the next codegen opt level on ANY failure (signal crash
+        // OR clean error-exit) — different opt levels genuinely produce
+        // different outcomes: the greedy-RA/WWM crash happens only at -O1+,
+        // while "ran out of registers" happens only at the fast (-O0)
+        // allocator. Trying the whole ladder maximizes the chance some level
+        // compiles the module. Only after every rung fails do we give up.
+        if attempt + 1 >= codegen_levels.len() {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA]   compile #{} FAILED at every codegen opt level (last: exit={} signal={})",
+                compile_n, exit_code, signal
+            ));
+            return Err(CUerror::UNKNOWN);
+        }
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA]   compile #{} failed (exit={} signal={}); retrying at lower codegen opt level",
+            compile_n, exit_code, signal
         ));
-        return Err(CUerror::UNKNOWN);
     }
-    Ok(elf_module)
+    Err(CUerror::UNKNOWN)
 }
 
 fn dump_compile_artifact(n: u32, data: &Vec<u8>, name: String) {

@@ -154,12 +154,27 @@ pub fn compile(
         return Err(message.to_str().to_string());
     }
 
+    // Backend (register-allocation / scheduling) opt level. Normally
+    // Aggressive. A few pathologically large kernels (e.g. Batman:AK's
+    // _Z14simulateClothsv, 80k PTX lines with hundreds of strict.wwm shfl
+    // regions) hit an LLVM AMDGPU greedy-RA/WWM MIR-corruption SIGSEGV in
+    // `SIPreAllocateWWMRegs` at -O1+; the same module codegens correctly at
+    // -O0 (fast RA). `module.rs::compile_in_subprocess` retries a crashed
+    // module with ZLUDA_CODEGEN_OPT_LEVEL=0 so it still compiles (correct,
+    // just less-optimized codegen) instead of failing the whole module.
+    // The middle-end default<O3> pipeline above is unaffected.
+    let codegen_level = match std::env::var("ZLUDA_CODEGEN_OPT_LEVEL").ok().as_deref() {
+        Some("0") | Some("none") => LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,
+        Some("1") => LLVMCodeGenOptLevel::LLVMCodeGenLevelLess,
+        Some("2") => LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
+        _ => LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+    };
     let target_machine = TargetMachine::new(
         target,
         triple,
         &cpu,
         features,
-        LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+        codegen_level,
         LLVMRelocMode::LLVMRelocDefault,
         LLVMCodeModel::LLVMCodeModelDefault,
     );

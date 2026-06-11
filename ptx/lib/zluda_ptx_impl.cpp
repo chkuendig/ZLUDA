@@ -299,6 +299,18 @@ extern "C"
     int32_t __ockl_wgred_and_i32(int32_t) __device__;
     int32_t __ockl_wgred_or_i32(int32_t) __device__;
 
+    // Whole-wave-mode wrapper for ds_bpermute. AMD's ds_bpermute reads 0 for
+    // source lanes whose EXEC bit is clear (diverged-off), whereas NVIDIA's
+    // shfl reads the source lane's physical register regardless of activity.
+    // CUB pre-Volta warp-synchronous code (radix-sort local-rank scan) relies
+    // on the NVIDIA lockstep behaviour. Wrapping the bpermute in
+    // llvm.amdgcn.strict.wwm forces EXEC=-1 across the permute so inactive
+    // source lanes contribute their real register value. The backend extends
+    // the WWM region (s_or_saveexec -1 ... s_mov exec) to cover the bpermute.
+    // See handover_iofx_nrss_rootcause_fixed_2026_06_11.md.
+    extern "C" __attribute__((device, convergent)) int32_t
+        __zluda_strict_wwm_i32(int32_t) __asm("llvm.amdgcn.strict.wwm.i32");
+
 #define BAR_RED_IMPL(reducer)                                                                                            \
     bool FUNC(bar_red_##reducer##_pred)(uint32_t barrier __attribute__((unused)), bool predicate, bool invert_predicate) \
     {                                                                                                                    \
@@ -337,7 +349,9 @@ extern "C"
         {                                                                                                                                       \
             idx = self;                                                                                                                         \
         }                                                                                                                                       \
-        int32_t output = __builtin_amdgcn_ds_bpermute(idx << 2, (int32_t)input);                                                                \
+        int32_t input_wwm = __zluda_strict_wwm_i32((int32_t)input);                                                                            \
+        int32_t output_raw = __builtin_amdgcn_ds_bpermute(idx << 2, input_wwm);                                                                 \
+        int32_t output = __zluda_strict_wwm_i32(output_raw);                                                                                    \
         return {(uint32_t)output, uint32_t(!out_of_bounds)};                                                                                    \
     }                                                                                                                                           \
                                                                                                                                                 \
