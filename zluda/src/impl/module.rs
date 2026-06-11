@@ -708,9 +708,25 @@ pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
 /// without touching the far-apart warp-total stores or unrelated kernels.
 ///
 /// Generic (pattern-based, ALL kernels — no name gate). Env-gate
-/// `ZLUDA_LDS_PRODUCER_VOLATILE=1`, default OFF (pending in-game A/B with
-/// NRSS_VALIDATE=2 to confirm the corrupt-frame rate drops and actorRange
-/// does not regress).
+/// `ZLUDA_LDS_PRODUCER_VOLATILE`: "1" = address-matched (weak — PTX
+/// recomputes LDS addrs into fresh regs, so it misses most pairs),
+/// "2" = ALL st.shared → volatile (full coverage).
+///
+/// VALIDATED 2026-06-11 (r22, mode=2): cuts the NRSS scatter corruption
+/// 100-1000× (break-pass violations thousands → 3-318, no key loss) with
+/// NO actorRange regression (reached 91k launches) — the April blanket-
+/// volatile→actorRange regression does NOT recur in the current codebase.
+/// Default OFF pending n≥3 game validation before flipping default-ON.
+///
+/// RESIDUAL (does NOT close with full LDS volatile, so it is NOT a store-
+/// visibility bug): the scatter's local rank comes from a `shfl.up`
+/// warp-scan that lowers to `__builtin_amdgcn_ds_bpermute`
+/// (zluda_ptx_impl.cpp). ds_bpermute reads source-lane VGPRs without
+/// guarding against INACTIVE (EXEC-off) lanes; at tile boundaries where
+/// the wave partially diverges, an in-bounds-but-inactive source lane
+/// returns 0 → wrong local rank → wrong scatter offset (the 3-318
+/// residual). The generic fix is in the shfl translation (mask the
+/// permute index / result by the active-lane set), NOT here.
 pub fn patch_lds_producer_volatile_store(ptx: &str) -> Option<String> {
     let env_on = std::env::var("ZLUDA_LDS_PRODUCER_VOLATILE").map_or(false, |v| v == "1");
     if !env_on {
