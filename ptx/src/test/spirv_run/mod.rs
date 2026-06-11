@@ -1944,6 +1944,62 @@ fn linked_shfl_helpers_use_physical_laneid() -> Result<(), Box<dyn error::Error>
 }
 
 #[test]
+/// 2026-06-11 diagnostic: compile EVERY dumped game module
+/// (/tmp/zluda_ptx_*.ptx) through the real compile path and report which
+/// fail. Used to find the kernel that the blanket WWM shfl fix breaks
+/// (the game dies at cold-compile; lab tests for cub/nrss/shfl pass, so
+/// the breakage is a game-only kernel). Re-apply the WWM .bc, run this,
+/// see which module errors. Run: `... --ignored compile_all_game_modules`
+#[test]
+#[ignore = "diagnostic: compile every /tmp/zluda_ptx_*.ptx, report failures"]
+fn compile_all_game_modules() -> Result<(), Box<dyn error::Error>> {
+    let mut paths: Vec<_> = std::fs::read_dir("/tmp")
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.starts_with("zluda_ptx_") && n.ends_with(".ptx"))
+        })
+        .collect();
+    paths.sort();
+    let mut fails = Vec::new();
+    let mut ok = 0usize;
+    for p in &paths {
+        let ptx = match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let name = p.file_name().unwrap().to_str().unwrap().to_string();
+        // Print+flush BEFORE compiling: a SIGSEGV in the LLVM backend is
+        // not a catchable Rust panic, so the last "COMPILING" line names
+        // the module that crashed the compiler.
+        eprintln!("COMPILING {} ({} kernels)", name, ptx.matches(".visible .entry").count());
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compile_fixture_artifacts(ptx.clone()).map(|_| ())
+        }));
+        match result {
+            Ok(Ok(())) => ok += 1,
+            Ok(Err(e)) => {
+                eprintln!("COMPILE_FAIL {} : {}", name, e);
+                fails.push(name);
+            }
+            Err(_) => {
+                eprintln!("COMPILE_PANIC {}", name);
+                fails.push(name);
+            }
+        }
+    }
+    eprintln!(
+        "compile_all_game_modules: {} ok, {} FAILED: {:?}",
+        ok, fails.len(), fails
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "diagnostic: dumps linked LLVM for the mixed-width shared alias reload probe"]
 fn dump_alias_reload_linked_ll() -> Result<(), Box<dyn error::Error>> {
     let ptx = read_test_file!("lds_transpose_counter_feed_alias_reload_test.ptx");
