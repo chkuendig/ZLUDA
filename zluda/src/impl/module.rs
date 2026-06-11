@@ -728,7 +728,8 @@ pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
 /// residual). The generic fix is in the shfl translation (mask the
 /// permute index / result by the active-lane set), NOT here.
 pub fn patch_lds_producer_volatile_store(ptx: &str) -> Option<String> {
-    let env_on = std::env::var("ZLUDA_LDS_PRODUCER_VOLATILE").map_or(false, |v| v == "1");
+    let env_on =
+        std::env::var("ZLUDA_LDS_PRODUCER_VOLATILE").map_or(false, |v| v == "1" || v == "2");
     if !env_on {
         return None;
     }
