@@ -7360,10 +7360,16 @@ unsafe fn validate_nrss_output_after_launch(
     extra: *mut *mut ::core::ffi::c_void,
     grid_x: u32,
 ) {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED
-        .get_or_init(|| std::env::var("ZLUDA_NRSS_VALIDATE").map_or(false, |v| v == "1"))
-    {
+    // 0=off, 1=final-pass-only (whose-fault), 2=EVERY scatter pass
+    // (which-pass localization: 2 D2H per phase-3 launch).
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        std::env::var("ZLUDA_NRSS_VALIDATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    if mode == 0 {
         return;
     }
     if name != "IOFX_newRadixSortStepKernel" {
@@ -7379,7 +7385,58 @@ unsafe fn validate_nrss_output_after_launch(
         Some(v) => v,
         None => return,
     };
-    if p11 != 3 || p5 != 28 {
+    if p11 != 3 {
+        return;
+    }
+    // Mode 2: validate EVERY scatter pass. Radix sort is LSB-first; after
+    // the pass for `bit`, keys must be sorted by the low (bit+4) bits, and
+    // its INPUT must already be sorted by the low `bit` bits. The first
+    // pass where input is OK but output breaks = the pass that corrupted.
+    if mode == 2 {
+        let p4: u32 = read_kernel_arg(kernel_params, extra, 20, 4).unwrap_or(0);
+        let p6: u64 = read_kernel_arg(kernel_params, extra, 32, 6).unwrap_or(0);
+        let p8: u64 = read_kernel_arg(kernel_params, extra, 48, 8).unwrap_or(0);
+        let n = (p4 as usize).min(65536);
+        if n >= 2 && p6 != 0 && p8 != 0 {
+            let in_mask: u32 = if p5 == 0 { 0 } else { ((1u64 << p5) - 1) as u32 };
+            let out_bits = p5 + 4;
+            let out_mask: u32 = if out_bits >= 32 {
+                0xFFFF_FFFF
+            } else {
+                ((1u64 << out_bits) - 1) as u32
+            };
+            let mut inp = vec![0u32; n];
+            let mut outp = vec![0u32; n];
+            let ok_in = hipMemcpyDtoH(inp.as_mut_ptr() as _, hipDeviceptr_t(p6 as _), n * 4).is_ok();
+            let ok_out = hipMemcpyDtoH(outp.as_mut_ptr() as _, hipDeviceptr_t(p8 as _), n * 4).is_ok();
+            if ok_in && ok_out {
+                let in_viol = inp
+                    .windows(2)
+                    .filter(|w| (w[1] & in_mask) < (w[0] & in_mask))
+                    .count();
+                let out_viol = outp
+                    .windows(2)
+                    .filter(|w| (w[1] & out_mask) < (w[0] & out_mask))
+                    .count();
+                if out_viol > 0 {
+                    static PSEQ: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let ps = PSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let verdict = if in_viol == 0 {
+                        "THIS scatter pass broke it (input clean, output unsorted)"
+                    } else {
+                        "came in already broken (upstream of this bit)"
+                    };
+                    super::driver::zluda_log_err(&format!(
+                        "*** NRSS_PASS #{} bit={} n={} p6=0x{:x} p8=0x{:x} in_viol={} out_viol={} grid={} => {}",
+                        ps, p5, n, p6, p8, in_viol, out_viol, grid_x, verdict
+                    ));
+                }
+            }
+        }
+        return;
+    }
+    if p5 != 28 {
         return;
     }
     let p4: u32 = read_kernel_arg(kernel_params, extra, 20, 4).unwrap_or(0);
