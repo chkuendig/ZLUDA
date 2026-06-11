@@ -323,15 +323,6 @@ extern "C"
     // The warp end ID is the max lane ID for a specific mode. For the CUDA __shfl_sync
     // intrinsics, it is always 31 for idx, bfly, and down, and 0 for up. This is used for the
     // bounds check.
-// LLVM 19 removed the __builtin_amdgcn_wwm / strict_wwm clang builtins;
-// access the intrinsic directly. strict.wwm runs its argument's
-// computation with all lanes of the wave active, so a cross-lane
-// ds_bpermute reading an EXEC-off source lane still gets that lane's VGPR
-// (matching NVIDIA's lockstep warp-shuffle semantic). See
-// shfl_up_upper_half_active repro / reference_shfl_translation_layers.
-extern "C" __attribute__((device, convergent)) int32_t
-__zluda_strict_wwm_i32(int32_t) __asm("llvm.amdgcn.strict.wwm.i32");
-
 #define SHFL_SYNC_IMPL(mode, calculate_index, CMP)                                                                                              \
     ShflSyncResult FUNC(shfl_sync_##mode##_b32_pred)(uint32_t input, int32_t delta, uint32_t opts, uint32_t membermask __attribute__((unused))) \
     {                                                                                                                                           \
@@ -346,8 +337,7 @@ __zluda_strict_wwm_i32(int32_t) __asm("llvm.amdgcn.strict.wwm.i32");
         {                                                                                                                                       \
             idx = self;                                                                                                                         \
         }                                                                                                                                       \
-        int32_t output = __zluda_strict_wwm_i32(                                                                                                 \
-            __builtin_amdgcn_ds_bpermute(idx << 2, (int32_t)input));                                                                            \
+        int32_t output = __builtin_amdgcn_ds_bpermute(idx << 2, (int32_t)input);                                                                \
         return {(uint32_t)output, uint32_t(!out_of_bounds)};                                                                                    \
     }                                                                                                                                           \
                                                                                                                                                 \
