@@ -2650,7 +2650,7 @@ fn compile_in_subprocess(
         // worker thread is sound (ForkChildSend at module scope).
         let payload = ForkChildSend(llvm_module, gcn_arch_owned, out_path, compile_n);
         let handle = std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
+            .stack_size(2usize * 1024 * 1024 * 1024)
             .spawn(move || -> i32 {
                 // Force whole-struct capture (Rust 2021 disjoint captures
                 // would otherwise capture the non-Send Module field directly,
