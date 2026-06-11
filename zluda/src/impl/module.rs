@@ -2608,6 +2608,12 @@ fn compile_and_cache(
     Ok((elf_module, sm_version))
 }
 
+/// Send wrapper so the forked child's compile can run on a large-stack
+/// worker thread. Sound because the freshly-forked child is single-threaded
+/// and only the one worker touches these raw LLVM pointers.
+struct ForkChildSend(ptx::Module, String, String, u32);
+unsafe impl Send for ForkChildSend {}
+
 #[allow(dead_code)]
 fn compile_in_subprocess(
     gcn_arch: &str,
@@ -2626,29 +2632,62 @@ fn compile_in_subprocess(
         return Err(CUerror::UNKNOWN);
     }
     if pid == 0 {
-        // Child process — do the compilation
-        let hook = move |data: &Vec<u8>, name: String| dump_compile_artifact(compile_n, data, name);
-        let result = llvm_zluda::compile(
-            &llvm_module.context,
-            gcn_arch,
-            llvm_module.llvm_ir,
-            ptx_impl,
-            llvm_module.attributes_ir,
-            llvm_module.metadata,
-            Some(&hook),
-        );
-        match result {
-            Ok(elf_module) => {
-                if let Ok(mut f) = std::fs::File::create(&output_path) {
-                    let _ = f.write_all(&elf_module);
+        // Child process — do the compilation on a LARGE-STACK thread.
+        //
+        // The AMDGPU backend has recursive passes (e.g. SIPreAllocateWWMRegs,
+        // and loadRegFromStackSlot) that OVERFLOW the default 8 MB stack on
+        // very large kernels — notably the FleX `simulateCloths` kernel
+        // (~80k PTX lines, hundreds of shfl/WWM regions): it SIGSEGVs the
+        // compile, the module fails to load, and the game dies at startup.
+        // A 256 MB stack compiles it cleanly (2 GB verified; 256 MB is ample
+        // headroom). Running on a spawned thread is the portable way to set
+        // a per-compile stack size. The forked-subprocess isolation above
+        // still protects the game from any genuine compiler abort().
+        let gcn_arch_owned = gcn_arch.to_string();
+        let out_path = output_path.clone();
+        // llvm_module holds raw LLVM pointers (not Send), but we are the only
+        // thread in this freshly-forked child, so moving it into the one
+        // worker thread is sound (ForkChildSend at module scope).
+        let payload = ForkChildSend(llvm_module, gcn_arch_owned, out_path, compile_n);
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || -> i32 {
+                // Force whole-struct capture (Rust 2021 disjoint captures
+                // would otherwise capture the non-Send Module field directly,
+                // defeating ForkChildSend's Send impl).
+                let payload = payload;
+                let ForkChildSend(llvm_module, gcn_arch_owned, out_path, compile_n) = payload;
+                let ptx_impl = llvm_module.linked_bitcode();
+                let hook = move |data: &Vec<u8>, name: String| {
+                    dump_compile_artifact(compile_n, data, name)
+                };
+                let result = llvm_zluda::compile(
+                    &llvm_module.context,
+                    &gcn_arch_owned,
+                    llvm_module.llvm_ir,
+                    ptx_impl,
+                    llvm_module.attributes_ir,
+                    llvm_module.metadata,
+                    Some(&hook),
+                );
+                match result {
+                    Ok(elf_module) => {
+                        if let Ok(mut f) = std::fs::File::create(&out_path) {
+                            let _ = f.write_all(&elf_module);
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        let _ = std::fs::write(&out_path, format!("ERROR: {:?}", e));
+                        1
+                    }
                 }
-                unsafe { libc::_exit(0) };
-            }
-            Err(e) => {
-                let _ = std::fs::write(&output_path, format!("ERROR: {:?}", e));
-                unsafe { libc::_exit(1) };
-            }
-        }
+            });
+        let code = match handle {
+            Ok(h) => h.join().unwrap_or(1),
+            Err(_) => 1,
+        };
+        unsafe { libc::_exit(code) };
     }
     // Parent process — wait for child
     super::driver::zluda_log(&format!(
