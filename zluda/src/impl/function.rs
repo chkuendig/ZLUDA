@@ -7411,9 +7411,50 @@ unsafe fn validate_nrss_output_after_launch(
             .unwrap_or(0);
         let lo = first.saturating_sub(3);
         let hi = (first + 5).min(n);
+        // LOCALIZATION (2026-06-11): also read the INPUT to this final pass
+        // (p6) and check the invariant the first 7 passes must have
+        // established — keys sorted by the low 28 bits (mask 0x0FFFFFFF).
+        //   in_lo28_sorted == true  -> the input to the bit-28 pass was
+        //     correct; THIS StepKernel launch turned correct input into
+        //     wrong output => the radix-sort kernel itself is the corrupter
+        //     at the final pass (our codegen / a kernel bug — read its ISA).
+        //   in_lo28_sorted == false -> corruption is UPSTREAM of the final
+        //     pass (an earlier pass, or an external kernel wrote into these
+        //     buffers between launches) => walk back / hunt the writer.
+        // Also flag wild values (a foreign scatter would leave non-key
+        // bit-patterns) vs a clean permutation that's merely mis-ordered.
+        let p6: u64 = read_kernel_arg(kernel_params, extra, 32, 6).unwrap_or(0);
+        let (in_lo28_viol, in_first, in_window): (i64, i64, Vec<u32>) = if p6 != 0 {
+            let mut inp = vec![0u32; n];
+            if hipMemcpyDtoH(inp.as_mut_ptr() as _, hipDeviceptr_t(p6 as _), n * 4).is_ok() {
+                let mask = 0x0FFF_FFFFu32;
+                let v = inp
+                    .windows(2)
+                    .filter(|w| (w[1] & mask) < (w[0] & mask))
+                    .count() as i64;
+                let f = inp
+                    .windows(2)
+                    .position(|w| (w[1] & mask) < (w[0] & mask))
+                    .map(|x| x as i64)
+                    .unwrap_or(-1);
+                let wlo = f.max(0) as usize;
+                let w = inp[wlo..(wlo + 6).min(n)].to_vec();
+                (v, f, w)
+            } else {
+                (-1, -1, Vec::new())
+            }
+        } else {
+            (-1, -1, Vec::new())
+        };
+        let verdict = match in_lo28_viol {
+            0 => "INPUT-OK => final bit28 pass corrupted (kernel-internal)",
+            v if v > 0 => "INPUT-CORRUPT => upstream of final pass (earlier pass or external writer)",
+            _ => "input-unread",
+        };
         super::driver::zluda_log_err(&format!(
-            "*** NRSS_VALIDATE #{} CORRUPT n={} p8=0x{:x} violations={} first_at={} window={:x?}",
-            seq, n, p8, viol, first, &keys[lo..hi]
+            "*** NRSS_VALIDATE #{} CORRUPT n={} p8=0x{:x} violations={} first_at={} window={:x?} | p6=0x{:x} in_lo28_viol={} in_first={} in_window={:x?} | {}",
+            seq, n, p8, viol, first, &keys[lo..hi],
+            p6, in_lo28_viol, in_first, in_window, verdict
         ));
         // Dump the last 32 NRSS launches (the corrupt sort's own 24 + tail
         // of the previous one) for arg-consistency analysis.
