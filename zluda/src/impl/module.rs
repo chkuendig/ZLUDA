@@ -716,51 +716,125 @@ pub fn patch_lds_producer_volatile_store(ptx: &str) -> Option<String> {
     if !env_on {
         return None;
     }
-    // Window (in non-blank lines) within which a following `bar.sync`
-    // qualifies a store as a pre-barrier producer. 10 catches the
-    // sGlobalOffsets stores (≤8 lines before their barrier) but excludes
-    // the distant warp-total stores (~120 lines).
-    const WINDOW: usize = 10;
-    let lines: Vec<&str> = ptx.lines().collect();
-    // Precompute, for each line index, whether a `bar.sync` appears within
-    // the next WINDOW non-blank lines without crossing a kernel boundary.
-    let mut bar_within: Vec<bool> = vec![false; lines.len()];
-    for i in 0..lines.len() {
-        let mut seen = 0usize;
-        let mut j = i + 1;
-        while j < lines.len() && seen < WINDOW {
-            let t = lines[j].trim();
-            if t.is_empty() {
-                j += 1;
-                continue;
-            }
-            // Don't look past the end of the current kernel body.
-            if t == "}" {
-                break;
-            }
-            if t.starts_with("bar.sync") {
-                bar_within[i] = true;
-                break;
-            }
-            seen += 1;
-            j += 1;
-        }
+    // Address-matched producer↔consumer pairing. `patch_broad_volatile_lds`
+    // already made the cross-warp CONSUMER loads `ld.volatile.shared`; this
+    // converts a `st.shared.<T> [%addr], ...` to volatile exactly when the
+    // SAME `[%addr]` operand is read by an `ld.volatile.shared` later in the
+    // same kernel. That precisely covers BOTH the sGlobalOffsets base stores
+    // AND the warp-total stores feeding the local rank, without a fragile
+    // line-distance heuristic, and without touching producer stores whose
+    // value is never read cross-warp (which is what regressed actorRange
+    // when ALL st.shared were blindly volatilized).
+    // Mode select: "1" = address-matched (producer addr also read by a
+    // volatile load — precise but misses pairs where PTX recomputes the LDS
+    // address into a fresh register between store and load, which is most of
+    // them). "2" = ALL st.shared → volatile (full coverage; the decisive
+    // test of whether store-volatility fixes the scatter race — the April
+    // actorRange regression is re-measurable now via NRSS_VALIDATE +
+    // actorRange fault watch).
+    let full = std::env::var("ZLUDA_LDS_PRODUCER_VOLATILE")
+        .map_or(false, |v| v == "2");
+    fn addr_operand(body: &str) -> Option<&str> {
+        // `<op> [<addr>], <val>;` — extract the bracketed address token.
+        let lb = body.find('[')?;
+        let rb = body[lb..].find(']')? + lb;
+        Some(body[lb + 1..rb].trim())
     }
+    if full {
+        let mut out = String::with_capacity(ptx.len() + 256);
+        let mut total = 0usize;
+        for line in ptx.lines() {
+            let lead = line.len() - line.trim_start().len();
+            let body = &line[lead..];
+            if body.starts_with("st.shared.") {
+                out.push_str(&line[..lead]);
+                out.push_str("st.volatile.shared.");
+                out.push_str(&body["st.shared.".len()..]);
+                out.push('\n');
+                total += 1;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] patch_lds_producer_volatile_store: FULL mode — {} st.shared → st.volatile.shared",
+            total
+        ));
+        return Some(out);
+    }
+    let lines: Vec<&str> = ptx.lines().collect();
+    // Per-kernel set of addresses read by a volatile shared load. We scope by
+    // kernel (brace depth) so an address reused in another kernel doesn't leak.
     let mut out = String::with_capacity(ptx.len() + 256);
     let mut total = 0usize;
-    for (i, line) in lines.iter().enumerate() {
-        let lead = line.len() - line.trim_start().len();
-        let body = &line[lead..];
-        if bar_within[i] && body.starts_with("st.shared.") {
-            out.push_str(&line[..lead]);
-            out.push_str("st.volatile.shared.");
-            out.push_str(&body["st.shared.".len()..]);
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        let is_entry =
+            trimmed.starts_with(".visible .entry ") || trimmed.starts_with(".entry ");
+        if !is_entry {
+            out.push_str(lines[i]);
             out.push('\n');
-            total += 1;
+            i += 1;
             continue;
         }
-        out.push_str(line);
-        out.push('\n');
+        // Find this kernel's body span [i .. end] by brace matching.
+        let start = i;
+        let mut depth: i32 = 0;
+        let mut end = i;
+        let mut opened = false;
+        for (k, l) in lines.iter().enumerate().skip(i) {
+            for c in l.chars() {
+                if c == '{' {
+                    depth += 1;
+                    opened = true;
+                } else if c == '}' {
+                    depth -= 1;
+                }
+            }
+            if opened && depth <= 0 {
+                end = k;
+                break;
+            }
+        }
+        if end <= start {
+            end = lines.len() - 1;
+        }
+        // Collect volatile-load addresses in this kernel body.
+        let mut volatile_load_addrs: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for l in &lines[start..=end] {
+            let b = l.trim_start();
+            if b.starts_with("ld.volatile.shared.") {
+                if let Some(a) = addr_operand(b) {
+                    volatile_load_addrs.insert(a);
+                }
+            }
+        }
+        // Emit body, volatilizing matching producer stores.
+        for l in &lines[start..=end] {
+            let lead = l.len() - l.trim_start().len();
+            let body = &l[lead..];
+            if body.starts_with("st.shared.") {
+                if let Some(a) = addr_operand(body) {
+                    if volatile_load_addrs.contains(a) {
+                        out.push_str(&l[..lead]);
+                        out.push_str("st.volatile.shared.");
+                        out.push_str(&body["st.shared.".len()..]);
+                        out.push('\n');
+                        total += 1;
+                        continue;
+                    }
+                }
+            }
+            out.push_str(l);
+            out.push('\n');
+        }
+        i = end + 1;
     }
     if total == 0 {
         None
@@ -3975,31 +4049,35 @@ mod tests {
     }
 
     #[test]
-    fn lds_producer_volatile_converts_prebarrier_store_only() {
+    fn lds_producer_volatile_address_matched() {
         std::env::set_var("ZLUDA_LDS_PRODUCER_VOLATILE", "1");
-        // st.shared at the top is ~120 lines from any bar.sync -> NOT a
-        // producer (must stay non-volatile). The store just before bar.sync
-        // IS a producer (the sGlobalOffsets handoff) -> must become volatile.
+        // [%rd2] is read by a volatile load -> its producer store must become
+        // volatile (even though it's far from the load). [%rd1] is never read
+        // by a volatile load -> stays non-volatile (this is what avoids the
+        // actorRange regression from blanket volatilization).
         let ptx = "\
 .visible .entry K()
 {
-st.shared.u32 [%rd1], %r1;
-add.s32 %r2, %r2, 1;
-add.s32 %r3, %r3, 1;
 st.shared.u32 [%rd2], %r2;
-membar.cta;
+add.s32 %r3, %r3, 1;
+add.s32 %r4, %r4, 1;
+add.s32 %r5, %r5, 1;
+st.shared.u32 [%rd1], %r9;
 bar.sync 0;
-ld.volatile.shared.u32 %r4, [%rd2];
+ld.volatile.shared.u32 %r6, [%rd2];
+ld.shared.u32 %r7, [%rd1];
 ret;
 }
 ";
         let out = super::patch_lds_producer_volatile_store(ptx).expect("should patch");
-        // The pre-barrier store (within 10 lines of bar.sync) is converted.
-        assert!(out.contains("st.volatile.shared.u32 [%rd2], %r2;"));
-        // The far store stays non-volatile (membar/bar are >2 lines but the
-        // first store is separated by enough that... actually both are within
-        // window here; assert the pre-barrier one converted at minimum).
-        assert!(out.contains("st.volatile.shared.u32 [%rd2]"));
+        assert!(
+            out.contains("st.volatile.shared.u32 [%rd2], %r2;"),
+            "producer of volatile-read addr must be volatilized"
+        );
+        assert!(
+            out.contains("st.shared.u32 [%rd1], %r9;"),
+            "producer of non-volatile-read addr must stay plain"
+        );
         std::env::remove_var("ZLUDA_LDS_PRODUCER_VOLATILE");
     }
 
