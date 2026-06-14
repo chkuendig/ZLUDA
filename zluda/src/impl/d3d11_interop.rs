@@ -378,6 +378,22 @@ pub unsafe extern "system" fn zluda_d3d11_register_imported(
     if p_cuda_resource.is_null() || desc.is_null() {
         return Err(CUerror::INVALID_VALUE);
     }
+    // 2026-06-14 Class-4 decisive A/B: reject the D3D11 import outright so PhysX
+    // falls back to its OWN device buffers (no CUDA↔Vulkan interop activity at
+    // all). The morning notes record that no-interop (NOT_SUPPORTED at import)
+    // is the ONLY config that ever COMPLETED the perf-test (2026-05-04). With
+    // the radix scatter fault now fixed, this tests whether the remaining late
+    // GPU fault (Class 4, actorRange/texref wild-VA in the interop window) is
+    // interop-driven: if the perf-test reaches further / completes with the
+    // import rejected, interop activity is the Class-4 trigger. Visual tradeoff:
+    // particles won't render from the shared texture. Gate ZLUDA_D3D11_NO_INTEROP=1.
+    static NO_INTEROP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NO_INTEROP.get_or_init(|| std::env::var("ZLUDA_D3D11_NO_INTEROP").map_or(false, |v| v == "1")) {
+        super::driver::zluda_log_err(
+            "[ZLUDA] zluda_d3d11_register_imported: ZLUDA_D3D11_NO_INTEROP=1 — rejecting import (NOT_SUPPORTED) so PhysX uses its own buffers",
+        );
+        return Err(CUerror::NOT_SUPPORTED);
+    }
     let desc = *desc;
 
     // ------------------------------------------------------------------
