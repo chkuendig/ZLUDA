@@ -97,12 +97,17 @@ struct Ms4CaptureSlot {
     shape_idx_bytes: u32, // 84
     struct_bytes: u32,    // 88
     counter_bytes: u32,   // 92
-    _pad1: [u8; 32],      // 96..=127
+    scatter_bytes: u32,   // 96 — bytes of the POST-launch scatter output (param4)
+    _pad1: [u8; 28],      // 100..=127
     // Data regions (aligned at 128)
     flags_data: [u8; MS4_PARTICLE_REGION_BYTES],
     shape_idx_data: [u8; MS4_PARTICLE_REGION_BYTES],
     struct_data: [u8; MS4_STRUCT_REGION_BYTES],
     counter_data: [u8; MS4_COUNTER_REGION_BYTES],
+    // 2026-06-14 Phase B1: MS_4's SCATTER OUTPUT (param4, the particle-index
+    // list). Captured POST-launch (it is written BY the kernel) to settle
+    // whether the GPU scatter is correct given the (proven-correct) inputs.
+    scatter_data: [u8; MS4_PARTICLE_REGION_BYTES],
 }
 
 const MS4_SLOT_SIZE: usize = std::mem::size_of::<Ms4CaptureSlot>();
@@ -223,9 +228,9 @@ unsafe fn capture_ms4_inputs(
     extra: *mut *mut ::core::ffi::c_void,
     grid_x: u32,
     block_x: u32,
-) {
+) -> Option<usize> {
     if !ms4_capture_enabled() {
-        return;
+        return None;
     }
 
     let flags_ptr: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
@@ -242,7 +247,7 @@ unsafe fn capture_ms4_inputs(
         || shape_idx_ptr == 0
         || counter_ptr == 0
     {
-        return;
+        return None;
     }
 
     let mut guard = match MS4_CAPTURE.lock() {
@@ -252,7 +257,7 @@ unsafe fn capture_ms4_inputs(
     ms4_capture_init(&mut guard);
     let state = match guard.as_mut() {
         Some(s) => s,
-        None => return, // init failed; it already logged
+        None => return None, // init failed; it already logged
     };
 
     let slot_index = (state.launch_counter as usize) % MS4_CAPTURE_SLOTS;
@@ -266,7 +271,7 @@ unsafe fn capture_ms4_inputs(
     let struct_bytes = MS4_STRUCT_REGION_BYTES;
     let counter_bytes = MS4_COUNTER_REGION_BYTES;
     if flags_bytes > MS4_PARTICLE_REGION_BYTES {
-        return;
+        return None;
     }
 
     // Compute offsets into the slot. The slot struct is repr(C), so we can
@@ -291,6 +296,10 @@ unsafe fn capture_ms4_inputs(
     (*slot_host).shape_idx_bytes = shape_idx_bytes as u32;
     (*slot_host).struct_bytes = struct_bytes as u32;
     (*slot_host).counter_bytes = counter_bytes as u32;
+    // scatter output (param4) is copied POST-launch by capture_ms4_output_post;
+    // pre-set the byte count here (num_particles u32 entries) and zero the region
+    // so an un-refreshed slot is obviously empty.
+    (*slot_host).scatter_bytes = (num_particles as usize * 4).min(MS4_PARTICLE_REGION_BYTES) as u32;
 
     // Device-to-device copies into the corresponding data regions of this
     // slot. Use std::mem::offset_of when stable, else hand-compute using
@@ -489,6 +498,55 @@ unsafe fn capture_ms4_inputs(
             }
         }
     }
+    Some(slot_index)
+}
+
+/// Called from launch_kernel AFTER hipModuleLaunchKernel for MS_4. Copies the
+/// SCATTER OUTPUT (param4 — the particle-index list the kernel just wrote) into
+/// the slot `capture_ms4_inputs` returned. D2D into host-mapped memory (the
+/// same race-safe path the input capture uses), then a device sync so the
+/// CPU-visible alias is coherent for the post-mortem dump. Lets Phase B decide
+/// GPU-vs-host: spec-sim the (proven-correct) inputs and compare to this output.
+unsafe fn capture_ms4_output_post(
+    slot_index: usize,
+    scatter_ptr: u64,
+    num_particles: u32,
+    _stream: hipStream_t,
+) {
+    if scatter_ptr == 0 || num_particles == 0 {
+        return;
+    }
+    let guard = match MS4_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+    let scatter_bytes =
+        (num_particles as usize * 4).min(MS4_PARTICLE_REGION_BYTES);
+    // scatter_data region is the LAST region in the slot:
+    // 128(header) + 2*PARTICLE + STRUCT + COUNTER.
+    let scatter_off = 128usize
+        + MS4_PARTICLE_REGION_BYTES
+        + MS4_PARTICLE_REGION_BYTES
+        + MS4_STRUCT_REGION_BYTES
+        + MS4_COUNTER_REGION_BYTES;
+    let slot_dev_base = (state.dev_ptr as usize + slot_index * MS4_SLOT_SIZE) as *mut u8;
+    let _ = hipMemcpyDtoD(
+        hipDeviceptr_t(slot_dev_base.add(scatter_off) as _),
+        hipDeviceptr_t(scatter_ptr as _),
+        scatter_bytes,
+    );
+    // NO per-launch hipDeviceSynchronize here: capture_ms4_inputs already does one
+    // device sync per MS_4 launch, and the NEXT launch's input-capture sync drains
+    // this DtoD before the buffer can be reused. Adding a 2nd full sync per launch
+    // roughly halved benchmark throughput and made the run miss the crash window.
+    // The crash-relevant MS_4 output is consumed several launches before the host
+    // SIGSEGV, so prior slots are always drained; only the very last slot may be
+    // in-flight at crash time (acceptable — the ring holds 32).
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 // ============================================================================
@@ -14211,11 +14269,14 @@ pub(crate) fn launch_kernel(
     }
 
     // MS_4 capture — ALL gated behind ZLUDA_MS4_CAPTURE=1
+    // (slot, scatter_ptr=param4, num_particles) threaded to the post-launch
+    // output capture below; mirrors the iofx_actor_range_slot pattern.
+    let mut ms4_output_capture: Option<(usize, u64, u32)> = None;
     if name.contains("CreateParticleShapesIncremental_MultiStage_4") {
         static MS4_CAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *MS4_CAP.get_or_init(|| std::env::var("ZLUDA_MS4_CAPTURE").map_or(false, |v| v == "1")) {
             unsafe {
-                capture_ms4_inputs(kernel_params, extra, grid_dim_x, block_dim_x);
+                let slot = capture_ms4_inputs(kernel_params, extra, grid_dim_x, block_dim_x);
                 latch_counter_ptr_from_ms4(kernel_params, extra);
                 let p3: u32 = read_kernel_arg(kernel_params, extra, 24, 3).unwrap_or(0);
                 let p2: u64 = read_kernel_arg(kernel_params, extra, 16, 2).unwrap_or(0);
@@ -14223,6 +14284,11 @@ pub(crate) fn launch_kernel(
                 let p5: u64 = read_kernel_arg(kernel_params, extra, 40, 5).unwrap_or(0);
                 let p6: u64 = read_kernel_arg(kernel_params, extra, 48, 6).unwrap_or(0);
                 let p7: u64 = read_kernel_arg(kernel_params, extra, 56, 7).unwrap_or(0);
+                if let Some(s) = slot {
+                    // SCATTER OUTPUT is param5 (PTX: st.global [cvta(param5)+r10*4]).
+                    // param4 (p4) is the struct/base table — NOT the output.
+                    ms4_output_capture = Some((s, p5, p3));
+                }
                 super::driver::zluda_log_err(&format!(
                     "[MS4_ARGS] grid={} block={} N={} p2=0x{:x} p4=0x{:x} p5=0x{:x} p6=0x{:x} p7=0x{:x}",
                     grid_dim_x, block_dim_x, p3, p2, p4, p5, p6, p7,
@@ -14932,6 +14998,15 @@ pub(crate) fn launch_kernel(
                 let _ = hipStreamSynchronize(stream);
             },
             _ => {}
+        }
+    }
+    // 2026-06-14 Phase B1: capture MS_4's SCATTER OUTPUT (param4) AFTER the
+    // kernel ran, into the slot capture_ms4_inputs reserved. This is the one
+    // untested GPU-side path for the Class-B host NULL-deref: spec-sim the
+    // (proven-correct) inputs and compare to this output (Phase B2).
+    if let Some((slot, scatter_ptr, np)) = ms4_output_capture.filter(|_| result.is_ok()) {
+        unsafe {
+            capture_ms4_output_post(slot, scatter_ptr, np, stream);
         }
     }
     // Translate HIP error 719 (LaunchFailure) → LaunchOutOfResources.

@@ -299,15 +299,25 @@ extern "C"
     int32_t __ockl_wgred_and_i32(int32_t) __device__;
     int32_t __ockl_wgred_or_i32(int32_t) __device__;
 
-    // Whole-wave-mode wrapper for ds_bpermute. AMD's ds_bpermute reads 0 for
-    // source lanes whose EXEC bit is clear (diverged-off), whereas NVIDIA's
-    // shfl reads the source lane's physical register regardless of activity.
-    // CUB pre-Volta warp-synchronous code (radix-sort local-rank scan) relies
-    // on the NVIDIA lockstep behaviour. Wrapping the bpermute in
-    // llvm.amdgcn.strict.wwm forces EXEC=-1 across the permute so inactive
-    // source lanes contribute their real register value. The backend extends
-    // the WWM region (s_or_saveexec -1 ... s_mov exec) to cover the bpermute.
-    // See handover_iofx_nrss_rootcause_fixed_2026_06_11.md.
+    // Whole-wave-mode wrapper for ds_bpermute.
+    //
+    // PROVEN (AMD GPUOpen, "AMD GCN Assembly Cross-Lane Operations"): ds_permute/
+    // ds_bpermute "Lanes disabled by the EXEC mask are also invalid locations from
+    // which to read values" and "All active lanes read data from the temporary
+    // buffer, with uninitialized locations considered to be zero valued" — i.e. a
+    // source lane whose EXEC bit is clear contributes 0.
+    // (https://gpuopen.com/learn/amd-gcn-assembly-cross-lane-operations/)
+    //
+    // CUB's pre-Volta warp-synchronous code (the radix-sort local-rank scan) was
+    // written for warp-lockstep semantics where the source lane's value is read
+    // regardless of branch divergence. On AMD, lanes diverged-off before the shfl
+    // would read 0 (per the above) and corrupt the scan. We do NOT assert NVIDIA's
+    // exact inactive-lane behaviour here; the FIX is mechanism-complete on its own:
+    // wrapping the bpermute in llvm.amdgcn.strict.wwm forces EXEC=-1 across the
+    // permute so there are NO inactive source lanes — every lane contributes its
+    // real register value, sidestepping the documented zero-return. The backend
+    // extends the WWM region (s_or_saveexec -1 ... s_mov exec) to cover the
+    // bpermute. See handover_iofx_nrss_rootcause_fixed_2026_06_11.md.
     extern "C" __attribute__((device, convergent)) int32_t
         __zluda_strict_wwm_i32(int32_t) __asm("llvm.amdgcn.strict.wwm.i32");
 

@@ -1450,20 +1450,27 @@ pub fn patch_radix_sort_branchless_oob_load(ptx: &str) -> Option<String> {
 ///     JOIN: ...                  // %dst then feeds the shfl.up warp scan
 /// ```
 ///
-/// ZLUDA miscompiles this divergent control flow on AMDGPU: lanes that take the
-/// `mov 0` (false) path end up with GARBAGE in `%dst` rather than 0. This was
-/// confirmed with per-lane dumps on the deterministic `nrss_replay` repro: the
-/// predicate evaluates correctly (`%p`=0 for the OOB lanes) yet the merged
-/// value at the join is non-zero garbage that varies per run. The garbage flows
+/// PROVEN BEHAVIOUR (measured, no cross-vendor assumption): on AMDGPU/gfx1033
+/// the lanes that take the `mov 0` (false) path end up with GARBAGE in `%dst`
+/// rather than 0. Measured directly with per-lane dumps on the deterministic
+/// `nrss_replay` repro: the predicate evaluates correctly (`%p`=0 for the OOB
+/// lanes), the OOB lanes provably take the false path, yet the value read back
+/// after the join is non-zero garbage that varies per run. The garbage flows
 /// through the warp scan into the per-block scatter LOCAL RANK, producing a wild
 /// scatter destination (`sGlobalOffsets[digit] + garbage_rank`) → GPU page fault
-/// on ANY partial tile (`n % tile != 0`). NVIDIA's lockstep warp execution
-/// zeroes the inactive lanes, so the bug is invisible on the original hardware.
+/// on ANY partial tile (`n % tile != 0`). The precise LLVM-AMDGPU defect that
+/// fails to preserve the false-path register definition across reconvergence is
+/// NOT pinned here; what IS proven is the measured garbage above and that the
+/// branchless rewrite below eliminates it (lab `nrss_replay` 0/60, in-game the
+/// `Memory access fault by GPU` no longer recurs). Whether NVIDIA hides this is
+/// not claimed — only the AMD-side behaviour was measured.
 ///
 /// FIX: rewrite the idiom branchlessly. An LDS read past the live region returns
 /// on-chip data and never faults, so load unconditionally and `selp` the OOB
-/// lanes back to 0 — semantically identical to the branch, but with no divergent
-/// control flow for the backend to miscompile:
+/// lanes back to 0 — semantically identical to the branch but with NO divergent
+/// control flow. Confirmed in the compiled ISA: the `selp` lowers to a straight-
+/// line `v_cndmask_b32_e64 vN, vN, 0, <pred>` predicated select (every lane
+/// executes it; no branch, no EXEC-masked register def to mis-preserve):
 ///
 /// ```text
 ///     setp.lt.u32 %p, %warpIdx, %numWarps;
