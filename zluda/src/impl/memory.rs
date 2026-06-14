@@ -1037,6 +1037,17 @@ pub(crate) unsafe fn free_v2(dptr: hipDeviceptr_t) -> CUresult {
             ));
         }
     }
+    // 2026-06-15 Class-4 texref use-after-free probe (ZLUDA_TEXREF_UAF_DETECT=1):
+    // warn when freeing a buffer that is still texref-bound. A dangling texref SRD
+    // → a later bbox tex.1d sample dereferences unmapped memory → the page-not-
+    // present GPU fault. (Buffer-keyed; may false-positive if the buffer was
+    // unbound before free — correlate hits against the bbox texref_src_ptr.)
+    if let Some((base, size)) = super::tex::texref_bound_lookup(dptr.0 as u64) {
+        super::driver::zluda_log_err(&format!(
+            "*** FREE-OF-TEXREF-BOUND-BUFFER dptr={:#x} bound_base={:#x} bound_size={}",
+            dptr.0 as u64, base, size
+        ));
+    }
     let hip_result = hipFree(dptr.0);
     untrack_dev_alloc(dptr.0 as u64);
     remove_allocation(dptr.0)?;

@@ -181,6 +181,50 @@ unsafe fn texref_post_sync_if_enabled(dptr: u64, bytes: usize) {
     super::stream::clear_dirty_flag_after_device_sync();
 }
 
+// 2026-06-15 Class-4 use-after-free probe. The Class-4 GPU fault is a
+// page-NOT-PRESENT at a wild VA with last kernel IOFX_bboxKernel, which SAMPLES
+// positions via a texref (tex.1d → ptr->textureObject SRD). Every captured
+// kernel INPUT is clean, so the wild VA is a stale DESCRIPTOR: the prime
+// suspect is a texref-bound buffer being cuMemFree'd (unmapped) WITHOUT
+// unbinding the texref → a later bbox sample dereferences the dangling SRD →
+// page-not-present fault. free_v2 does NOT check texref bindings. This gated
+// registry (ZLUDA_TEXREF_UAF_DETECT=1) records bound buffer ranges so free_v2
+// can WARN when freeing one. Read-only diagnostic; no behaviour change.
+static TEXREF_BOUND_BUFS: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> =
+    std::sync::Mutex::new(None);
+
+fn texref_uaf_detect_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("ZLUDA_TEXREF_UAF_DETECT").map_or(false, |v| v == "1"))
+}
+pub(crate) fn texref_track_bind(base: u64, size: usize) {
+    if !texref_uaf_detect_enabled() || base == 0 {
+        return;
+    }
+    let mut g = TEXREF_BOUND_BUFS.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(Default::default).insert(base, size);
+}
+pub(crate) fn texref_untrack_bind(base: u64) {
+    if !texref_uaf_detect_enabled() {
+        return;
+    }
+    let mut g = TEXREF_BOUND_BUFS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(m) = g.as_mut() {
+        m.remove(&base);
+    }
+}
+/// Some((base,size)) if `addr` falls inside a currently texref-bound buffer.
+pub(crate) fn texref_bound_lookup(addr: u64) -> Option<(u64, usize)> {
+    if !texref_uaf_detect_enabled() {
+        return None;
+    }
+    let g = TEXREF_BOUND_BUFS.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref()?
+        .iter()
+        .find(|(base, size)| addr >= **base && addr < **base + **size as u64)
+        .map(|(b, s)| (*b, *s))
+}
+
 pub(crate) unsafe fn ref_set_address_v2(
     byte_offset: *mut usize,
     h_tex_ref: CUtexref,
@@ -220,6 +264,7 @@ pub(crate) unsafe fn ref_set_address_v2(
     // matching the pattern in ref_set_array()
     sync_synthetic_texref(tex_ref);
     texref_post_sync_if_enabled(dptr.0 as u64, bytes);
+    texref_track_bind(dptr.0 as u64, bytes);
     Ok(())
 }
 
