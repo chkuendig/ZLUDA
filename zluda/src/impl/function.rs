@@ -7359,6 +7359,8 @@ unsafe fn validate_nrss_output_after_launch(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
     grid_x: u32,
+    block_x: u32,
+    shared_mem: u32,
 ) {
     // 0=off, 1=final-pass-only (whose-fault), 2=EVERY scatter pass
     // (which-pass localization: 2 D2H per phase-3 launch).
@@ -7385,6 +7387,70 @@ unsafe fn validate_nrss_output_after_launch(
         Some(v) => v,
         None => return,
     };
+    // 2026-06-12 PHASE-2 SCAN validation (root-cause bisection): read the spine
+    // (p10) RIGHT AFTER the scan, BEFORE phase-3 runs, so phase-3 can't confound
+    // the read by using p10 as scratch. A correct scan produces a monotonic
+    // non-decreasing exclusive prefix (the per-CTA-per-digit global bases). A
+    // non-monotonic spine here = Step2 (scan) / Step1 (count) is the corrupter,
+    // independent of the scatter. Gated to mode 2; only logs when broken.
+    if mode == 2 && p11 == 2 {
+        let p10s: u64 = read_kernel_arg(kernel_params, extra, 64, 10).unwrap_or(0);
+        // For phase-2 the LAUNCH grid is always 1 (single-block scan); the real
+        // CTA count being scanned (= the spine's CTA dimension) is param 12.
+        let num_ctas: u32 = read_kernel_arg(kernel_params, extra, 76, 12).unwrap_or(grid_x).max(1);
+        let g = num_ctas as usize;
+        if p10s != 0 {
+            let mut spine = vec![0u32; 16 * g];
+            if hipMemcpyDtoH(spine.as_mut_ptr() as _, hipDeviceptr_t(p10s as _), 16 * g * 4).is_ok() {
+                // Scan order is digit-major, CTA-minor: spine[d*g + c]. Check the
+                // full sequence is non-decreasing (a valid exclusive prefix sum).
+                let inversions = spine.windows(2).filter(|w| w[1] < w[0]).count();
+                if inversions > 0 {
+                    static SSEQ: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let ss = SSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if ss < 40 || ss % 50 == 0 {
+                        super::driver::zluda_log_err(&format!(
+                            "*** NRSS_SCAN_BROKEN #{} bit={} num_ctas={} block={} inversions={} spine[0]={:x} spine={:x?} => Step2 scan produced NON-MONOTONIC spine (count/scan corrupter, NOT scatter)",
+                            ss, p5, num_ctas, block_x, inversions, spine.first().copied().unwrap_or(0), spine
+                        ));
+                        // NO-OP vs MISCOMPUTE: for grid==1 the histogram == the
+                        // GLOBAL per-digit counts (computable from the input keys
+                        // p6), and the correct spine is their exclusive prefix sum.
+                        // If actual spine == raw histogram => the scan ran as
+                        // IDENTITY (no-op: didn't accumulate). If actual spine
+                        // == correct exclusive-prefix => scan fine (shouldn't
+                        // happen here). Otherwise the scan miscomputed.
+                        if g == 1 {
+                            let p6h: u64 = read_kernel_arg(kernel_params, extra, 32, 6).unwrap_or(0);
+                            let p4h: u32 = read_kernel_arg(kernel_params, extra, 20, 4).unwrap_or(0);
+                            let nn = (p4h as usize).min(65536);
+                            if p6h != 0 && nn >= 2 {
+                                let mut keys = vec![0u32; nn];
+                                if hipMemcpyDtoH(keys.as_mut_ptr() as _, hipDeviceptr_t(p6h as _), nn * 4).is_ok() {
+                                    let mut hist = [0u32; 16];
+                                    for &k in &keys { hist[((k >> p5) & 0xF) as usize] += 1; }
+                                    let mut excl = [0u32; 16];
+                                    let mut acc = 0u32;
+                                    for d in 0..16 { excl[d] = acc; acc += hist[d]; }
+                                    let eq_raw = (0..16).all(|d| spine[d] == hist[d]);
+                                    let eq_scan = (0..16).all(|d| spine[d] == excl[d]);
+                                    let verdict = if eq_raw { "SCAN IS NO-OP (spine == raw histogram; Step2 did not accumulate)" }
+                                        else if eq_scan { "scan correct?!" }
+                                        else { "scan MISCOMPUTED (spine != raw AND != correct prefix)" };
+                                    super::driver::zluda_log_err(&format!(
+                                        "*** NRSS_SCAN_DETAIL bit={} n={} hist={:x?} correct_excl={:x?} actual_spine={:x?} => {}",
+                                        p5, nn, hist, excl, &spine[..16], verdict
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
     if p11 != 3 {
         return;
     }
@@ -7409,6 +7475,178 @@ unsafe fn validate_nrss_output_after_launch(
             let mut outp = vec![0u32; n];
             let ok_in = hipMemcpyDtoH(inp.as_mut_ptr() as _, hipDeviceptr_t(p6 as _), n * 4).is_ok();
             let ok_out = hipMemcpyDtoH(outp.as_mut_ptr() as _, hipDeviceptr_t(p8 as _), n * 4).is_ok();
+            // 2026-06-12 VALUE-scatter validation: the radix sort carries a
+            // (key, value) pair; IOFX_actorRangeKernel scatters using the sorted
+            // VALUES (particle indices, param 9), NOT the keys (param 8). A run
+            // with 52/52 clean KEY validations still crashed at actorRange ⇒ the
+            // bug may be in the VALUE permutation, invisible to key checks. The
+            // sorted values must be a permutation of the input values (param 7).
+            let p7v: u64 = read_kernel_arg(kernel_params, extra, 40, 7).unwrap_or(0);
+            let p9v: u64 = read_kernel_arg(kernel_params, extra, 56, 9).unwrap_or(0);
+            if p7v != 0 && p9v != 0 {
+                let mut vin = vec![0u32; n];
+                let mut vout = vec![0u32; n];
+                let vi_ok = hipMemcpyDtoH(vin.as_mut_ptr() as _, hipDeviceptr_t(p7v as _), n * 4).is_ok();
+                let vo_ok = hipMemcpyDtoH(vout.as_mut_ptr() as _, hipDeviceptr_t(p9v as _), n * 4).is_ok();
+                if vi_ok && vo_ok {
+                    let mut svi = vin.clone();
+                    let mut svo = vout.clone();
+                    svi.sort_unstable();
+                    svo.sort_unstable();
+                    if svi != svo {
+                        let in_set: std::collections::HashSet<u32> = vin.iter().copied().collect();
+                        let foreign = vout.iter().filter(|v| !in_set.contains(v)).count();
+                        let vzeros = vout.iter().filter(|&&v| v == 0).count();
+                        static VSEQ: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        let vs = VSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        super::driver::zluda_log_err(&format!(
+                            "*** NRSS_VAL_LOSS #{} bit={} n={} grid={} block={} shmem={} p9=0x{:x} VALUES-NOT-PERM foreign={} vzeros={} vin[..6]={:x?} vout[..6]={:x?} => value-scatter corrupt (actorRange producer)",
+                            vs, p5, n, grid_x, block_x, shared_mem, p9v, foreign, vzeros,
+                            &vin[..6.min(n)], &vout[..6.min(n)]
+                        ));
+                        // One-shot capture of the failing value-scatter dataset.
+                        static VDUMP: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !VDUMP.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            let path = format!("/tmp/nrss_valcorrupt_bit{}_grid{}_n{}.bin", p5, grid_x, n);
+                            let mut blob: Vec<u8> = Vec::with_capacity((6 + 4 * n) * 4);
+                            // header v2: magic 0x4e525357, n, bit, grid, block, shmem
+                            for h in [0x4e525357u32, n as u32, p5, grid_x, block_x, shared_mem] {
+                                blob.extend_from_slice(&h.to_le_bytes());
+                            }
+                            for &k in &inp { blob.extend_from_slice(&k.to_le_bytes()); }
+                            for &k in &vin { blob.extend_from_slice(&k.to_le_bytes()); }
+                            for &k in &outp { blob.extend_from_slice(&k.to_le_bytes()); }
+                            for &k in &vout { blob.extend_from_slice(&k.to_le_bytes()); }
+                            let _ = std::fs::write(&path, &blob);
+                            super::driver::zluda_log_err(&format!(
+                                "*** NRSS_VAL_CAPTURE wrote value-scatter dataset to {} ({} bytes)",
+                                path, blob.len()
+                            ));
+                        }
+                        // 2026-06-12 PHASE-PINPOINT probe (fires on every value-loss):
+                        // (1) SPINE consistency — read p10 (the scanned global digit
+                        //     bases, layout digit*grid+ctaid). For a correct scatter the
+                        //     bases must be non-decreasing in scan order and the final
+                        //     base+count must equal n. A broken spine => phase-2 scan is
+                        //     the corrupter. A consistent spine + lost elements => phase-3
+                        //     scatter (rank/write) is the corrupter.
+                        // (2) OOB-SCATTER — read the OUTPUT key buffer's beyond-n region
+                        //     [n, n+256). If written (non-zero), the scatter computed an
+                        //     offset >= n and wrote OUT OF BOUNDS (wild write = the GPU
+                        //     fault), which ALSO removes the element from [0,n) => loss.
+                        let p10s: u64 = read_kernel_arg(kernel_params, extra, 64, 10).unwrap_or(0);
+                        let g = grid_x.max(1) as usize;
+                        let mut spine = vec![0u32; 16 * g];
+                        let spine_ok = p10s != 0
+                            && hipMemcpyDtoH(spine.as_mut_ptr() as _, hipDeviceptr_t(p10s as _), 16 * g * 4).is_ok();
+                        if spine_ok {
+                            let maxv = spine.iter().copied().max().unwrap_or(0);
+                            let over_n = spine.iter().filter(|&&v| v > n as u32).count();
+                            super::driver::zluda_log_err(&format!(
+                                "*** NRSS_SPINE bit={} grid={} n={} max={} over_n={} spine={:x?}",
+                                p5, grid_x, n, maxv, over_n, spine
+                            ));
+                        }
+                        // ROOT-CAUSE BISECTION (2026-06-12): rank-error vs spine/count-error.
+                        // Per-digit input count at THIS bit vs the spine-reserved region
+                        // size. spine layout = base[digit*grid + cta]; digit d's region
+                        // = [spine[d*grid], spine[(d+1)*grid]). If region size == input
+                        // count for every digit, the spine RESERVED exactly right => any
+                        // overflow is a LOCAL-RANK error (rank exceeds the digit's count).
+                        // If they mismatch, the count/scan (Step1/2) is the corrupter.
+                        if spine_ok {
+                            let mut in_count = [0u32; 16];
+                            for &k in &inp {
+                                in_count[((k >> p5) & 0xF) as usize] += 1;
+                            }
+                            let region = |d: usize| -> i64 {
+                                let lo = spine[d * g] as i64;
+                                let hi = if d + 1 < 16 { spine[(d + 1) * g] as i64 } else { n as i64 };
+                                hi - lo
+                            };
+                            let mut mismatches: Vec<(usize, i64, u32)> = Vec::new();
+                            for d in 0..16 {
+                                let r = region(d);
+                                if r != in_count[d] as i64 {
+                                    mismatches.push((d, r, in_count[d]));
+                                }
+                            }
+                            // Capture the FULL overflow region [n, aligned + 4*pad + slack)
+                            // and classify the overflowed elements by digit.
+                            let aligned = ((n + 127) & !127) as usize;
+                            // Read just past the aligned (tile-padded) region + a small
+                            // margin; bounded so we never read far past the allocation.
+                            let oob_words = ((aligned - n) + 256).min(4096);
+                            let mut oob = vec![0u32; oob_words];
+                            let oob_read = hipMemcpyDtoH(
+                                oob.as_mut_ptr() as _,
+                                hipDeviceptr_t((p8 + (n as u64) * 4) as _),
+                                oob_words * 4,
+                            ).is_ok();
+                            let nz = if oob_read { oob.iter().filter(|&&v| v != 0).count() } else { 0 };
+                            let mut oob_digits = [0u32; 16];
+                            if oob_read {
+                                for &k in oob.iter().filter(|&&v| v != 0) {
+                                    oob_digits[((k >> p5) & 0xF) as usize] += 1;
+                                }
+                            }
+                            // Are all OOB-element digits ones whose spine region fit in [0,n)?
+                            let oob_digits_fit = (0..16).all(|d| {
+                                oob_digits[d] == 0 || (spine[d * g] as i64 + in_count[d] as i64) <= n as i64
+                            });
+                            let verdict = if !mismatches.is_empty() {
+                                "SPINE/COUNT ERROR (region size != input count) => Step1/Step2 corrupter"
+                            } else if nz > 0 && oob_digits_fit {
+                                "LOCAL-RANK ERROR (spine reserved exactly, yet rank overflowed past digit region) => Step3 intra-CTA scan"
+                            } else if nz > 0 {
+                                "OOB but spine-region for those digits already exceeds n => mixed"
+                            } else {
+                                "no OOB (in-bounds collision only)"
+                            };
+                            super::driver::zluda_log_err(&format!(
+                                "*** NRSS_BISECT bit={} n={} oob_nz={} region_mismatches={:?} oob_digits={:?} => {}",
+                                p5, n, nz, mismatches, oob_digits, verdict
+                            ));
+                        }
+                    }
+                }
+            }
+            // 2026-06-12: on the FIRST pass (bit=0) dump the input buffer's
+            // beyond-n tail [n, ceil(n/128)*128). The radix StepKernel pads the
+            // partial final tile to 128 and its scatter over-reads this region
+            // unclamped; correctness REQUIRES these slots == 0xFFFFFFFF
+            // (sentinel). all-FF => PhysX sentinel-padded (ZLUDA bug is
+            // elsewhere); all-zero => no padding (benign-on-NVIDIA or
+            // zero-init divergence); stale keys => zero-init divergence.
+            if p5 == 0 && n % 128 != 0 {
+                let aligned = (n + 127) & !127;
+                let tail = aligned - n;
+                let mut tbuf = vec![0u32; tail];
+                if hipMemcpyDtoH(
+                    tbuf.as_mut_ptr() as _,
+                    hipDeviceptr_t((p6 + (n as u64) * 4) as _),
+                    tail * 4,
+                )
+                .is_ok()
+                {
+                    let zeros = tbuf.iter().filter(|&&x| x == 0).count();
+                    let ffs = tbuf.iter().filter(|&&x| x == 0xFFFF_FFFF).count();
+                    let cls = if zeros == tail {
+                        "ALL-ZERO (no sentinel pad)"
+                    } else if ffs == tail {
+                        "ALL-FF (sentinel padded)"
+                    } else {
+                        "MIXED (stale/valid keys)"
+                    };
+                    super::driver::zluda_log_err(&format!(
+                        "NRSS_TAIL n={} nmod128={} tail={} zeros={} ffs={} first6={:x?} => {}",
+                        n, n % 128, tail, zeros, ffs,
+                        &tbuf[..6.min(tbuf.len())], cls
+                    ));
+                }
+            }
             if ok_in && ok_out {
                 let in_viol = inp
                     .windows(2)
@@ -7459,6 +7697,92 @@ unsafe fn validate_nrss_output_after_launch(
                         "*** NRSS_PASS #{} bit={} n={} p6=0x{:x} p8=0x{:x} p10=0x{:x} in_viol={} out_viol={} is_perm={} foreign={:x?} hist16={:?} grid={} => {}",
                         ps, p5, n, p6, p8, p10, in_viol, out_viol, is_perm, foreign, hist, grid_x, verdict
                     ));
+                    // 2026-06-12 faithful-repro capture: on the FIRST true
+                    // corrupter (clean input -> lost-element output), dump the
+                    // exact input-key buffer + output so the failing grid>=2
+                    // scatter can be replayed deterministically in the lab.
+                    // The lab harness is grid>=3-unfaithful only because it
+                    // lacks the real data; this hands it the real data.
+                    if in_viol == 0 && !is_perm {
+                        static DUMPED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            let path = format!(
+                                "/tmp/nrss_corrupt_bit{}_grid{}_n{}.bin",
+                                p5, grid_x, n
+                            );
+                            // Layout: [u32 magic=0x4e525353, u32 n, u32 bit,
+                            //          u32 grid, n*u32 input_keys, n*u32 output_keys]
+                            let mut blob: Vec<u8> = Vec::with_capacity((4 + 2 * n) * 4);
+                            for h in [0x4e52_5353u32, n as u32, p5, grid_x] {
+                                blob.extend_from_slice(&h.to_le_bytes());
+                            }
+                            for &k in &inp {
+                                blob.extend_from_slice(&k.to_le_bytes());
+                            }
+                            for &k in &outp {
+                                blob.extend_from_slice(&k.to_le_bytes());
+                            }
+                            let _ = std::fs::write(&path, &blob);
+                            super::driver::zluda_log_err(&format!(
+                                "*** NRSS_CAPTURE wrote failing dataset to {} ({} bytes) — replay in lab",
+                                path, blob.len()
+                            ));
+                        }
+                    }
+                }
+                // 2026-06-12 Class-B silent-loss detector: a dropped scatter
+                // can leave an output slot UNWRITTEN. If that slot ends up
+                // holding a low/zero value the multiset shrinks but adjacent
+                // sortedness can still hold (out_viol==0) — the exact pattern
+                // behind the host-side Class-B NULL deref (inner_array[0..2]=0,
+                // a compaction PhysX builds from this sort's permutation). The
+                // out_viol>0 branch already reports is_perm; here we catch the
+                // case it misses: sorted-but-not-a-permutation (elements LOST).
+                if out_viol == 0 {
+                    let mut si = inp.clone();
+                    let mut so = outp.clone();
+                    si.sort_unstable();
+                    so.sort_unstable();
+                    if si != so {
+                        // Count output values absent from the input multiset
+                        // and zero-holes (the canonical lost-slot fill).
+                        let in_set: std::collections::HashSet<u32> =
+                            inp.iter().copied().collect();
+                        let foreign = outp.iter().filter(|v| !in_set.contains(v)).count();
+                        let out_zeros = outp.iter().filter(|&&v| v == 0).count();
+                        let in_zeros = inp.iter().filter(|&&v| v == 0).count();
+                        static LSEQ: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        let ls = LSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        super::driver::zluda_log_err(&format!(
+                            "*** NRSS_LOSS #{} bit={} n={} p8=0x{:x} grid={} SORTED-BUT-NOT-PERM foreign={} out_zeros={} in_zeros={} => silent element loss (Class-B producer signature)",
+                            ls, p5, n, p8, grid_x, foreign, out_zeros, in_zeros
+                        ));
+                        nrss_ring_dump(&format!("loss#{}", ls));
+                    }
+                }
+                // 2026-06-12 partial-tile correlation: on the FINAL scatter
+                // pass (bit=28) log a compact shape line for EVERY episode
+                // (clean OR corrupt) so n%128==0 (clean-predicted) vs n%128!=0
+                // (corrupt-predicted) can be correlated. Tests the lab finding
+                // that out_viol tracks the partial final tile (tile size 128).
+                // is_perm catches silent element loss even when out_viol==0.
+                if p5 == 28 {
+                    static FSEQ: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let fs = FSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if out_viol > 0 || fs < 60 || fs % 50 == 0 {
+                        let mut si = inp.clone();
+                        let mut so = outp.clone();
+                        si.sort_unstable();
+                        so.sort_unstable();
+                        let is_perm = si == so;
+                        super::driver::zluda_log_err(&format!(
+                            "NRSS_FINAL #{} n={} nmod128={} out_viol={} is_perm={} grid={}",
+                            fs, n, (n as u32) % 128, out_viol, is_perm, grid_x
+                        ));
+                    }
                 }
             }
         }
@@ -14253,10 +14577,15 @@ pub(crate) fn launch_kernel(
     // scratch contents with the RESET log lines we can see whether the
     // bug-firing rd5 is included in the batch (kernel-internal bug) or
     // excluded (PhysX host-side scheduling mismatch).
-    // MCB scratch dump — disabled
-    // if name == "MemCopyBatchedAsync" {
-    //     unsafe { dump_mcb_scratch(kernel_params, extra, grid_dim_y); }
-    // }
+    // MCB scratch dump — gated on ZLUDA_MS4_CAPTURE=1. Dumps the
+    // MemCopyBatchedAsync param_2 descriptor batch (f0 base) BEFORE each launch.
+    // 2026-06-13: re-enabled to find which batch entry holds the wild dst that
+    // faults the render-interop blit at the perf-test ~314s crash
+    // (project_hsa_poisoning_falsified_2026_06_13). The last MCB SCRATCH line
+    // before the SIGABRT == the faulting blit's batch.
+    if name == "MemCopyBatchedAsync" {
+        unsafe { dump_mcb_scratch(kernel_params, extra, grid_dim_y); }
+    }
     // NULL-stream synchronization: CUDA guarantees that operations on the NULL
     // stream (stream 0) serialize with ALL other streams. HIP/ROCm 6.2.4 doesn't
     // enforce this. We call hipDeviceSynchronize only for NULL-stream launches
@@ -14810,12 +15139,65 @@ pub(crate) fn launch_kernel(
     // Gated behind the same ZLUDA_FREE_AFTER_LAUNCH_SCAN=1 to avoid any
     // runtime cost on default-config benches.
     if let Some(n) = global_launch_n {
-        let ranges: Vec<(u64, u64)> = if super::memory::free_after_launch_scan_enabled() {
+        let mut ranges: Vec<(u64, u64)> = if super::memory::free_after_launch_scan_enabled() {
             unsafe { collect_narrow_ptr_ranges(&name, kernel_params, extra) }
         } else {
             Vec::new()
         };
-        super::driver::record_kernel_launch(n, &name, &ranges, None);
+        // 2026-06-13: the perf-test GPU fault is pinned to IOFX_newRadixSortStepKernel
+        // (the radix scatter). Record its full kernargs into the launch-history ring
+        // so the SIGABRT dump (newest entry = faulting launch) reveals keys_out (p8)
+        // / values_out (p9) / n (p4) / bit (p5) / phase (p11) / num_ctas (p12). The
+        // wild scatter dst = p8 or p9 + rank*4, so rank = (fault_VA - base)/4 tells us
+        // whether it's a rank overflow (bit31-set / >n) or a garbage base ptr.
+        // StepKernel layout is fixed (>=13 params) so these reads are in-bounds.
+        let nrss_info = if name == "IOFX_newRadixSortStepKernel" {
+            let p4: u32 = unsafe { read_kernel_arg(kernel_params, extra, 20, 4) }.unwrap_or(0);
+            let p5: u32 = unsafe { read_kernel_arg(kernel_params, extra, 24, 5) }.unwrap_or(0);
+            let p6: u64 = unsafe { read_kernel_arg(kernel_params, extra, 32, 6) }.unwrap_or(0);
+            let p7: u64 = unsafe { read_kernel_arg(kernel_params, extra, 40, 7) }.unwrap_or(0);
+            let p8: u64 = unsafe { read_kernel_arg(kernel_params, extra, 48, 8) }.unwrap_or(0);
+            let p9: u64 = unsafe { read_kernel_arg(kernel_params, extra, 56, 9) }.unwrap_or(0);
+            let p10: u64 = unsafe { read_kernel_arg(kernel_params, extra, 64, 10) }.unwrap_or(0);
+            let p11: u32 = unsafe { read_kernel_arg(kernel_params, extra, 72, 11) }.unwrap_or(0);
+            let p12: u32 = unsafe { read_kernel_arg(kernel_params, extra, 76, 12) }.unwrap_or(0);
+            let nb = (p4 as u64).saturating_mul(4);
+            for (base, _label) in [(p6, "kin"), (p7, "vin"), (p8, "kout"), (p9, "vout"), (p10, "spine")] {
+                if base != 0 { ranges.push((base, base.saturating_add(nb.max(4096)))); }
+            }
+            Some(format!(
+                "NRSS n={} bit={} phase={} nctas={} grid={} kin=0x{:x} vin=0x{:x} kout=0x{:x} vout=0x{:x} spine=0x{:x}",
+                p4, p5, p11, p12, grid_dim_x, p6, p7, p8, p9, p10
+            ))
+        } else {
+            None
+        };
+        super::driver::record_kernel_launch(n, &name, &ranges, nrss_info);
+    }
+    // 2026-06-12 per-kernel GPU-fault isolation. ZLUDA_SYNC_LAUNCHES=1 forces a
+    // hipDeviceSynchronize after EVERY launch, so a kernel that does a wild GPU
+    // access faults during ITS OWN sync — the launch-history ring's newest
+    // entry (dumped by the SIGABRT handler) then NAMES the faulting kernel
+    // instead of whatever happened to be queued last. Heavy (serializes the
+    // GPU) but only needed for the diagnostic bench.
+    {
+        static SYNC_LAUNCHES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SYNC_FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let sync_each = *SYNC_LAUNCHES
+            .get_or_init(|| std::env::var("ZLUDA_SYNC_LAUNCHES").map_or(false, |v| v == "1"));
+        // Only serialize from this launch count onward (keeps loading fast;
+        // the wild-VA fault is at the perf-test scene ~30-35k launches).
+        let sync_from = *SYNC_FROM.get_or_init(|| {
+            std::env::var("ZLUDA_SYNC_LAUNCHES_FROM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25000u64)
+        });
+        if sync_each && result.is_ok() && global_launch_n.map_or(false, |n| n >= sync_from) {
+            unsafe {
+                let _ = hipDeviceSynchronize();
+            }
+        }
     }
     // Log launch failures with full context for diagnosis
     if result.is_err() {
@@ -14921,7 +15303,9 @@ pub(crate) fn launch_kernel(
             // 2026-06-10 IOFX writer hunt: in-game NRSS final-pass output
             // sortedness check (ZLUDA_NRSS_VALIDATE=1). Device already
             // synced above.
-            validate_nrss_output_after_launch(&name, kernel_params, extra, grid_dim_x);
+            validate_nrss_output_after_launch(
+                &name, kernel_params, extra, grid_dim_x, block_dim_x, shared_mem_bytes,
+            );
             // Plan v14 Step 1: per-kernel mapped-buffer write tracer.
             // Gated by ZLUDA_MAPPED_WRITE_TRACE=1 (default OFF). Reads each
             // tracked cuMemHostAlloc buffer, diffs vs mirror, emits

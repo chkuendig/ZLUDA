@@ -3536,6 +3536,136 @@ fn radix_sort_histogram_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
 
 
+/// 2026-06-12: minimal isolated reproducer for the divergent-control-flow
+/// register-corruption bug found in IOFX_newRadixSortStepKernel's partial
+/// chunk. 32 lanes: lane<16 loads in[lane], lane>=16 sets -1, merge, store.
+/// Correct: out[i]==in[i] for i<16. Buggy ZLUDA: lanes 4-15 get 0.
+/// Loads PTX from DIVTEST_PTX_PATH (default /tmp/divtest.ptx).
+#[cfg(feature = "has_rocm")]
+#[test]
+fn divergent_load_repro_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "10.3.0");
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+    let path = std::env::var("DIVTEST_PTX_PATH").unwrap_or_else(|_| "/tmp/divtest.ptx".into());
+    let ptx = std::fs::read_to_string(&path)?;
+    let ast = ptx_parser::parse_module_checked(&ptx).unwrap();
+    let module = pass::to_llvm_module(ast, pass::Attributes { clock_rate: 2124000 }, |_| {}).unwrap();
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }.to_str().unwrap();
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(&module.context, gcn_arch, module.llvm_ir, ptx_impl,
+        module.attributes_ir, module.metadata, None).unwrap();
+    let mut hip_mod = unsafe { mem::zeroed() };
+    unsafe { hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _) }.unwrap();
+    let mut f = unsafe { mem::zeroed() };
+    unsafe { hipModuleGetFunction(&mut f, hip_mod, c"divtest".as_ptr()) }.unwrap();
+    let h_in: Vec<u32> = (0..32u32).map(|i| i + 100).collect();
+    let (mut d_in, mut d_out): (*mut std::ffi::c_void, *mut std::ffi::c_void) = (ptr::null_mut(), ptr::null_mut());
+    unsafe {
+        hipMalloc(&mut d_in, 128).unwrap();
+        hipMalloc(&mut d_out, 128).unwrap();
+        hipMemsetD8(hipDeviceptr_t(d_out), 0, 128).unwrap();
+        hipMemcpyHtoD(hipDeviceptr_t(d_in), h_in.as_ptr() as _, 128).unwrap();
+    }
+    let (mut a0, mut a1) = (d_in as u64, d_out as u64);
+    let mut args = [&mut a0 as *mut _ as *mut std::ffi::c_void, &mut a1 as *mut _ as *mut _];
+    unsafe {
+        hipModuleLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, hipStream_t(ptr::null_mut()),
+            args.as_mut_ptr(), ptr::null_mut()).unwrap();
+        hipDeviceSynchronize().unwrap();
+    }
+    let mut out = vec![0u32; 32];
+    unsafe { hipMemcpyDtoH(out.as_mut_ptr() as _, hipDeviceptr_t(d_out), 128).unwrap() };
+    eprintln!("DIVTEST out={:?}", out);
+    let bad: Vec<u32> = (0..16).filter(|&i| out[i] != h_in[i]).map(|i| i as u32).collect();
+    assert!(bad.is_empty(), "divergent-load lost lanes {:?}; out={:?}", bad, out);
+    Ok(())
+}
+
+
+
+/// 2026-06-12: faithful deterministic replay of the in-game NRSS corruption.
+/// `validate_nrss_output_after_launch` captures the EXACT input-key buffer of
+/// the first true corrupter (clean input -> is_perm=false output) to
+/// /tmp/nrss_corrupt_bit<B>_grid<G>_n<N>.bin. This test loads that buffer and
+/// re-runs the SINGLE failing StepKernel pass (count/scan/scatter at the same
+/// bit, same grid) so the cross-block element-loss reproduces in the lab where
+/// it can be ISA-debugged. The harness was only "grid>=3-unfaithful" because it
+/// lacked the real data; this hands it the real data.
+/// 2026-06-12 co-residency noise kernel. The in-game StepKernel runs with
+/// per-launch sync (no concurrent HIP compute) but DXVK GRAPHICS runs
+/// co-resident on the same CUs/caches. This kernel mimics that GPU contention:
+/// a long loop of hashed random global RMW + atomics that thrashes L2/TCP and
+/// occupies CUs while the sort runs on another stream. Launched async on a
+/// non-blocking noise stream so it overlaps the sort. Param 0 = buffer,
+/// param 1 = n_words, param 2 = iters.
+#[cfg(feature = "has_rocm")]
+const NOISE_PTX: &str = r#".version 6.0
+.target sm_50
+.address_size 64
+.visible .entry noisek(
+.param .u64 noisek_param_0,
+.param .u32 noisek_param_1,
+.param .u32 noisek_param_2
+)
+{
+.reg .pred %p<2>;
+.reg .b32 %r<12>;
+.reg .b64 %rd<4>;
+ld.param.u64 %rd1, [noisek_param_0];
+ld.param.u32 %r1, [noisek_param_1];
+ld.param.u32 %r2, [noisek_param_2];
+cvta.to.global.u64 %rd1, %rd1;
+mov.u32 %r3, %ntid.x;
+mov.u32 %r4, %ctaid.x;
+mov.u32 %r5, %tid.x;
+mad.lo.s32 %r6, %r4, %r3, %r5;
+mov.u32 %r7, 0;
+LOOP:
+setp.ge.u32 %p1, %r7, %r2;
+@%p1 bra END;
+mad.lo.s32 %r8, %r7, 2654435761, %r6;
+rem.u32 %r9, %r8, %r1;
+mul.wide.u32 %rd2, %r9, 4;
+add.s64 %rd3, %rd1, %rd2;
+ld.global.u32 %r10, [%rd3];
+add.s32 %r10, %r10, %r6;
+st.global.u32 [%rd3], %r10;
+add.s32 %r7, %r7, 1;
+bra LOOP;
+END:
+ret;
+}
+"#;
+
+/// Compile a standalone PTX kernel string through the ZLUDA pipeline and return
+/// (hip_module, function) for the named entry.
+#[cfg(feature = "has_rocm")]
+unsafe fn compile_aux_kernel(
+    ptx: &str,
+    entry: &std::ffi::CStr,
+    gcn_arch: &str,
+) -> (hip_runtime_sys::hipModule_t, hip_runtime_sys::hipFunction_t) {
+    use hip_runtime_sys::*;
+    let ast = ptx_parser::parse_module_checked(ptx).unwrap();
+    let module =
+        pass::to_llvm_module(ast, pass::Attributes { clock_rate: 2124000 }, |_| {}).unwrap();
+    let ptx_impl = module.linked_bitcode();
+    let elf = llvm_zluda::compile(
+        &module.context, gcn_arch, module.llvm_ir, ptx_impl,
+        module.attributes_ir, module.metadata, None,
+    ).unwrap();
+    let mut hip_mod = mem::zeroed();
+    hipModuleLoadData(&mut hip_mod, elf.as_ptr() as _).unwrap();
+    let mut f = mem::zeroed();
+    hipModuleGetFunction(&mut f, hip_mod, entry.as_ptr()).unwrap();
+    (hip_mod, f)
+}
+
 
 
 

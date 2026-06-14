@@ -458,6 +458,24 @@ pub unsafe extern "system" fn zluda_d3d11_register_imported(
         return Err(CUerror::UNKNOWN);
     }
 
+    // 2026-06-13 DIAGNOSTIC (ZLUDA_D3D11_POISON_IMPORT=1): fill the freshly
+    // imported dma_buf with 0xCD bytes. The DXVK interop blit-on-Map
+    // (CopySurfaceToExternalBuffer) OVERWRITES this on every Map — UNLESS the
+    // blit is skipped (commit 8684646cf: "skip blit when source image lacks
+    // VK_IMAGE_USAGE_TRANSFER_SRC_BIT"), in which case the buffer stays whatever
+    // it was. If PhysX then reads an unpopulated surface as containing pointers,
+    // a wild access lands at 0xcdcdcdcdcdcdcdcd (unmistakable) instead of a
+    // random gap VA (e.g. 0x7f6916ab9000). Discriminates "DXVK left the buffer
+    // uninitialized" from "wild pointer originates elsewhere". See
+    // project_hsa_poisoning_falsified_2026_06_13.
+    if std::env::var("ZLUDA_D3D11_POISON_IMPORT").ok().as_deref() == Some("1") {
+        let r = hipMemsetD8(hipDeviceptr_t(dev_ptr), 0xCD, desc.size as usize);
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] D3D11 POISON_IMPORT memset 0xCD dev_ptr={:p} size={} -> {:?}",
+            dev_ptr, desc.size, r
+        ));
+    }
+
     // ------------------------------------------------------------------
     // Allocate state, register in the lookup table, hand back the pointer.
     // ------------------------------------------------------------------
@@ -526,6 +544,54 @@ unsafe fn ensure_hip_array(state: &D3D11ResourceState) -> Result<hipArray_t, CUe
         return Ok(*guard);
     }
 
+    // 2026-06-13 COPY-PATH (ZLUDA_D3D11_COPY_PATH=1): allocate a REAL hipArray
+    // (hipMallocArray) instead of binding an HSA image to the imported dma_buf.
+    // A real array flows through the normal surf/tex/array paths (it is NOT
+    // registered in D3D11_ARRAY_TABLE, so surf::object_create uses
+    // hipCreateSurfaceObject normally — no sentinel, no T# synthesis, no HSA
+    // image). refresh_array_from_buffer copies the dma_buf into it per-Map. This
+    // is the pre-HSA approach (commit 70683673).
+    //
+    // A/B RESULT (2026-06-13, 2 runs): this copy-path is NOT a fix and the
+    // earlier "HSA image creation poisons PhysX" root-cause claim is FALSIFIED.
+    // With copy-path active (hsa_imgs=0 copy_imgs=18, ZERO HSA images created)
+    // the perf-test still crashes IDENTICALLY to the HSA path: SIGABRT at the
+    // same ~317s wall-clock, same `cuGraphicsSubResourceGetMappedArray`-cluster
+    // site, even when the radix sort is fully correct (NRSS val_loss=0). The
+    // real crash is a GENUINE GPU page fault (PROTON_LOG: "Memory access fault by
+    // GPU node-1 ... Page not present") at a wild VA in an unmapped gap
+    // (e.g. 0x7f6916ab9000), produced by the render-interop MemCopyBatchedAsync
+    // blit touching the just-mapped D3D11 surfaces. It is NOT HSA-image-specific
+    // and NOT the radix sort. See project_hsa_poisoning_falsified_2026_06_13.
+    if std::env::var("ZLUDA_D3D11_COPY_PATH").ok().as_deref() == Some("1") {
+        let mut fmt: hipChannelFormatDesc = std::mem::zeroed();
+        fmt.x = 32;
+        fmt.y = 32;
+        fmt.z = 32;
+        fmt.w = 32;
+        fmt.f = hipChannelFormatKind::hipChannelFormatKindFloat;
+        let mut arr: hipArray_t = std::ptr::null_mut();
+        if let Err(e) = hipMallocArray(
+            &mut arr,
+            &fmt,
+            state.desc.width as usize,
+            state.desc.height as usize,
+            hipArrayDefault,
+        ) {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] D3D11 ensure_hip_array (COPY path) hipMallocArray failed: {:?} ({}x{})",
+                e, state.desc.width, state.desc.height
+            ));
+            return Err(CUerror::OUT_OF_MEMORY);
+        }
+        *guard = arr;
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] D3D11 ensure_hip_array (COPY path) allocated {}x{} array={:p} (no HSA image)",
+            state.desc.width, state.desc.height, arr
+        ));
+        return Ok(arr);
+    }
+
     let agent = match get_gpu_agent() {
         Some(a) => a,
         None => return Err(CUerror::UNKNOWN),
@@ -560,16 +626,79 @@ unsafe fn ensure_hip_array(state: &D3D11ResourceState) -> Result<hipArray_t, CUe
                 channel_order: HSA_EXT_IMAGE_CHANNEL_ORDER_RGBA,
             },
         };
-        let st = hsa_ext_image_create_with_layout(
-            agent,
-            &descriptor,
-            state.dev_ptr as *const c_void,
-            HSA_ACCESS_PERMISSION_RW,
-            HSA_EXT_IMAGE_DATA_LAYOUT_LINEAR,
-            row_pitch,
-            0,
-            &mut image,
-        );
+        // P4 (2026-06-13): hsa_ext_image_create_with_layout POISONS subsequent
+        // PhysX compute kernels (radix sort / bbox) — the root cause of the
+        // in-game radix-sort corruption (project_classb_two_producers_2026_06_12;
+        // prior d3d11_interop.rs:646 data + the 2026-05-09 "4 vs 5694 bbox"
+        // finding). The native lab never creates these images, which is why the
+        // sort is clean in isolation but corrupts in-game across all codegen
+        // levels. ZLUDA_D3D11_HSA_ISOLATE isolates the create so it cannot
+        // interleave with / pollute in-flight compute (breaks the observed
+        // "3 back-to-back creates -> next kernel faults" pattern):
+        //   1 = hipDeviceSynchronize before AND after the create.
+        //   2 = (1) + run the create on a dedicated worker thread, isolating any
+        //       thread-local HSA runtime/queue state from PhysX's render thread.
+        let isolate = std::env::var("ZLUDA_D3D11_HSA_ISOLATE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        if isolate >= 1 {
+            let _ = hipDeviceSynchronize();
+        }
+        let st = if isolate >= 2 {
+            let agent_h = agent.handle;
+            let dev_ptr_u = state.dev_ptr as usize;
+            let w = state.desc.width as usize;
+            let h = state.desc.height as usize;
+            let rp = row_pitch;
+            let join = std::thread::Builder::new()
+                .name("zluda-hsa-img".into())
+                .spawn(move || {
+                    let desc = HsaExtImageDescriptor {
+                        geometry: HSA_EXT_IMAGE_GEOMETRY_2D,
+                        width: w,
+                        height: h,
+                        depth: 0,
+                        array_size: 0,
+                        format: HsaExtImageFormat {
+                            channel_type: HSA_EXT_IMAGE_CHANNEL_TYPE_FLOAT,
+                            channel_order: HSA_EXT_IMAGE_CHANNEL_ORDER_RGBA,
+                        },
+                    };
+                    let mut img = HsaExtImage { handle: 0 };
+                    let s = unsafe {
+                        hsa_ext_image_create_with_layout(
+                            HsaAgent { handle: agent_h },
+                            &desc,
+                            dev_ptr_u as *const c_void,
+                            HSA_ACCESS_PERMISSION_RW,
+                            HSA_EXT_IMAGE_DATA_LAYOUT_LINEAR,
+                            rp,
+                            0,
+                            &mut img,
+                        )
+                    };
+                    (s, img.handle)
+                })
+                .map_err(|_| CUerror::UNKNOWN)?;
+            let (s, handle) = join.join().map_err(|_| CUerror::UNKNOWN)?;
+            image.handle = handle;
+            s
+        } else {
+            hsa_ext_image_create_with_layout(
+                agent,
+                &descriptor,
+                state.dev_ptr as *const c_void,
+                HSA_ACCESS_PERMISSION_RW,
+                HSA_EXT_IMAGE_DATA_LAYOUT_LINEAR,
+                row_pitch,
+                0,
+                &mut image,
+            )
+        };
+        if isolate >= 1 {
+            let _ = hipDeviceSynchronize();
+        }
         if st != HSA_STATUS_SUCCESS || image.handle == 0 {
             super::driver::zluda_log_err(&format!(
                 "[ZLUDA] D3D11 ensure_hip_array hsa_ext_image_create_with_layout failed: 0x{:x} ({}x{})",
@@ -629,7 +758,29 @@ unsafe fn ensure_hip_array(state: &D3D11ResourceState) -> Result<hipArray_t, CUe
 /// Kept as a function so the `get_mapped_array` call site below doesn't
 /// need to change semantics.
 unsafe fn refresh_array_from_buffer(state: &D3D11ResourceState) -> Result<(), CUerror> {
-    let _ = ensure_hip_array(state)?;
+    let arr = ensure_hip_array(state)?;
+    // COPY path: the array is a real hipArray, copy the current dma_buf contents
+    // into it (linear dev_ptr -> tiled array, 2D with the imported pitch). The
+    // HSA path's sentinel aliases the import directly so there's nothing to copy.
+    if std::env::var("ZLUDA_D3D11_COPY_PATH").ok().as_deref() == Some("1") {
+        let row_bytes = (state.desc.width as usize).saturating_mul(16); // R32G32B32A32_FLOAT
+        if let Err(e) = hipMemcpy2DToArray(
+            arr,
+            0,
+            0,
+            state.dev_ptr,
+            state.desc.pitch as usize,
+            row_bytes,
+            state.desc.height as usize,
+            hipMemcpyKind::hipMemcpyDeviceToDevice,
+        ) {
+            super::driver::zluda_log_err(&format!(
+                "[ZLUDA] D3D11 refresh_array_from_buffer (COPY) hipMemcpy2DToArray failed: {:?}",
+                e
+            ));
+            return Err(CUerror::UNKNOWN);
+        }
+    }
     Ok(())
 }
 
