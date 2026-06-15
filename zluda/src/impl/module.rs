@@ -196,6 +196,124 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
     }
 }
 
+/// 2026-06-15 Class-4 bit31 SAFETY GUARD on the IOFX_bbox wild store.
+///
+/// Measured root cause (fault-VA correlation): IOFX_bboxKernel does
+/// `mul.wide.u32 %rdX, %rY, 16; add.s64 %rdA,<out>,%rdX; st.global.v4.f32 [%rdA],…`
+/// where %rY (= sWarpLastActorID[tid], unguarded `setp.ne -1` site) holds a
+/// GARBAGE bit31-set value (a float bit-pattern ~0xC0000000 read as a u32 index)
+/// for some lane → index*16 ≈ 48GB → page-not-present wild store = the Class-4
+/// SIGABRT (last kernel IOFX_bboxKernel; fault VA ~48GB above every allocation).
+///
+/// A store index with bit31 set is UNAMBIGUOUSLY ILLEGAL (valid actor indices are
+/// small), so skipping that store is a SAFETY fix, not value-mutation (sanctioned
+/// by CLAUDE.md for the radix bit31 case). For each `mul.wide.u32 %rdX,%rY,16`
+/// that feeds a `st.global` (a WRITE), inject before it a bit31 check that, when
+/// set, branches PAST the store to the next basic-block boundary. The check lives
+/// in a nested `{ .reg … }` block so no function-scope register renumbering is
+/// needed. Gate: ZLUDA_BBOX_BIT31_GUARD=0.
+pub fn patch_iofx_bbox_bit31_guard(ptx: &str) -> Option<String> {
+    if std::env::var("ZLUDA_BBOX_BIT31_GUARD").map_or(false, |v| v == "0") {
+        return None;
+    }
+    if !ptx.contains("IOFX_bbox") {
+        return None;
+    }
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut out = String::with_capacity(ptx.len() + 2048);
+    let mut in_bbox = false;
+    let mut depth: i32 = 0;
+    let mut uid = 0usize;
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+        if t.starts_with(".visible .entry IOFX_bbox") || t.starts_with(".entry IOFX_bbox") {
+            in_bbox = true;
+            depth = 0;
+        }
+        // Detect `mul.wide.u32 %rdX, %rY, 16;` that feeds a st.global within the BB.
+        let guard_target: Option<(String, String)> = if in_bbox && depth >= 1 {
+            parse_mul_wide_by_16(t).and_then(|(_rd, ry)| {
+                // Look ahead (until a label / unconditional bra) for a st.global
+                // (a WRITE), and capture the skip target (first label, or the
+                // target of the first unconditional bra).
+                let mut feeds_store = false;
+                let mut skip: Option<String> = None;
+                let mut k = i + 1;
+                while k < lines.len() && k <= i + 30 {
+                    let l = lines[k].trim_start();
+                    if let Some(lbl) = l.strip_suffix(':') {
+                        if !lbl.contains(char::is_whitespace) {
+                            skip = Some(lbl.to_string());
+                            break;
+                        }
+                    }
+                    if l.starts_with("st.global") {
+                        feeds_store = true;
+                    }
+                    if l.starts_with("bra.uni ") {
+                        skip = Some(l["bra.uni ".len()..].trim_end_matches(';').to_string());
+                        break;
+                    }
+                    k += 1;
+                }
+                if feeds_store {
+                    skip.map(|s| (ry, s))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if let Some((ry, skip)) = guard_target {
+            out.push_str(&format!(
+                "{{\n.reg .b32 %rbg{u};\n.reg .pred %pbg{u};\nand.b32 %rbg{u}, %{ry}, -2147483648;\nsetp.ne.s32 %pbg{u}, %rbg{u}, 0;\n@%pbg{u} bra {skip};\n}}\n",
+                u = uid, ry = ry, skip = skip
+            ));
+            uid += 1;
+            count += 1;
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        if in_bbox {
+            for c in lines[i].chars() {
+                if c == '{' {
+                    depth += 1;
+                } else if c == '}' {
+                    depth -= 1;
+                    if depth <= 0 {
+                        in_bbox = false;
+                        break;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    super::driver::zluda_log_err(&format!(
+        "[ZLUDA] patch_iofx_bbox_bit31_guard: guarded {} bbox wild-store site(s)",
+        count
+    ));
+    Some(out)
+}
+
+/// Parse `mul.wide.u32 %rdX, %rY, 16;` → (rdX-without-%, rY-without-%).
+fn parse_mul_wide_by_16(t: &str) -> Option<(String, String)> {
+    let rest = t.strip_prefix("mul.wide.u32 ")?.trim_end_matches(';');
+    let mut p = rest.split(',').map(|s| s.trim());
+    let rd = p.next()?.strip_prefix('%')?;
+    let ry = p.next()?.strip_prefix('%')?;
+    if p.next()? != "16" || p.next().is_some() {
+        return None;
+    }
+    Some((rd.to_string(), ry.to_string()))
+}
+
 /// 2026-06-09 MS_4 underflow guard — surgical fix for the Class A wild-VA
 /// scatter Bug at the root.
 ///
@@ -2712,10 +2830,16 @@ fn get_best_ptx_and_compile(
                         Some(patched) => Cow::Owned(patched),
                         None => Cow::Borrowed(ptx),
                     };
-                    let after_volatile: Cow<str> =
-                        match patch_broad_volatile_lds(after_bbox.as_ref()) {
+                    // 2026-06-15 Class-4 bit31 safety guard on the bbox wild store.
+                    let after_bbox_b31: Cow<str> =
+                        match patch_iofx_bbox_bit31_guard(after_bbox.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_bbox,
+                        };
+                    let after_volatile: Cow<str> =
+                        match patch_broad_volatile_lds(after_bbox_b31.as_ref()) {
+                            Some(p) => Cow::Owned(p),
+                            None => after_bbox_b31,
                         };
                     let after_membar: Cow<str> =
                         match patch_broad_membar_before_bar_sync(after_volatile.as_ref()) {
@@ -2810,10 +2934,16 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => text,
                                         };
-                                    let after_volatile: Cow<str> =
-                                        match patch_broad_volatile_lds(after_bbox.as_ref()) {
+                                    // 2026-06-15 Class-4 bit31 safety guard.
+                                    let after_bbox_b31: Cow<str> =
+                                        match patch_iofx_bbox_bit31_guard(after_bbox.as_ref()) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_bbox,
+                                        };
+                                    let after_volatile: Cow<str> =
+                                        match patch_broad_volatile_lds(after_bbox_b31.as_ref()) {
+                                            Some(p) => Cow::Owned(p),
+                                            None => after_bbox_b31,
                                         };
                                     let after_membar: Cow<str> =
                                         match patch_broad_membar_before_bar_sync(
@@ -3598,6 +3728,50 @@ mod patch_tests {
     fn patch_skips_non_bbox_ptx() {
         let ptx = "// not a bbox kernel\n.visible .entry foo() { ret; }\n";
         assert!(patch_iofx_bbox_tail_merge(ptx).is_none());
+    }
+
+    #[test]
+    fn bbox_bit31_guard_injects_and_parses() {
+        std::env::remove_var("ZLUDA_BBOX_BIT31_GUARD");
+        let ptx = "\
+.version 7.0
+.target sm_50
+.address_size 64
+.visible .entry IOFX_bboxKernel()
+{
+.reg .b32 %r<8>;
+.reg .f32 %f<8>;
+.reg .b64 %rd<8>;
+mov.u32 %r1, %tid.x;
+BB_W:
+mul.wide.u32 %rd1, %r22, 16;
+add.s64 %rd2, %rd5, %rd1;
+st.global.v4.f32 [%rd2], {%f1, %f2, %f3, %f4};
+BB_NEXT:
+ret;
+}
+";
+        let out = patch_iofx_bbox_bit31_guard(ptx).expect("bbox write should be guarded");
+        assert!(out.contains("and.b32 %rbg0, %r22, -2147483648;"), "bit31 mask missing:\n{}", out);
+        assert!(out.contains("@%pbg0 bra BB_NEXT;"), "guard branch to next BB missing:\n{}", out);
+        // guard must be BEFORE the mul.wide store-index computation.
+        assert!(out.find("@%pbg0 bra BB_NEXT;").unwrap() < out.find("mul.wide.u32 %rd1, %r22, 16;").unwrap());
+        ptx_parser::parse_module_checked(&out).expect("guarded bbox PTX must parse");
+        std::env::set_var("ZLUDA_BBOX_BIT31_GUARD", "0");
+        assert!(patch_iofx_bbox_bit31_guard(ptx).is_none(), "gate ignored");
+        std::env::remove_var("ZLUDA_BBOX_BIT31_GUARD");
+    }
+
+    #[test]
+    #[ignore = "reads run_archives/classb_2026_06_14/bbox_module.ptx — verifies the real bbox kernel guards + parses"]
+    fn bbox_bit31_guard_on_real_module_parses() {
+        std::env::remove_var("ZLUDA_BBOX_BIT31_GUARD");
+        let src = std::fs::read_to_string("../../run_archives/classb_2026_06_14/bbox_module.ptx")
+            .expect("bbox_module.ptx present");
+        let out = patch_iofx_bbox_bit31_guard(&src).expect("real bbox module should be guarded");
+        ptx_parser::parse_module_checked(&out).expect("guarded real bbox module must parse");
+        let n = out.matches("and.b32 %rbg").count();
+        eprintln!("real bbox module guarded {} store sites + parsed OK", n);
     }
 
     #[test]
