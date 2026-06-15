@@ -103,9 +103,39 @@ fn texref_log_enabled() -> bool {
 /// device sync per binding change. Worth measuring; PhysX issues
 /// thousands per frame, so the cost ceiling is "one device sync per
 /// hipTexRefSet*" and not "free".
+/// ZLUDA_TEXREF_SYNC level:
+///   0 — OFF
+///   1 — drain in-flight kernels before SetAddress/SetArray binds (the original
+///       behaviour; set =1 by the Batman protonfix).
+///   2 — ALSO drain before the non-address texref-state mutators (SetFlags /
+///       SetFormat / SetAddressMode / SetFilterMode). 2026-06-15 Class-4 fix:
+///       CUDA snapshots the WHOLE texref state at launch; a mid-flight
+///       SetFlags(READ_AS_INTEGER) / SetFormat race makes an in-flight
+///       IOFX_remapKernel `tex.1d.u32` fetch return a normalized FLOAT instead
+///       of the raw int actor-ID → float-pattern index → bbox/actorRange wild
+///       store. Gated separately because these mutators are on a hot path and
+///       an unconditional sync risks PhysX-init timing perturbation (cf. the
+///       rejected TEXREF_POST_SYNC=2); =2 lets us A/B it in-game.
+fn texref_sync_level() -> u32 {
+    static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("ZLUDA_TEXREF_SYNC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn texref_sync_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("ZLUDA_TEXREF_SYNC").map_or(false, |v| v == "1"))
+    texref_sync_level() >= 1
+}
+
+/// Pre-sync gate for the non-address texref-state mutators (level >= 2).
+unsafe fn texref_pre_sync_all_mutators_if_enabled() {
+    if texref_sync_level() >= 2 {
+        let _ = hipDeviceSynchronize();
+        super::stream::clear_dirty_flag_after_device_sync();
+    }
 }
 
 /// 2026-06-09 Class A bf000 candidate fix: post-sync the texref binding.
@@ -361,6 +391,10 @@ pub(crate) unsafe fn ref_set_format(
     num_packed_components: i32,
 ) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
+    // 2026-06-15 Class-4: format (channel kind: int vs float) also decides how
+    // tex.1d interprets the bytes; an immediate mid-flight flip is the same
+    // float-vs-int race as SetFlags (see ref_set_flags). Drain first.
+    texref_pre_sync_all_mutators_if_enabled();
     let fmt_hip: hipArray_Format = mem::transmute(fmt);
     let res = hipTexRefSetFormat(tex_ref, fmt_hip, num_packed_components);
     if texref_log_enabled() {
@@ -384,12 +418,18 @@ pub(crate) unsafe fn ref_set_address_mode(
     am: CUaddress_mode,
 ) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
+    // 2026-06-15 Class-4: complete the CUDA texref-snapshot semantic — drain
+    // in-flight kernels before flipping addressing mode too (see ref_set_flags).
+    texref_pre_sync_all_mutators_if_enabled();
     hipTexRefSetAddressMode(tex_ref, dim, mem::transmute(am))?;
     reset(tex_ref)
 }
 
 pub(crate) unsafe fn ref_set_filter_mode(h_tex_ref: CUtexref, fm: CUfilter_mode) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
+    // 2026-06-15 Class-4: complete the CUDA texref-snapshot semantic (see
+    // ref_set_flags) — drain in-flight kernels before flipping filter mode.
+    texref_pre_sync_all_mutators_if_enabled();
     hipTexRefSetFilterMode(tex_ref, mem::transmute(fm))?;
     reset(tex_ref)
 }
@@ -436,6 +476,19 @@ pub(crate) unsafe fn ref_set_border_color(
 
 pub(crate) unsafe fn ref_set_flags(h_tex_ref: CUtexref, flags: u32) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
+    // 2026-06-15 Class-4 root-cause fix: CUDA snapshots the WHOLE texref state
+    // (incl. flags) at kernel-launch; HIP flips it immediately. The flags carry
+    // CU_TRSF_READ_AS_INTEGER — if an in-flight IOFX_remapKernel reads
+    // `tex.1d.v4.u32.s32 [IOFX_texRefRemapActorIDs]` while this flag is
+    // mid-transition, the fetch returns a NORMALIZED FLOAT instead of the raw
+    // int actor-ID, which it then stores as an index → bbox/actorRange scatter
+    // a float bit-pattern → page-aligned CB/DB wild store. Offline capture
+    // proof: the actorID input buffer's idx[3] is the int 3 in 7 non-faulting
+    // launches but a position float (0xc5366dba) in the faulting one. The
+    // existing pre-bind sync covered SetAddress/SetArray but NOT SetFlags, so
+    // the race stayed open. Drain in-flight kernels first (gated, same as the
+    // address path) to restore the CUDA snapshot semantic for flag changes too.
+    texref_pre_sync_all_mutators_if_enabled();
     hipTexRefSetFlags(tex_ref, flags)?;
     reset(tex_ref)
 }
