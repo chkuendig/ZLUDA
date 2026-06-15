@@ -325,8 +325,25 @@ fn init_globals() -> Result<(), String> {
                     c"-inlinehint-threshold=3250",
                 ]
             };
+            // ZLUDA_LLVM_ARGS: whitespace-separated extra LLVM cl::opt flags,
+            // injected at first-compile init. Diagnostic-only — used to bisect
+            // AMDGPU codegen passes (e.g. "-amdgpu-enable-whole-quad-mode=0")
+            // against the deterministic nrss_replay GPU A/B without rebuilding
+            // LLVM. The CStrings must outlive ParseCommandLineOptions, so leak
+            // them (one-shot init, negligible).
+            let extra_args: Vec<&'static CStr> = match std::env::var("ZLUDA_LLVM_ARGS") {
+                Ok(s) if !s.trim().is_empty() => s
+                    .split_whitespace()
+                    .map(|tok| {
+                        let cs = std::ffi::CString::new(tok).unwrap();
+                        &*Box::leak(cs.into_boxed_c_str())
+                    })
+                    .collect(),
+                _ => vec![],
+            };
             let llvm_args_ptrs: Vec<*const i8> = common_options
                 .chain(opt_options)
+                .chain(extra_args.into_iter())
                 .map(|s| s.as_ptr())
                 .collect();
             let mut err_msg = std::ptr::null_mut();
