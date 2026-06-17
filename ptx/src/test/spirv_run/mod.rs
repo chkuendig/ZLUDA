@@ -3604,6 +3604,157 @@ fn divergent_load_repro_amdgpu() -> Result<(), Box<dyn error::Error>> {
 /// non-blocking noise stream so it overlaps the sort. Param 0 = buffer,
 /// param 1 = n_words, param 2 = iters.
 #[cfg(feature = "has_rocm")]
+// 2026-06-16 Class-2 (BUG-3) HDP-coherency microbench producer. Single block of
+// `n` threads writes buf[tid]=val, bar.sync, membar.sys, then thread 0 writes
+// the FLAG buf[n]=val. The CPU spins on the flag (no hipStreamSynchronize,
+// mirroring PhysX's direct mapped read) then checks the data — if the flag is
+// visible but data is stale, that's HDP write-combine reordering.
+const HDP_PROD_PTX: &str = r#".version 6.0
+.target sm_50
+.address_size 64
+.visible .entry hdp_prod(
+.param .u64 hdp_prod_param_0,
+.param .u32 hdp_prod_param_1,
+.param .u32 hdp_prod_param_2
+)
+{
+.reg .pred %p<3>;
+.reg .b32 %r<4>;
+.reg .b64 %rd<5>;
+ld.param.u64 %rd1, [hdp_prod_param_0];
+ld.param.u32 %r1, [hdp_prod_param_1];
+ld.param.u32 %r2, [hdp_prod_param_2];
+cvta.to.global.u64 %rd1, %rd1;
+mov.u32 %r3, %tid.x;
+setp.ge.u32 %p1, %r3, %r1;
+@%p1 bra SKIP;
+mul.wide.u32 %rd2, %r3, 4;
+add.s64 %rd3, %rd1, %rd2;
+st.global.u32 [%rd3], %r2;
+SKIP:
+bar.sync 0;
+setp.ne.u32 %p2, %r3, 0;
+@%p2 bra END;
+mul.wide.u32 %rd4, %r1, 4;
+add.s64 %rd3, %rd1, %rd4;
+st.global.u32 [%rd3], %r2;
+END:
+ret;
+}
+"#;
+
+/// 2026-06-16 Class-2 (BUG-3) HDP write-combine coherency microbench.
+///
+/// Tests whether coarse-grained mapped host memory (`cuMemHostAlloc` default on
+/// AMD) shows GPU→CPU staleness that `hipHostMallocCoherent` (fine-grained, what
+/// `ZLUDA_HOST_COHERENT=1` forces) fixes. Each iteration the producer kernel
+/// writes `buf[i] = val` to a zero-copy mapped buffer; after
+/// `hipStreamSynchronize` (NO `hipDeviceSynchronize` — mirroring PhysX's direct
+/// mapped read with no API sync hook), the CPU reads via the host pointer and
+/// counts elements that are NOT the freshly-written value. A/B coarse vs
+/// coherent; if a stale element becomes correct after `hipDeviceSynchronize`,
+/// that pinpoints HDP write-combine. No-op without ROCm. Env: HDP_ITERS (4000).
+#[cfg(feature = "has_rocm")]
+#[test]
+fn hdp_coherency_microbench_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    use hip_runtime_sys::*;
+    std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "10.3.0");
+    if unsafe { hipInit(0) }.is_err() {
+        return Ok(());
+    }
+    let mut dev_props = unsafe { mem::zeroed() };
+    unsafe { hipGetDevicePropertiesR0600(&mut dev_props, 0) }.unwrap();
+    let gcn_arch = unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let (_m, f) = unsafe { compile_aux_kernel(HDP_PROD_PTX, c"hdp_prod", &gcn_arch) };
+
+    let n: u32 = 256; // one block; data in [0,n), flag at [n]
+    let bytes = (n as usize + 1) * 4;
+    let iters: u32 = std::env::var("HDP_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+    let max_spin: u64 = std::env::var("HDP_MAX_SPIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000_000);
+
+    for &(label, flags) in &[
+        ("coarse  ", hipHostMallocMapped),
+        ("coherent", hipHostMallocMapped | hipHostMallocCoherent),
+    ] {
+        let mut host: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe { hipHostMalloc(&mut host, bytes, flags) }.is_err() {
+            eprintln!("HDP[{}] flags=0x{:08x}: hipHostMalloc FAILED (skip)", label, flags);
+            continue;
+        }
+        let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe { hipHostGetDevicePointer(&mut dev, host, 0) }.unwrap();
+        let host_u32 = host as *mut u32;
+        let flag_idx = n as usize;
+        for i in 0..=flag_idx {
+            unsafe { host_u32.add(i).write_volatile(0) };
+        }
+        unsafe { hipDeviceSynchronize().unwrap() };
+        let mut flag_arrived: u64 = 0;
+        let mut flag_timeout: u64 = 0;
+        let mut stale_when_flag_seen: u64 = 0; // flag visible but data still stale = HDP reorder
+        let mut iters_stale: u64 = 0;
+        for it in 1..=iters {
+            let val: u32 = it;
+            let mut dptr = dev;
+            let mut n_arg = n;
+            let mut val_arg = val;
+            let mut args: [*mut std::ffi::c_void; 3] = [
+                &mut dptr as *mut _ as *mut _,
+                &mut n_arg as *mut _ as *mut _,
+                &mut val_arg as *mut _ as *mut _,
+            ];
+            // Launch async; do NOT synchronize (PhysX reads the mapped buffer directly).
+            unsafe {
+                hipModuleLaunchKernel(
+                    f, 1, 1, 1, n, 1, 1, 0, hipStream_t(std::ptr::null_mut()),
+                    args.as_mut_ptr(), std::ptr::null_mut(),
+                )
+                .unwrap();
+            }
+            // Spin on the FLAG via the host pointer, like PhysX's spin-wait.
+            let mut spins = 0u64;
+            while spins < max_spin
+                && unsafe { host_u32.add(flag_idx).read_volatile() } != val
+            {
+                spins += 1;
+                std::hint::spin_loop();
+            }
+            if unsafe { host_u32.add(flag_idx).read_volatile() } == val {
+                flag_arrived += 1;
+                // Flag is visible — now check the data is too.
+                let mut s = 0u64;
+                for i in 0..n as usize {
+                    if unsafe { host_u32.add(i).read_volatile() } != val {
+                        s += 1;
+                    }
+                }
+                if s > 0 {
+                    stale_when_flag_seen += s;
+                    iters_stale += 1;
+                }
+            } else {
+                flag_timeout += 1;
+                unsafe { hipStreamSynchronize(hipStream_t(std::ptr::null_mut())).unwrap() };
+            }
+        }
+        eprintln!(
+            "HDP-spin[{}] flags=0x{:08x}: flag_arrived={}/{} flag_timeout={} STALE_DATA_when_flag_seen={} ({} iters)",
+            label, flags, flag_arrived, iters, flag_timeout, stale_when_flag_seen, iters_stale
+        );
+        unsafe { hipHostFree(host).unwrap() };
+    }
+    Ok(())
+}
+
 const NOISE_PTX: &str = r#".version 6.0
 .target sm_50
 .address_size 64
@@ -3665,6 +3816,8 @@ unsafe fn compile_aux_kernel(
     hipModuleGetFunction(&mut f, hip_mod, entry.as_ptr()).unwrap();
     (hip_mod, f)
 }
+
+
 
 
 

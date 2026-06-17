@@ -9994,6 +9994,191 @@ unsafe fn capture_iofx_chain_post(slot_index: usize, stream: hipStream_t) {
     unsafe { capture_iofx_chain_ptr_regions(slot_index, stream, false) };
 }
 
+// 2026-06-16 BUG-2 Step-1a: in-process value-scan TRIP-WIRE (ZLUDA_IOFX_VALUE_TRIPWIRE=1).
+// Class-4 = a consumer (bbox/actorRange) reads a garbage actor-index (a float bit-pattern) from a
+// pooled index buffer → wild tex fetch / scatter. This catches the corrupt word + names the buffer +
+// the adjacent pooled sub-buffer it likely came from, in the faulting frame, with NO debugger.
+// MUST use DtoD into a pinned-mapped scratch then read the HOST side — hipMemcpyDtoH from launch_kernel
+// crashes the ROCm runtime (see file-header note line 49). Light: <=8 * 2KB DtoD only on the target
+// IOFX kernels, only after a warmup, one-shot on first hit.
+const IOFX_TW_SLOTS: usize = 8;
+const IOFX_TW_SLOT_BYTES: usize = 16384; // first 4096 u32 of each ptr param (cover mid-range indices)
+struct IofxTwState { host: *mut u8, dev: *mut std::ffi::c_void }
+unsafe impl Send for IofxTwState {}
+static IOFX_TW: Mutex<Option<IofxTwState>> = Mutex::new(None);
+static IOFX_TW_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IOFX_TW_FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn iofx_value_tripwire_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("ZLUDA_IOFX_VALUE_TRIPWIRE").map_or(false, |v| v == "1"))
+}
+
+unsafe fn iofx_value_tripwire(
+    name: &str,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+    stream: hipStream_t,
+) {
+    if !iofx_value_tripwire_enabled() || IOFX_TW_FOUND.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // Target the index CONSUMERS (where the fault reads the garbage index) + makeSortKeys/remap.
+    let is_target = name == "IOFX_bboxKernel"
+        || name == "IOFX_actorRangeKernel"
+        || name.starts_with("IOFX_remapKernel")
+        || name.starts_with("IOFX_makeSortKeys");
+    if !is_target {
+        return;
+    }
+    let nl = IOFX_TW_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if nl < 3000 {
+        return; // warmup — skip init/early frames; Class-4 is deep
+    }
+    // up to 14 pointer args; keep the 0x7f-prefixed, page-aligned ones (real device ptrs)
+    let mut ptrs: Vec<u64> = Vec::new();
+    for i in 0..14usize {
+        if let Some(v) = read_kernel_arg::<u64>(kernel_params, extra, i * 8, i) {
+            if (v >> 40) == 0x7f && (v & 0xFFFF) == 0 && (v & 0xFFFFFFFF) >= 0x10000 {
+                ptrs.push(v);
+            }
+        }
+        if ptrs.len() >= IOFX_TW_SLOTS {
+            break;
+        }
+    }
+    if ptrs.is_empty() {
+        return;
+    }
+    let mut guard = match IOFX_TW.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if guard.is_none() {
+        let mut host: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe {
+            hipHostMalloc(&mut host, IOFX_TW_SLOTS * IOFX_TW_SLOT_BYTES, hipHostMallocMapped)
+        }
+        .is_err()
+            || host.is_null()
+        {
+            return;
+        }
+        let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe { hipHostGetDevicePointer(&mut dev, host, 0) }.is_err() {
+            return;
+        }
+        *guard = Some(IofxTwState { host: host as *mut u8, dev });
+    }
+    let st = guard.as_ref().unwrap();
+    for (i, &p) in ptrs.iter().enumerate() {
+        let dst = hipDeviceptr_t((st.dev as usize + i * IOFX_TW_SLOT_BYTES) as *mut std::ffi::c_void);
+        let _ = unsafe { hipMemcpyDtoDAsync(dst, hipDeviceptr_t(p as _), IOFX_TW_SLOT_BYTES, stream) };
+    }
+    let _ = unsafe { hipStreamSynchronize(stream) };
+    // scan each captured slot host-side for an index-buffer-with-float-outlier
+    let floaty = |w: u32| {
+        let hb = (w >> 24) & 0xff;
+        (0x40..=0x4f).contains(&hb) || (0xb8..=0xcf).contains(&hb)
+    };
+    for (i, &p) in ptrs.iter().enumerate() {
+        let base = unsafe { st.host.add(i * IOFX_TW_SLOT_BYTES) } as *const u32;
+        let words: &[u32] = unsafe { std::slice::from_raw_parts(base, IOFX_TW_SLOT_BYTES / 4) };
+        let nz: Vec<u32> = words
+            .iter()
+            .copied()
+            .filter(|&w| w != 0 && w != 0xffff_ffff)
+            .collect();
+        if nz.len() < 16 {
+            continue;
+        }
+        let small = nz
+            .iter()
+            .filter(|&&w| w < (1 << 20) && w != 0xffff_ffff)
+            .count();
+        let outliers: Vec<(usize, u32)> = words
+            .iter()
+            .enumerate()
+            .filter(|(_, &w)| w >= (1 << 24) && w != 0xffff_ffff && floaty(w))
+            .map(|(j, &w)| (j, w))
+            .collect();
+        if small >= (nz.len() * 6) / 10 && (1..=8).contains(&outliers.len()) {
+            // HIT — name the buffer, its alloc, and hunt the float's source in adjacent sub-buffers
+            IOFX_TW_FOUND.store(true, std::sync::atomic::Ordering::Relaxed);
+            let alloc = unsafe { query_device_pointer_range(p) };
+            let (abase, asize) = alloc.map(|(b, s, _)| (b, s)).unwrap_or((0, 0));
+            let bad = outliers[0].1;
+            // look for the same float value in the two adjacent pooled sub-buffers below this ptr
+            let mut src = String::from("none");
+            for delta in [0x800u64, 0x1000, 0x80000, 0x40000] {
+                if p < delta {
+                    continue;
+                }
+                let probe = p - delta;
+                if let Some((b2, _, _)) = unsafe { query_device_pointer_range(probe) } {
+                    if b2 == abase {
+                        src = format!("same-alloc@-0x{:x}", delta);
+                    } else {
+                        src = format!("alloc@0x{:x}(-0x{:x})", b2, delta);
+                    }
+                    break;
+                }
+            }
+            super::driver::zluda_log_err(&format!(
+                "[IOFX_VALUE_TRIPWIRE] kernel={} launch={} param_slot={} ptr=0x{:x} \
+                 alloc[base=0x{:x} size={} off={}] small={}/{} OUTLIERS={:x?} below={}",
+                name,
+                nl,
+                i,
+                p,
+                abase,
+                asize,
+                p.wrapping_sub(abase),
+                small,
+                nz.len(),
+                &outliers[..outliers.len().min(8)],
+                src
+            ));
+            // 2026-06-17 tripwire→ring dump: snapshot the IOFX_CHAIN_CAPTURE
+            // 256-slot ring to disk so `scripts/analyze_iofx_chain.py` can name
+            // the exact kernel+param that wrote these distance-KEY floats into the
+            // value/index buffer (the Class-4 producer). The offline shared-pool
+            // repro proved the sort scatter is clean in isolation, so the producer
+            // must be caught live. Requires the run to ALSO set
+            // ZLUDA_IOFX_CHAIN_CAPTURE=1 (+ ZLUDA_IOFX_CHAIN_CAPTURE_BUFS=1 for the
+            // pre/post buffer images the analyzer scans). One-shot — IOFX_TW_FOUND
+            // is already set above so this fires once, on the first corrupt frame.
+            let ring_host =
+                IOFX_CHAIN_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+            let ring_bytes =
+                IOFX_CHAIN_CAPTURE_TOTAL_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+            if ring_host != 0 && ring_bytes != 0 {
+                let path = format!("/tmp/iofx_chain_tripwire_{}.bin", nl);
+                let slice =
+                    unsafe { std::slice::from_raw_parts(ring_host as *const u8, ring_bytes) };
+                match std::fs::write(&path, slice) {
+                    Ok(_) => super::driver::zluda_log_err(&format!(
+                        "[IOFX_VALUE_TRIPWIRE] dumped chain ring ({} bytes) to {} — \
+                         run scripts/analyze_iofx_chain.py on it to name the producer",
+                        ring_bytes, path
+                    )),
+                    Err(e) => super::driver::zluda_log_err(&format!(
+                        "[IOFX_VALUE_TRIPWIRE] chain ring dump to {} FAILED: {}",
+                        path, e
+                    )),
+                }
+            } else {
+                super::driver::zluda_log_err(
+                    "[IOFX_VALUE_TRIPWIRE] chain ring EMPTY — set ZLUDA_IOFX_CHAIN_CAPTURE=1 \
+                     + ZLUDA_IOFX_CHAIN_CAPTURE_BUFS=1 to capture the producer",
+                );
+            }
+            let _ = bad;
+            break;
+        }
+    }
+}
+
 unsafe fn tfs_capture_init(state: &mut Option<TfsCaptureState>) {
     if state.is_some() {
         return;
@@ -14743,6 +14928,11 @@ pub(crate) fn launch_kernel(
             capture_iofx_chain_pre(slot_index, stream);
         }
     }
+    // 2026-06-16 BUG-2 Step-1a: scan the CONSUMER's input PRE-launch. The post-launch scan misses
+    // the faulting bbox launch (the GPU faults mid-launch, before the post hook runs), and the
+    // upstream producers' buffers are still clean when post-scanned — so the corrupt index is only
+    // visible PRE-bbox. This sees bbox/actorRange input before the fault.
+    unsafe { iofx_value_tripwire(&name, kernel_params, extra, stream) };
 
     // Plan v15+v16: pre-launch sync + mirror refresh for clean per-kernel
     // attribution, with BETWEEN-launch diff emit. Drains all prior async
@@ -15030,6 +15220,47 @@ pub(crate) fn launch_kernel(
     if let Some(slot_index) = iofx_bbox_slot.filter(|_| result.is_ok()) {
         unsafe {
             capture_iofx_bbox_post(slot_index, stream);
+        }
+    }
+    // 2026-06-16 BUG-2 Phase-A adjacency probe (ZLUDA_IOFX_ADJ_PROBE=1).
+    // Class-4 is a single position-float word in the value/index buffer that
+    // makeSortKeys writes (param_15) and bbox/actorRange scatter by. Offline
+    // (iofx_bbox_C4_withVA.bin) the value buffer sits 0x800/0x1000 ABOVE
+    // float/position buffers holding values in the leaked float's magnitude
+    // range. The decisive question for the fix: are those one cuMemAlloc
+    // (intra-buffer stride bug → padding won't help) or separate adjacent
+    // allocs (→ guard-page/ALLOC_PAD fix). The buffer LAYOUT is the same every
+    // frame, so this answers it on ANY run reaching makeSortKeys — no need to
+    // reach the rare Class-4 frame. Logs the HIP alloc range (cuMemGetAddressRange)
+    // of makeSortKeys' input(p4)/positions(p9)/keys(p14)/values(p15) so their
+    // same-alloc-vs-separate layout + inter-buffer gaps are visible. Throttled.
+    if result.is_ok() && (name == "IOFX_makeSortKeys_templ$0" || name == "IOFX_makeSortKeys_templ$1") {
+        static ADJ_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ADJ_PROBE.get_or_init(|| std::env::var("ZLUDA_IOFX_ADJ_PROBE").map_or(false, |v| v == "1")) {
+            static ADJ_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = ADJ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 24 {
+                // (label, arg_byte_offset, arg_index) for the 4 pointer params.
+                let probes: [(&str, usize, usize); 4] = [
+                    ("input_p4", 24, 4),
+                    ("positions_p9", 48, 9),
+                    ("keys_p14", 88, 14),
+                    ("values_p15", 96, 15),
+                ];
+                let mut parts = String::new();
+                for (lbl, off, idx) in probes {
+                    let va = unsafe { read_kernel_arg::<u64>(kernel_params, extra, off, idx) }.unwrap_or(0);
+                    let range = unsafe { query_device_pointer_range(va) };
+                    match range {
+                        Some((base, size, _)) => parts.push_str(&format!(
+                            " {}=0x{:x}[base=0x{:x} size={} off={}]",
+                            lbl, va, base, size, va.wrapping_sub(base)
+                        )),
+                        None => parts.push_str(&format!(" {}=0x{:x}[no-range]", lbl, va)),
+                    }
+                }
+                super::driver::zluda_log_err(&format!("[IOFX_ADJ_PROBE #{}]{}", n, parts));
+            }
         }
     }
     if let Some(slot_index) = iofx_chain_slot.filter(|_| result.is_ok()) {
