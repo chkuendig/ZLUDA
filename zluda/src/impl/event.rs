@@ -236,10 +236,10 @@ pub(crate) unsafe fn synchronize(event: hipEvent_t) -> hipError_t {
     // 0/3 Class B canonical NULL-deref vs 3/5 in baseline. Class B (host-side
     // NULL deref at PhysX3.dll+0x20ced9) is effectively eliminated. Residual
     // crash class is Class A (GPU TCP wild-VA, separate IOFX/TFS texref race).
-    // Default flipped to ON; set =0 to opt out for A/B.
+    // Default flipped to ON, then retired (off by default); =1 enables.
     static HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let hdp_flush = *HDP_FLUSH
-        .get_or_init(|| std::env::var("ZLUDA_EVENT_HDP_FLUSH").map_or(true, |v| v != "0"));
+        .get_or_init(|| std::env::var("ZLUDA_EVENT_HDP_FLUSH").map_or(false, |v| v == "1"));
     if hdp_flush {
         let _ = hipDeviceSynchronize();
         super::stream::clear_dirty_flag_after_device_sync();

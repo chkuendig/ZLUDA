@@ -368,7 +368,9 @@ fn init_globals() -> Result<(), String> {
                         &*Box::leak(cs.into_boxed_c_str())
                     })
                     .collect(),
-                _ => vec![],
+                // Default: the AMDGPU zero-VGPR prolog stays off, as in the
+                // configuration validated in games.
+                _ => vec![c"-amdgpu-zero-vgpr-prolog=false"],
             };
             let llvm_args_ptrs: Vec<*const i8> = common_options
                 //.chain(opt_options)

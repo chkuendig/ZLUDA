@@ -103,7 +103,7 @@ fn strict_null_stream_barrier_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         let raw = std::env::var("ZLUDA_NULL_STREAM_STRICT").ok();
-        let v = raw.as_deref().map_or(false, |s| s == "1");
+        let v = raw.as_deref().map_or(true, |s| s != "0");
         super::driver::zluda_log_err(&format!(
             "[ZLUDA] ZLUDA_NULL_STREAM_STRICT env={:?} → strict={}",
             raw, v
@@ -207,10 +207,10 @@ pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
     // include HDP flush semantics. Forcing a hipDeviceSynchronize after the
     // stream sync acts as an HDP flush via the driver's full-device wait
     // path. Heavy-handed (~adds latency to every sync) but a clean test of
-    // the hypothesis. Env-gate ZLUDA_HDP_FLUSH_ON_SYNC=1 (default ON).
+    // the hypothesis. Env-gate ZLUDA_HDP_FLUSH_ON_SYNC=1 (off by default since the retirement profile).
     static HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let hdp_flush = *HDP_FLUSH
-        .get_or_init(|| std::env::var("ZLUDA_HDP_FLUSH_ON_SYNC").map_or(true, |v| v != "0"));
+        .get_or_init(|| std::env::var("ZLUDA_HDP_FLUSH_ON_SYNC").map_or(false, |v| v == "1"));
     if hdp_flush {
         let _ = unsafe { hipDeviceSynchronize() };
         clear_non_default_stream_dirty();
@@ -374,11 +374,11 @@ pub(crate) fn query(stream: hipStream_t) -> hipError_t {
     // query returns SUCCESS (stream is idle), trigger HDP flush via
     // hipDeviceSynchronize. On an idle stream this is fast — just an AQL
     // barrier-AND packet round-trip whose release fence does the flush.
-    // Env-gate ZLUDA_QUERY_HDP_FLUSH default-ON, opt-out with =0.
+    // Env-gate ZLUDA_QUERY_HDP_FLUSH: off by default (retirement profile), =1 enables.
     if returned == Ok(()) {
         static QUERY_HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *QUERY_HDP_FLUSH
-            .get_or_init(|| std::env::var("ZLUDA_QUERY_HDP_FLUSH").map_or(true, |v| v != "0"))
+            .get_or_init(|| std::env::var("ZLUDA_QUERY_HDP_FLUSH").map_or(false, |v| v == "1"))
         {
             unsafe {
                 let _ = hipDeviceSynchronize();

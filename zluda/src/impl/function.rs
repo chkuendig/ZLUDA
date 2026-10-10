@@ -12960,8 +12960,8 @@ pub(crate) fn launch_kernel(
         static WRITER_TRACK_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let barrier_on = *BARRIER_ENABLED.get_or_init(|| {
             std::env::var("ZLUDA_NTHREADS_BARRIER")
-                .map(|v| v != "0")
-                .unwrap_or(true)
+                .map(|v| v == "1")
+                .unwrap_or(false)
         });
         let writer_log_on = *WRITER_TRACK_ENABLED
             .get_or_init(|| std::env::var("ZLUDA_NTHREADS_WRITER").map_or(false, |v| v == "1"));
@@ -13412,10 +13412,10 @@ pub(crate) fn launch_kernel(
         // default-ON mean 1.10M (~2.6×). Run1: 1.06M, 0 Class B (ended Class
         // A GPU fault). Run2: 1.146M, 1 Class B (much later than baseline).
         // Class B not fully eliminated but heavily delayed. Default flipped
-        // to ON; set =0 to opt out.
+        // to ON, then retired (off by default); set =1 to enable.
         static MEMCPY_HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *MEMCPY_HDP_FLUSH
-            .get_or_init(|| std::env::var("ZLUDA_MEMCPY_HDP_FLUSH").map_or(true, |v| v != "0"))
+            .get_or_init(|| std::env::var("ZLUDA_MEMCPY_HDP_FLUSH").map_or(false, |v| v == "1"))
         {
             unsafe {
                 let _ = hipDeviceSynchronize();

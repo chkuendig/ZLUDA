@@ -105,8 +105,8 @@ fn texref_log_enabled() -> bool {
 /// hipTexRefSet*" and not "free".
 /// ZLUDA_TEXREF_SYNC level:
 ///   0 — OFF
-///   1 — drain in-flight kernels before SetAddress/SetArray binds (the original
-///       behaviour; set =1 by the Batman protonfix).
+///   1 — drain in-flight kernels before SetAddress/SetArray binds (default;
+///       Arkham Asylum hangs without it).
 ///   2 — ALSO drain before the non-address texref-state mutators (SetFlags /
 ///       SetFormat / SetAddressMode / SetFilterMode). 2026-06-15 Class-4 fix:
 ///       CUDA snapshots the WHOLE texref state at launch; a mid-flight
@@ -122,7 +122,7 @@ fn texref_sync_level() -> u32 {
         std::env::var("ZLUDA_TEXREF_SYNC")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
+            .unwrap_or(1)
     })
 }
 
@@ -630,8 +630,8 @@ pub(crate) unsafe fn object_create(
     // sync ensures the texture object is fully ready before the
     // returned handle escapes to the caller. Cost: ~50–200µs added
     // latency per call; Batman creates ~6–12 per frame → ~3% perf hit.
-    // Gated by ZLUDA_TEXOBJ_SYNC=0 to disable for A/B testing.
-    if std::env::var("ZLUDA_TEXOBJ_SYNC").ok().as_deref() != Some("0") {
+    // Off by default (validated retirement profile); ZLUDA_TEXOBJ_SYNC=1 enables.
+    if std::env::var("ZLUDA_TEXOBJ_SYNC").ok().as_deref() == Some("1") {
         let _ = hip_runtime_sys::hipDeviceSynchronize();
     }
     // Encode pixel shift in top 3 bits of the handle, same as cuSurfObjectCreate.

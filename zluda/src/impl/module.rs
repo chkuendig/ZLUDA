@@ -712,7 +712,7 @@ fn match_setp_eq_s64_zero_pair(setp_line: &str, bra_line: &str) -> Option<(Strin
 ///
 /// Skip CUB / cuda::* — those are not our suspect class.
 ///
-/// Env-gate: `ZLUDA_BROAD_VOLATILE_LDS=1` (default ON in protonfix).
+/// Env-gate: `ZLUDA_BROAD_VOLATILE_LDS=1` (off by default since the retirement profile).
 ///
 /// Originally kernel-name-targeted (PhysX/TFS/IOFX/FleX prefixes, skip
 /// `_ZN3cub`). After 2026-05-05's SubResource interop landing made PhysX
@@ -726,7 +726,8 @@ fn match_setp_eq_s64_zero_pair(setp_line: &str, bra_line: &str) -> Option<(Strin
 /// don't trigger the AMDGPU race. For our hardware (gfx1033) and goal
 /// (gameplay correctness over benchmark perf), correctness wins.
 pub fn patch_broad_volatile_lds(ptx: &str) -> Option<String> {
-    let env_off = std::env::var("ZLUDA_BROAD_VOLATILE_LDS").map_or(false, |v| v == "0");
+    // Off by default since the validated retirement profile; =1 enables.
+    let env_off = std::env::var("ZLUDA_BROAD_VOLATILE_LDS").map_or(true, |v| v != "1");
     if env_off {
         return None;
     }
@@ -1081,9 +1082,10 @@ pub fn patch_broad_membar_before_bar_sync(ptx: &str) -> Option<String> {
 /// `s_waitcnt lgkmcnt(0)` after `s_barrier`, giving reader threads a
 /// fresh acquire of LDS state.
 ///
-/// Default ON. Set `ZLUDA_SCAN_READER_ACQUIRE=0` to disable.
+/// Off by default (retirement profile). Set `ZLUDA_SCAN_READER_ACQUIRE=1` to enable.
 pub fn patch_scan_kernel_reader_acquire(ptx: &str) -> Option<String> {
-    let env_off = std::env::var("ZLUDA_SCAN_READER_ACQUIRE").map_or(false, |v| v == "0");
+    // Off by default since the validated retirement profile; =1 enables.
+    let env_off = std::env::var("ZLUDA_SCAN_READER_ACQUIRE").map_or(true, |v| v != "1");
     if env_off {
         return None;
     }
@@ -1139,7 +1141,8 @@ pub fn patch_scan_kernel_reader_acquire(ptx: &str) -> Option<String> {
 }
 
 pub fn patch_divergent_lds_merge_sync(ptx: &str) -> Option<String> {
-    let env_off = std::env::var("ZLUDA_DIVERGENT_LDS_MERGE_SYNC").map_or(false, |v| v == "0");
+    // Off by default since the validated retirement profile; =1 enables.
+    let env_off = std::env::var("ZLUDA_DIVERGENT_LDS_MERGE_SYNC").map_or(true, |v| v != "1");
     if env_off {
         return None;
     }
@@ -3894,8 +3897,9 @@ ret;
     // ===== patch_divergent_lds_merge_sync tests =====
 
     fn ensure_default_on() {
-        // Tests default-on behavior; clear any inherited env.
-        std::env::remove_var("ZLUDA_DIVERGENT_LDS_MERGE_SYNC");
+        // The patch is off by default since the retirement profile; these
+        // tests exercise it, so enable it explicitly.
+        std::env::set_var("ZLUDA_DIVERGENT_LDS_MERGE_SYNC", "1");
     }
 
     #[test]
