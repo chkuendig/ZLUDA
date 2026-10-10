@@ -212,6 +212,10 @@ impl<'a> FatbinFile<'a> {
             .contains(FatbinFileHeaderFlags::CompressedZstd)
         {
             Cow::Owned(unsafe { decompress_zstd(self) }?)
+        } else if self.header.flags.contains(FatbinFileHeaderFlags::Compress) {
+            // Old-style compression flag (0x1000): LZ4 compressed, but
+            // compressed size is in payload_size (not compressed_size)
+            Cow::Owned(unsafe { decompress_legacy(self) }?)
         } else {
             Cow::Borrowed(unsafe { self.get_non_compressed_payload() })
         };
@@ -273,6 +277,24 @@ impl<'a> FatbinFileIterator<'a> {
 }
 
 const MAX_MODULE_DECOMPRESSION_BOUND: usize = 64 * 1024 * 1024;
+
+/// Decompress data using the old-style compression flag (0x1000).
+/// This flag indicates zlib/deflate compression (used by older CUDA toolkits).
+/// In this format, `payload_size` contains the compressed data size
+/// and `uncompressed_payload` contains the expected decompressed size.
+pub unsafe fn decompress_legacy(file: FatbinFile) -> Result<Vec<u8>, FatbinError> {
+    use flate2::bufread::ZlibDecoder;
+    use std::io::Read;
+
+    let compressed = file.get_non_compressed_payload();
+    let mut decoder = ZlibDecoder::new(compressed);
+    let expected_size = file.header.uncompressed_payload as usize;
+    let mut decompressed = Vec::with_capacity(expected_size);
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|_| FatbinError::Lz4DecompressionFailure)?;
+    Ok(decompressed)
+}
 
 pub unsafe fn decompress_lz4(file: FatbinFile) -> Result<Vec<u8>, FatbinError> {
     let decompressed_size = usize::max(1024, file.header.uncompressed_payload as usize);

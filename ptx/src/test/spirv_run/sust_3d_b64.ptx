@@ -1,0 +1,52 @@
+.version 6.5
+.target sm_50
+.address_size 64
+
+// Regression test: sust.b.3d.b64 on a 1-channel FLOAT surface.
+// This crashes on AMDGPU because the b64 implementation uses dmask:0x3
+// (2 channels) on a 1-channel image descriptor.
+// CUDA semantics: b64 writes 8 consecutive bytes (2 pixels on 1-ch float).
+// AMDGPU fix: write 2 consecutive x positions with dmask:0x1 each.
+
+.visible .entry sust_3d_b64(
+    .param .u64 sust_3d_b64_param_0,
+    .param .u64 sust_3d_b64_param_1
+)
+{
+    .reg .u64   out_addr;
+    .reg .u64   surf_handle;
+    .reg .s32   x_elem, x_byte, y, z;
+    .reg .s32   bx, by, bz, tx, ty, tz, nx, ny, nz;
+    .reg .b64   val64;
+    .reg .b32   marker;
+
+    ld.param.u64    out_addr, [sust_3d_b64_param_0];
+    ld.param.u64    surf_handle, [sust_3d_b64_param_1];
+
+    // Compute 3D coordinates
+    mov.u32     bx, %ctaid.x;
+    mov.u32     by, %ctaid.y;
+    mov.u32     bz, %ctaid.z;
+    mov.u32     tx, %tid.x;
+    mov.u32     ty, %tid.y;
+    mov.u32     tz, %tid.z;
+    mov.u32     nx, %ntid.x;
+    mov.u32     ny, %ntid.y;
+    mov.u32     nz, %ntid.z;
+
+    mad.lo.s32  x_elem, nx, bx, tx;
+    mad.lo.s32  y, ny, by, ty;
+    mad.lo.s32  z, nz, bz, tz;
+
+    // Byte-scale x for b64: x *= 8 (2 consecutive floats)
+    shl.b32     x_byte, x_elem, 3;
+
+    // Write 64-bit value (0x00000042_00000042 = two floats of value 42)
+    mov.b64     val64, 0x4224000042240000;
+    sust.b.3d.b64.zero [surf_handle, {x_byte, y, z, z}], {val64};
+
+    // Write marker to confirm kernel completed
+    mov.b32     marker, 1;
+    st.global.b32   [out_addr], marker;
+    ret;
+}

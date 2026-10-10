@@ -97,6 +97,7 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   br label %"118"
 
 "118":                                            ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"152", align 8
   store i64 %2, ptr addrspace(5) %"153", align 8
   %"76" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -156,7 +157,7 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %21 = load i16, ptr addrspace(5) %"157", align 2
   %22 = load i16, ptr addrspace(5) %"158", align 2
   %23 = load i16, ptr addrspace(5) %"159", align 2
-  %24 = insertelement <4 x i16> undef, i16 %20, i8 0
+  %24 = insertelement <4 x i16> zeroinitializer, i16 %20, i8 0
   %25 = insertelement <4 x i16> %24, i16 %21, i8 1
   %26 = insertelement <4 x i16> %25, i16 %22, i8 2
   %"100" = insertelement <4 x i16> %26, i16 %23, i8 3
@@ -171,7 +172,7 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %29 = load i16, ptr addrspace(5) %"161", align 2
   %30 = load i16, ptr addrspace(5) %"162", align 2
   %31 = load i16, ptr addrspace(5) %"163", align 2
-  %32 = insertelement <4 x i16> undef, i16 %28, i8 0
+  %32 = insertelement <4 x i16> zeroinitializer, i16 %28, i8 0
   %33 = insertelement <4 x i16> %32, i16 %29, i8 1
   %34 = insertelement <4 x i16> %33, i16 %30, i8 2
   %"101" = insertelement <4 x i16> %34, i16 %31, i8 3
@@ -186,7 +187,7 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %37 = load i16, ptr addrspace(5) %"165", align 2
   %38 = load i16, ptr addrspace(5) %"166", align 2
   %39 = load i16, ptr addrspace(5) %"167", align 2
-  %40 = insertelement <4 x i16> undef, i16 %36, i8 0
+  %40 = insertelement <4 x i16> zeroinitializer, i16 %36, i8 0
   %41 = insertelement <4 x i16> %40, i16 %37, i8 1
   %42 = insertelement <4 x i16> %41, i16 %38, i8 2
   %"102" = insertelement <4 x i16> %42, i16 %39, i8 3
@@ -201,7 +202,7 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %45 = load i16, ptr addrspace(5) %"169", align 2
   %46 = load i16, ptr addrspace(5) %"170", align 2
   %47 = load i16, ptr addrspace(5) %"171", align 2
-  %48 = insertelement <4 x i16> undef, i16 %44, i8 0
+  %48 = insertelement <4 x i16> zeroinitializer, i16 %44, i8 0
   %49 = insertelement <4 x i16> %48, i16 %45, i8 1
   %50 = insertelement <4 x i16> %49, i16 %46, i8 2
   %"103" = insertelement <4 x i16> %50, i16 %47, i8 3
@@ -216,7 +217,7 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %53 = load i16, ptr addrspace(5) %"157", align 2
   %54 = load i16, ptr addrspace(5) %"158", align 2
   %55 = load i16, ptr addrspace(5) %"159", align 2
-  %56 = insertelement <4 x i16> undef, i16 %52, i8 0
+  %56 = insertelement <4 x i16> zeroinitializer, i16 %52, i8 0
   %57 = insertelement <4 x i16> %56, i16 %53, i8 1
   %58 = insertelement <4 x i16> %57, i16 %54, i8 2
   %"104" = insertelement <4 x i16> %58, i16 %55, i8 3
@@ -231,7 +232,7 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %61 = load i16, ptr addrspace(5) %"157", align 2
   %62 = load i16, ptr addrspace(5) %"158", align 2
   %63 = load i16, ptr addrspace(5) %"159", align 2
-  %64 = insertelement <4 x i16> undef, i16 %60, i8 0
+  %64 = insertelement <4 x i16> zeroinitializer, i16 %60, i8 0
   %65 = insertelement <4 x i16> %64, i16 %61, i8 1
   %66 = insertelement <4 x i16> %65, i16 %62, i8 2
   %"105" = insertelement <4 x i16> %66, i16 %63, i8 3
@@ -258,19 +259,19 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %73 = load i32, ptr addrspace(5) %"177", align 4
   %74 = load i32, ptr addrspace(5) %"178", align 4
   %75 = load i32, ptr addrspace(5) %"179", align 4
-  %76 = insertelement <4 x i32> undef, i32 %72, i8 0
+  %76 = insertelement <4 x i32> zeroinitializer, i32 %72, i8 0
   %77 = insertelement <4 x i32> %76, i32 %73, i8 1
   %78 = insertelement <4 x i32> %77, i32 %74, i8 2
   %"107" = insertelement <4 x i32> %78, i32 %75, i8 3
   %79 = load i32, ptr addrspace(5) %"180", align 4
   %80 = load i32, ptr addrspace(5) %"181", align 4
-  %81 = insertelement <2 x i32> undef, i32 %79, i8 0
+  %81 = insertelement <2 x i32> zeroinitializer, i32 %79, i8 0
   %"108" = insertelement <2 x i32> %81, i32 %80, i8 1
   %82 = load i32, ptr addrspace(5) %"172", align 4
   %83 = load i32, ptr addrspace(5) %"173", align 4
   %84 = load i32, ptr addrspace(5) %"174", align 4
   %85 = load i32, ptr addrspace(5) %"175", align 4
-  %86 = insertelement <4 x i32> undef, i32 %82, i8 0
+  %86 = insertelement <4 x i32> zeroinitializer, i32 %82, i8 0
   %87 = insertelement <4 x i32> %86, i32 %83, i8 1
   %88 = insertelement <4 x i32> %87, i32 %84, i8 2
   %"109" = insertelement <4 x i32> %88, i32 %85, i8 3
@@ -316,8 +317,9 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %100 = load i32, ptr addrspace(5) %"185", align 4
   %"342" = bitcast i32 %100 to float
   store float %"342", ptr %"116", align 4
+  fence seq_cst
   ret void
 }
 
 attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

@@ -1,0 +1,53 @@
+.version 6.5
+.target sm_50
+.address_size 64
+
+// Regression test for surface write pixel size encoding.
+// Mimics TurbulenceFS_dynamicGridClearKernel: byte-scaled x coordinate
+// on a 64x64x64 surface. Without pixel size encoding in the surface
+// handle's top bits, the x coordinate stays byte-scaled (max 252),
+// exceeding the 64-element row → GPU page fault.
+//
+// Launch: grid=[8,8,8] block=[8,8,8] → covers full 64x64x64 volume
+
+.visible .entry sust_3d_large(
+    .param .u64 sust_3d_large_param_0,
+    .param .u64 sust_3d_large_param_1
+)
+{
+    .reg .u64   out_addr;
+    .reg .u64   surf_handle;
+    .reg .s32   x_elem, x_byte, y, z;
+    .reg .s32   bx, by, bz, tx, ty, tz, nx, ny, nz;
+    .reg .b32   val;
+
+    ld.param.u64    out_addr, [sust_3d_large_param_0];
+    ld.param.u64    surf_handle, [sust_3d_large_param_1];
+
+    // Compute 3D coordinates from thread/block indices
+    mov.u32     bx, %ctaid.x;
+    mov.u32     by, %ctaid.y;
+    mov.u32     bz, %ctaid.z;
+    mov.u32     tx, %tid.x;
+    mov.u32     ty, %tid.y;
+    mov.u32     tz, %tid.z;
+    mov.u32     nx, %ntid.x;
+    mov.u32     ny, %ntid.y;
+    mov.u32     nz, %ntid.z;
+
+    mad.lo.s32  x_elem, nx, bx, tx;    // x = blockDim.x * blockIdx.x + threadIdx.x
+    mad.lo.s32  y, ny, by, ty;
+    mad.lo.s32  z, nz, bz, tz;
+
+    // Byte-scale x like CUDA PTX does (shl by log2(sizeof(float)))
+    shl.b32     x_byte, x_elem, 2;     // x *= 4 (byte addressing for float)
+
+    // Write value 42 to the surface
+    mov.b32     val, 42;
+    sust.b.3d.b32.zero [surf_handle, {x_byte, y, z, z}], {val};
+
+    // Write 1 to output to confirm kernel completed
+    mov.b32     val, 1;
+    st.global.b32   [out_addr], val;
+    ret;
+}

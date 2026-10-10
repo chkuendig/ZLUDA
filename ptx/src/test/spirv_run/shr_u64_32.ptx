@@ -1,0 +1,30 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Test shr.u64 by 32 — extracts high 32 bits
+// Input: [0x00000000FFFFFFFF] (u64) — high32 should be 0
+// CopyBits2 uses: shr.u64 %rd, value, 32; then st.global.u32 [addr], %rd (stores low 32 of result)
+.visible .entry shr_u64_32(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .u64 in_addr, out_addr, val, shifted;
+	.reg .u32 result;
+
+	ld.param.u64 in_addr, [input];
+	ld.param.u64 out_addr, [output];
+
+	// Load u64 value
+	ld.u64 val, [in_addr];
+
+	// Shift right by 32 (extract high 32 bits)
+	shr.u64 shifted, val, 32;
+
+	// Store low 32 bits of shifted result (= high 32 bits of original)
+	cvt.u32.u64 result, shifted;
+	st.u32 [out_addr], result;
+
+	ret;
+}

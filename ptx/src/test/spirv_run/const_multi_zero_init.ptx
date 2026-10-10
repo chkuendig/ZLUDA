@@ -1,0 +1,34 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Multiple .const globals without initializers — exercises the Batman AK
+// gParams/gBounds pattern where two .const arrays must get distinct device
+// addresses via hipModuleGetGlobal.
+.const .align 8 .b8 gParams[16];
+.const .align 8 .b8 gBounds[16];
+
+.visible .entry const_multi_zero_init(
+    .param .u64 input,
+    .param .u64 output
+)
+{
+    .reg .u64       in_addr;
+    .reg .u64       out_addr;
+    .reg .u64       val0;
+    .reg .u64       val1;
+    .reg .u64       val2;
+    .reg .u64       val3;
+
+    ld.param.u64    in_addr, [input];
+    ld.param.u64    out_addr, [output];
+    ld.const.u64    val0, [gParams];
+    ld.const.u64    val1, [gParams+8];
+    ld.const.u64    val2, [gBounds];
+    ld.const.u64    val3, [gBounds+8];
+    st.u64          [out_addr], val0;
+    st.u64          [out_addr+8], val1;
+    st.u64          [out_addr+16], val2;
+    st.u64          [out_addr+24], val3;
+    ret;
+}

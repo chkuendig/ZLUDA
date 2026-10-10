@@ -10,6 +10,7 @@ define amdgpu_kernel void @global_array_f32(ptr addrspace(4) byref(i64) %"42", p
   br label %"41"
 
 "41":                                             ; preds = %1
+  fence seq_cst
   store i64 ptrtoint (ptr addrspace(1) @foobar to i64), ptr addrspace(5) %"44", align 8
   %2 = load i64, ptr addrspace(4) %"43", align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
@@ -22,7 +23,8 @@ define amdgpu_kernel void @global_array_f32(ptr addrspace(4) byref(i64) %"42", p
   %6 = load float, ptr addrspace(5) %"46", align 4
   %"55" = inttoptr i64 %5 to ptr
   store float %6, ptr %"55", align 4
+  fence seq_cst
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

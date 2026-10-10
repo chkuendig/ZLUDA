@@ -5,6 +5,7 @@ define amdgpu_kernel void @trap(ptr addrspace(4) byref(i64) %"37", ptr addrspace
   br label %"35"
 
 "35":                                             ; preds = %1
+  fence seq_cst
   call void @llvm.trap()
   unreachable
 }
@@ -12,5 +13,5 @@ define amdgpu_kernel void @trap(ptr addrspace(4) byref(i64) %"37", ptr addrspace
 ; Function Attrs: cold noreturn nounwind memory(inaccessiblemem: write)
 declare void @llvm.trap() #1
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
 attributes #1 = { cold noreturn nounwind memory(inaccessiblemem: write) }

@@ -88,6 +88,7 @@ define amdgpu_kernel void @call_rnd(ptr addrspace(4) byref(i64) %"101", ptr addr
   br label %"93"
 
 "93":                                             ; preds = %1
+  fence seq_cst
   call void @llvm.amdgcn.s.setreg(i32 6145, i32 1)
   %2 = load i64, ptr addrspace(4) %"101", align 8
   store i64 %2, ptr addrspace(5) %"103", align 8
@@ -147,6 +148,7 @@ define amdgpu_kernel void @call_rnd(ptr addrspace(4) byref(i64) %"101", ptr addr
   %"74" = getelementptr inbounds i8, ptr %"168", i64 4
   %25 = load float, ptr addrspace(5) %"110", align 4
   store float %25, ptr %"74", align 4
+  fence seq_cst
   ret void
 }
 
@@ -157,6 +159,6 @@ declare void @llvm.amdgcn.s.setreg(i32 immarg, i32) #2
 declare float @llvm.experimental.constrained.fadd.f32(float, float, metadata, metadata) #3
 
 attributes #0 = { strictfp "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { strictfp "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="ieee" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { strictfp "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="ieee" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
 attributes #2 = { nocallback nofree nosync nounwind willreturn }
 attributes #3 = { nocallback nofree nosync nounwind strictfp willreturn memory(inaccessiblemem: readwrite) }

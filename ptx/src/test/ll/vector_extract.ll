@@ -12,6 +12,7 @@ define amdgpu_kernel void @vector_extract(ptr addrspace(4) byref(i64) %"49", ptr
   br label %"48"
 
 "48":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"49", align 8
   store i64 %2, ptr addrspace(5) %"51", align 8
   %3 = load i64, ptr addrspace(4) %"50", align 8
@@ -35,7 +36,7 @@ define amdgpu_kernel void @vector_extract(ptr addrspace(4) byref(i64) %"49", ptr
   %7 = load i16, ptr addrspace(5) %"55", align 2
   %8 = load i16, ptr addrspace(5) %"56", align 2
   %9 = load i16, ptr addrspace(5) %"53", align 2
-  %10 = insertelement <4 x i16> undef, i16 %6, i8 0
+  %10 = insertelement <4 x i16> zeroinitializer, i16 %6, i8 0
   %11 = insertelement <4 x i16> %10, i16 %7, i8 1
   %12 = insertelement <4 x i16> %11, i16 %8, i8 2
   %"43" = insertelement <4 x i16> %12, i16 %9, i8 3
@@ -53,7 +54,7 @@ define amdgpu_kernel void @vector_extract(ptr addrspace(4) byref(i64) %"49", ptr
   %15 = load i16, ptr addrspace(5) %"56", align 2
   %16 = load i16, ptr addrspace(5) %"53", align 2
   %17 = load i16, ptr addrspace(5) %"54", align 2
-  %18 = insertelement <4 x i16> undef, i16 %14, i8 0
+  %18 = insertelement <4 x i16> zeroinitializer, i16 %14, i8 0
   %19 = insertelement <4 x i16> %18, i16 %15, i8 1
   %20 = insertelement <4 x i16> %19, i16 %16, i8 2
   %"46" = insertelement <4 x i16> %20, i16 %17, i8 3
@@ -73,14 +74,15 @@ define amdgpu_kernel void @vector_extract(ptr addrspace(4) byref(i64) %"49", ptr
   %"94" = trunc i16 %22 to i8
   %"95" = trunc i16 %23 to i8
   %"96" = trunc i16 %24 to i8
-  %25 = insertelement <4 x i8> undef, i8 %"93", i8 0
+  %25 = insertelement <4 x i8> zeroinitializer, i8 %"93", i8 0
   %26 = insertelement <4 x i8> %25, i8 %"94", i8 1
   %27 = insertelement <4 x i8> %26, i8 %"95", i8 2
   %"47" = insertelement <4 x i8> %27, i8 %"96", i8 3
   %28 = load i64, ptr addrspace(5) %"52", align 8
   %"97" = inttoptr i64 %28 to ptr addrspace(1)
   store <4 x i8> %"47", ptr addrspace(1) %"97", align 4
+  fence seq_cst
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

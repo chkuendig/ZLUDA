@@ -1,0 +1,32 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Test broadcasting lane 31's value to all lanes using shfl.sync.idx.
+// Each thread has val = tid + 1. Lane 31 has val = 32.
+// After shfl.sync.idx with srcLane=31, opts=31, all threads should have 32.
+// Output: each thread writes its received value.
+
+.visible .entry shfl_broadcast_31(
+    .param .u64 output
+)
+{
+    .reg .u64   out_addr, out_off;
+    .reg .u32   tid, val, result;
+    .reg .pred  pv;
+
+    ld.param.u64 out_addr, [output];
+    mov.u32 tid, %tid.x;
+    add.u32 val, tid, 1;
+
+    // Broadcast lane 31's value: shfl.sync.idx srcLane=31 opts=31 mask=0xFFFFFFFF
+    shfl.sync.idx.b32 result|pv, val, 31, 31, 0xFFFFFFFF;
+
+    // Write result
+    cvt.u64.u32 out_off, tid;
+    mul.lo.u64 out_off, out_off, 4;
+    add.u64 out_addr, out_addr, out_off;
+    st.u32 [out_addr], result;
+
+    ret;
+}

@@ -13,6 +13,7 @@ define amdgpu_kernel void @cvt_relu_f16x2_f32(ptr addrspace(4) byref(i64) %"52",
   br label %"51"
 
 "51":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"52", align 8
   store i64 %2, ptr addrspace(5) %"54", align 8
   %3 = load i64, ptr addrspace(4) %"53", align 8
@@ -73,11 +74,12 @@ define amdgpu_kernel void @cvt_relu_f16x2_f32(ptr addrspace(4) byref(i64) %"52",
   %29 = load <2 x half>, ptr addrspace(5) %"61", align 4
   %"97" = bitcast <2 x half> %29 to i32
   store i32 %"97", ptr addrspace(1) %"50", align 4
+  fence seq_cst
   ret void
 }
 
 ; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
 declare half @llvm.maximum.f16(half, half) #1
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="ieee" "denormal-fp-math-f32"="ieee" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="ieee" "denormal-fp-math-f32"="ieee" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
 attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }

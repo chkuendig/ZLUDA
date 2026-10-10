@@ -13250,6 +13250,29 @@ extern "C" {
 #[cfg_attr(windows, link(name = "amdhip64_7", kind = "raw-dylib"))]
 extern "C" {
     #[must_use]
+    pub fn hipGraphicsGLRegisterBuffer(
+        resource: *mut hipGraphicsResource_t,
+        buffer: ::core::ffi::c_uint,
+        flags: ::core::ffi::c_uint,
+    ) -> hipError_t;
+    #[must_use]
+    pub fn hipGraphicsGLRegisterImage(
+        resource: *mut hipGraphicsResource_t,
+        image: ::core::ffi::c_uint,
+        target: ::core::ffi::c_uint,
+        flags: ::core::ffi::c_uint,
+    ) -> hipError_t;
+    #[must_use]
+    pub fn hipGLGetDevices(
+        pHipDeviceCount: *mut ::core::ffi::c_uint,
+        pHipDevices: *mut ::core::ffi::c_int,
+        hipDeviceCount: ::core::ffi::c_uint,
+        deviceList: ::core::ffi::c_int, // hipGLDeviceList enum, 0 = All
+    ) -> hipError_t;
+}
+#[cfg_attr(windows, link(name = "amdhip64_7", kind = "raw-dylib"))]
+extern "C" {
+    #[must_use]
     /** @brief Create a surface object.
 
  @param [out] pSurfObject  Pointer of surface object to be created.

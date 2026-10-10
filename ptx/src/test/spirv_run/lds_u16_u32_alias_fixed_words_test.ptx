@@ -1,0 +1,120 @@
+.version 3.2
+.target sm_30
+.address_size 64
+
+// Fixed-address follow-up to the mixed-width alias reproducer. Thread 0 seeds and
+// updates the shared word at 160, thread 1 updates the low halfword at 200, and
+// thread 2 updates the low halfword at 280. After a barrier, each thread rereads
+// its word as u32.
+.visible .entry lds_u16_u32_alias_fixed_words_test(
+    .param .u64 lds_u16_u32_alias_fixed_words_test_param_0
+)
+.maxntid 3, 1, 1
+{
+    .reg .pred %p<4>;
+    .reg .u32 %r<16>;
+    .reg .u64 %rd<4>;
+    .shared .align 4 .u32 smem[80];
+
+    ld.param.u64 %rd0, [lds_u16_u32_alias_fixed_words_test_param_0];
+    cvta.to.global.u64 %rd1, %rd0;
+
+    mov.u32 %r0, %tid.x;
+    setp.ge.u32 %p0, %r0, 3;
+    @%p0 bra DONE;
+
+    mov.u32 %r1, smem;
+    setp.eq.u32 %p1, %r0, 0;
+    @!%p1 bra SKIP_INIT;
+    mov.u32 %r2, 0;
+    st.shared.u32 [%r1+160], %r2;
+    mov.u32 %r2, 0x10000010;
+    st.shared.u32 [%r1+200], %r2;
+    mov.u32 %r2, 0x10000024;
+    st.shared.u32 [%r1+280], %r2;
+
+SKIP_INIT:
+    bar.sync 0;
+
+    @!%p1 bra SKIP_WORD160;
+    ld.shared.u16 %r2, [%r1+160];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+160], %r2;
+    ld.shared.u16 %r2, [%r1+160];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+160], %r2;
+    ld.shared.u16 %r2, [%r1+160];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+160], %r2;
+    ld.shared.u16 %r2, [%r1+160];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+160], %r2;
+    ld.shared.u16 %r2, [%r1+160];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+160], %r2;
+    ld.shared.u16 %r2, [%r1+160];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+160], %r2;
+
+    ld.shared.u16 %r2, [%r1+162];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+162], %r2;
+    ld.shared.u16 %r2, [%r1+162];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+162], %r2;
+    ld.shared.u16 %r2, [%r1+162];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+162], %r2;
+    ld.shared.u16 %r2, [%r1+162];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+162], %r2;
+    ld.shared.u16 %r2, [%r1+162];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+162], %r2;
+    ld.shared.u16 %r2, [%r1+162];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+162], %r2;
+    ld.shared.u16 %r2, [%r1+162];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+162], %r2;
+
+SKIP_WORD160:
+    setp.eq.u32 %p2, %r0, 1;
+    @!%p2 bra SKIP_WORD200;
+    ld.shared.u16 %r2, [%r1+200];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+200], %r2;
+
+SKIP_WORD200:
+    setp.eq.u32 %p3, %r0, 2;
+    @!%p3 bra SKIP_WORD280;
+    ld.shared.u16 %r2, [%r1+280];
+    add.u32 %r2, %r2, 1;
+    st.shared.u16 [%r1+280], %r2;
+
+SKIP_WORD280:
+    bar.sync 0;
+
+    setp.eq.u32 %p1, %r0, 0;
+    @!%p1 bra CHECK_WORD200;
+    ld.shared.u32 %r3, [%r1+160];
+    bra WRITE_OUT;
+
+CHECK_WORD200:
+    setp.eq.u32 %p2, %r0, 1;
+    @!%p2 bra CHECK_WORD280;
+    ld.shared.u32 %r3, [%r1+200];
+    bra WRITE_OUT;
+
+CHECK_WORD280:
+    ld.shared.u32 %r3, [%r1+280];
+
+WRITE_OUT:
+    mul.lo.u32 %r4, %r0, 4;
+    cvt.u64.u32 %rd2, %r4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r3;
+
+DONE:
+    ret;
+}

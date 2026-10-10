@@ -8,6 +8,7 @@ define amdgpu_kernel void @ld_st_implicit(ptr addrspace(4) byref(i64) %"40", ptr
   br label %"39"
 
 "39":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"40", align 8
   store i64 %2, ptr addrspace(5) %"42", align 8
   %3 = load i64, ptr addrspace(4) %"41", align 8
@@ -25,7 +26,8 @@ define amdgpu_kernel void @ld_st_implicit(ptr addrspace(4) byref(i64) %"40", ptr
   %9 = trunc i64 %8 to i32
   %"55" = bitcast i32 %9 to float
   store float %"55", ptr addrspace(1) %"54", align 4
+  fence seq_cst
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

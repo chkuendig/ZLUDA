@@ -7,6 +7,10 @@ pub(crate) fn compute_capability(major: &mut i32, minor: &mut i32, _dev: hipDevi
     let (major_cap, minor_cap) = driver::global_state()?.compute_capability;
     *major = major_cap;
     *minor = minor_cap;
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuDeviceComputeCapability -> {}.{}",
+        *major, *minor
+    ));
     Ok(())
 }
 
@@ -439,8 +443,59 @@ pub(crate) fn get_name(
     Ok(())
 }
 
+pub(crate) fn total_memory(bytes: &mut ::core::ffi::c_uint, dev: hipDevice_t) -> hipError_t {
+    // cuDeviceTotalMem v1 uses unsigned int* (4 bytes). Wine relay allocates 4 bytes.
+    // We must NOT write more than 4 bytes or we'll corrupt the caller's stack.
+    let mut total: usize = 0;
+    let result = total_mem_v2(&mut total as *mut usize, dev);
+    // Truncate to u32. For >4GB GPUs, report 4GB (0xF0000000) instead of
+    // UINT_MAX which PhysX might interpret as an error sentinel.
+    *bytes = if total > 0xF0000000usize {
+        0xF0000000u32
+    } else {
+        total as u32
+    };
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuDeviceTotalMem_v1(dev={}) -> {} bytes (full={}), result={:?}",
+        dev, *bytes, total, result
+    ));
+    result
+}
+
+/// Read the real VRAM size from sysfs. On APUs this is the BIOS carve-out
+/// (e.g. 1024 MiB on Steam Deck). Falls back to hip_total/2 if unavailable.
+pub(crate) fn sysfs_vram_total(fallback: usize) -> usize {
+    std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_total")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(fallback)
+}
+
 pub(crate) fn total_mem_v2(bytes: *mut usize, dev: hipDevice_t) -> hipError_t {
-    unsafe { hipDeviceTotalMem(bytes, dev) }
+    let result = unsafe { hipDeviceTotalMem(bytes, dev) };
+    if let Ok(()) = result {
+        let hip_total = unsafe { *bytes };
+        // hipDeviceTotalMem returns VRAM+GTT combined (8GB on Steam Deck APU).
+        // On APU with hipMallocManaged, allocations go to GTT (8 GiB) not VRAM
+        // (1 GiB). Report half the HIP total (3 GiB) — enough for PhysX GPU
+        // physics while fitting in GTT. No VRAM pressure since we don't use it.
+        let vram_total = hip_total / 2;
+        unsafe { *bytes = vram_total };
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> {} bytes ({} MiB) (hip={}, sysfs_vram={})",
+            dev,
+            unsafe { *bytes },
+            vram_total / (1024 * 1024),
+            hip_total,
+            vram_total
+        ));
+    } else {
+        super::driver::zluda_log(&format!(
+            "[ZLUDA] cuDeviceTotalMem_v2(dev={}) -> ERROR",
+            dev
+        ));
+    }
+    result
 }
 
 pub(crate) fn get_properties(prop: &mut CUdevprop, dev: hipDevice_t) -> hipError_t {
@@ -459,7 +514,12 @@ pub(crate) fn get_properties(prop: &mut CUdevprop, dev: hipDevice_t) -> hipError
 }
 
 pub(crate) fn get_count(count: &mut ::core::ffi::c_int) -> hipError_t {
-    unsafe { hipGetDeviceCount(count) }
+    let result = unsafe { hipGetDeviceCount(count) };
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuDeviceGetCount -> count={}, result={:?}",
+        *count, result
+    ));
+    result
 }
 
 fn clamp_usize(x: usize) -> i32 {
@@ -493,6 +553,10 @@ pub(crate) fn primary_context_set_flags_v2(
 }
 
 pub(crate) fn primary_context_retain(pctx: &mut CUcontext, hip_dev: hipDevice_t) -> CUresult {
+    super::driver::zluda_log(&format!(
+        "[ZLUDA] cuDevicePrimaryCtxRetain(dev={})",
+        hip_dev
+    ));
     let (ctx, cu_ctx) = get_primary_context(hip_dev)?;
 
     ctx.with_state_mut(|state: &mut context::ContextState| {
@@ -501,6 +565,7 @@ pub(crate) fn primary_context_retain(pctx: &mut CUcontext, hip_dev: hipDevice_t)
     })?;
 
     *pctx = cu_ctx;
+    super::driver::zluda_log("[ZLUDA] cuDevicePrimaryCtxRetain -> SUCCESS");
     Ok(())
 }
 

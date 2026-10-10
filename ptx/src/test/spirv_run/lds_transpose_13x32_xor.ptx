@@ -1,0 +1,127 @@
+.version 3.2
+.target sm_30
+.address_size 64
+
+// Minimal reproduction of the Downsweep key staging pattern:
+// 3 warp-groups, each storing 13x32 words through one computed LDS view,
+// then reading them back through the transposed 13*lane view before applying
+// the key xor flipback.
+.visible .entry lds_transpose_13x32_xor_test(
+    .param .u64 lds_transpose_13x32_xor_test_param_0,
+    .param .u64 lds_transpose_13x32_xor_test_param_1
+)
+.maxntid 96, 1, 1
+{
+    .reg .pred %p<2>;
+    .reg .u32 %r<32>;
+    .reg .u64 %rd<8>;
+    .shared .align 4 .u32 smem[1248];
+
+    ld.param.u64 %rd0, [lds_transpose_13x32_xor_test_param_0];
+    ld.param.u64 %rd1, [lds_transpose_13x32_xor_test_param_1];
+    cvta.to.global.u64 %rd2, %rd0;
+    cvta.to.global.u64 %rd3, %rd1;
+
+    mov.u32 %r0, %tid.x;
+    setp.ge.u32 %p0, %r0, 96;
+    @%p0 bra DONE;
+
+    and.b32 %r1, %r0, 31;          // lane
+    shr.u32 %r2, %r0, 5;           // wave-group
+    mul.lo.u32 %r3, %r2, 416;      // group base in elements
+    mul.lo.u32 %r4, %r3, 4;        // group base in bytes
+    mov.u32 %r5, smem;
+    add.u32 %r6, %r5, %r4;         // row view base
+
+    // Store 13 items as row-major [32 * item + lane].
+    mul.lo.u32 %r7, %r1, 4;
+    mul.wide.u32 %rd4, %r3, 4;
+    add.u64 %rd4, %rd2, %rd4;
+    cvt.u64.u32 %rd6, %r7;
+    add.u64 %rd4, %rd4, %rd6;
+
+    add.u32 %r8, %r6, %r7;
+    add.u32 %r8, %r8, 136;
+
+    ld.global.u32 %r9, [%rd4+0];
+    st.shared.u32 [%r8+0], %r9;
+    ld.global.u32 %r10, [%rd4+128];
+    st.shared.u32 [%r8+128], %r10;
+    ld.global.u32 %r11, [%rd4+256];
+    st.shared.u32 [%r8+256], %r11;
+    ld.global.u32 %r12, [%rd4+384];
+    st.shared.u32 [%r8+384], %r12;
+    ld.global.u32 %r13, [%rd4+512];
+    st.shared.u32 [%r8+512], %r13;
+    ld.global.u32 %r14, [%rd4+640];
+    st.shared.u32 [%r8+640], %r14;
+    ld.global.u32 %r15, [%rd4+768];
+    st.shared.u32 [%r8+768], %r15;
+    ld.global.u32 %r16, [%rd4+896];
+    st.shared.u32 [%r8+896], %r16;
+    ld.global.u32 %r17, [%rd4+1024];
+    st.shared.u32 [%r8+1024], %r17;
+    ld.global.u32 %r18, [%rd4+1152];
+    st.shared.u32 [%r8+1152], %r18;
+    ld.global.u32 %r19, [%rd4+1280];
+    st.shared.u32 [%r8+1280], %r19;
+    ld.global.u32 %r20, [%rd4+1408];
+    st.shared.u32 [%r8+1408], %r20;
+    ld.global.u32 %r21, [%rd4+1536];
+    st.shared.u32 [%r8+1536], %r21;
+
+    bar.sync 0;
+
+    // Read back through the transposed [13 * lane + item] view and xor like keys.
+    mul.lo.u32 %r22, %r1, 52;
+    add.u32 %r23, %r6, %r22;
+    add.u32 %r23, %r23, 136;
+
+    mul.lo.u32 %r24, %r1, 13;
+    add.u32 %r24, %r24, %r3;
+    mul.wide.u32 %rd5, %r24, 4;
+    add.u64 %rd5, %rd3, %rd5;
+
+    ld.shared.u32 %r9, [%r23+0];
+    xor.b32 %r9, %r9, 0x80000000;
+    st.global.u32 [%rd5+0], %r9;
+    ld.shared.u32 %r10, [%r23+4];
+    xor.b32 %r10, %r10, 0x80000000;
+    st.global.u32 [%rd5+4], %r10;
+    ld.shared.u32 %r11, [%r23+8];
+    xor.b32 %r11, %r11, 0x80000000;
+    st.global.u32 [%rd5+8], %r11;
+    ld.shared.u32 %r12, [%r23+12];
+    xor.b32 %r12, %r12, 0x80000000;
+    st.global.u32 [%rd5+12], %r12;
+    ld.shared.u32 %r13, [%r23+16];
+    xor.b32 %r13, %r13, 0x80000000;
+    st.global.u32 [%rd5+16], %r13;
+    ld.shared.u32 %r14, [%r23+20];
+    xor.b32 %r14, %r14, 0x80000000;
+    st.global.u32 [%rd5+20], %r14;
+    ld.shared.u32 %r15, [%r23+24];
+    xor.b32 %r15, %r15, 0x80000000;
+    st.global.u32 [%rd5+24], %r15;
+    ld.shared.u32 %r16, [%r23+28];
+    xor.b32 %r16, %r16, 0x80000000;
+    st.global.u32 [%rd5+28], %r16;
+    ld.shared.u32 %r17, [%r23+32];
+    xor.b32 %r17, %r17, 0x80000000;
+    st.global.u32 [%rd5+32], %r17;
+    ld.shared.u32 %r18, [%r23+36];
+    xor.b32 %r18, %r18, 0x80000000;
+    st.global.u32 [%rd5+36], %r18;
+    ld.shared.u32 %r19, [%r23+40];
+    xor.b32 %r19, %r19, 0x80000000;
+    st.global.u32 [%rd5+40], %r19;
+    ld.shared.u32 %r20, [%r23+44];
+    xor.b32 %r20, %r20, 0x80000000;
+    st.global.u32 [%rd5+44], %r20;
+    ld.shared.u32 %r21, [%r23+48];
+    xor.b32 %r21, %r21, 0x80000000;
+    st.global.u32 [%rd5+48], %r21;
+
+DONE:
+    ret;
+}

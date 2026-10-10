@@ -1,5 +1,5 @@
 @from = addrspace(1) externally_initialized global [4 x i32] [i32 1, i32 2, i32 3, i32 4]
-@to = external addrspace(3) global [4 x i32]
+@to = internal addrspace(3) global [4 x i32] undef
 
 define amdgpu_kernel void @cp_async(ptr addrspace(4) byref(i64) %"57", ptr addrspace(4) byref(i64) %"58") #0 {
   %"59" = alloca i64, align 8, addrspace(5)
@@ -14,6 +14,7 @@ define amdgpu_kernel void @cp_async(ptr addrspace(4) byref(i64) %"57", ptr addrs
   br label %"56"
 
 "56":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"57", align 8
   store i64 %2, ptr addrspace(5) %"59", align 8
   %3 = load i64, ptr addrspace(4) %"58", align 8
@@ -48,7 +49,8 @@ define amdgpu_kernel void @cp_async(ptr addrspace(4) byref(i64) %"57", ptr addrs
   %"55" = getelementptr inbounds i8, ptr %"88", i64 12
   %17 = load i32, ptr addrspace(5) %"64", align 4
   store i32 %17, ptr %"55", align 4
+  fence seq_cst
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

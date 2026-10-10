@@ -1,0 +1,51 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Replicate PhysX's parallel prefix sum pattern:
+//   shfl.up.b32 tmp|p, val, 1, 0; @p add.u32 val, tmp, val;
+//   shfl.up.b32 tmp|p, val, 2, 0; @p add.u32 val, tmp, val;
+//   shfl.up.b32 tmp|p, val, 4, 0; @p add.u32 val, tmp, val;
+//   shfl.up.b32 tmp|p, val, 8, 0; @p add.u32 val, tmp, val;
+//   shfl.up.b32 tmp|p, val, 16, 0; @p add.u32 val, tmp, val;
+// This is an inclusive prefix sum (scan) across 32 lanes.
+// Input: each lane holds 1. Expected output: lane i holds i+1.
+
+.visible .entry shfl_prefix_sum(
+    .param .u64 output
+)
+{
+    .reg .u64       out_addr, out_index;
+    .reg .u32       tid, val, tmp;
+    .reg .pred      p;
+
+    ld.param.u64    out_addr, [output];
+    mov.u32         tid, %tid.x;
+
+    // Each lane starts with value 1
+    mov.u32         val, 1;
+
+    // Inclusive prefix sum via shfl.up cascade (exact PhysX pattern)
+    shfl.up.b32 tmp|p, val, 0x1, 0x0;
+    @p add.u32 val, tmp, val;
+
+    shfl.up.b32 tmp|p, val, 0x2, 0x0;
+    @p add.u32 val, tmp, val;
+
+    shfl.up.b32 tmp|p, val, 0x4, 0x0;
+    @p add.u32 val, tmp, val;
+
+    shfl.up.b32 tmp|p, val, 0x8, 0x0;
+    @p add.u32 val, tmp, val;
+
+    shfl.up.b32 tmp|p, val, 0x10, 0x0;
+    @p add.u32 val, tmp, val;
+
+    // Write result: lane i should hold i+1
+    cvt.u64.u32     out_index, tid;
+    mul.lo.u64      out_index, out_index, 4;
+    add.u64         out_addr, out_addr, out_index;
+    st.u32          [out_addr], val;
+
+    ret;
+}

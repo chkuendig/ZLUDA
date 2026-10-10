@@ -76,6 +76,17 @@ pub(crate) unsafe fn instantiate_with_flags(
     hipGraphInstantiateWithFlags(graph_exec, graph, flags)
 }
 
+static GRAPH_LAUNCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) unsafe fn launch(graph_exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t {
-    hipGraphLaunch(graph_exec, stream)
+    let n = GRAPH_LAUNCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    super::driver::zluda_log_err(&format!(
+        "cuGraphLaunch #{} exec={:?} stream={:?}",
+        n, graph_exec, stream
+    ));
+    let result = hipGraphLaunch(graph_exec, stream);
+    if result.is_err() {
+        super::driver::zluda_log_err(&format!("cuGraphLaunch #{} FAILED -> {:?}", n, result));
+    }
+    result
 }

@@ -11,6 +11,7 @@ define amdgpu_kernel void @mad_wide(ptr addrspace(4) byref(i64) %"46", ptr addrs
   br label %"45"
 
 "45":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"46", align 8
   store i64 %2, ptr addrspace(5) %"48", align 8
   %3 = load i64, ptr addrspace(4) %"47", align 8
@@ -41,7 +42,8 @@ define amdgpu_kernel void @mad_wide(ptr addrspace(4) byref(i64) %"46", ptr addrs
   %17 = load i64, ptr addrspace(5) %"50", align 8
   %"71" = inttoptr i64 %16 to ptr
   store i64 %17, ptr %"71", align 8
+  fence seq_cst
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

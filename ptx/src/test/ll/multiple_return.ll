@@ -14,7 +14,7 @@ define hidden %struct.i32.i1 @do_something(i32 %"13") #0 {
   store i1 true, ptr addrspace(5) %"56", align 1
   %2 = load i32, ptr addrspace(5) %"55", align 4
   %3 = load i1, ptr addrspace(5) %"56", align 1
-  %4 = insertvalue %struct.i32.i1 undef, i32 %2, 0
+  %4 = insertvalue %struct.i32.i1 zeroinitializer, i32 %2, 0
   %5 = insertvalue %struct.i32.i1 %4, i1 %3, 1
   ret %struct.i32.i1 %5
 }
@@ -31,6 +31,7 @@ define amdgpu_kernel void @multiple_return(ptr addrspace(4) byref(i64) %"59", pt
   br label %"53"
 
 "53":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"59", align 8
   store i64 %2, ptr addrspace(5) %"61", align 8
   %3 = load i64, ptr addrspace(4) %"60", align 8
@@ -63,8 +64,9 @@ define amdgpu_kernel void @multiple_return(ptr addrspace(4) byref(i64) %"59", pt
   br label %"23"
 
 "23":                                             ; preds = %"22", %"54"
+  fence seq_cst
   ret void
 }
 
 attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

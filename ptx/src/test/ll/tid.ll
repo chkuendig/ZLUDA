@@ -11,6 +11,7 @@ define amdgpu_kernel void @tid(ptr addrspace(4) byref(i64) %"42") #1 {
   br label %"40"
 
 "40":                                             ; preds = %1
+  fence seq_cst
   %"39" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
   store i32 %"39", ptr addrspace(5) %"44", align 4
   %2 = load i32, ptr addrspace(5) %"44", align 4
@@ -29,8 +30,9 @@ define amdgpu_kernel void @tid(ptr addrspace(4) byref(i64) %"42") #1 {
   %8 = load i8, ptr addrspace(5) %"46", align 1
   %"58" = inttoptr i64 %7 to ptr
   store i8 %8, ptr %"58", align 1
+  fence seq_cst
   ret void
 }
 
 attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

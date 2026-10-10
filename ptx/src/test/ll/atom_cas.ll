@@ -9,6 +9,7 @@ define amdgpu_kernel void @atom_cas(ptr addrspace(4) byref(i64) %"47", ptr addrs
   br label %"46"
 
 "46":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"47", align 8
   store i64 %2, ptr addrspace(5) %"49", align 8
   %3 = load i64, ptr addrspace(4) %"48", align 8
@@ -21,7 +22,7 @@ define amdgpu_kernel void @atom_cas(ptr addrspace(4) byref(i64) %"47", ptr addrs
   %"67" = inttoptr i64 %6 to ptr
   %"40" = getelementptr inbounds i8, ptr %"67", i64 4
   %7 = load i32, ptr addrspace(5) %"51", align 4
-  %8 = cmpxchg ptr %"40", i32 %7, i32 100 syncscope("agent-one-as") monotonic monotonic, align 4
+  %8 = cmpxchg ptr %"40", i32 %7, i32 100 syncscope("one-as") acq_rel acquire, align 4
   %"68" = extractvalue { i32, i1 } %8, 0
   store i32 %"68", ptr addrspace(5) %"51", align 4
   %9 = load i64, ptr addrspace(5) %"49", align 8
@@ -38,7 +39,8 @@ define amdgpu_kernel void @atom_cas(ptr addrspace(4) byref(i64) %"47", ptr addrs
   %"45" = getelementptr inbounds i8, ptr %"72", i64 4
   %14 = load i32, ptr addrspace(5) %"52", align 4
   store i32 %14, ptr %"45", align 4
+  fence seq_cst
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

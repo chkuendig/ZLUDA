@@ -20,6 +20,7 @@ define amdgpu_kernel void @sub_extended(ptr addrspace(4) byref(i64) %"70", ptr a
   br label %"69"
 
 "69":                                             ; preds = %1
+  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"70", align 8
   store i64 %2, ptr addrspace(5) %"72", align 8
   %3 = load i64, ptr addrspace(4) %"71", align 8
@@ -128,11 +129,12 @@ define amdgpu_kernel void @sub_extended(ptr addrspace(4) byref(i64) %"70", ptr a
   %"68" = getelementptr inbounds i8, ptr %"135", i64 12
   %66 = load i32, ptr addrspace(5) %"85", align 4
   store i32 %66, ptr %"68", align 4
+  fence seq_cst
   ret void
 }
 
 ; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
 declare { i32, i1 } @llvm.usub.with.overflow.i32(i32, i32) #1
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
 attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }

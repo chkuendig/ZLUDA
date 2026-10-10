@@ -1,0 +1,84 @@
+// Bug A cross-kernel coherency reproducer.
+//
+// Tests whether the AMDGPU command processor invalidates per-CU L0/L1
+// caches between back-to-back kernel dispatches on different streams.
+//
+// Pattern:
+//   writer(buf, iter):  st.global.u32 [buf+22176], iter   (one thread)
+//   reader(buf, iter, fail):  ld.global.u32 r, [buf+22176]
+//                              if r != iter: atom_add fail, 1
+//
+// Expectation: every iteration the reader sees the latest writer value.
+// If L0/L1 isn't invalidated between dispatches, reader's CU will return
+// the cached previous-iteration value → fail_count > 0.
+//
+// Uses NON-atomic loads so the read goes through L0/L1 (atomics bypass
+// L0/L1 and always hit L2, masking this class of bug).
+
+.version 6.5
+.target sm_60
+.address_size 64
+
+.visible .entry bug_a_writer(
+    .param .u64 buffer_ptr,
+    .param .u32 iter_val
+)
+{
+    .reg .pred %p<2>;
+    .reg .u64 %rd<5>;
+    .reg .u32 %r<5>;
+
+    ld.param.u64 %rd1, [buffer_ptr];
+    ld.param.u32 %r1, [iter_val];
+    cvta.to.global.u64 %rd2, %rd1;
+
+    // Only thread (0,0,0) writes the sentinel
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %tid.x;
+    or.b32 %r2, %r2, %r3;
+    setp.ne.u32 %p1, %r2, 0;
+    @%p1 bra wskip;
+
+    add.s64 %rd3, %rd2, 22176;
+    st.global.u32 [%rd3], %r1;
+wskip:
+    ret;
+}
+
+.visible .entry bug_a_reader(
+    .param .u64 buffer_ptr,
+    .param .u32 iter_val,
+    .param .u64 fail_ptr
+)
+{
+    .reg .pred %p<2>;
+    .reg .u64 %rd<6>;
+    .reg .u32 %r<6>;
+
+    ld.param.u64 %rd1, [buffer_ptr];
+    ld.param.u32 %r1, [iter_val];
+    ld.param.u64 %rd2, [fail_ptr];
+
+    // Only thread (0,0,0) reads — matches MS_1's single-thread path
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %tid.x;
+    or.b32 %r2, %r2, %r3;
+    setp.ne.u32 %p1, %r2, 0;
+    @%p1 bra rskip;
+
+    add.s64 %rd3, %rd1, 22176;
+    cvta.to.global.u64 %rd4, %rd3;
+
+    // NON-ATOMIC load — goes through L0/L1.
+    ld.global.u32 %r4, [%rd4];
+
+    // If we got the latest iter_val, success.
+    setp.eq.u32 %p1, %r4, %r1;
+    @%p1 bra rskip;
+
+    // Stale read detected
+    cvta.to.global.u64 %rd5, %rd2;
+    atom.global.add.u32 %r5, [%rd5], 1;
+rskip:
+    ret;
+}

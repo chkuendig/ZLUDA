@@ -1,11 +1,234 @@
 use hip_runtime_sys::*;
+use std::sync::Mutex;
+
+/// Global lock implementing CUDA's NULL-stream implicit synchronization.
+///
+/// CUDA semantics: the NULL stream (stream 0) serializes with ALL other streams.
+/// An operation on the NULL stream cannot begin until all prior operations on all
+/// streams complete, and no operation on any stream can begin until the NULL-stream
+/// operation completes.
+///
+/// HIP/ROCm 6.2.4 does NOT implement this. We enforce it with:
+/// - Before any NULL-stream operation (kernel launch, memcpy, memset): acquire this
+///   lock + hipDeviceSynchronize (drain all pending work)
+/// - The lock is held until the operation is submitted, preventing another thread
+///   from submitting work between our sync and our operation
+///
+/// This lock is shared between kernel launches (function.rs) and memory operations
+/// (memory.rs) so that ALL NULL-stream operations serialize with each other.
+pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
+
+/// Cross-kernel L1 visibility fix ("Bug A") — default ON.
+///
+/// On gfx10 RDNA, rocclr's default AQL `release_fence_scope = AGENT` does NOT
+/// trigger the Command Processor's inter-dispatch L1 invalidation. A reader
+/// kernel on a different CU can therefore read STALE L1 lines for data a writer
+/// kernel stored on another stream — reproduced by `bug_a_xkernel_coherency`
+/// (5/50k stale reads). In PhysX this surfaces as wild indices/counters →
+/// `(u32)-N × 4` wild VA → GPU page fault.
+///
+/// The CP inter-dispatch L1 invalidation only runs at `HSA_FENCE_SCOPE_SYSTEM`,
+/// which rocclr sets after memcpy/image ops (`gpu().addSystemScope()` in
+/// rocblit.cpp). So a tiny `hipMemcpyDtoDAsync` on a stream forces the NEXT AQL
+/// packet on that stream to SYSTEM scope. We inject it at the cross-stream
+/// dependency points (`cuEventRecord` producer-release, `cuStreamWaitEvent`
+/// consumer-acquire) so PhysX's producer→consumer hand-offs become coherent.
+///
+/// Validated by a decisive same-session A/B (2026-05-28): fix OFF crashed with
+/// 10 GPU page faults; fix ON ran 3/3 clean (~1.5M kernels, 0 faults).
+///
+/// Default ON. Set `ZLUDA_XKERNEL_SYSTEM_SCOPE=0` to disable (e.g. for A/B).
+/// NOTE: the D2D-to-force-SYSTEM-scope is a pragmatic mechanism; see the active
+/// plan for a less hacky replacement (direct AQL fence scope / cache invalidate).
+fn xkernel_system_scope_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZLUDA_XKERNEL_SYSTEM_SCOPE").map_or(true, |v| v != "0")
+    })
+}
+
+/// Lazily-allocated 8-byte device scratch for the system-scope D2D.
+/// Stored as usize so the OnceLock is Send+Sync.
+fn system_scope_scratch() -> Option<hipDeviceptr_t> {
+    static SCRATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let p = *SCRATCH.get_or_init(|| {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe { hipMalloc(&mut ptr, 8) }.is_ok() {
+            ptr as usize
+        } else {
+            0
+        }
+    });
+    (p != 0).then(|| hipDeviceptr_t(p as *mut std::ffi::c_void))
+}
+
+/// Force the next AQL packet on `stream` to SYSTEM fence scope via a 4-byte
+/// device-to-device copy (routes through rocblit → `gpu().addSystemScope()`).
+/// Active by default; no-op if `ZLUDA_XKERNEL_SYSTEM_SCOPE=0`. See `xkernel_system_scope_enabled`.
+pub(crate) fn force_system_scope(stream: hipStream_t) {
+    if !xkernel_system_scope_enabled() {
+        return;
+    }
+    if let Some(scratch) = system_scope_scratch() {
+        let dst = hipDeviceptr_t((scratch.0 as usize + 4) as *mut std::ffi::c_void);
+        let _ = unsafe { hipMemcpyDtoDAsync(dst, scratch, 4, stream) };
+    }
+}
+
+/// Dirty flag: set when a kernel launches on a non-default stream.
+/// Cleared after hipDeviceSynchronize in null_stream_sync.
+/// When false, null-stream memops skip the expensive device sync
+/// because no cross-stream work is outstanding.
+static NON_DEFAULT_STREAM_DIRTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn mark_non_default_stream_dirty() {
+    NON_DEFAULT_STREAM_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    NULL_STREAM_HAD_BLOCKING_WORK.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn non_default_stream_is_dirty() -> bool {
+    NON_DEFAULT_STREAM_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn clear_non_default_stream_dirty() {
+    NON_DEFAULT_STREAM_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn clear_dirty_flag_after_device_sync() {
+    clear_non_default_stream_dirty();
+}
+
+fn strict_null_stream_barrier_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let raw = std::env::var("ZLUDA_NULL_STREAM_STRICT").ok();
+        let v = raw.as_deref().map_or(false, |s| s == "1");
+        super::driver::zluda_log_err(&format!(
+            "[ZLUDA] ZLUDA_NULL_STREAM_STRICT env={:?} → strict={}",
+            raw, v
+        ));
+        v
+    })
+}
+
+fn null_stream_uses_global_lock(stream: hipStream_t, strict: bool) -> bool {
+    strict || stream.0.is_null()
+}
+
+fn null_stream_needs_pre_sync(stream: hipStream_t) -> bool {
+    stream.0.is_null() && non_default_stream_is_dirty()
+}
+
+fn null_stream_needs_post_sync(stream: hipStream_t, strict: bool) -> bool {
+    strict && stream.0.is_null()
+}
+
+pub(crate) struct NullStreamGuard {
+    guard: Option<std::sync::MutexGuard<'static, ()>>,
+    post_sync: bool,
+}
+
+impl Drop for NullStreamGuard {
+    fn drop(&mut self) {
+        if self.post_sync {
+            let _ = unsafe { hipDeviceSynchronize() };
+        }
+    }
+}
+
+/// Synchronize for CUDA NULL-stream semantics before performing a GPU operation.
+/// Call this before hipModuleLaunchKernel, hipMemcpyAsync, hipMemsetAsync, etc.
+///
+/// If `stream` is NULL (0x0): acquires the global lock and waits for ALL pending
+/// work on all streams. Returns a guard that must be held until the HIP operation
+/// is submitted — this prevents another thread from submitting work in between.
+///
+/// If `ZLUDA_NULL_STREAM_STRICT=1` is set, we also enforce the missing postlaunch
+/// half of CUDA's NULL-stream barrier by:
+/// - keeping the lock held until the NULL-stream operation completes, and
+/// - briefly taking the same lock for non-NULL submissions so they cannot race
+///   ahead of an in-flight NULL-stream operation.
+/// This gate is kept opt-in because it fixed Batman's earlier late `n=8827`
+/// CreateGrid corruption but still exposes a different later `n=4688` family.
+pub(crate) fn null_stream_sync(stream: hipStream_t) -> NullStreamGuard {
+    let strict = strict_null_stream_barrier_enabled();
+    let guard = if null_stream_uses_global_lock(stream, strict) {
+        Some(NULL_STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        None
+    };
+    if null_stream_needs_pre_sync(stream) {
+        let _ = unsafe { hipDeviceSynchronize() };
+        clear_non_default_stream_dirty();
+    }
+    NullStreamGuard {
+        guard,
+        post_sync: null_stream_needs_post_sync(stream, strict),
+    }
+}
+
+/// 2026-05-15 Plan v6 Step A: NULL-stream barrier for cuEventRecord and
+/// cuStreamWaitEvent. Per NVIDIA docs, NULL-stream actions (including
+/// kernel launches, cuEventRecord, cuStreamWaitEvent) first wait on all
+/// blocking streams. HIP doesn't enforce this. We provide the
+/// pre-action sync via the same null_stream_sync mechanism.
+///
+/// Env-disable with `ZLUDA_NULL_STREAM_BARRIER=0` for A/B testing.
+/// Default ON (matches CUDA spec).
+pub(crate) fn null_stream_sync_for_event(stream: hipStream_t) -> NullStreamGuard {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let disabled = *DISABLED
+        .get_or_init(|| std::env::var("ZLUDA_NULL_STREAM_BARRIER").map_or(false, |v| v == "0"));
+    if disabled || !stream.0.is_null() {
+        return NullStreamGuard {
+            guard: None,
+            post_sync: false,
+        };
+    }
+    null_stream_sync(stream)
+}
 
 pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
-    unsafe { hipStreamSynchronize(stream) }
+    super::driver::sync_timeline_log("stream", stream.0 as usize);
+    super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize({:?})", stream));
+    // 2026-06-03: MS_1 rd5+22176 reset drain. Host-thread safe DtoD;
+    // no-op when ZLUDA_MS1_RD5_RESET=0. Placed before the actual
+    // hipStreamSynchronize so deferred resets land before downstream
+    // launches see the "synchronized" state.
+    super::memory::drain_ms1_rd5_reset_queue();
+    let result = unsafe { hipStreamSynchronize(stream) };
+    // 2026-04-29 Phase 3g: HDP flush hypothesis test. Mode B SIGSEGVs continue
+    // even after our LDS-visibility patches eliminated all GPU page faults.
+    // Hypothesis: the GPU writes to host-pinned (zero-copy) memory complete
+    // on the GPU side, but the writes sit in the HDP write buffer and aren't
+    // visible to a subsequent CPU read. NVIDIA cuStreamSynchronize implicitly
+    // ensures host visibility; HIP hipStreamSynchronize on AMDGPU may not
+    // include HDP flush semantics. Forcing a hipDeviceSynchronize after the
+    // stream sync acts as an HDP flush via the driver's full-device wait
+    // path. Heavy-handed (~adds latency to every sync) but a clean test of
+    // the hypothesis. Env-gate ZLUDA_HDP_FLUSH_ON_SYNC=1 (default ON).
+    static HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let hdp_flush = *HDP_FLUSH
+        .get_or_init(|| std::env::var("ZLUDA_HDP_FLUSH_ON_SYNC").map_or(true, |v| v != "0"));
+    if hdp_flush {
+        let _ = unsafe { hipDeviceSynchronize() };
+        clear_non_default_stream_dirty();
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+    super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize -> {:?}", result));
+    result
 }
 
 pub(crate) fn create(stream: *mut hipStream_t, flags: ::core::ffi::c_uint) -> hipError_t {
-    unsafe { hipStreamCreateWithFlags(stream, flags) }
+    let result = unsafe { hipStreamCreateWithFlags(stream, flags) };
+    super::driver::zluda_log_err(&format!(
+        "cuStreamCreate(flags={:#x}) -> {:?} stream={:?}",
+        flags,
+        result,
+        unsafe { *stream }
+    ));
+    result
 }
 
 pub(crate) fn create_with_priority(
@@ -79,14 +302,167 @@ pub(crate) fn get_capture_info_v3(
     }
 }
 
+static QUERY_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 2026-06-04 Option A Fix: track whether any blocking-stream work has occurred.
+/// This is set when mark_non_default_stream_dirty() is called (i.e., first non-NULL-stream
+/// kernel launch or async memop). This flag is the proper predicate for cuStreamQuery(NULL)
+/// because CUDA semantics require the query to know whether blocking streams have work.
+/// Before this flag is set, cuStreamQuery(NULL) should return NotReady to keep PhysX's
+/// dispatch loop alive. AFTER this flag is set, pass through the real hipStreamQuery result.
+pub(crate) static NULL_STREAM_HAD_BLOCKING_WORK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 2026-05-15 Plan v6 Step C: track whether PhysX has launched its first real
+/// kernel. Before the first launch, return NotReady for cuStreamQuery(NULL)
+/// to keep PhysX's dispatch loop alive during startup (the original masking
+/// rationale). AFTER first launch, pass through the real hipStreamQuery
+/// result — matches NVIDIA CUDA spec ("all operations in the stream have
+/// completed"; for NULL legacy stream, that means all blocking-stream work).
+/// DEPRECATED 2026-06-04: replaced by NULL_STREAM_HAD_BLOCKING_WORK which
+/// tracks blocking-stream activity instead of any kernel launch.
+pub(crate) static FIRST_REAL_LAUNCH_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn query(stream: hipStream_t) -> hipError_t {
+    let hip_result = unsafe { hipStreamQuery(stream) };
+    // PhysX uses cuStreamQuery(NULL) as a push-buffer flush / dispatch heartbeat.
+    // On real NVIDIA, this returns NOT_READY when there's pending GPU work and
+    // SUCCESS when idle. Our previous behavior was hardcoded NotReady (poisoned
+    // PhysX dispatch logic). Now: NotReady ONLY before first blocking-stream work
+    // (PhysX startup race), then real result.
+    //
+    // CUDA semantics (verified 2026-06-04): cuStreamQuery(NULL/legacy) returns SUCCESS
+    // only when all BLOCKING-STREAM work is idle. Non-blocking streams do NOT affect
+    // the result. NULL_STREAM_HAD_BLOCKING_WORK tracks the first non-NULL-stream
+    // kernel launch or async memop, which is the real blocking-stream marker.
+    //
+    // Env overrides:
+    //   ZLUDA_STREAM_QUERY_LEGACY=1 → restore old always-NotReady behavior
+    //   ZLUDA_STREAM_QUERY_REAL=1 → always pass through real result (no startup mask)
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        if std::env::var("ZLUDA_STREAM_QUERY_REAL").map_or(false, |v| v == "1") {
+            2 // always-real
+        } else if std::env::var("ZLUDA_STREAM_QUERY_LEGACY").map_or(false, |v| v == "1") {
+            0 // always-NotReady (old behavior)
+        } else {
+            1 // refined: NotReady before first blocking-stream work, real after
+        }
+    });
+    let returned = if stream.0.is_null() {
+        match mode {
+            0 => Err(hipErrorCode_t::NotReady),
+            // Default (mode 1) and REAL (mode 2): always pass through the real HIP result.
+            // Evidence from 2026-06-04: masking queries as NotReady causes PhysX to take
+            // the wrong dispatch path and crash at ~152k launches (Class B). Passing through
+            // the real result lets PhysX get Ok() early (when HIP is actually idle at startup)
+            // and take the correct "proceed" path. LEGACY override (mode 0) retained for A/B.
+            _ => hip_result,
+        }
+    } else {
+        hip_result
+    };
+    // 2026-06-05 Class B residual investigation: PhysX uses cuStreamQuery as
+    // an UN-SYNCED "is this kernel done?" poll. Live evidence: 6,015 query
+    // calls per Class B bench run, vs 51k cuEventSync calls. When the query
+    // returns SUCCESS, PhysX reads mapped-host memory directly without an
+    // explicit sync — but on AMD, HDP write-combine can still be holding
+    // the kernel's writes. CPU sees stale data → inner_array[0]=NULL →
+    // canonical Class B host crash. NVIDIA has no HDP equivalent, so this
+    // works there. Mirror the Phase 2 / MEMCPY_HDP_FLUSH pattern: when the
+    // query returns SUCCESS (stream is idle), trigger HDP flush via
+    // hipDeviceSynchronize. On an idle stream this is fast — just an AQL
+    // barrier-AND packet round-trip whose release fence does the flush.
+    // Env-gate ZLUDA_QUERY_HDP_FLUSH default-ON, opt-out with =0.
+    if returned == Ok(()) {
+        static QUERY_HDP_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *QUERY_HDP_FLUSH
+            .get_or_init(|| std::env::var("ZLUDA_QUERY_HDP_FLUSH").map_or(true, |v| v != "0"))
+        {
+            unsafe {
+                let _ = hipDeviceSynchronize();
+                clear_dirty_flag_after_device_sync();
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+    let count = QUERY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Log first 200, then every 100th, or always when ZLUDA_LOG_ALL is set
+    if count < 200 || count % 100 == 0 || crate::is_log_all_enabled() {
+        // Show both real HIP result and what we return, to detect masking
+        if stream.0.is_null() {
+            super::driver::zluda_log_err(&format!(
+                "cuStreamQuery(NULL) hip={:?} returned={:?} [#{}]",
+                hip_result, returned, count
+            ));
+        } else {
+            super::driver::zluda_log_err(&format!(
+                "cuStreamQuery(stream={:?}) -> {:?} [#{}]",
+                stream, returned, count
+            ));
+        }
+    }
+    returned
+}
+
 pub(crate) fn wait_event(
     stream: hipStream_t,
     event: hipEvent_t,
     flags: ::core::ffi::c_uint,
 ) -> hipError_t {
-    unsafe { hipStreamWaitEvent(stream, event, flags) }
+    // CUDA NULL-stream semantics (NVIDIA docs verified 2026-05-15):
+    // "When an action is taken in the legacy stream such as a kernel launch
+    // or cudaStreamWaitEvent(), the legacy stream first waits on all blocking
+    // streams, the action is queued in the legacy stream, and then all
+    // blocking streams wait on the legacy stream."
+    //
+    // HIP doesn't enforce the pre-action global barrier. Use null_stream_sync
+    // (env-disable via ZLUDA_NULL_STREAM_BARRIER=0).
+    let _guard = null_stream_sync_for_event(stream);
+    let result = unsafe { hipStreamWaitEvent(stream, event, flags) };
+    super::driver::zluda_log_err(&format!(
+        "cuStreamWaitEvent(stream={:?}, event={:?}, flags={:#x}) -> {:?}",
+        stream, event, flags, result
+    ));
+    // Consumer-acquire side of the Bug A fix (cherry-picked from 49414873):
+    // after waiting on a producer stream's event, force SYSTEM scope so the
+    // consumer's next kernel invalidates stale L1 lines and sees the
+    // producer's stores. Env-gated ZLUDA_XKERNEL_SYSTEM_SCOPE (default-ON
+    // per a9427b04 — fixes the IOFX_actorRange / TFS wild-VA TCP faults).
+    force_system_scope(stream);
+    result
 }
 
-pub(crate) fn query(stream: hipStream_t) -> hipError_t {
-    unsafe { hipStreamQuery(stream) }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_stream_policy_default_mode_only_locks_null_stream() {
+        let null = hipStream_t(std::ptr::null_mut());
+        let other = hipStream_t(1usize as *mut _);
+        let strict = false;
+
+        assert!(null_stream_uses_global_lock(null, strict));
+        assert!(!null_stream_uses_global_lock(other, strict));
+        assert!(null_stream_needs_pre_sync(null));
+        assert!(!null_stream_needs_pre_sync(other));
+        assert!(!null_stream_needs_post_sync(null, strict));
+        assert!(!null_stream_needs_post_sync(other, strict));
+    }
+
+    #[test]
+    fn null_stream_policy_strict_mode_blocks_all_submissions_and_postsyncs_null() {
+        let null = hipStream_t(std::ptr::null_mut());
+        let other = hipStream_t(1usize as *mut _);
+        let strict = true;
+
+        assert!(null_stream_uses_global_lock(null, strict));
+        assert!(null_stream_uses_global_lock(other, strict));
+        assert!(null_stream_needs_pre_sync(null));
+        assert!(!null_stream_needs_pre_sync(other));
+        assert!(null_stream_needs_post_sync(null, strict));
+        assert!(!null_stream_needs_post_sync(other, strict));
+    }
 }
