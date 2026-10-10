@@ -15,12 +15,11 @@ use llvm_sys::{
 };
 use llvm_sys::{LLVMLinkage, LLVMVisibility};
 use std::ffi::{CStr, CString};
-use std::fs;
 use std::sync::OnceLock;
+use std::{fs, ptr};
 use tempfile::NamedTempFile;
 
 const OCKL_MODULE: &[u8] = include_bytes!("device-libs/ockl.bc");
-const OCML_MODULE: &[u8] = include_bytes!("device-libs/ocml.bc");
 
 // https://llvm.org/docs/AMDGPUUsage.html#address-spaces
 const CONSTANT_ADDRESS_SPACE: u32 = 4;
@@ -94,7 +93,8 @@ pub fn compile(
     main: Module,
     ptx_impl: &[u8],
     attributes: Module,
-    metadata: kernel_metadata::KernelMetadataV1,
+    metadata: kernel_metadata::ModuleMetadataV1,
+    metadata32: Option<kernel_metadata::ModuleMetadata32Bit>,
     compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
 ) -> Result<Vec<u8>, String> {
     init_globals()?;
@@ -103,7 +103,6 @@ pub fn compile(
 
     let ptx_impl = load_module(ctx, ptx_impl, c"ptx_impl.bc")?;
     let ockl = load_module(ctx, OCKL_MODULE, c"ockl.bc")?;
-    let ocml = load_module(ctx, OCML_MODULE, c"ocml.bc")?;
 
     let oclc_constants = create_oclc_constants(ctx, gcn_arch)?;
 
@@ -112,7 +111,6 @@ pub fn compile(
     linked.link(oclc_constants)?;
     linked.link(ptx_impl)?;
     linked.link(ockl)?;
-    linked.link(ocml)?;
 
     linked.verify()?;
 
@@ -268,17 +266,49 @@ pub fn compile(
     metadata
         .write_object(&object_file, section_path.as_file_mut())
         .map_err(|e| format!("Failed to write metadata section: {}", e))?;
+    let section32_path = if let Some(metadata32) = metadata32 {
+        let mut section32_path = NamedTempFile::with_prefix("zluda32_section")
+            .map_err(|e| format!("Failed to create temporary file: {}", e))?;
+        metadata32
+            .write_object(&object_file, section32_path.as_file_mut())
+            .map_err(|e| format!("Failed to write 32-bit metadata section: {}", e))?;
+        Some(section32_path)
+    } else {
+        None
+    };
 
     let object_path_cstr = path_to_cstring(&object_path)?;
     let section_path_cstr = path_to_cstring(section_path.as_ref())?;
+    let section32_path_cstr = section32_path
+        .as_ref()
+        .map(|p| path_to_cstring(p.as_ref()))
+        .transpose()?;
     let executable_path_cstr = path_to_cstring(&executable_path)?;
 
-    let inputs = [object_path_cstr.as_ptr(), section_path_cstr.as_ptr()];
+    let (inputs, inputs_len) = if let Some(ref section32_path_cstr) = section32_path_cstr {
+        (
+            [
+                object_path_cstr.as_ptr(),
+                section_path_cstr.as_ptr(),
+                section32_path_cstr.as_ptr(),
+            ],
+            3,
+        )
+    } else {
+        (
+            [
+                object_path_cstr.as_ptr(),
+                section_path_cstr.as_ptr(),
+                ptr::null(),
+            ],
+            2,
+        )
+    };
 
     let mut err = std::ptr::null_mut();
     let result = unsafe {
         LLVMZludaLinkWithLLD(
-            inputs.len() as u32,
+            inputs_len,
             inputs.as_ptr(),
             executable_path_cstr.as_ptr(),
             &mut err,
@@ -310,12 +340,15 @@ fn init_globals() -> Result<(), String> {
                 // Uncomment to save passes
                 // c"-print-before-all",
                 c"llvm_zluda",
+                //c"-debug-only=isel",
                 c"-ignore-tti-inline-compatible",
                 // c"-amdgpu-early-inline-all=true",
                 c"-amdgpu-internalize-symbols",
                 c"-amdhsa-code-object-version=5",
+                //c"--pass-remarks-missed=.*inlin.*",
             ]
             .into_iter();
+            /* Does not provide as much performance improvement on ROCm 7.2
             let opt_options = if cfg!(debug_assertions) {
                 vec![]
             } else {
@@ -325,6 +358,7 @@ fn init_globals() -> Result<(), String> {
                     c"-inlinehint-threshold=3250",
                 ]
             };
+            */
             // ZLUDA_LLVM_ARGS: whitespace-separated extra LLVM cl::opt flags,
             // injected at first-compile init. Diagnostic-only — used to bisect
             // AMDGPU codegen passes (e.g. "-amdgpu-enable-whole-quad-mode=0")
@@ -342,7 +376,7 @@ fn init_globals() -> Result<(), String> {
                 _ => vec![],
             };
             let llvm_args_ptrs: Vec<*const i8> = common_options
-                .chain(opt_options)
+                //.chain(opt_options)
                 .chain(extra_args.into_iter())
                 .map(|s| s.as_ptr())
                 .collect();
@@ -366,5 +400,5 @@ fn init_globals() -> Result<(), String> {
         })
         .as_ref()
         .map(|()| ())
-        .map_err(|e| e.to_str().to_owned())
+        .map_err(|e| e.to_str().to_string())
 }

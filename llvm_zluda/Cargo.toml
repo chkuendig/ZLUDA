@@ -13,7 +13,7 @@ tempfile = "3"
 rmpv = "1"
 
 [dependencies.llvm-sys]
-version = "191"
+version = "211"
 features = ["disable-alltargets-init", "no-llvm-linking"]
 
 [build-dependencies]

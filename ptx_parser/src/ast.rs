@@ -5,7 +5,7 @@ use super::{
 use crate::{
     BmskMode, CacheLevel, EvictionPriority, FunnelShiftMode, MatrixLayout, MatrixNumber,
     MatrixShape, Mul24Control, PtxError, PtxParserState, Reduction, ShiftDirection, ShuffleMode,
-    VoteMode,
+    VoteMode, VshOp,
 };
 use bitflags::bitflags;
 use derive_more::Display;
@@ -334,7 +334,7 @@ ptx_parser_macros::generate_instruction_type!(
         },
         Cvta {
             data: CvtaDetails,
-            type: { Type::Scalar(ScalarType::B64) },
+            type: { if data.size == 64 { Type::Scalar(ScalarType::B64) } else { Type::Scalar(ScalarType::B32) } },
             arguments<T>: {
                 dst: T,
                 src: T,
@@ -671,8 +671,8 @@ ptx_parser_macros::generate_instruction_type!(
                 }
             }
         },
-        ShflSync {
-            data: ShflSyncDetails,
+        Shfl {
+            data: ShflDetails,
             type: Type::Scalar(ScalarType::B32),
             arguments<T>: {
                 dst: T,
@@ -683,22 +683,19 @@ ptx_parser_macros::generate_instruction_type!(
                 src: T,
                 src_lane: T,
                 src_opts: T,
-                src_membermask: T
+                src_membermask: Option<T>
             }
         },
-        // Pre-sm_70 shfl without .sync and without membermask
-        Shfl {
-            data: ShflSyncDetails,
+        MatchSync {
+            data: ScalarType,
             type: Type::Scalar(ScalarType::B32),
             arguments<T>: {
                 dst: T,
-                dst_pred: {
-                    repr: Option<T>,
-                    type: Type::from(ScalarType::Pred)
+                src: {
+                    repr: T,
+                    type: Type::Scalar(data.clone())
                 },
-                src: T,
-                src_lane: T,
-                src_opts: T
+                src_membermask: T
             }
         },
         Shf {
@@ -785,6 +782,7 @@ ptx_parser_macros::generate_instruction_type!(
             }
         },
         Trap { },
+        Exit { },
         Xor {
             type: Type::Scalar(data.clone()),
             data: ScalarType,
@@ -812,7 +810,7 @@ ptx_parser_macros::generate_instruction_type!(
                     type: { Type::Scalar(ScalarType::Pred) },
                 },
                 src2: {
-                    repr: T,
+                    repr: Option<T>,
                     type: { Type::Scalar(ScalarType::U32) },
                 }
             }
@@ -935,6 +933,16 @@ ptx_parser_macros::generate_instruction_type!(
                     type: { Type::Scalar(data.ctype()) },
 
                 }
+            }
+        },
+        Vshr {
+            type: Type::Scalar(ScalarType::U32),
+            data: VshData,
+            arguments<T>: {
+                dst: T,
+                src1: T,
+                src2: T,
+                src3: T
             }
         },
         // tex.{geometry}.v4.{dtype}.{ctype} {dst_v4}, [tex_handle, {coords}]
@@ -1101,21 +1109,21 @@ where
                 (self)(ident, type_space, is_dst, relaxed_type_check)?,
                 index,
             ),
-            ParsedOperand::VecPack(vec) => ParsedOperand::VecPack(
-                vec.into_iter()
-                    .map(|reg_or_immediate| {
-                        Ok(match reg_or_immediate {
-                            RegOrImmediate::Reg(ident) => RegOrImmediate::Reg((self)(
-                                ident,
-                                type_space,
-                                is_dst,
-                                relaxed_type_check,
-                            )?),
-                            RegOrImmediate::Imm(imm) => RegOrImmediate::Imm(imm),
+            ParsedOperand::VecPack(vec) => {
+                ParsedOperand::VecPack(
+                    vec.into_iter()
+                        .map(|element| {
+                            Ok(match element {
+                                Some(RegOrImmediate::Reg(ident)) => Some(RegOrImmediate::Reg(
+                                    (self)(ident, type_space, is_dst, relaxed_type_check)?,
+                                )),
+                                Some(RegOrImmediate::Imm(imm)) => Some(RegOrImmediate::Imm(imm)),
+                                None => None,
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
         })
     }
 
@@ -1365,8 +1373,8 @@ impl Type {
         }
     }
 
-    pub fn layout(&self) -> Layout {
-        match self {
+    pub fn layout(&self) -> Option<Layout> {
+        Some(match self {
             Type::Scalar(type_) => type_.layout(),
             Type::Vector(elements, scalar_type) => {
                 let scalar_layout = scalar_type.layout();
@@ -1378,7 +1386,7 @@ impl Type {
                 }
             }
             Type::Array(non_zero, scalar, vec) => {
-                let element_layout = Type::maybe_vector_parsed(*non_zero, *scalar).layout();
+                let element_layout = Type::maybe_vector_parsed(*non_zero, *scalar).layout()?;
                 let len = vec.iter().copied().reduce(std::ops::Mul::mul).unwrap_or(0);
                 unsafe {
                     Layout::from_size_align_unchecked(
@@ -1389,7 +1397,7 @@ impl Type {
             }
             // sizeof(textureReference) = 88, align 8
             Type::Texref | Type::Surfref => unsafe { Layout::from_size_align_unchecked(88, 8) },
-        }
+        })
     }
 }
 
@@ -1546,7 +1554,7 @@ impl MovDetails {
 }
 
 #[derive(Copy, Clone)]
-pub struct ShflSyncDetails {
+pub struct ShflDetails {
     pub mode: ShuffleMode,
 }
 
@@ -1731,7 +1739,8 @@ pub enum ParsedOperand<Ident> {
     RegOffset(Ident, i64),
     Imm(ImmediateValue),
     VecMember(Ident, u8),
-    VecPack(Vec<RegOrImmediate<Ident>>),
+    // None denotes a sink; retain its position in the vector.
+    VecPack(Vec<Option<RegOrImmediate<Ident>>>),
 }
 
 impl<Ident> ParsedOperand<Ident> {
@@ -1768,7 +1777,10 @@ where
                     if idx != 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", item)?;
+                    match item {
+                        Some(item) => write!(f, "{}", item)?,
+                        None => f.write_char('_')?,
+                    }
                 }
                 f.write_char('}')?
             }
@@ -2171,6 +2183,7 @@ pub struct Module<'input> {
     pub sm_version: u32,
     pub directives: Vec<Directive<'input, ParsedOperand<&'input str>>>,
     pub invalid_directives: usize,
+    pub address_size: u8,
 }
 
 impl Module<'_> {
@@ -2180,6 +2193,7 @@ impl Module<'_> {
             sm_version: 0,
             directives: Vec::new(),
             invalid_directives: usize::MAX,
+            address_size: 64,
         }
     }
 }
@@ -2764,6 +2778,7 @@ pub enum RightShiftKind {
 pub struct CvtaDetails {
     pub state_space: StateSpace,
     pub direction: CvtaDirection,
+    pub size: u8,
 }
 
 pub enum CvtaDirection {
@@ -3040,4 +3055,10 @@ impl Dp2aData {
 pub enum Dp2aControl {
     Low,
     High,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VshData {
+    pub mode: FunnelShiftMode,
+    pub op2: VshOp,
 }

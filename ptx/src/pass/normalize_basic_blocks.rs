@@ -21,7 +21,7 @@ pub(crate) fn run(
 ) -> Result<Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
     for directive in directives.iter_mut() {
         let (body_ref, is_kernel) = match directive {
-            Directive2::Method(Function2 {
+            Directive2::Method(Function {
                 body: Some(body),
                 kernel_attributes,
                 ..
@@ -129,6 +129,7 @@ fn is_block_terminator(
     match statement {
         Statement::Conditional(..)
         | Statement::Instruction(ast::Instruction::Trap { .. })
+        | Statement::Instruction(ast::Instruction::Exit { .. })
         | Statement::Instruction(ast::Instruction::Bra { .. })
         // Normally call is not a terminator, but we treat it as such because it
         // makes the "instruction modes to global modes" pass possible

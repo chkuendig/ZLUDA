@@ -19,6 +19,9 @@ pub(super) mod pointer;
 pub(super) mod stream;
 pub(super) mod surf;
 pub(super) mod tex;
+// Upstream #625 texture tests, run against this fork's texture implementation.
+#[cfg(test)]
+mod tex_upstream_tests;
 
 #[cfg(debug_assertions)]
 pub(crate) fn unimplemented() -> CUerror {

@@ -1,7 +1,7 @@
 use either::Either;
 use proc_macro2::{Span, TokenStream};
-use ptx_parser_macros_impl::parser;
-use quote::{format_ident, quote, ToTokens};
+use ptx_parser_macros_impl::parser::{self, IdentLike};
+use quote::{quote, ToTokens};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{collections::hash_map, hash::Hash, iter, rc::Rc};
 use syn::{
@@ -33,7 +33,7 @@ struct OpcodeDefinitions {
 }
 
 impl OpcodeDefinitions {
-    fn new(opcode: &Ident, definitions: Vec<SingleOpcodeDefinition>) -> Self {
+    fn new(opcode: &IdentLike, definitions: Vec<SingleOpcodeDefinition>) -> Self {
         let mut selections = vec![None; definitions.len()];
         let mut generation = 0usize;
         loop {
@@ -231,8 +231,8 @@ impl SingleOpcodeDefinition {
     }
 
     fn extract_and_insert(
-        definitions: &mut FxHashMap<Ident, Vec<SingleOpcodeDefinition>>,
-        special_definitions: &mut FxHashMap<Ident, proc_macro2::Group>,
+        definitions: &mut FxHashMap<IdentLike, Vec<SingleOpcodeDefinition>>,
+        special_definitions: &mut FxHashMap<IdentLike, proc_macro2::Group>,
         parser::OpcodeDefinition(pattern_seq, rules): parser::OpcodeDefinition,
     ) {
         let (mut named_rules, mut unnamed_rules) = gather_rules(rules);
@@ -315,7 +315,6 @@ impl SingleOpcodeDefinition {
                 }
                 Some(DotModifierRef::Indirect { value, .. }) => {
                     let type_ = value.type_.to_token_stream().to_string();
-                    //panic!("{} {}", type_, POSTFIX_TYPES.contains(&&*type_));
                     POSTFIX_TYPES.contains(&&*type_)
                 }
                 None => break,
@@ -326,6 +325,13 @@ impl SingleOpcodeDefinition {
                 break;
             }
         }
+        // Observably, if there's a single type specifier it can be passed
+        // out of order. E.g. nonsense like "lg2.f32.ftz.approx" is fine
+        if result.len() == 1 {
+            unordered_modifiers.push(result.pop().unwrap());
+        }
+        // If all modifiers are ordered, move single unordered modifier to
+        // the ordered list for better performance
         if unordered_modifiers.len() == 1 {
             result.push(unordered_modifiers.pop().unwrap());
         }
@@ -465,9 +471,9 @@ fn emit_enum_types(
 
 fn emit_parse_function(
     type_name: &Ident,
-    defs: &FxHashMap<Ident, OpcodeDefinitions>,
-    special_defs: &FxHashMap<Ident, proc_macro2::Group>,
-    all_opcode: Vec<&Ident>,
+    defs: &FxHashMap<IdentLike, OpcodeDefinitions>,
+    special_defs: &FxHashMap<IdentLike, proc_macro2::Group>,
+    all_opcode: Vec<&IdentLike>,
     all_modifier: FxHashSet<&parser::DotModifier>,
 ) -> TokenStream {
     use std::fmt::Write;
@@ -600,7 +606,7 @@ fn emit_parse_function(
 
 fn emit_definition_parser(
     token_type: &Ident,
-    (opcode, fn_idx): (&Ident, usize),
+    (opcode, fn_idx): (&IdentLike, usize),
     definition: &SingleOpcodeDefinition,
 ) -> TokenStream {
     let return_error_ref = quote! {
@@ -624,11 +630,11 @@ fn emit_definition_parser(
                 let variant = value.dot_capitalized();
                 if *optional {
                     quote! {
-                        #arg_name = opt(any.verify(|(t, _)| *t == #token_type :: #variant)).parse_next(&mut stream)?.is_some();
+                        #arg_name = opt(winnow::token::any.verify(|(t, _)| *t == #token_type :: #variant)).parse_next(&mut stream)?.is_some();
                     }
                 } else {
                     quote! {
-                        any.verify(|(t, _)| *t == #token_type :: #variant).parse_next(&mut stream)?;
+                        winnow::token::any.verify(|(t, _)| *t == #token_type :: #variant).parse_next(&mut stream)?;
                     }
                 }
             }
@@ -637,7 +643,7 @@ fn emit_definition_parser(
                 let variant = value.dot_capitalized();
                 let parsed_variant = value.variant_capitalized();
                 quote! {
-                    any.verify(|(t, _)| *t == #token_type :: #variant).parse_next(&mut stream)?;
+                    winnow::token::any.verify(|(t, _)| *t == #token_type :: #variant).parse_next(&mut stream)?;
                     #variable = #type_ :: #parsed_variant;
                 }
             }
@@ -653,7 +659,7 @@ fn emit_definition_parser(
                 });
                 if *optional {
                     quote! {
-                        #arg_name = opt(any.verify_map(|(tok, _)| {
+                        #arg_name = opt(winnow::token::any.verify_map(|(tok, _)| {
                             Some(match tok {
                                 #(#variants)*
                                 _ => return None
@@ -662,7 +668,7 @@ fn emit_definition_parser(
                     }
                 } else {
                     quote! {
-                        #arg_name = any.verify_map(|(tok, _)| {
+                        #arg_name = winnow::token::any.verify_map(|(tok, _)| {
                             Some(match tok {
                                 #(#variants)*
                                 _ => return None
@@ -791,12 +797,12 @@ fn emit_definition_parser(
         let comma = if idx == 0 || arg.pre_pipe {
             quote! { empty }
         } else {
-            quote! { any.verify(|(t, _)| *t == #token_type::Comma).void() }
+            quote! { winnow::token::any.verify(|(t, _)| *t == #token_type::Comma).void() }
         };
 
         let pre_bracket = if arg.pre_bracket {
             quote! {
-                any.verify(|(t, _)| *t == #token_type::LBracket).void()
+                winnow::token::any.verify(|(t, _)| *t == #token_type::LBracket).void()
             }
         } else {
             quote! {
@@ -805,7 +811,7 @@ fn emit_definition_parser(
         };
         let pre_pipe = if arg.pre_pipe {
             quote! {
-                any.verify(|(t, _)| *t == #token_type::Pipe).void()
+                winnow::token::any.verify(|(t, _)| *t == #token_type::Pipe).void()
             }
         } else {
             quote! {
@@ -814,7 +820,7 @@ fn emit_definition_parser(
         };
         let can_be_negated = if arg.can_be_negated {
             quote! {
-                opt(any.verify(|(t, _)| *t == #token_type::Exclamation)).map(|o| o.is_some())
+                opt(winnow::token::any.verify(|(t, _)| *t == #token_type::Exclamation)).map(|o| o.is_some())
             }
         } else {
             quote! {
@@ -828,7 +834,7 @@ fn emit_definition_parser(
         };
         let post_bracket = if arg.post_bracket {
             quote! {
-                any.verify(|(t, _)| *t == #token_type::RBracket).void()
+                winnow::token::any.verify(|(t, _)| *t == #token_type::RBracket).void()
             }
         } else {
             quote! {
@@ -837,7 +843,7 @@ fn emit_definition_parser(
         };
         let unified = if arg.unified {
             quote! {
-                opt(any.verify(|(t, _)| *t == #token_type::DotUnified).void()).map(|u| u.is_some())
+                opt(winnow::token::any.verify(|(t, _)| *t == #token_type::DotUnified).void()).map(|u| u.is_some())
             }
         } else {
             quote! {
@@ -880,7 +886,7 @@ fn emit_definition_parser(
         quote! { let #arguments_pattern = ( #arguments_parser ).parse_next(stream)?; };
 
     let fn_args = definition.function_arguments();
-    let fn_name = format_ident!("{}_{}", opcode, fn_idx);
+    let fn_name = Ident::new(&*format!("{}_{}", opcode, fn_idx), opcode.span());
     let fn_call = quote! {
         #fn_name(&mut stream.state,  #(#fn_args),* )
     };
@@ -905,10 +911,10 @@ fn emit_definition_parser(
 }
 
 fn write_definitions_into_tokens<'a>(
-    defs: &'a FxHashMap<Ident, OpcodeDefinitions>,
-    special_definitions: impl Iterator<Item = &'a Ident>,
+    defs: &'a FxHashMap<IdentLike, OpcodeDefinitions>,
+    special_definitions: impl Iterator<Item = &'a IdentLike>,
     variants: &mut Punctuated<Variant, Token![,]>,
-) -> (Vec<&'a Ident>, FxHashSet<&'a parser::DotModifier>) {
+) -> (Vec<&'a IdentLike>, FxHashSet<&'a parser::DotModifier>) {
     let mut all_opcodes = Vec::new();
     let mut all_modifiers = FxHashSet::default();
     for (opcode, definitions) in defs.iter() {

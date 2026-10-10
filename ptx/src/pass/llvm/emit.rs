@@ -66,9 +66,10 @@ pub(crate) fn run<'input>(
     context: &Context,
     id_defs: GlobalStringIdentResolver2<'input>,
     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
+    fp_mode: FloatingPointMode,
 ) -> Result<llvm::Module, TranslateError> {
     let module = llvm::Module::new(context, LLVM_UNNAMED);
-    let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs);
+    let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs, fp_mode);
     // Forward-declare all functions so that FunctionPointer statements can
     // reference functions that appear later in the directive list.
     for directive in &directives {
@@ -130,6 +131,7 @@ struct ModuleEmitContext<'a, 'input> {
     /// and .const globals that need to be visible to hipModuleGetGlobal).
     /// These get added to @llvm.used so -amdgpu-internalize-symbols doesn't strip them.
     preserved_globals: Vec<LLVMValueRef>,
+    fp_mode: FloatingPointMode,
 }
 
 impl<'a, 'input> ModuleEmitContext<'a, 'input> {
@@ -137,6 +139,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         context: &Context,
         module: &llvm::Module,
         id_defs: &'a GlobalStringIdentResolver2<'input>,
+        fp_mode: FloatingPointMode,
     ) -> Self {
         ModuleEmitContext {
             context: context.get(),
@@ -145,6 +148,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             id_defs,
             resolver: ResolveIdent::new(&id_defs),
             preserved_globals: Vec::new(),
+            fp_mode,
         }
     }
 
@@ -161,7 +165,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
     /// it's fully emitted.
     fn forward_declare_method(
         &mut self,
-        method: &Function2<ast::Instruction<SpirvWord>, SpirvWord>,
+        method: &Function<ast::Instruction<SpirvWord>, SpirvWord>,
     ) -> Result<(), TranslateError> {
         if method.is_kernel() {
             return Ok(()); // Kernels don't need forward declaration (not called via ptrs)
@@ -191,7 +195,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
 
     fn emit_method(
         &mut self,
-        method: Function2<ast::Instruction<SpirvWord>, SpirvWord>,
+        method: Function<ast::Instruction<SpirvWord>, SpirvWord>,
     ) -> Result<(), TranslateError> {
         let name = method
             .import_as
@@ -210,9 +214,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             )?;
             fn_ = unsafe { LLVMAddFunction(self.module, name.as_ptr(), fn_type) };
         }
-        self.emit_fn_attribute(fn_, "amdgpu-unsafe-fp-atomics", "true");
-        self.emit_fn_attribute(fn_, "uniform-work-group-size", "true");
-        self.emit_fn_attribute(fn_, "no-trapping-math", "true");
+        self.emit_fn_attribute_string(fn_, "amdgpu-unsafe-fp-atomics", "true");
+        self.emit_fn_attribute_string(fn_, "uniform-work-group-size", "true");
+        self.emit_fn_attribute_string(fn_, "no-trapping-math", "true");
+        if self.fp_mode == FloatingPointMode::Constrained {
+            self.emit_fn_attribute_enum(fn_, "strictfp");
+        }
         self.emit_target_features(fn_);
         self.emit_tuning(fn_, &method.tuning);
         // Kernels without .maxntid/.reqntid get no amdgpu-flat-work-group-size,
@@ -229,26 +236,26 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 )
             });
             if !has_workgroup_size {
-                self.emit_fn_attribute(fn_, "amdgpu-flat-work-group-size", "1,1024");
+                self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", "1,1024");
             }
         }
         if let Some(kernel_attrs) = &method.kernel_attributes {
-            self.emit_fn_attribute(
+            self.emit_fn_attribute_string(
                 fn_,
                 "denormal-fp-math-f32",
                 llvm_ftz(kernel_attrs.flush_to_zero_f32),
             );
-            self.emit_fn_attribute(
+            self.emit_fn_attribute_string(
                 fn_,
                 "denormal-fp-math",
                 llvm_ftz(kernel_attrs.flush_to_zero_f16f64),
             );
         } else {
             self.resolver.register(method.name, fn_);
-            self.emit_fn_attribute(fn_, "denormal-fp-math-f32", "dynamic");
-            self.emit_fn_attribute(fn_, "denormal-fp-math", "dynamic");
+            self.emit_fn_attribute_string(fn_, "denormal-fp-math-f32", "dynamic");
+            self.emit_fn_attribute_string(fn_, "denormal-fp-math", "dynamic");
         }
-        self.emit_fn_attribute(fn_, "amdgpu-ieee", "false");
+        self.emit_fn_attribute_string(fn_, "amdgpu-ieee", "false");
         for (i, param) in method.input_arguments.iter().enumerate() {
             let value = unsafe { LLVMGetParam(fn_, i as u32) };
             let name = self.resolver.get_or_add(param.name);
@@ -274,12 +281,13 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 unsafe { LLVMAddAttributeAtIndex(fn_, i as u32 + 1, attr) };
             }
         }
-        if !method.is_kernel() {
+        let is_kernel = method.is_kernel();
+        if !is_kernel {
             unsafe {
                 LLVMSetVisibility(fn_, llvm_zluda::LLVMVisibility::LLVMHiddenVisibility);
             }
         }
-        let call_conv = if method.is_kernel() {
+        let call_conv = if is_kernel {
             Self::kernel_call_convention()
         } else {
             Self::func_call_convention()
@@ -288,7 +296,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         for directive in method.tuning {
             match directive {
                 ptx_parser::TuningDirective::NoReturn => {
-                    self.emit_fn_attribute(fn_, "noreturn", "true")
+                    self.emit_fn_attribute_string(fn_, "noreturn", "true")
                 }
                 _ => {
                     // Ignore other tuning directives for now
@@ -303,7 +311,9 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             let real_bb =
                 unsafe { LLVMAppendBasicBlockInContext(self.context, fn_, LLVM_UNNAMED.as_ptr()) };
             unsafe { LLVMPositionBuilderAtEnd(self.builder.get(), real_bb) };
-            let mut method_emitter = MethodEmitContext::new(self, fn_, variables_builder);
+            let base_32bit_memory = method.kernel_meta32.as_ref().map(|m| m.implicit_memory_ptr);
+            let mut method_emitter =
+                MethodEmitContext::new(self, fn_, variables_builder, base_32bit_memory, is_kernel);
             for var in method.return_arguments {
                 method_emitter.emit_variable(var)?;
             }
@@ -318,7 +328,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             } else {
                 return Err(error_unreachable());
             }
-            method_emitter.emit_kernel_rounding_prelude(method.kernel_attributes)?;
+            method_emitter.emit_kernel_prelude(method.kernel_attributes)?;
             for statement in statements {
                 method_emitter.emit_statement(statement)?;
             }
@@ -346,10 +356,11 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             .transpose()
             .map_err(|_| error_unreachable())?
             .unwrap_or(Cow::Borrowed(LLVM_UNNAMED));
+        let llvm_type = get_type(self.context, &var.info.v_type)?;
         let global = unsafe {
             LLVMAddGlobalInAddressSpace(
                 self.module,
-                get_type(self.context, &var.info.v_type)?,
+                llvm_type,
                 name.as_ptr(),
                 get_state_space(var.info.state_space)?,
             )
@@ -452,7 +463,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         Ok(initializer)
     }
 
-    fn emit_fn_attribute(&self, llvm_object: LLVMValueRef, key: &str, value: &str) {
+    fn emit_fn_attribute_string(&self, llvm_object: LLVMValueRef, key: &str, value: &str) {
         let attribute = unsafe {
             LLVMCreateStringAttribute(
                 self.context,
@@ -462,6 +473,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 value.len() as u32,
             )
         };
+        unsafe { LLVMAddAttributeAtIndex(llvm_object, LLVMAttributeFunctionIndex, attribute) };
+    }
+
+    fn emit_fn_attribute_enum(&self, llvm_object: LLVMValueRef, key: &str) {
+        let attr_kind = unsafe { LLVMGetEnumAttributeKindForName(key.as_ptr().cast(), key.len()) };
+        let attribute = unsafe { LLVMCreateEnumAttribute(self.context, attr_kind, 0) };
         unsafe { LLVMAddAttributeAtIndex(llvm_object, LLVMAttributeFunctionIndex, attribute) };
     }
 
@@ -484,12 +501,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     // scratch if pressure is too high.
                     let size = (x * y * z).max(1024);
                     let value = format!("1,{size}");
-                    self.emit_fn_attribute(fn_, "amdgpu-flat-work-group-size", &value);
+                    self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
                 }
                 ptx_parser::TuningDirective::ReqNtid(x, y, z) => {
                     let size = x * y * z;
                     let value = format!("{size},{size}");
-                    self.emit_fn_attribute(fn_, "amdgpu-flat-work-group-size", &value);
+                    self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
                 }
                 ptx_parser::TuningDirective::MinNCtaPerSm(_) => {
                     // .minnctapersm maps to CUDA occupancy hints, not directly
@@ -513,7 +530,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         // See: LLVM #131386, Codeplay's GROMACS regalloc analysis.
         // Performance impact: adds s_waitcnt after every memory op (~5-10% slower).
         let value = "+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory";
-        self.emit_fn_attribute(fn_, "target-features", value)
+        self.emit_fn_attribute_string(fn_, "target-features", value)
     }
 
     fn emit_linkage(
@@ -606,6 +623,9 @@ fn get_input_argument_type(
             Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
         }
         ast::StateSpace::Reg => get_type(context, v_type),
+        ast::StateSpace::Global | ast::StateSpace::Const if matches!(v_type, ast::Type::Texref) => {
+            Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
+        }
         _ => return Err(error_unreachable()),
     }
 }
@@ -618,6 +638,9 @@ struct MethodEmitContext<'a> {
     variables_builder: Builder,
     resolver: &'a mut ResolveIdent,
     carry_flag: Option<LLVMValueRef>,
+    base_32bit_memory: Option<SpirvWord>,
+    is_kernel: bool,
+    fp: FloatingPoint,
 }
 
 impl<'a> MethodEmitContext<'a> {
@@ -625,7 +648,15 @@ impl<'a> MethodEmitContext<'a> {
         parent: &'a mut ModuleEmitContext,
         method: LLVMValueRef,
         variables_builder: Builder,
+        base_32bit_memory: Option<SpirvWord>,
+        is_kernel: bool,
     ) -> MethodEmitContext<'a> {
+        let fp = FloatingPoint {
+            context: parent.context,
+            module: parent.module,
+            builder: parent.builder.get(),
+            mode: parent.fp_mode,
+        };
         MethodEmitContext {
             context: parent.context,
             module: parent.module,
@@ -634,6 +665,9 @@ impl<'a> MethodEmitContext<'a> {
             resolver: &mut parent.resolver,
             method,
             carry_flag: None,
+            base_32bit_memory,
+            is_kernel,
+            fp,
         }
     }
 
@@ -676,10 +710,17 @@ impl<'a> MethodEmitContext<'a> {
     // This should be a kernel attribute, but sadly AMDGPU LLVM target does
     // not support attribute for it. So we have to set it as the first
     // instruction in the body of a kernel
-    fn emit_kernel_rounding_prelude(
+    fn emit_kernel_prelude(
         &mut self,
         kernel_attrs: Option<KernelAttributes>,
     ) -> Result<(), TranslateError> {
+        // TODO
+        // On Windows, with 32 bit ZLUDA on kernel _Z29KernelDeformableUberCollisionPi in
+        // SampleCloth.exe scalar memory accesses read stale memory. This might also affect
+        // Linux. Until I have a repro that's the best I can do
+        if cfg!(windows) {
+            self.emit_intrinsic(c"llvm.amdgcn.s.dcache.inv", None, Vec::new(), Vec::new())?;
+        }
         if let Some(KernelAttributes {
             rounding_mode_f32,
             rounding_mode_f16f64,
@@ -842,6 +883,7 @@ impl<'a> MethodEmitContext<'a> {
             ast::Instruction::Shr { data, arguments } => self.emit_shr(data, arguments),
             ast::Instruction::Shl { data, arguments } => self.emit_shl(data, arguments),
             ast::Instruction::Ret { data } => Ok(self.emit_ret(data)),
+            ast::Instruction::Exit {} => self.emit_exit(),
             ast::Instruction::Cvta { data, arguments } => self.emit_cvta(data, arguments),
             ast::Instruction::Abs { data, arguments } => self.emit_abs(data, arguments),
             ast::Instruction::Mad { data, arguments } => self.emit_mad(data, arguments),
@@ -871,13 +913,13 @@ impl<'a> MethodEmitContext<'a> {
             ast::Instruction::BarWarp { .. } => self.emit_bar_warp(),
             ast::Instruction::Membar { data } => self.emit_membar(data),
             ast::Instruction::Trap {} => self.emit_trap(),
-            ast::Instruction::Tanh { data, arguments } => self.emit_tanh(data, arguments),
             ast::Instruction::CpAsync { data, arguments } => self.emit_cp_async(data, arguments),
             ast::Instruction::Copysign { data, arguments } => self.emit_copysign(data, arguments),
             ast::Instruction::CreatePolicyFractional { data, arguments } => {
                 self.emit_createpolicy_fractional(data, arguments)
             }
             ast::Instruction::Sad { data, arguments } => self.emit_sad(data, arguments),
+            ast::Instruction::Vshr { data, arguments } => self.emit_vshr(data, arguments),
             ast::Instruction::CpAsyncCommitGroup {} => Ok(()), // nop
             ast::Instruction::CpAsyncWaitGroup { .. } => Ok(()), // nop
             ast::Instruction::CpAsyncWaitAll { .. } => Ok(()), // nop
@@ -890,8 +932,8 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::Bfi { .. }
             | ast::Instruction::Bmsk { .. }
             | ast::Instruction::Activemask { .. }
-            | ast::Instruction::ShflSync { .. }
             | ast::Instruction::Shfl { .. }
+            | ast::Instruction::MatchSync { .. }
             | ast::Instruction::Vote { .. }
             | ast::Instruction::VotePreSync { .. }
             | ast::Instruction::Nanosleep { .. }
@@ -900,6 +942,7 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::Prmt { .. }
             | ast::Instruction::Mma { .. }
             | ast::Instruction::Dp2a { .. }
+            | ast::Instruction::Tanh { .. }
             | ast::Instruction::Tex { .. }
             | ast::Instruction::Sust { .. }
             | ast::Instruction::Suld { .. } => return Err(error_unreachable()),
@@ -915,7 +958,12 @@ impl<'a> MethodEmitContext<'a> {
         let underlying_type = get_type(self.context, &data.typ)?;
         let needs_cast = not_supported_by_atomics(data.qualifier, underlying_type);
         let op_type = if needs_cast {
-            unsafe { LLVMIntTypeInContext(self.context, data.typ.layout().size() as u32 * 8) }
+            unsafe {
+                LLVMIntTypeInContext(
+                    self.context,
+                    data.typ.layout().ok_or_else(error_unreachable)?.size() as u32 * 8,
+                )
+            }
         } else {
             underlying_type
         };
@@ -931,7 +979,12 @@ impl<'a> MethodEmitContext<'a> {
         if data.state_space == ast::StateSpace::Shared {
             unsafe { LLVMSetVolatile(load, 1) };
         }
-        unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
+        unsafe {
+            LLVMSetAlignment(
+                load,
+                data.typ.layout().ok_or_else(error_unreachable)?.align() as u32,
+            )
+        };
         if needs_cast {
             self.resolver.with_result(arguments.dst, |dst| unsafe {
                 LLVMBuildBitCast(builder, load, underlying_type, dst)
@@ -963,8 +1016,37 @@ impl<'a> MethodEmitContext<'a> {
             }
             ConversionKind::BitToPtr => {
                 let src = self.resolver.value(conversion.src)?;
-                let type_ = get_pointer_type(self.context, conversion.to_space)?;
-                let from_size = conversion.from_type.layout().size();
+                let ptr_type = get_pointer_type(self.context, conversion.to_space)?;
+                if let (
+                    Some(base32),
+                    ast::StateSpace::Global | ast::StateSpace::Generic | ast::StateSpace::Const,
+                ) = (self.base_32bit_memory, conversion.to_space)
+                {
+                    let i8_type = get_scalar_type(self.context, ast::ScalarType::B8);
+                    let i64_type = get_scalar_type(self.context, ast::ScalarType::B64);
+                    let src_64 =
+                        unsafe { LLVMBuildZExt(builder, src, i64_type, LLVM_UNNAMED.as_ptr()) };
+                    let base32 = self.resolver.value(base32)?;
+                    let base32_typed = unsafe {
+                        LLVMBuildIntToPtr(builder, base32, ptr_type, LLVM_UNNAMED.as_ptr())
+                    };
+                    self.resolver.with_result(conversion.dst, |dst| unsafe {
+                        LLVMBuildInBoundsGEP2(
+                            builder,
+                            i8_type,
+                            base32_typed,
+                            [src_64].as_mut_ptr(),
+                            1,
+                            dst,
+                        )
+                    });
+                    return Ok(());
+                }
+                let from_size = conversion
+                    .from_type
+                    .layout()
+                    .ok_or_else(error_unreachable)?
+                    .size();
                 // On AMDGPU, shared (addrspace 3) and local (addrspace 5)
                 // pointers are 32-bit. PTX uses 64-bit integers for addresses
                 // (`mov.u64 reg, shared_var`), so the round-trip through i64
@@ -986,11 +1068,18 @@ impl<'a> MethodEmitContext<'a> {
                     src
                 };
                 self.resolver.with_result(conversion.dst, |dst| unsafe {
-                    LLVMBuildIntToPtr(builder, src, type_, dst)
+                    LLVMBuildIntToPtr(builder, src, ptr_type, dst)
                 });
                 Ok(())
             }
             ConversionKind::PtrToPtr => {
+                if conversion.from_space == conversion.to_space {
+                    // With opaque pointers it's meaningless
+                    return self.emit_mov(ast::MovArgs {
+                        dst: conversion.dst,
+                        src: conversion.src,
+                    });
+                }
                 let src = self.resolver.value(conversion.src)?;
                 let dst_type = get_pointer_type(self.context, conversion.to_space)?;
                 self.resolver.with_result(conversion.dst, |dst| unsafe {
@@ -1001,7 +1090,19 @@ impl<'a> MethodEmitContext<'a> {
             ConversionKind::AddressOf => {
                 let src = self.resolver.value(conversion.src)?;
                 let dst_type = get_type(self.context, &conversion.to_type)?;
-                let to_size = conversion.to_type.layout().size();
+                if let (
+                    Some(_),
+                    ast::StateSpace::Global | ast::StateSpace::Generic | ast::StateSpace::Const,
+                ) = (self.base_32bit_memory, conversion.to_space)
+                {
+                    // Should never happen because globals are removed
+                    return Err(error_unreachable());
+                }
+                let to_size = conversion
+                    .to_type
+                    .layout()
+                    .ok_or_else(error_unreachable)?
+                    .size();
                 // On AMDGPU, shared (addrspace 3) and local (addrspace 5)
                 // pointers are 32-bit. PTX takes addresses into 64-bit regs
                 // (`mov.u64 reg, shared_var`), producing `ptrtoint ptr
@@ -1040,7 +1141,7 @@ impl<'a> MethodEmitContext<'a> {
         match (from_type, to_type) {
             (ast::Type::Scalar(from_type), ast::Type::Scalar(to_type_scalar)) => {
                 let from_layout = from_type.layout();
-                let to_layout = to_type.layout();
+                let to_layout = to_type.layout().ok_or_else(error_unreachable)?;
                 if from_layout.size() == to_layout.size() {
                     let dst_type = get_type(self.context, &to_type)?;
                     if from_type.kind() != ast::ScalarKind::Float
@@ -1150,7 +1251,9 @@ impl<'a> MethodEmitContext<'a> {
         arguments: ast::AddArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         let builder = self.builder;
-        let fn_ = match data {
+        let src1 = self.resolver.value(arguments.src1)?;
+        let src2 = self.resolver.value(arguments.src2)?;
+        match data {
             ast::ArithDetails::Integer(ast::ArithInteger {
                 saturate: true,
                 type_,
@@ -1160,24 +1263,20 @@ impl<'a> MethodEmitContext<'a> {
                 } else {
                     "uadd"
                 };
-                return self.emit_intrinsic_saturate(
-                    op,
-                    type_,
-                    arguments.dst,
-                    arguments.src1,
-                    arguments.src2,
-                );
+                return self.emit_intrinsic_saturate(op, type_, arguments.dst, src1, src2);
             }
             ast::ArithDetails::Integer(ast::ArithInteger {
                 saturate: false, ..
-            }) => LLVMBuildAdd,
-            ast::ArithDetails::Float(..) => LLVMBuildFAdd,
+            }) => {
+                self.resolver.with_result(arguments.dst, |dst| unsafe {
+                    LLVMBuildAdd(builder, src1, src2, dst)
+                });
+            }
+            ast::ArithDetails::Float(..) => {
+                self.fp
+                    .fadd(self.resolver, data.type_(), arguments.dst, src1, src2)?;
+            }
         };
-        let src1 = self.resolver.value(arguments.src1)?;
-        let src2 = self.resolver.value(arguments.src2)?;
-        self.resolver.with_result(arguments.dst, |dst| unsafe {
-            fn_(builder, src1, src2, dst)
-        });
         Ok(())
     }
 
@@ -1385,7 +1484,10 @@ impl<'a> MethodEmitContext<'a> {
                 LLVMBuildBitCast(
                     self.builder,
                     value,
-                    LLVMIntTypeInContext(self.context, data.typ.layout().size() as u32 * 8),
+                    LLVMIntTypeInContext(
+                        self.context,
+                        data.typ.layout().ok_or_else(error_unreachable)?.size() as u32 * 8,
+                    ),
                     LLVM_UNNAMED.as_ptr(),
                 )
             };
@@ -1406,7 +1508,10 @@ impl<'a> MethodEmitContext<'a> {
         // 56ffc0fd which regressed IOFX_actorRange to SIGABRT). Keep
         // volatile=true ONLY on loads (Phase 2.1, in emit_ld).
         unsafe {
-            LLVMSetAlignment(store, data.typ.layout().align() as u32);
+            LLVMSetAlignment(
+                store,
+                data.typ.layout().ok_or_else(error_unreachable)?.align() as u32,
+            );
         }
         Ok(())
     }
@@ -1658,20 +1763,14 @@ impl<'a> MethodEmitContext<'a> {
             8 => c"llvm.bitreverse.i64",
             _ => return Err(error_unreachable()),
         };
-        let mut fn_ = unsafe { LLVMGetNamedFunction(self.module, llvm_fn.as_ptr()) };
         let type_ = get_scalar_type(self.context, data);
-        let fn_type = get_function_type(
-            self.context,
-            iter::once(&data.into()),
-            iter::once(Ok(type_)),
+        let src = self.resolver.value(arguments.src)?;
+        self.emit_intrinsic(
+            llvm_fn,
+            Some(arguments.dst),
+            vec![&data.into()],
+            vec![(src, type_)],
         )?;
-        if fn_ == ptr::null_mut() {
-            fn_ = unsafe { LLVMAddFunction(self.module, llvm_fn.as_ptr(), fn_type) };
-        }
-        let mut src = self.resolver.value(arguments.src)?;
-        self.resolver.with_result(arguments.dst, |dst| unsafe {
-            LLVMBuildCall2(self.builder, fn_type, fn_, &mut src, 1, dst)
-        });
         Ok(())
     }
 
@@ -1688,7 +1787,10 @@ impl<'a> MethodEmitContext<'a> {
                     LLVMBuildLoad2(self.builder, lowered_type, value, LLVM_UNNAMED.as_ptr())
                 };
                 unsafe {
-                    LLVMSetAlignment(load, type_.layout().align() as u32);
+                    LLVMSetAlignment(
+                        load,
+                        type_.layout().ok_or_else(error_unreachable)?.align() as u32,
+                    );
                 }
                 Ok((load, type_))
             })
@@ -1727,22 +1829,35 @@ impl<'a> MethodEmitContext<'a> {
         data: ptx_parser::ScalarType,
         arguments: ptx_parser::ClzArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        let llvm_fn = match data.size_of() {
+        let clz_result = self.emit_clz_impl(data, arguments.src)?;
+        self.resolver.register(arguments.dst, clz_result);
+        Ok(())
+    }
+
+    fn emit_clz_impl(
+        &mut self,
+        type_: ptx_parser::ScalarType,
+        src: SpirvWord,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        let llvm_fn = match type_.size_of() {
             4 => c"llvm.ctlz.i32",
             8 => c"llvm.ctlz.i64",
             _ => return Err(error_unreachable()),
         };
-        let type_ = get_scalar_type(self.context, data.into());
+        let llvm_type = get_scalar_type(self.context, type_);
         let pred = get_scalar_type(self.context, ast::ScalarType::Pred);
-        let src = self.resolver.value(arguments.src)?;
+        let src = self.resolver.value(src)?;
         let false_ = unsafe { LLVMConstInt(pred, 0, 0) };
-        self.emit_intrinsic(
+        let result = self.emit_intrinsic(
             llvm_fn,
-            Some(arguments.dst),
-            vec![&data.into()],
-            vec![(src, type_), (false_, pred)],
+            None,
+            vec![&type_.into()],
+            vec![(src, llvm_type), (false_, pred)],
         )?;
-        Ok(())
+        let i32_llvm = get_scalar_type(self.context, ast::ScalarType::B32);
+        Ok(unsafe {
+            LLVMBuildTruncOrBitCast(self.builder, result, i32_llvm, LLVM_UNNAMED.as_ptr())
+        })
     }
 
     fn emit_bfind(
@@ -1840,7 +1955,9 @@ impl<'a> MethodEmitContext<'a> {
                     return Ok(self.emit_mul_wide_impl(type_, dst, src1, src2)?.1)
                 }
             },
-            ast::MulDetails::Float(..) => LLVMBuildFMul,
+            ast::MulDetails::Float(..) => {
+                return self.fp.fmul(self.resolver, data.type_(), dst, src1, src2)
+            }
         };
         let src1 = self.resolver.value(src1)?;
         let src2 = self.resolver.value(src2)?;
@@ -1904,13 +2021,8 @@ impl<'a> MethodEmitContext<'a> {
         _data: ast::FlushToZero,
         arguments: ast::CosArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        let llvm_f32 = get_scalar_type(self.context, ast::ScalarType::F32);
-        let cos = self.emit_intrinsic(
-            c"llvm.cos.f32",
-            Some(arguments.dst),
-            vec![&ast::ScalarType::F32.into()],
-            vec![(self.resolver.value(arguments.src)?, llvm_f32)],
-        )?;
+        let src = self.resolver.value(arguments.src)?;
+        let cos = self.fp.cos_f32(self.resolver, arguments.dst, src)?;
         unsafe { LLVMZludaSetFastMathFlags(cos, LLVMZludaFastMathApproxFunc) }
         Ok(())
     }
@@ -1948,17 +2060,17 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
-    fn emit_vector_read(&mut self, vec_acccess: VectorRead) -> Result<(), TranslateError> {
-        let src = self.resolver.value(vec_acccess.vector_src)?;
+    fn emit_vector_read(&mut self, vector_read: VectorRead) -> Result<(), TranslateError> {
+        let src = self.resolver.value(vector_read.vector_src)?;
         let index = unsafe {
             LLVMConstInt(
                 get_scalar_type(self.context, ast::ScalarType::B8),
-                vec_acccess.member as _,
+                vector_read.member as _,
                 0,
             )
         };
         self.resolver
-            .with_result(vec_acccess.scalar_dst, |dst| unsafe {
+            .with_result(vector_read.scalar_dst, |dst| unsafe {
                 LLVMBuildExtractElement(self.builder, src, index, dst)
             });
         Ok(())
@@ -1986,6 +2098,7 @@ impl<'a> MethodEmitContext<'a> {
         if repack.is_extract {
             let src = self.resolver.value(repack.packed)?;
             for (index, dst) in repack.unpacked.iter().enumerate() {
+                let Some(dst) = dst else { continue };
                 let index: *mut LLVMValue = unsafe { LLVMConstInt(i8_type, index as _, 0) };
                 self.resolver.with_result(*dst, |dst| unsafe {
                     LLVMBuildExtractElement(self.builder, src, index, dst)
@@ -2008,7 +2121,9 @@ impl<'a> MethodEmitContext<'a> {
                 } else {
                     None
                 };
-                let scalar_src = self.resolver.value(*src_id)?;
+                let scalar_src = self
+                    .resolver
+                    .value(src_id.ok_or_else(error_mismatched_type)?)?;
                 let index = unsafe { LLVMConstInt(i8_type, index as _, 0) };
                 temp_vec = self.resolver.with_result_option(dst, |dst| unsafe {
                     LLVMBuildInsertElement(self.builder, temp_vec, scalar_src, index, dst)
@@ -2043,53 +2158,23 @@ impl<'a> MethodEmitContext<'a> {
         float_div: ptx_parser::DivFloatDetails,
         arguments: ptx_parser::DivArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        let builder = self.builder;
         let src1 = self.resolver.value(arguments.src1)?;
         let src2 = self.resolver.value(arguments.src2)?;
-        let _rnd = match float_div.kind {
-            ptx_parser::DivFloatKind::Approx => ast::RoundingMode::NearestEven,
-            ptx_parser::DivFloatKind::ApproxFull => ast::RoundingMode::NearestEven,
-            ptx_parser::DivFloatKind::Rounding(rounding_mode) => rounding_mode,
-        };
-        let approx = match float_div.kind {
-            ptx_parser::DivFloatKind::Approx => {
-                LLVMZludaFastMathAllowReciprocal | LLVMZludaFastMathApproxFunc
-            }
-            ptx_parser::DivFloatKind::ApproxFull => LLVMZludaFastMathNone,
-            ptx_parser::DivFloatKind::Rounding(_) => LLVMZludaFastMathNone,
-        };
-        let fdiv = self.resolver.with_result(arguments.dst, |dst| unsafe {
-            LLVMBuildFDiv(builder, src1, src2, dst)
-        });
-        unsafe { LLVMZludaSetFastMathFlags(fdiv, approx) };
-        if let ptx_parser::DivFloatKind::ApproxFull = float_div.kind {
-            // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-div:
-            // div.full.f32 implements a relatively fast, full-range approximation that scales
-            // operands to achieve better accuracy, but is not fully IEEE 754 compliant and does not
-            // support rounding modifiers. The maximum ulp error is 2 across the full range of
-            // inputs.
-            // https://llvm.org/docs/LangRef.html#fpmath-metadata
-            let fpmath_value =
-                unsafe { LLVMConstReal(get_scalar_type(self.context, ast::ScalarType::F32), 2.0) };
-            let fpmath_value = unsafe { LLVMValueAsMetadata(fpmath_value) };
-            let mut md_node_content = [fpmath_value];
-            let md_node = unsafe {
-                LLVMMDNodeInContext2(
-                    self.context,
-                    md_node_content.as_mut_ptr(),
-                    md_node_content.len(),
-                )
-            };
-            let md_node = unsafe { LLVMMetadataAsValue(self.context, md_node) };
-            let kind = unsafe {
-                LLVMGetMDKindIDInContext(
-                    self.context,
-                    "fpmath".as_ptr().cast(),
-                    "fpmath".len() as u32,
-                )
-            };
-            unsafe { LLVMSetMetadata(fdiv, kind, md_node) };
+        if matches!(
+            float_div.kind,
+            ptx_parser::DivFloatKind::ApproxFull | ptx_parser::DivFloatKind::Rounding(_)
+        ) {
+            return Err(error_unreachable());
         }
+        let fdiv = self
+            .fp
+            .fdiv(self.resolver, float_div.type_, arguments.dst, src1, src2)?;
+        unsafe {
+            LLVMZludaSetFastMathFlags(
+                fdiv,
+                LLVMZludaFastMathAllowReciprocal | LLVMZludaFastMathApproxFunc,
+            )
+        };
         Ok(())
     }
 
@@ -2106,6 +2191,17 @@ impl<'a> MethodEmitContext<'a> {
                 (data.state_space, ast::StateSpace::Generic)
             }
         };
+        if self.base_32bit_memory.is_some()
+            && matches!(
+                data.state_space,
+                ast::StateSpace::Global | ast::StateSpace::Generic | ast::StateSpace::Const
+            )
+        {
+            return self.emit_mov(ast::MovArgs {
+                dst: arguments.dst,
+                src: arguments.src,
+            });
+        }
         let from_type = get_pointer_type(self.context, from_space)?;
         let dest_type = get_pointer_type(self.context, to_space)?;
         let src = self.resolver.value(arguments.src)?;
@@ -2136,8 +2232,12 @@ impl<'a> MethodEmitContext<'a> {
         };
         let temp_ptr =
             unsafe { LLVMBuildIntToPtr(self.builder, src, from_type, LLVM_UNNAMED.as_ptr()) };
+        let temp_converted = unsafe {
+            LLVMBuildAddrSpaceCast(self.builder, temp_ptr, dest_type, LLVM_UNNAMED.as_ptr())
+        };
+        let scalar_type = unsafe { LLVMIntTypeInContext(self.context, data.size as u32) };
         self.resolver.with_result(arguments.dst, |dst| unsafe {
-            LLVMBuildAddrSpaceCast(self.builder, temp_ptr, dest_type, dst)
+            LLVMBuildPtrToInt(self.builder, temp_converted, scalar_type, dst)
         });
         Ok(())
     }
@@ -2162,6 +2262,8 @@ impl<'a> MethodEmitContext<'a> {
         arith_integer: ptx_parser::ArithInteger,
         arguments: ptx_parser::SubArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
+        let src1 = self.resolver.value(arguments.src1)?;
+        let src2 = self.resolver.value(arguments.src2)?;
         if arith_integer.saturate {
             let op = if arith_integer.type_.kind() == ast::ScalarKind::Signed {
                 "ssub"
@@ -2172,12 +2274,10 @@ impl<'a> MethodEmitContext<'a> {
                 op,
                 arith_integer.type_,
                 arguments.dst,
-                arguments.src1,
-                arguments.src2,
+                src1,
+                src2,
             );
         }
-        let src1 = self.resolver.value(arguments.src1)?;
-        let src2 = self.resolver.value(arguments.src2)?;
         self.resolver.with_result(arguments.dst, |dst| unsafe {
             LLVMBuildSub(self.builder, src1, src2, dst)
         });
@@ -2186,14 +2286,13 @@ impl<'a> MethodEmitContext<'a> {
 
     fn emit_sub_float(
         &mut self,
-        _arith_float: ptx_parser::ArithFloat,
+        arith_float: ptx_parser::ArithFloat,
         arguments: ptx_parser::SubArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         let src1 = self.resolver.value(arguments.src1)?;
         let src2 = self.resolver.value(arguments.src2)?;
-        self.resolver.with_result(arguments.dst, |dst| unsafe {
-            LLVMBuildFSub(self.builder, src1, src2, dst)
-        });
+        self.fp
+            .fsub(self.resolver, arith_float.type_, arguments.dst, src1, src2)?;
         Ok(())
     }
 
@@ -2202,24 +2301,33 @@ impl<'a> MethodEmitContext<'a> {
         _data: ptx_parser::FlushToZero,
         arguments: ptx_parser::SinArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        let llvm_f32 = get_scalar_type(self.context, ast::ScalarType::F32);
-        let sin = self.emit_intrinsic(
-            c"llvm.sin.f32",
-            Some(arguments.dst),
-            vec![&ast::ScalarType::F32.into()],
-            vec![(self.resolver.value(arguments.src)?, llvm_f32)],
-        )?;
+        let src = self.resolver.value(arguments.src)?;
+        let sin = self.fp.sin_f32(self.resolver, arguments.dst, src)?;
         unsafe { LLVMZludaSetFastMathFlags(sin, LLVMZludaFastMathApproxFunc) }
         Ok(())
     }
 
-    fn emit_intrinsic(
+    fn emit_intrinsic_with_metadata(
         &mut self,
         name: &CStr,
         dst: Option<SpirvWord>,
         return_types: Vec<&ast::Type>,
-        arguments: Vec<(LLVMValueRef, LLVMTypeRef)>,
+        mut arguments: Vec<(LLVMValueRef, LLVMTypeRef)>,
+        metadata: &[&str],
     ) -> Result<LLVMValueRef, TranslateError> {
+        let has_metadata_args = !metadata.is_empty();
+        let metadata_type = unsafe { LLVMMetadataTypeInContext(self.context) };
+        let metadata = metadata.iter().map(|m| {
+            let m_value =
+                unsafe { LLVMMDStringInContext2(self.context, m.as_ptr().cast(), m.len()) };
+            (
+                unsafe { LLVMMetadataAsValue(self.context, m_value) },
+                metadata_type,
+            )
+        });
+        if has_metadata_args {
+            arguments = arguments.into_iter().chain(metadata).collect::<Vec<_>>();
+        }
         let fn_type = get_intrinsic_type(
             self.context,
             return_types.iter().copied(),
@@ -2240,6 +2348,16 @@ impl<'a> MethodEmitContext<'a> {
                 dst,
             )
         }))
+    }
+
+    fn emit_intrinsic(
+        &mut self,
+        name: &CStr,
+        dst: Option<SpirvWord>,
+        return_types: Vec<&ast::Type>,
+        arguments: Vec<(LLVMValueRef, LLVMTypeRef)>,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        self.emit_intrinsic_with_metadata(name, dst, return_types, arguments, &[])
     }
 
     fn emit_neg(
@@ -2293,25 +2411,26 @@ impl<'a> MethodEmitContext<'a> {
         data: ptx_parser::SetpData,
         arguments: ptx_parser::SetpArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
+        if data.type_.packed_type().is_some() {
+            return Err(error_todo_msg("setp with a packed type not yet supported"));
+        }
         let src1 = self.resolver.value(arguments.src1)?;
         let src2 = self.resolver.value(arguments.src2)?;
-        let dst = self.emit_setp_impl(data, arguments.dst2, src1, src2)?;
+        let dst = self.emit_setp_impl(data, src1, src2)?;
         self.resolver.register(arguments.dst1, dst);
+        if let Some(dst2) = arguments.dst2 {
+            let not = unsafe { LLVMBuildNot(self.builder, dst, LLVM_UNNAMED.as_ptr()) };
+            self.resolver.register(dst2, not);
+        }
         Ok(())
     }
 
     fn emit_setp_impl(
         &mut self,
         data: ptx_parser::SetpData,
-        dst2: Option<SpirvWord>,
         src1: LLVMValueRef,
         src2: LLVMValueRef,
     ) -> Result<LLVMValueRef, TranslateError> {
-        if dst2.is_some() {
-            return Err(error_todo_msg(
-                "setp with two dst arguments not yet supported",
-            ));
-        }
         match data.cmp_op {
             ptx_parser::SetpCompareOp::Integer(setp_compare_int) => {
                 self.emit_setp_int(setp_compare_int, src1, src2)
@@ -2420,8 +2539,12 @@ impl<'a> MethodEmitContext<'a> {
             ptx_parser::CvtMode::IntSaturateToUnsigned => {
                 return self.emit_cvt_signed_to_unsigned_sat(data.from, data.to, arguments)
             }
-            ptx_parser::CvtMode::FPExtend { .. } => LLVMBuildFPExt,
-            ptx_parser::CvtMode::FPTruncate { .. } => LLVMBuildFPTrunc,
+            ptx_parser::CvtMode::FPExtend { .. } => {
+                return self.emit_cvt_float_to_float(data.from, data.to, false, false, arguments)
+            }
+            ptx_parser::CvtMode::FPTruncate { relu, .. } => {
+                return self.emit_cvt_float_to_float(data.from, data.to, true, relu, arguments)
+            }
             ptx_parser::CvtMode::FPRound {
                 integer_rounding: None,
                 flush_to_zero: None | Some(false),
@@ -2460,65 +2583,108 @@ impl<'a> MethodEmitContext<'a> {
                 )
             }
             ptx_parser::CvtMode::FPFromSigned { .. } => {
-                return self.emit_cvt_int_to_float(data.to, arguments, LLVMBuildSIToFP)
+                return self.emit_cvt_int_to_float(data.from, data.to, arguments, true)
             }
             ptx_parser::CvtMode::FPFromUnsigned { .. } => {
-                return self.emit_cvt_int_to_float(data.to, arguments, LLVMBuildUIToFP)
+                return self.emit_cvt_int_to_float(data.from, data.to, arguments, false)
             }
         };
+        if arguments.src2.is_some() {
+            return Err(error_unreachable());
+        }
         let src = self.resolver.value(arguments.src)?;
-        let emit_relu = matches!(
-            data.mode,
-            ptx_parser::CvtMode::FPTruncate { relu: true, .. }
-        );
-        if let Some(src2) = arguments.src2 {
-            let packed_type = get_scalar_type(
-                self.context,
-                data.to
-                    .packed_type()
-                    .ok_or_else(|| error_mismatched_type())?,
-            );
-            let src2 = self.resolver.value(src2)?;
-            let mut src_result =
-                unsafe { llvm_fn(self.builder, src, packed_type, LLVM_UNNAMED.as_ptr()) };
-            let mut src2_result =
-                unsafe { llvm_fn(self.builder, src2, packed_type, LLVM_UNNAMED.as_ptr()) };
-            if emit_relu {
-                src_result = self.emit_relu(
-                    data.to.packed_type().ok_or_else(error_unreachable)?,
-                    src_result,
-                )?;
-                src2_result = self.emit_relu(
-                    data.to.packed_type().ok_or_else(error_unreachable)?,
-                    src2_result,
-                )?;
-            }
-            let vec = unsafe {
-                LLVMBuildInsertElement(
-                    self.builder,
-                    LLVMGetPoison(dst_type),
-                    src_result,
-                    LLVMConstInt(LLVMInt32TypeInContext(self.context), 1, false as i32),
-                    LLVM_UNNAMED.as_ptr(),
-                )
-            };
-            self.resolver.with_result(arguments.dst, |dst| unsafe {
-                LLVMBuildInsertElement(
-                    self.builder,
-                    vec,
-                    src2_result,
-                    LLVMConstInt(LLVMInt32TypeInContext(self.context), 0, false as i32),
-                    dst,
-                )
-            });
-        } else {
-            let mut result = unsafe { llvm_fn(self.builder, src, dst_type, LLVM_UNNAMED.as_ptr()) };
-            if emit_relu {
-                result = self.emit_relu(data.to, result)?;
-            }
-            self.resolver.register(arguments.dst, result);
-        };
+        self.resolver.with_result(arguments.dst, |dst| unsafe {
+            llvm_fn(self.builder, src, dst_type, dst)
+        });
         Ok(())
+    }
+
+    fn emit_cvt_float_to_float(
+        &mut self,
+        from: ast::ScalarType,
+        to: ast::ScalarType,
+        truncate: bool,
+        relu: bool,
+        arguments: ptx_parser::CvtArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let src = self.resolver.value(arguments.src)?;
+        // cvt.frnd2.f16x2.f32 d, a, b;
+        if let Some(src2) = arguments.src2 {
+            let src2 = self.resolver.value(src2)?;
+            return self.emit_cvt_float_to_packed_float(
+                from,
+                to,
+                truncate,
+                relu,
+                arguments.dst,
+                src,
+                src2,
+            );
+        }
+        if relu {
+            let result = self.emit_cvt_float_to_float_impl(truncate, to, None, from, src)?;
+            let result = self.emit_relu(to, result)?;
+            self.resolver.register(arguments.dst, result);
+        } else {
+            self.emit_cvt_float_to_float_impl(truncate, to, Some(arguments.dst), from, src)?;
+        }
+        Ok(())
+    }
+
+    fn emit_cvt_float_to_packed_float(
+        &mut self,
+        from: ast::ScalarType,
+        to: ast::ScalarType,
+        truncate: bool,
+        relu: bool,
+        dst: SpirvWord,
+        src: LLVMValueRef,
+        src2: LLVMValueRef,
+    ) -> Result<(), TranslateError> {
+        let element_type = to.packed_type().ok_or_else(|| error_mismatched_type())?;
+        let mut src_result =
+            self.emit_cvt_float_to_float_impl(truncate, element_type, None, from, src)?;
+        let mut src2_result =
+            self.emit_cvt_float_to_float_impl(truncate, element_type, None, from, src2)?;
+        if relu {
+            src_result = self.emit_relu(element_type, src_result)?;
+            src2_result = self.emit_relu(element_type, src2_result)?;
+        }
+        let dst_type = get_scalar_type(self.context, to);
+        let vec = unsafe {
+            LLVMBuildInsertElement(
+                self.builder,
+                LLVMGetPoison(dst_type),
+                src_result,
+                LLVMConstInt(LLVMInt32TypeInContext(self.context), 1, false as i32),
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        self.resolver.with_result(dst, |dst| unsafe {
+            LLVMBuildInsertElement(
+                self.builder,
+                vec,
+                src2_result,
+                LLVMConstInt(LLVMInt32TypeInContext(self.context), 0, false as i32),
+                dst,
+            )
+        });
+        Ok(())
+    }
+
+    fn emit_cvt_float_to_float_impl(
+        &mut self,
+        truncate: bool,
+        dst_type: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src_type: ast::ScalarType,
+        src: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        if truncate {
+            self.fp.fptrunc(self.resolver, dst_type, dst, src_type, src)
+        } else {
+            self.fp.fpext(self.resolver, dst_type, dst, src_type, src)
+        }
     }
 
     fn emit_relu(
@@ -2753,15 +2919,13 @@ impl<'a> MethodEmitContext<'a> {
             }
         };
         if is_saturating_cast {
-            let to = get_scalar_type(self.context, to);
             let src =
                 dst_int_rounded.unwrap_or_else(|| self.resolver.value(arguments.src).unwrap());
-            let llvm_cast = if signed_cast {
-                LLVMBuildFPToSI
+            let poisoned_dst = if signed_cast {
+                self.fp.fptosi(self.resolver, to, None, from, src)?
             } else {
-                LLVMBuildFPToUI
+                self.fp.fptoui(self.resolver, to, None, from, src)?
             };
-            let poisoned_dst = unsafe { llvm_cast(self.builder, src, to, LLVM_UNNAMED.as_ptr()) };
             self.resolver.with_result(arguments.dst, |dst| unsafe {
                 LLVMBuildFreeze(self.builder, poisoned_dst, dst)
             });
@@ -2795,21 +2959,27 @@ impl<'a> MethodEmitContext<'a> {
         arguments: &ptx_parser::CvtArgs<SpirvWord>,
         will_saturate_with_cvt: bool,
     ) -> Result<Option<LLVMValueRef>, TranslateError> {
-        let prefix = match rounding {
-            ptx_parser::RoundingMode::NearestEven => "llvm.roundeven",
+        let name = match rounding {
+            ptx_parser::RoundingMode::NearestEven => "roundeven",
             ptx_parser::RoundingMode::Zero => {
                 // cvt has round-to-zero semantics
                 if will_saturate_with_cvt {
                     return Ok(None);
                 } else {
-                    "llvm.trunc"
+                    "trunc"
                 }
             }
-            ptx_parser::RoundingMode::NegativeInf => "llvm.floor",
-            ptx_parser::RoundingMode::PositiveInf => "llvm.ceil",
+            ptx_parser::RoundingMode::NegativeInf => "floor",
+            ptx_parser::RoundingMode::PositiveInf => "ceil",
         };
-        let intrinsic = format!("{}.{}\0", prefix, LLVMTypeDisplay(from));
-        let rounded_float = self.emit_intrinsic(
+        let (prefix, metadata): (_, &[&str]) = match self.fp.mode {
+            FloatingPointMode::Normal => ("llvm", &[]),
+            FloatingPointMode::Constrained => {
+                ("llvm.experimental.constrained", &["fpexcept.ignore"])
+            }
+        };
+        let intrinsic = format!("{}.{}.{}\0", prefix, name, LLVMTypeDisplay(from));
+        let rounded_float = self.emit_intrinsic_with_metadata(
             unsafe { CStr::from_bytes_with_nul_unchecked(intrinsic.as_bytes()) },
             None,
             vec![&from.into()],
@@ -2817,26 +2987,25 @@ impl<'a> MethodEmitContext<'a> {
                 self.resolver.value(arguments.src)?,
                 get_scalar_type(self.context, from),
             )],
+            metadata,
         )?;
         Ok(Some(rounded_float))
     }
 
     fn emit_cvt_int_to_float(
         &mut self,
+        from: ptx_parser::ScalarType,
         to: ptx_parser::ScalarType,
         arguments: ptx_parser::CvtArgs<SpirvWord>,
-        llvm_func: unsafe extern "C" fn(
-            LLVMBuilderRef,
-            LLVMValueRef,
-            LLVMTypeRef,
-            *const i8,
-        ) -> LLVMValueRef,
+        signed: bool,
     ) -> Result<(), TranslateError> {
-        let type_ = get_scalar_type(self.context, to);
         let src = self.resolver.value(arguments.src)?;
-        self.resolver.with_result(arguments.dst, |dst| unsafe {
-            llvm_func(self.builder, src, type_, dst)
-        });
+        let dst = Some(arguments.dst);
+        if signed {
+            self.fp.sitofp(self.resolver, to, dst, from, src)?;
+        } else {
+            self.fp.uitofp(self.resolver, to, dst, from, src)?;
+        }
         Ok(())
     }
 
@@ -2846,9 +3015,15 @@ impl<'a> MethodEmitContext<'a> {
         arguments: ptx_parser::RsqrtArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         let type_ = get_scalar_type(self.context, data.type_);
-        let intrinsic = match data.type_ {
-            ast::ScalarType::F32 => c"llvm.amdgcn.rsq.f32",
-            ast::ScalarType::F64 => c"llvm.amdgcn.rsq.f64",
+        let intrinsic = match (data.type_, self.fp.mode) {
+            (ast::ScalarType::F32, FloatingPointMode::Normal) => c"llvm.amdgcn.rsq.f32",
+            (ast::ScalarType::F32, FloatingPointMode::Constrained) => {
+                c"llvm.amdgcn.constrained.rsq.f32"
+            }
+            (ast::ScalarType::F64, FloatingPointMode::Normal) => c"llvm.amdgcn.rsq.f64",
+            (ast::ScalarType::F64, FloatingPointMode::Constrained) => {
+                c"llvm.amdgcn.constrained.rsq.f64"
+            }
             _ => return Err(error_unreachable()),
         };
         self.emit_intrinsic(
@@ -2866,17 +3041,39 @@ impl<'a> MethodEmitContext<'a> {
         arguments: ptx_parser::SqrtArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         let type_ = get_scalar_type(self.context, data.type_);
-        let intrinsic = match (data.type_, data.kind) {
-            (ast::ScalarType::F32, ast::RcpKind::Approx) => c"llvm.amdgcn.sqrt.f32",
-            (ast::ScalarType::F32, ast::RcpKind::Compliant(..)) => c"llvm.sqrt.f32",
-            (ast::ScalarType::F64, ast::RcpKind::Compliant(..)) => c"llvm.sqrt.f64",
+        let (intrinsic, metadata): (_, &[&str]) = match (data.type_, data.kind, self.fp.mode) {
+            (ast::ScalarType::F32, ast::RcpKind::Approx, FloatingPointMode::Normal) => {
+                (c"llvm.amdgcn.sqrt.f32", &[])
+            }
+            (ast::ScalarType::F32, ast::RcpKind::Approx, FloatingPointMode::Constrained) => {
+                (c"llvm.amdgcn.constrained.sqrt.f32", &[])
+            }
+            (ast::ScalarType::F32, ast::RcpKind::Compliant(..), FloatingPointMode::Normal) => {
+                (c"llvm.sqrt.f32", &[])
+            }
+            (ast::ScalarType::F32, ast::RcpKind::Compliant(..), FloatingPointMode::Constrained) => {
+                (
+                    c"llvm.experimental.constrained.sqrt.f32",
+                    &["round.dynamic", "fpexcept.ignore"],
+                )
+            }
+            (ast::ScalarType::F64, ast::RcpKind::Compliant(..), FloatingPointMode::Normal) => {
+                (c"llvm.sqrt.f64", &[])
+            }
+            (ast::ScalarType::F64, ast::RcpKind::Compliant(..), FloatingPointMode::Constrained) => {
+                (
+                    c"llvm.experimental.constrained.sqrt.f64",
+                    &["round.dynamic", "fpexcept.ignore"],
+                )
+            }
             _ => return Err(error_unreachable()),
         };
-        self.emit_intrinsic(
+        self.emit_intrinsic_with_metadata(
             intrinsic,
             Some(arguments.dst),
             vec![&data.type_.into()],
             vec![(self.resolver.value(arguments.src)?, type_)],
+            metadata,
         )?;
         Ok(())
     }
@@ -2887,11 +3084,18 @@ impl<'a> MethodEmitContext<'a> {
         arguments: ptx_parser::RcpArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         let type_ = get_scalar_type(self.context, data.type_);
-        let intrinsic = match (data.type_, data.kind) {
-            (ast::ScalarType::F32, ast::RcpKind::Approx) => c"llvm.amdgcn.rcp.f32",
-            (ast::ScalarType::F64, ast::RcpKind::Approx) => c"llvm.amdgcn.rcp.f64",
-            (_, ast::RcpKind::Compliant(rnd)) => {
-                return self.emit_rcp_compliant(data, arguments, rnd)
+        let intrinsic = match (data.type_, data.kind, self.fp.mode) {
+            (ast::ScalarType::F32, ast::RcpKind::Approx, FloatingPointMode::Normal) => {
+                c"llvm.amdgcn.rcp.f32"
+            }
+            (ast::ScalarType::F32, ast::RcpKind::Approx, FloatingPointMode::Constrained) => {
+                c"llvm.amdgcn.constrained.rcp.f32"
+            }
+            (ast::ScalarType::F64, ast::RcpKind::Approx, FloatingPointMode::Normal) => {
+                c"llvm.amdgcn.rcp.f64"
+            }
+            (ast::ScalarType::F64, ast::RcpKind::Approx, FloatingPointMode::Constrained) => {
+                c"llvm.amdgcn.constrained.rcp.f64"
             }
             _ => return Err(error_unreachable()),
         };
@@ -2901,22 +3105,6 @@ impl<'a> MethodEmitContext<'a> {
             vec![&data.type_.into()],
             vec![(self.resolver.value(arguments.src)?, type_)],
         )?;
-        Ok(())
-    }
-
-    fn emit_rcp_compliant(
-        &mut self,
-        data: ptx_parser::RcpData,
-        arguments: ptx_parser::RcpArgs<SpirvWord>,
-        _rnd: ast::RoundingMode,
-    ) -> Result<(), TranslateError> {
-        let type_ = get_scalar_type(self.context, data.type_);
-        let one = unsafe { LLVMConstReal(type_, 1.0) };
-        let src = self.resolver.value(arguments.src)?;
-        let rcp = self.resolver.with_result(arguments.dst, |dst| unsafe {
-            LLVMBuildFDiv(self.builder, one, src, dst)
-        });
-        unsafe { LLVMZludaSetFastMathFlags(rcp, LLVMZludaFastMathAllowReciprocal) };
         Ok(())
     }
 
@@ -3088,9 +3276,15 @@ impl<'a> MethodEmitContext<'a> {
         data: ptx_parser::TypeFtz,
         arguments: ptx_parser::Ex2Args<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        let intrinsic = match data.type_ {
-            ast::ScalarType::F16 => c"llvm.amdgcn.exp2.f16",
-            ast::ScalarType::F32 => c"llvm.amdgcn.exp2.f32",
+        let intrinsic = match (data.type_, self.fp.mode) {
+            (ast::ScalarType::F16, FloatingPointMode::Normal) => c"llvm.amdgcn.exp2.f16",
+            (ast::ScalarType::F16, FloatingPointMode::Constrained) => {
+                c"llvm.amdgcn.constrained.exp2.f16"
+            }
+            (ast::ScalarType::F32, FloatingPointMode::Normal) => c"llvm.amdgcn.exp2.f32",
+            (ast::ScalarType::F32, FloatingPointMode::Constrained) => {
+                c"llvm.amdgcn.constrained.exp2.f32"
+            }
             _ => return Err(error_unreachable()),
         };
         self.emit_intrinsic(
@@ -3110,8 +3304,12 @@ impl<'a> MethodEmitContext<'a> {
         _data: ptx_parser::FlushToZero,
         arguments: ptx_parser::Lg2Args<SpirvWord>,
     ) -> Result<(), TranslateError> {
+        let intrinsic = match self.fp.mode {
+            FloatingPointMode::Normal => c"llvm.amdgcn.log.f32",
+            FloatingPointMode::Constrained => c"llvm.amdgcn.constrained.log.f32",
+        };
         self.emit_intrinsic(
-            c"llvm.amdgcn.log.f32",
+            intrinsic,
             Some(arguments.dst),
             vec![&ast::ScalarType::F32.into()],
             vec![(
@@ -3170,12 +3368,16 @@ impl<'a> MethodEmitContext<'a> {
             _ => return Err(error_unreachable()),
         };
         let llvm_type = get_scalar_type(self.context, type_);
-        self.emit_intrinsic(
+        let population = self.emit_intrinsic(
             intrinsic,
-            Some(arguments.dst),
+            None,
             vec![&type_.into()],
             vec![(self.resolver.value(arguments.src)?, llvm_type)],
         )?;
+        let i32_llvm = get_scalar_type(self.context, ast::ScalarType::B32);
+        self.resolver.with_result(arguments.dst, |dst_name| unsafe {
+            LLVMBuildTruncOrBitCast(self.builder, population, i32_llvm, dst_name)
+        });
         Ok(())
     }
 
@@ -3187,7 +3389,12 @@ impl<'a> MethodEmitContext<'a> {
         let llvm_prefix = match data {
             ptx_parser::MinMaxDetails::Signed(..) => "llvm.smin",
             ptx_parser::MinMaxDetails::Unsigned(..) => "llvm.umin",
-            ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat { .. }) => "llvm.minnum",
+            ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat { nan: false, .. }) => {
+                "llvm.minimumnum"
+            }
+            ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat { nan: true, .. }) => {
+                "llvm.minimum"
+            }
         };
         let intrinsic = format!("{}.{}\0", llvm_prefix, LLVMTypeDisplay(data.type_()));
         let llvm_type = get_scalar_type(self.context, data.type_());
@@ -3201,32 +3408,7 @@ impl<'a> MethodEmitContext<'a> {
             vec![&data.type_().into()],
             vec![(a, llvm_type), (b, llvm_type)],
         )?;
-
-        if let ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat {
-            nan: true, type_, ..
-        }) = data
-        {
-            let is_nan = unsafe {
-                LLVMBuildFCmp(
-                    self.builder,
-                    LLVMRealPredicate::LLVMRealUNO,
-                    a,
-                    b,
-                    LLVM_UNNAMED.as_ptr(),
-                )
-            };
-            self.resolver.with_result(arguments.dst, |dst| unsafe {
-                LLVMBuildSelect(
-                    self.builder,
-                    is_nan,
-                    LLVMConstReal(get_scalar_type(self.context, type_), f64::NAN),
-                    min,
-                    dst,
-                )
-            });
-        } else {
-            self.resolver.register(arguments.dst, min);
-        }
+        self.resolver.register(arguments.dst, min);
         Ok(())
     }
 
@@ -3238,7 +3420,12 @@ impl<'a> MethodEmitContext<'a> {
         let llvm_prefix = match data {
             ptx_parser::MinMaxDetails::Signed(..) => "llvm.smax",
             ptx_parser::MinMaxDetails::Unsigned(..) => "llvm.umax",
-            ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat { .. }) => "llvm.maxnum",
+            ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat { nan: false, .. }) => {
+                "llvm.maximumnum"
+            }
+            ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat { nan: true, .. }) => {
+                "llvm.maximum"
+            }
         };
         let intrinsic = format!("{}.{}\0", llvm_prefix, LLVMTypeDisplay(data.type_()));
         let llvm_type = get_scalar_type(self.context, data.type_());
@@ -3252,32 +3439,7 @@ impl<'a> MethodEmitContext<'a> {
             vec![&data.type_().into()],
             vec![(a, llvm_type), (b, llvm_type)],
         )?;
-
-        if let ptx_parser::MinMaxDetails::Float(ptx_parser::MinMaxFloat {
-            nan: true, type_, ..
-        }) = data
-        {
-            let is_nan = unsafe {
-                LLVMBuildFCmp(
-                    self.builder,
-                    LLVMRealPredicate::LLVMRealUNO,
-                    a,
-                    b,
-                    LLVM_UNNAMED.as_ptr(),
-                )
-            };
-            self.resolver.with_result(arguments.dst, |dst| unsafe {
-                LLVMBuildSelect(
-                    self.builder,
-                    is_nan,
-                    LLVMConstReal(get_scalar_type(self.context, type_), f64::NAN),
-                    max,
-                    dst,
-                )
-            });
-        } else {
-            self.resolver.register(arguments.dst, max);
-        }
+        self.resolver.register(arguments.dst, max);
         Ok(())
     }
 
@@ -3286,8 +3448,15 @@ impl<'a> MethodEmitContext<'a> {
         data: ptx_parser::ArithFloat,
         arguments: ptx_parser::FmaArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        let intrinsic = format!("llvm.fma.{}\0", LLVMTypeDisplay(data.type_));
-        self.emit_intrinsic(
+        let (prefix, metadata): (_, &[&str]) = match self.fp.mode {
+            FloatingPointMode::Normal => ("llvm.fma", &[]),
+            FloatingPointMode::Constrained => (
+                "llvm.experimental.constrained.fma",
+                &["round.dynamic", "fpexcept.ignore"],
+            ),
+        };
+        let intrinsic = format!("{}.{}\0", prefix, LLVMTypeDisplay(data.type_));
+        self.emit_intrinsic_with_metadata(
             unsafe { CStr::from_bytes_with_nul_unchecked(intrinsic.as_bytes()) },
             Some(arguments.dst),
             vec![&data.type_.into()],
@@ -3305,6 +3474,7 @@ impl<'a> MethodEmitContext<'a> {
                     get_scalar_type(self.context, data.type_),
                 ),
             ],
+            metadata,
         )?;
         Ok(())
     }
@@ -3517,8 +3687,8 @@ impl<'a> MethodEmitContext<'a> {
         let llvm_type = get_scalar_type(self.context, type_);
         let zero = unsafe { LLVMConstReal(llvm_type, 0.0) };
         let one = unsafe { LLVMConstReal(llvm_type, 1.0) };
-        let maxnum_intrinsic = format!("llvm.maxnum.{}\0", LLVMTypeDisplay(type_));
-        let minnum_intrinsic = format!("llvm.minnum.{}\0", LLVMTypeDisplay(type_));
+        let maxnum_intrinsic = format!("llvm.maximumnum.{}\0", LLVMTypeDisplay(type_));
+        let minnum_intrinsic = format!("llvm.minimumnum.{}\0", LLVMTypeDisplay(type_));
         let src = self.resolver.value(src)?;
         let maxnum = self.emit_intrinsic(
             unsafe { CStr::from_bytes_with_nul_unchecked(maxnum_intrinsic.as_bytes()) },
@@ -3540,12 +3710,10 @@ impl<'a> MethodEmitContext<'a> {
         op: &str,
         type_: ast::ScalarType,
         dst: SpirvWord,
-        src1: SpirvWord,
-        src2: SpirvWord,
+        src1: LLVMValueRef,
+        src2: LLVMValueRef,
     ) -> Result<(), TranslateError> {
         let llvm_type = get_scalar_type(self.context, type_);
-        let src1 = self.resolver.value(src1)?;
-        let src2 = self.resolver.value(src2)?;
         let intrinsic = format!("llvm.{}.sat.{}\0", op, LLVMTypeDisplay(type_));
         self.emit_intrinsic(
             unsafe { CStr::from_bytes_with_nul_unchecked(intrinsic.as_bytes()) },
@@ -3661,44 +3829,71 @@ impl<'a> MethodEmitContext<'a> {
                 type_: scalar_type,
                 ..data.base
             };
-            let setp_result_0 = self.emit_setp_impl(data, None, src1_0, src2_0)?;
-            let setp_result_1 = self.emit_setp_impl(data, None, src1_1, src2_1)?;
-            if dtype != ast::ScalarType::U32 {
-                return Err(error_unreachable());
-            }
-            let setp_result_0 = self.setp_to_set(ast::ScalarType::U16, setp_result_0)?;
-            let setp_result_1 = self.setp_to_set(ast::ScalarType::U16, setp_result_1)?;
-            let vector_result = unsafe {
-                LLVMBuildInsertElement(
-                    self.builder,
-                    LLVMGetPoison(get_type(
-                        self.context,
-                        &ast::Type::Vector(2, ast::ScalarType::U16),
-                    )?),
-                    setp_result_0,
-                    zero,
-                    LLVM_UNNAMED.as_ptr(),
-                )
-            };
-            let vector_result = unsafe {
-                LLVMBuildInsertElement(
-                    self.builder,
-                    vector_result,
-                    setp_result_1,
-                    one,
-                    LLVM_UNNAMED.as_ptr(),
-                )
-            };
-            unsafe {
-                LLVMBuildBitCast(
-                    self.builder,
-                    vector_result,
-                    get_scalar_type(self.context, dtype),
-                    LLVM_UNNAMED.as_ptr(),
-                )
+            let setp_result_0 = self.emit_setp_impl(data, src1_0, src2_0)?;
+            let setp_result_1 = self.emit_setp_impl(data, src1_1, src2_1)?;
+            match dtype {
+                ast::ScalarType::U32 => {
+                    let setp_result_0 = self.setp_to_set(ast::ScalarType::U16, setp_result_0)?;
+                    let setp_result_1 = self.setp_to_set(ast::ScalarType::U16, setp_result_1)?;
+                    let vector_result = unsafe {
+                        LLVMBuildInsertElement(
+                            self.builder,
+                            LLVMGetPoison(get_type(
+                                self.context,
+                                &ast::Type::Vector(2, ast::ScalarType::U16),
+                            )?),
+                            setp_result_0,
+                            zero,
+                            LLVM_UNNAMED.as_ptr(),
+                        )
+                    };
+                    let vector_result = unsafe {
+                        LLVMBuildInsertElement(
+                            self.builder,
+                            vector_result,
+                            setp_result_1,
+                            one,
+                            LLVM_UNNAMED.as_ptr(),
+                        )
+                    };
+                    unsafe {
+                        LLVMBuildBitCast(
+                            self.builder,
+                            vector_result,
+                            get_scalar_type(self.context, dtype),
+                            LLVM_UNNAMED.as_ptr(),
+                        )
+                    }
+                }
+                ast::ScalarType::F16x2 => {
+                    let setp_result_0 = self.setp_to_set(ast::ScalarType::F16, setp_result_0)?;
+                    let setp_result_1 = self.setp_to_set(ast::ScalarType::F16, setp_result_1)?;
+                    let vector_result = unsafe {
+                        LLVMBuildInsertElement(
+                            self.builder,
+                            LLVMGetPoison(get_type(
+                                self.context,
+                                &ast::Type::Vector(2, ast::ScalarType::F16),
+                            )?),
+                            setp_result_0,
+                            zero,
+                            LLVM_UNNAMED.as_ptr(),
+                        )
+                    };
+                    unsafe {
+                        LLVMBuildInsertElement(
+                            self.builder,
+                            vector_result,
+                            setp_result_1,
+                            one,
+                            LLVM_UNNAMED.as_ptr(),
+                        )
+                    }
+                }
+                _ => return Err(error_unreachable()),
             }
         } else {
-            let setp_result = self.emit_setp_impl(data.base, None, src1, src2)?;
+            let setp_result = self.emit_setp_impl(data.base, src1, src2)?;
             self.setp_to_set(data.dtype, setp_result)?
         };
         self.resolver.register(arguments.dst, result);
@@ -3710,8 +3905,9 @@ impl<'a> MethodEmitContext<'a> {
         data: ptx_parser::SetBoolData,
         arguments: ptx_parser::SetBoolArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        let result_bool =
-            self.emit_setp_bool_impl(data.base, arguments.src1, arguments.src2, arguments.src3)?;
+        let src3 = self.resolver.value(arguments.src3)?;
+        let (result_bool, _) =
+            self.emit_setp_bool_impl(data.base, arguments.src1, arguments.src2, src3, false)?;
         let set_result = self.setp_to_set(data.dtype, result_bool)?;
         self.resolver.register(arguments.dst, set_result);
         Ok(())
@@ -3722,8 +3918,13 @@ impl<'a> MethodEmitContext<'a> {
         data: ast::SetpBoolData,
         args: ast::SetpBoolArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        let dst = self.emit_setp_bool_impl(data, args.src1, args.src2, args.src3)?;
+        let src3 = self.resolver.value(args.src3)?;
+        let (dst, dst2_value) =
+            self.emit_setp_bool_impl(data, args.src1, args.src2, src3, args.dst2.is_some())?;
         self.resolver.register(args.dst1, dst);
+        if let (Some(dst2), Some(dst2_value)) = (args.dst2, dst2_value) {
+            self.resolver.register(dst2, dst2_value);
+        }
         Ok(())
     }
 
@@ -3732,17 +3933,17 @@ impl<'a> MethodEmitContext<'a> {
         data: ptx_parser::SetpBoolData,
         src1: SpirvWord,
         src2: SpirvWord,
-        src3: SpirvWord,
-    ) -> Result<LLVMValueRef, TranslateError> {
+        src3: LLVMValueRef,
+        with_dst2: bool,
+    ) -> Result<(LLVMValueRef, Option<LLVMValueRef>), TranslateError> {
         let src1 = self.resolver.value(src1)?;
         let src2 = self.resolver.value(src2)?;
-        let bool_result = self.emit_setp_impl(data.base, None, src1, src2)?;
+        let bool_result = self.emit_setp_impl(data.base, src1, src2)?;
         let post_op = match data.bool_op {
             ptx_parser::SetpBoolPostOp::Xor => LLVMBuildXor,
             ptx_parser::SetpBoolPostOp::And => LLVMBuildAnd,
             ptx_parser::SetpBoolPostOp::Or => LLVMBuildOr,
         };
-        let src3 = self.resolver.value(src3)?;
         let src3 = if data.negate_src3 {
             let constant =
                 unsafe { LLVMConstInt(LLVMIntTypeInContext(self.context, 1), u64::MAX, 0) };
@@ -3750,7 +3951,12 @@ impl<'a> MethodEmitContext<'a> {
         } else {
             src3
         };
-        Ok(unsafe { post_op(self.builder, bool_result, src3, LLVM_UNNAMED.as_ptr()) })
+        let result = unsafe { post_op(self.builder, bool_result, src3, LLVM_UNNAMED.as_ptr()) };
+        let dst2_value = with_dst2.then(|| {
+            let not = unsafe { LLVMBuildNot(self.builder, bool_result, LLVM_UNNAMED.as_ptr()) };
+            unsafe { post_op(self.builder, not, src3, LLVM_UNNAMED.as_ptr()) }
+        });
+        Ok((result, dst2_value))
     }
 
     #[must_use]
@@ -3767,26 +3973,6 @@ impl<'a> MethodEmitContext<'a> {
             unsafe { LLVMConstInt(llvm_dtype, u64::MAX, 0) }
         };
         Ok(unsafe { LLVMBuildSelect(self.builder, setp_result, one, zero, LLVM_UNNAMED.as_ptr()) })
-    }
-
-    // TODO: revisit this on gfx1250 which has native tanh support
-    fn emit_tanh(
-        &mut self,
-        data: ast::ScalarType,
-        arguments: ast::TanhArgs<SpirvWord>,
-    ) -> Result<(), TranslateError> {
-        let src = self.resolver.value(arguments.src)?;
-        let llvm_type = get_scalar_type(self.context, data);
-        let name = format!("__ocml_tanh_{}\0", LLVMTypeDisplay(data));
-        let tanh = self.emit_intrinsic(
-            unsafe { CStr::from_bytes_with_nul_unchecked(name.as_bytes()) },
-            Some(arguments.dst),
-            vec![&data.into()],
-            vec![(src, llvm_type)],
-        )?;
-        // Not sure if it ultimately does anything
-        unsafe { LLVMZludaSetFastMathFlags(tanh, LLVMZludaFastMathApproxFunc) }
-        Ok(())
     }
 
     fn emit_dp4a(
@@ -3888,6 +4074,64 @@ impl<'a> MethodEmitContext<'a> {
         self.resolver.with_result(arguments.dst, |dst| unsafe {
             LLVMBuildAdd(self.builder, subtraction, src3, dst)
         });
+        Ok(())
+    }
+
+    fn emit_vshr(
+        &mut self,
+        data: ast::VshData,
+        arguments: ast::VshrArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let src1 = self.resolver.value(arguments.src1)?;
+        let shift_amount = self.resolver.value(arguments.src2)?;
+        let shifted = match data.mode {
+            ast::FunnelShiftMode::Clamp => {
+                let pre_shifted = unsafe {
+                    LLVMBuildLShr(self.builder, src1, shift_amount, LLVM_UNNAMED.as_ptr())
+                };
+                let llvm_i32 = get_scalar_type(self.context, ast::ScalarType::B32);
+                let const_32 = unsafe { LLVMConstInt(llvm_i32, 32, 0) };
+                let const_0 = unsafe { LLVMConstInt(llvm_i32, 0, 0) };
+                let should_clamp = unsafe {
+                    LLVMBuildICmp(
+                        self.builder,
+                        LLVMIntPredicate::LLVMIntUGE,
+                        shift_amount,
+                        const_32,
+                        LLVM_UNNAMED.as_ptr(),
+                    )
+                };
+                unsafe {
+                    LLVMBuildSelect(
+                        self.builder,
+                        should_clamp,
+                        const_0,
+                        pre_shifted,
+                        LLVM_UNNAMED.as_ptr(),
+                    )
+                }
+            }
+            ast::FunnelShiftMode::Wrap => {
+                return Err(error_todo());
+            }
+        };
+        match data.op2 {
+            ast::VshOp::Add => {
+                let src3 = self.resolver.value(arguments.src3)?;
+                self.resolver.with_result(arguments.dst, |dst| unsafe {
+                    LLVMBuildAdd(self.builder, shifted, src3, dst)
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_exit(&mut self) -> Result<(), TranslateError> {
+        if !self.is_kernel {
+            return Err(error_todo());
+        }
+        // Same kernel exit as `ret`, including its system-scope fence.
+        self.emit_ret(ast::RetData { uniform: false });
         Ok(())
     }
 
@@ -4195,7 +4439,7 @@ fn get_function_type_impl<'a>(
     context: LLVMContextRef,
     mut return_args: impl DoubleEndedIterator<Item = &'a ast::Type>
         + ExactSizeIterator<Item = &'a ast::Type>,
-    input_args: impl ExactSizeIterator<Item = Result<LLVMTypeRef, TranslateError>>,
+    input_args: impl Iterator<Item = Result<LLVMTypeRef, TranslateError>>,
     struct_kind: StructKind,
 ) -> Result<LLVMTypeRef, TranslateError> {
     let mut input_args = input_args.collect::<Result<Vec<_>, _>>()?;
@@ -4222,7 +4466,7 @@ fn get_function_type<'a>(
     context: LLVMContextRef,
     return_args: impl DoubleEndedIterator<Item = &'a ast::Type>
         + ExactSizeIterator<Item = &'a ast::Type>,
-    input_args: impl ExactSizeIterator<Item = Result<LLVMTypeRef, TranslateError>>,
+    input_args: impl Iterator<Item = Result<LLVMTypeRef, TranslateError>>,
 ) -> Result<LLVMTypeRef, TranslateError> {
     get_function_type_impl(context, return_args, input_args, StructKind::Named)
 }
@@ -4231,7 +4475,7 @@ fn get_intrinsic_type<'a>(
     context: LLVMContextRef,
     return_args: impl DoubleEndedIterator<Item = &'a ast::Type>
         + ExactSizeIterator<Item = &'a ast::Type>,
-    input_args: impl ExactSizeIterator<Item = Result<LLVMTypeRef, TranslateError>>,
+    input_args: impl Iterator<Item = Result<LLVMTypeRef, TranslateError>>,
 ) -> Result<LLVMTypeRef, TranslateError> {
     get_function_type_impl(context, return_args, input_args, StructKind::Anonymous)
 }
@@ -4318,7 +4562,7 @@ impl std::fmt::Display for LLVMTypeDisplay {
             ast::ScalarType::B64 | ast::ScalarType::U64 | ast::ScalarType::S64 => write!(f, "i64"),
             ptx_parser::ScalarType::B128 => write!(f, "i128"),
             ast::ScalarType::F16 => write!(f, "f16"),
-            ptx_parser::ScalarType::BF16 => write!(f, "bfloat"),
+            ptx_parser::ScalarType::BF16 => write!(f, "bf16"),
             ast::ScalarType::F32 => write!(f, "f32"),
             ast::ScalarType::F64 => write!(f, "f64"),
             ptx_parser::ScalarType::S16x2 | ptx_parser::ScalarType::U16x2 => write!(f, "v2i16"),
@@ -4328,13 +4572,442 @@ impl std::fmt::Display for LLVMTypeDisplay {
     }
 }
 
-/*
-fn rounding_to_llvm(this: ast::RoundingMode) -> u32 {
-    match this {
-        ptx_parser::RoundingMode::Zero => 0,
-        ptx_parser::RoundingMode::NearestEven => 1,
-        ptx_parser::RoundingMode::PositiveInf => 2,
-        ptx_parser::RoundingMode::NegativeInf => 3,
+struct FloatingPoint {
+    context: LLVMContextRef,
+    module: LLVMModuleRef,
+    builder: LLVMBuilderRef,
+    mode: FloatingPointMode,
+}
+
+impl FloatingPoint {
+    fn emit_constrained<const N: usize, const M: usize>(
+        &self,
+        resolver: &mut ResolveIdent,
+        name: &'static str,
+        type_: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        srcs: [LLVMValueRef; N],
+        metadata: [&str; M],
+    ) -> Result<LLVMValueRef, TranslateError> {
+        let name = format!("{}.{}\0", name, LLVMTypeDisplay(type_));
+        self.emit_constrained_impl(resolver, &name, type_, dst, type_, srcs, metadata)
+    }
+
+    // Constrained conversions are overloaded on both the destination and the
+    // source type, e.g. llvm.experimental.constrained.fptosi.i32.f32
+    fn emit_constrained_convert<const M: usize>(
+        &self,
+        resolver: &mut ResolveIdent,
+        name: &'static str,
+        dst_type: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src_type: ast::ScalarType,
+        src: LLVMValueRef,
+        metadata: [&str; M],
+    ) -> Result<LLVMValueRef, TranslateError> {
+        let name = format!(
+            "{}.{}.{}\0",
+            name,
+            LLVMTypeDisplay(dst_type),
+            LLVMTypeDisplay(src_type)
+        );
+        self.emit_constrained_impl(resolver, &name, dst_type, dst, src_type, [src], metadata)
+    }
+
+    fn emit_constrained_impl<const N: usize, const M: usize>(
+        &self,
+        resolver: &mut ResolveIdent,
+        name: &str,
+        dst_type: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src_type: ast::ScalarType,
+        srcs: [LLVMValueRef; N],
+        metadata: [&str; M],
+    ) -> Result<LLVMValueRef, TranslateError> {
+        let metadata_type = unsafe { LLVMMetadataTypeInContext(self.context) };
+        let metadata = metadata.map(|m| {
+            let m_value =
+                unsafe { LLVMMDStringInContext2(self.context, m.as_ptr().cast(), m.len()) };
+            (
+                unsafe { LLVMMetadataAsValue(self.context, m_value) },
+                metadata_type,
+            )
+        });
+        let name = unsafe { CString::from_vec_unchecked(name.as_bytes().to_vec()) };
+        emit_intrinsic(
+            self.context,
+            self.module,
+            self.builder,
+            resolver,
+            &name,
+            dst,
+            vec![&dst_type.into()],
+            srcs.iter()
+                .map(|&src| (src, get_scalar_type(self.context, src_type)))
+                .chain(metadata.into_iter())
+                .collect(),
+        )
+    }
+
+    fn fadd(
+        &self,
+        resolver: &mut ResolveIdent,
+        type_: ast::ScalarType,
+        dst: SpirvWord,
+        src1: LLVMValueRef,
+        src2: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result(dst, |dst| unsafe {
+                LLVMBuildFAdd(self.builder, src1, src2, dst)
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained(
+                resolver,
+                "llvm.experimental.constrained.fadd",
+                type_,
+                Some(dst),
+                [src1, src2],
+                ["round.dynamic", "fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn fmul(
+        &self,
+        resolver: &mut ResolveIdent,
+        type_: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src1: SpirvWord,
+        src2: SpirvWord,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        let src1 = resolver.value(src1)?;
+        let src2 = resolver.value(src2)?;
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result_option(dst, |dst| unsafe {
+                LLVMBuildFMul(self.builder, src1, src2, dst)
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained(
+                resolver,
+                "llvm.experimental.constrained.fmul",
+                type_,
+                dst,
+                [src1, src2],
+                ["round.dynamic", "fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn fdiv(
+        &self,
+        resolver: &mut ResolveIdent,
+        type_: ast::ScalarType,
+        dst: SpirvWord,
+        src1: LLVMValueRef,
+        src2: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result(dst, |dst| unsafe {
+                LLVMBuildFDiv(self.builder, src1, src2, dst)
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained(
+                resolver,
+                "llvm.experimental.constrained.fdiv",
+                type_,
+                Some(dst),
+                [src1, src2],
+                ["round.dynamic", "fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn fsub(
+        &self,
+        resolver: &mut ResolveIdent,
+        type_: ast::ScalarType,
+        dst: SpirvWord,
+        src1: LLVMValueRef,
+        src2: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result(dst, |dst| unsafe {
+                LLVMBuildFSub(self.builder, src1, src2, dst)
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained(
+                resolver,
+                "llvm.experimental.constrained.fsub",
+                type_,
+                Some(dst),
+                [src1, src2],
+                ["round.dynamic", "fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn fpext(
+        &self,
+        resolver: &mut ResolveIdent,
+        dst_type: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src_type: ast::ScalarType,
+        src: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result_option(dst, |dst| unsafe {
+                LLVMBuildFPExt(
+                    self.builder,
+                    src,
+                    get_scalar_type(self.context, dst_type),
+                    dst,
+                )
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained_convert(
+                resolver,
+                "llvm.experimental.constrained.fpext",
+                dst_type,
+                dst,
+                src_type,
+                src,
+                ["fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn fptrunc(
+        &self,
+        resolver: &mut ResolveIdent,
+        dst_type: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src_type: ast::ScalarType,
+        src: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result_option(dst, |dst| unsafe {
+                LLVMBuildFPTrunc(
+                    self.builder,
+                    src,
+                    get_scalar_type(self.context, dst_type),
+                    dst,
+                )
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained_convert(
+                resolver,
+                "llvm.experimental.constrained.fptrunc",
+                dst_type,
+                dst,
+                src_type,
+                src,
+                ["round.dynamic", "fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn fptosi(
+        &self,
+        resolver: &mut ResolveIdent,
+        dst_type: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src_type: ast::ScalarType,
+        src: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result_option(dst, |dst| unsafe {
+                LLVMBuildFPToSI(
+                    self.builder,
+                    src,
+                    get_scalar_type(self.context, dst_type),
+                    dst,
+                )
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained_convert(
+                resolver,
+                "llvm.experimental.constrained.fptosi",
+                dst_type,
+                dst,
+                src_type,
+                src,
+                ["fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn fptoui(
+        &self,
+        resolver: &mut ResolveIdent,
+        dst_type: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src_type: ast::ScalarType,
+        src: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result_option(dst, |dst| unsafe {
+                LLVMBuildFPToUI(
+                    self.builder,
+                    src,
+                    get_scalar_type(self.context, dst_type),
+                    dst,
+                )
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained_convert(
+                resolver,
+                "llvm.experimental.constrained.fptoui",
+                dst_type,
+                dst,
+                src_type,
+                src,
+                ["fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn sitofp(
+        &self,
+        resolver: &mut ResolveIdent,
+        dst_type: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src_type: ast::ScalarType,
+        src: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result_option(dst, |dst| unsafe {
+                LLVMBuildSIToFP(
+                    self.builder,
+                    src,
+                    get_scalar_type(self.context, dst_type),
+                    dst,
+                )
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained_convert(
+                resolver,
+                "llvm.experimental.constrained.sitofp",
+                dst_type,
+                dst,
+                src_type,
+                src,
+                ["round.dynamic", "fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn uitofp(
+        &self,
+        resolver: &mut ResolveIdent,
+        dst_type: ast::ScalarType,
+        dst: Option<SpirvWord>,
+        src_type: ast::ScalarType,
+        src: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => Ok(resolver.with_result_option(dst, |dst| unsafe {
+                LLVMBuildUIToFP(
+                    self.builder,
+                    src,
+                    get_scalar_type(self.context, dst_type),
+                    dst,
+                )
+            })),
+            FloatingPointMode::Constrained => self.emit_constrained_convert(
+                resolver,
+                "llvm.experimental.constrained.uitofp",
+                dst_type,
+                dst,
+                src_type,
+                src,
+                ["round.dynamic", "fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn sin_f32(
+        &self,
+        resolver: &mut ResolveIdent,
+        dst: SpirvWord,
+        src: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => emit_intrinsic(
+                self.context,
+                self.module,
+                self.builder,
+                resolver,
+                c"llvm.sin.f32",
+                Some(dst),
+                vec![&ast::ScalarType::F32.into()],
+                vec![(src, get_scalar_type(self.context, ast::ScalarType::F32))],
+            ),
+            FloatingPointMode::Constrained => self.emit_constrained(
+                resolver,
+                "llvm.experimental.constrained.sin",
+                ast::ScalarType::F32,
+                Some(dst),
+                [src],
+                ["round.dynamic", "fpexcept.ignore"],
+            ),
+        }
+    }
+
+    fn cos_f32(
+        &self,
+        resolver: &mut ResolveIdent,
+        dst: SpirvWord,
+        src: LLVMValueRef,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        match self.mode {
+            FloatingPointMode::Normal => emit_intrinsic(
+                self.context,
+                self.module,
+                self.builder,
+                resolver,
+                c"llvm.cos.f32",
+                Some(dst),
+                vec![&ast::ScalarType::F32.into()],
+                vec![(src, get_scalar_type(self.context, ast::ScalarType::F32))],
+            ),
+            FloatingPointMode::Constrained => self.emit_constrained(
+                resolver,
+                "llvm.experimental.constrained.cos",
+                ast::ScalarType::F32,
+                Some(dst),
+                [src],
+                ["round.dynamic", "fpexcept.ignore"],
+            ),
+        }
     }
 }
-*/
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FloatingPointMode {
+    Normal,
+    Constrained,
+}
+
+fn emit_intrinsic(
+    context: LLVMContextRef,
+    module: LLVMModuleRef,
+    builder: LLVMBuilderRef,
+    resolver: &mut ResolveIdent,
+    name: &CStr,
+    dst: Option<SpirvWord>,
+    return_types: Vec<&ast::Type>,
+    arguments: Vec<(LLVMValueRef, LLVMTypeRef)>,
+) -> Result<LLVMValueRef, TranslateError> {
+    let fn_type = get_intrinsic_type(
+        context,
+        return_types.iter().copied(),
+        arguments.iter().map(|(_, type_)| Ok(*type_)),
+    )?;
+    let mut fn_ = unsafe { LLVMGetNamedFunction(module, name.as_ptr()) };
+    if fn_ == ptr::null_mut() {
+        fn_ = unsafe { LLVMAddFunction(module, name.as_ptr(), fn_type) };
+    }
+    let mut arguments = arguments.iter().map(|(arg, _)| *arg).collect::<Vec<_>>();
+    Ok(resolver.with_result_option(dst, |dst| unsafe {
+        LLVMBuildCall2(
+            builder,
+            fn_type,
+            fn_,
+            arguments.as_mut_ptr(),
+            arguments.len() as u32,
+            dst,
+        )
+    }))
+}

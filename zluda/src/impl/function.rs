@@ -1,4 +1,5 @@
 use cuda_types::cuda::{CUfunction, CUfunction_attribute, CUkernel};
+use dark_api::FunctionArgInfo;
 use hip_runtime_sys::*;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -12516,6 +12517,7 @@ pub(crate) struct Function {
     pub(crate) base: hipFunction_t,
     pub(crate) module: hipModule_t,
     pub(crate) sm_version: u32,
+    pub(crate) explicit_args_size_align: Option<Vec<FunctionArgInfo>>,
 }
 
 fn iofx_bbox_texref_desc_from_hip(desc: &HIP_TEXTURE_DESC) -> IofxBboxTexrefCaptureDesc {

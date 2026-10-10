@@ -5,11 +5,11 @@ use std::hash::Hash;
 use std::{
     borrow::Cow,
     collections::{hash_map, HashMap},
-    iter,
 };
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
+mod convert_32bit_to_64bit;
 mod deparamize_functions;
 mod expand_operands;
 mod fix_special_registers;
@@ -22,6 +22,8 @@ pub mod llvm;
 mod normalize_basic_blocks;
 mod normalize_identifiers;
 mod normalize_predicates;
+mod optimize_function_arguments;
+mod rcp_f64_into_div;
 mod remove_unreachable_basic_blocks;
 mod replace_instructions_with_functions;
 mod replace_instructions_with_functions_fp_required;
@@ -32,6 +34,8 @@ mod resolve_function_pointers;
 mod test;
 
 static ZLUDA_PTX_IMPL: &'static [u8] = include_bytes!("../../lib/zluda_ptx_impl.bc");
+static ZLUDA_PTX_IMPL_CONSTRAINED: &'static [u8] =
+    include_bytes!("../../lib/zluda_ptx_impl_constrained.bc");
 const ZLUDA_PTX_PREFIX: &'static str = "__zluda_ptx_impl_";
 
 quick_error! {
@@ -300,6 +304,8 @@ pub fn to_llvm_module<'input>(
     on_pass_end("replace_known_functions");
     let directives = normalize_predicates::run(&mut flat_resolver, directives)?;
     on_pass_end("normalize_predicates");
+    let directives = optimize_function_arguments::run(&mut flat_resolver, directives)?;
+    on_pass_end("optimize_function_arguments");
     let directives = resolve_function_pointers::run(directives)?;
     on_pass_end("resolve_function_pointers");
     let directives = fix_special_registers::run(&mut flat_resolver, &sreg_map, directives)?;
@@ -310,6 +316,8 @@ pub fn to_llvm_module<'input>(
     on_pass_end("insert_post_saturation");
     let directives = deparamize_functions::run(&mut flat_resolver, directives)?;
     on_pass_end("deparamize_functions");
+    let directives = rcp_f64_into_div::run(&mut flat_resolver, directives)?;
+    on_pass_end("rcp_f64_into_div");
     let directives =
         replace_instructions_with_functions_fp_required::run(&mut flat_resolver, directives)?;
     on_pass_end("replace_instructions_with_functions_fp_required");
@@ -319,12 +327,11 @@ pub fn to_llvm_module<'input>(
     on_pass_end("remove_unreachable_basic_blocks");
     let directives = instruction_mode_to_global_mode::run(&mut flat_resolver, directives)?;
     on_pass_end("instruction_mode_to_global_mode");
-    let directives = insert_explicit_load_store::run(&mut flat_resolver, directives)?;
+    let mut directives = insert_explicit_load_store::run(&mut flat_resolver, directives)?;
     on_pass_end("insert_explicit_load_store");
     // Mark Tex instructions that use .texref globals (vs object-based access).
     // Must run before insert_implicit_conversions, which replaces the texref
     // operand with an AddressOf conversion (losing the original type info).
-    let mut directives = directives;
     for directive in &mut directives {
         if let Directive2::Method(ref mut method) = directive {
             if let Some(ref mut stmts) = method.body {
@@ -342,7 +349,16 @@ pub fn to_llvm_module<'input>(
             }
         }
     }
-    let directives = insert_implicit_conversions::run(&mut flat_resolver, directives)?;
+    let mut metadata32 = None;
+    if ast.address_size == 32 {
+        let (new_directives, new_module32) =
+            convert_32bit_to_64bit::run(&mut flat_resolver, directives)?;
+        directives = new_directives;
+        metadata32 = Some(new_module32);
+        on_pass_end("convert_32bit_to_64bit");
+    }
+    let directives =
+        insert_implicit_conversions::run(ast.address_size == 32, &mut flat_resolver, directives)?;
     on_pass_end("insert_implicit_conversions");
     // Insert workgroup barriers at shared-memory WAR hazard points.
     //
@@ -495,16 +511,19 @@ pub fn to_llvm_module<'input>(
     on_pass_end("replace_instructions_with_functions");
     let directives = hoist_globals::run(directives)?;
     on_pass_end("hoist_globals");
+    let fp_mode = get_fp_mode(&directives[..]);
+    on_pass_end("get_fp_mode");
     let context = llvm_zluda::utils::Context::new();
-    let llvm_ir = llvm::emit::run(&context, flat_resolver, directives)?;
+    let llvm_ir = llvm::emit::run(&context, flat_resolver, directives, fp_mode)?;
     let attributes_ir = llvm::attributes::run(&context, attributes)?;
     on_pass_end("emit_llvm");
     Ok(Module {
         llvm_ir,
         attributes_ir,
-        kernel_info: HashMap::new(),
         context,
-        metadata: kernel_metadata::KernelMetadataV1::new(sm_version),
+        metadata: kernel_metadata::ModuleMetadataV1::new(sm_version),
+        metadata32,
+        constrained_fp: fp_mode == llvm::emit::FloatingPointMode::Constrained,
     })
 }
 
@@ -709,23 +728,38 @@ mod shared_war_barrier_tests {
     }
 }
 
+fn get_fp_mode(
+    directives: &[Directive2<ast::Instruction<SpirvWord>, SpirvWord>],
+) -> llvm::emit::FloatingPointMode {
+    for d in directives {
+        if let Directive2::Method(method) = d {
+            for s in method.body.iter().flatten() {
+                if let Statement::SetMode(_) = s {
+                    return llvm::emit::FloatingPointMode::Constrained;
+                }
+            }
+        }
+    }
+    llvm::emit::FloatingPointMode::Normal
+}
+
 pub struct Module {
     pub llvm_ir: llvm_zluda::utils::Module,
     pub attributes_ir: llvm_zluda::utils::Module,
-    pub kernel_info: HashMap<String, KernelInfo>,
     pub context: llvm_zluda::utils::Context,
-    pub metadata: kernel_metadata::KernelMetadataV1,
+    pub metadata: kernel_metadata::ModuleMetadataV1,
+    pub metadata32: Option<kernel_metadata::ModuleMetadata32Bit>,
+    pub constrained_fp: bool,
 }
 
 impl Module {
     pub fn linked_bitcode(&self) -> &'static [u8] {
-        ZLUDA_PTX_IMPL
+        if self.constrained_fp {
+            ZLUDA_PTX_IMPL_CONSTRAINED
+        } else {
+            ZLUDA_PTX_IMPL
+        }
     }
-}
-
-pub struct KernelInfo {
-    pub arguments_sizes: Vec<(usize, bool)>,
-    pub uses_shared_mem: bool,
 }
 
 #[derive(Ord, PartialOrd, Eq, PartialEq, Hash, Copy, Clone, EnumIter)]
@@ -882,6 +916,8 @@ enum Statement<I, P: ast::Operand> {
     FpModeRequired {
         ftz_f32: Option<bool>,
         rnd_f32: Option<ast::RoundingMode>,
+        ftz_f16f64: Option<bool>,
+        rnd_f16f64: Option<ast::RoundingMode>,
     },
     FpSaturate {
         dst: SpirvWord,
@@ -1122,21 +1158,18 @@ impl<T: ast::Operand<Ident = SpirvWord>> Statement<ast::Instruction<T>, T> {
                 is_extract,
                 typ,
                 packed,
-                unpacked,
+                mut unpacked,
                 relaxed_type_check,
             }) => {
                 let (packed, unpacked) = if is_extract {
-                    let unpacked = unpacked
-                        .into_iter()
-                        .map(|ident| {
-                            visitor.visit_ident(
-                                ident,
-                                Some((&typ.into(), ast::StateSpace::Reg)),
-                                true,
-                                relaxed_type_check,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                    for ident in unpacked.iter_mut().flatten() {
+                        *ident = visitor.visit_ident(
+                            *ident,
+                            Some((&typ.into(), ast::StateSpace::Reg)),
+                            true,
+                            relaxed_type_check,
+                        )?;
+                    }
                     let packed = visitor.visit_ident(
                         packed,
                         Some((
@@ -1157,17 +1190,14 @@ impl<T: ast::Operand<Ident = SpirvWord>> Statement<ast::Instruction<T>, T> {
                         true,
                         false,
                     )?;
-                    let unpacked = unpacked
-                        .into_iter()
-                        .map(|ident| {
-                            visitor.visit_ident(
-                                ident,
-                                Some((&typ.into(), ast::StateSpace::Reg)),
-                                false,
-                                relaxed_type_check,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                    for ident in unpacked.iter_mut().flatten() {
+                        *ident = visitor.visit_ident(
+                            *ident,
+                            Some((&typ.into(), ast::StateSpace::Reg)),
+                            false,
+                            relaxed_type_check,
+                        )?;
+                    }
                     (packed, unpacked)
                 };
                 Statement::RepackVector(RepackVectorDetails {
@@ -1207,9 +1237,17 @@ impl<T: ast::Operand<Ident = SpirvWord>> Statement<ast::Instruction<T>, T> {
                 )?;
                 Statement::FpSaturate { dst, src, type_ }
             }
-            Statement::FpModeRequired { ftz_f32, rnd_f32 } => {
-                Statement::FpModeRequired { ftz_f32, rnd_f32 }
-            }
+            Statement::FpModeRequired {
+                ftz_f32,
+                rnd_f32,
+                ftz_f16f64,
+                rnd_f16f64,
+            } => Statement::FpModeRequired {
+                ftz_f32,
+                rnd_f32,
+                ftz_f16f64,
+                rnd_f16f64,
+            },
         })
     }
 }
@@ -1282,7 +1320,8 @@ struct RepackVectorDetails {
     is_extract: bool,
     typ: ast::ScalarType,
     packed: SpirvWord,
-    unpacked: Vec<SpirvWord>,
+    // None discards an extracted lane without allocating a destination register.
+    unpacked: Vec<Option<SpirvWord>>,
     relaxed_type_check: bool,
 }
 
@@ -1347,7 +1386,7 @@ type NormalizedStatement = Statement<
 
 enum Directive2<Instruction, Operand: ast::Operand> {
     Variable(ast::LinkingDirective, ast::Variable<SpirvWord>),
-    Method(Function2<Instruction, Operand>),
+    Method(Function<Instruction, Operand>),
 }
 
 struct KernelAttributes {
@@ -1357,7 +1396,7 @@ struct KernelAttributes {
     rounding_mode_f16f64: ast::RoundingMode,
 }
 
-struct Function2<Instruction, Operand: ast::Operand> {
+struct Function<Instruction, Operand: ast::Operand> {
     pub return_arguments: Vec<ast::Variable<Operand::Ident>>,
     pub name: Operand::Ident,
     pub input_arguments: Vec<ast::Variable<Operand::Ident>>,
@@ -1366,9 +1405,17 @@ struct Function2<Instruction, Operand: ast::Operand> {
     import_as: Option<String>,
     tuning: Vec<ast::TuningDirective>,
     linkage: ast::LinkingDirective,
+    kernel_meta32: Option<Function32>,
 }
 
-impl<I, O: ast::Operand> Function2<I, O> {
+// We transform the method so that it takes an implicit pointer to memory as an
+// additional argument, and all explicit memory accesses are done through that
+// pointer
+struct Function32 {
+    implicit_memory_ptr: SpirvWord,
+}
+
+impl<I, O: ast::Operand> Function<I, O> {
     fn is_kernel(&self) -> bool {
         self.kernel_attributes.is_some()
     }
@@ -1382,7 +1429,7 @@ type NormalizedDirective2 = Directive2<
     ast::ParsedOperand<SpirvWord>,
 >;
 
-type NormalizedFunction2 = Function2<
+type NormalizedFunction2 = Function<
     (
         Option<ast::PredAt<SpirvWord>>,
         ast::Instruction<ast::ParsedOperand<SpirvWord>>,
@@ -1394,7 +1441,7 @@ type UnconditionalDirective =
     Directive2<ast::Instruction<ast::ParsedOperand<SpirvWord>>, ast::ParsedOperand<SpirvWord>>;
 
 type UnconditionalFunction =
-    Function2<ast::Instruction<ast::ParsedOperand<SpirvWord>>, ast::ParsedOperand<SpirvWord>>;
+    Function<ast::Instruction<ast::ParsedOperand<SpirvWord>>, ast::ParsedOperand<SpirvWord>>;
 
 struct GlobalStringIdentResolver2<'input> {
     pub(crate) current_id: SpirvWord,

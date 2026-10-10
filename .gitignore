@@ -5,6 +5,7 @@ Cargo.lock
 .idea/
 
 ptx/lib/zluda_ptx_impl.ll
+ptx/lib/zluda_ptx_impl_constrained.ll
 
 # Downloaded ROCm packages / local runtime symlink (reproducible via script)
 ext/rocm

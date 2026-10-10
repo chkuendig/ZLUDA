@@ -1,5 +1,5 @@
 /*
-Every time this file changes it must be rebuilt.
+Every time this file (or any other file in this directory) changes it must be rebuilt.
 You must use LLVM from ZLUDA submodule dir ext/llvm-project:
 
 cd ext/llvm-project && \
@@ -16,6 +16,7 @@ ninja clang llvm-dis llvm-as
 then cd to the directory with this file and run this simple command:
 
 ../../ext/llvm-project/build/bin/clang \
+    -DHIP_ENABLE_WARP_SYNC_BUILTINS \
     -std=c++20 \
     -Xclang -fdenormal-fp-math=dynamic \
     -Wno-unused-parameter -Wno-sign-conversion -Wno-shorten-64-to-32 \
@@ -29,7 +30,8 @@ then cd to the directory with this file and run this simple command:
     -o zluda_ptx_impl.bc \
     -emit-llvm \
     -c \
-    --offload-device-only --offload-arch=gfx1030 && \
+    --offload-device-only --offload-arch=gfx1030 \
+    -Xclang -mlink-bitcode-file -Xclang /opt/rocm/amdgcn/bitcode/ocml.bc && \
 ../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl.bc -o - \
     | sed '/@llvm.used/d' \
     | sed '/wchar_size/d' \
@@ -40,22 +42,63 @@ then cd to the directory with this file and run this simple command:
     | sed 's/\"target-cpu\"=\"gfx1030\"//g' \
     | sed -E 's/\"target-features\"=\"[^\"]+\"//g'| \
 ../../ext/llvm-project/build/bin/llvm-as - -o  zluda_ptx_impl.bc && \
-../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl.bc
+../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl.bc && \
+../../ext/llvm-project/build/bin/clang \
+    -ffp-model=strict -ffp-exception-behavior=ignore \
+    -DHIP_ENABLE_WARP_SYNC_BUILTINS \
+    -std=c++20 \
+    -Xclang -fdenormal-fp-math=dynamic \
+    -Wno-unused-parameter -Wno-sign-conversion -Wno-shorten-64-to-32 \
+    -Wno-deprecated-pragma -Wno-unused-variable -Wno-deprecated-builtins \
+    --rocm-path=../../ext/rocm \
+    -x hip \
+    zluda_ptx_impl.cpp \
+    -nogpulib \
+    -O3 \
+    -mno-wavefrontsize64 \
+    -o zluda_ptx_impl_constrained.bc \
+    -emit-llvm \
+    -c \
+    --offload-device-only --offload-arch=gfx1030 \
+    -Xclang -mlink-bitcode-file -Xclang /opt/rocm/amdgcn/bitcode/ocml.bc && \
+../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl_constrained.bc -o - \
+    | sed '/@llvm.used/d' \
+    | sed '/wchar_size/d' \
+    | sed '/llvm.module.flags/d' \
+    | sed '/__hip_cuid/d' \
+    | sed 's/optnone//g' \
+    | sed 's/define hidden/define linkonce_odr/g' \
+    | sed 's/\"target-cpu\"=\"gfx1030\"//g' \
+    | sed -E 's/\"target-features\"=\"[^\"]+\"//g'| \
+../../ext/llvm-project/build/bin/llvm-as - -o  zluda_ptx_impl_constrained.bc && \
+../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl_constrained.bc
 */
 
 #include <cstddef>
 #include <cstdint>
 #include <bit>
 #include <cmath>
+#include <utility>
 #include <hip/hip_runtime.h>
 #include <hip/amd_detail/amd_device_functions.h>
+#include <hip/amd_detail/amd_warp_sync_functions.h>
 #include <hip/hip_fp8.h>
 
 #define GLOBAL_SPACE __attribute__((address_space(1)))
 #define SHARED_SPACE __attribute__((address_space(3)))
 #define CONSTANT_SPACE __attribute__((address_space(4)))
 
+typedef unsigned int v2u32 __attribute__((ext_vector_type(2)));
+typedef int s32;
+typedef int v1s32 __attribute__((ext_vector_type(1)));
+typedef int v2s32 __attribute__((ext_vector_type(2)));
+typedef int v4s32 __attribute__((ext_vector_type(4)));
+typedef int v8s32 __attribute__((ext_vector_type(8)));
 typedef _Float16 half16 __attribute__((ext_vector_type(16)));
+typedef float f32;
+typedef float v1f32 __attribute__((ext_vector_type(1)));
+typedef float v2f32 __attribute__((ext_vector_type(2)));
+typedef float v4f32 __attribute__((ext_vector_type(4)));
 typedef float float8 __attribute__((ext_vector_type(8)));
 typedef _Float16 f16;
 typedef _Float16 f16x2 __attribute__((ext_vector_type(2)));
@@ -70,13 +113,13 @@ typedef char s8x4 __attribute__((ext_vector_type(4)));
 #define FUNC(NAME) __device__ __attribute__((retain)) __zluda_ptx_impl_##NAME
 #define FUNC_CALL(NAME) __zluda_ptx_impl_##NAME
 #define ATTR(NAME) __ZLUDA_PTX_IMPL_ATTRIBUTE_##NAME
-#define DECLARE_ATTR(TYPE, NAME)                                        \
-    extern "C" __attribute__((constant)) CONSTANT_SPACE TYPE ATTR(NAME) \
+#define DECLARE_ATTR(TYPE, NAME)                         \
+    extern "C" __attribute__((constant)) TYPE ATTR(NAME) \
     __device__
 
 extern "C"
 {
-    extern "C" __attribute__((constant)) CONSTANT_SPACE uint32_t __oclc_ISA_version __device__;
+    extern "C" __attribute__((constant)) uint32_t __oclc_ISA_version __device__;
 
     __device__ static __forceinline__ uint32_t workitem_id(uint8_t member)
     {
@@ -350,6 +393,7 @@ extern "C"
     {                                                                                                                                           \
         int32_t section_mask = (opts >> 8) & 0b11111;                                                                                           \
         int32_t warp_end = opts & 0b11111;                                                                                                      \
+        delta &= 0b11111;                                                                                                                       \
         int32_t self = (int32_t)FUNC_CALL(sreg_laneid)();                                                                                       \
         int32_t subsection = section_mask & self;                                                                                               \
         int32_t subsection_end = subsection | (~section_mask & warp_end);                                                                       \
@@ -410,7 +454,7 @@ extern "C"
                             uint64_t char_size)
     {
         (void)char_size;
-        __assert_fail((const char *)message, (const char *)file, line, (const char *)function);
+        [[clang::noinline]] __assert_fail((const char *)message, (const char *)file, line, (const char *)function);
     }
 
     // * Smallest denormal is 1.4 × 10^-45
@@ -644,6 +688,58 @@ extern "C"
         return div_f32_part2(x, y, {fma_4, fma_1, fma_3, numerator_scaled_flag});
     }
 
+    struct DivRnFtzF64Part1Result
+    {
+        double fma4;
+        double fma3;
+        double mul;
+        uint8_t num_scaled;
+    };
+
+    DivRnFtzF64Part1Result FUNC(div_f64_part1)(double x, double y)
+    {
+        bool den_scaled, num_scaled;
+        double div_scale0 = __builtin_amdgcn_div_scale(x, y, false, &den_scaled);
+        double div_scale1 = __builtin_amdgcn_div_scale(x, y, true, &num_scaled);
+
+        double neg_div_scale0 = -div_scale0;
+        double rcp = __builtin_amdgcn_rcp(div_scale0);
+        double fma0 = __builtin_fma(neg_div_scale0, rcp, 1.0);
+        double fma1 = __builtin_fma(rcp, fma0, rcp);
+        double fma2 = __builtin_fma(neg_div_scale0, fma1, 1.0);
+        double fma3 = __builtin_fma(fma1, fma2, fma1);
+
+        double mul = div_scale1 * fma3;
+        double fma4 = __builtin_fma(neg_div_scale0, mul, div_scale1);
+        return {fma4, fma3, mul, num_scaled};
+    }
+
+    __device__ static double div_f64_part2(double x, double y, DivRnFtzF64Part1Result part1)
+    {
+        double fmas = __builtin_amdgcn_div_fmas(part1.fma4, part1.fma3, part1.mul, part1.num_scaled);
+        return __builtin_amdgcn_div_fixup(fmas, y, x);
+    }
+
+    double FUNC(div_f64_part2)(double x, double y,
+                               double fma4,
+                               double fma3,
+                               double mul,
+                               uint8_t num_scaled)
+    {
+        return div_f64_part2(x, y, {fma4, fma3, mul, num_scaled});
+    }
+
+    // Taken from LLVM, pasted here because LLVM doesn't support constrained fdiv
+    __device__ float FUNC(div_full_f32)(float a, float b)
+    {
+        float mb = __builtin_amdgcn_frexp_mantf(b);
+        int eb = __builtin_amdgcn_frexp_expf(b);
+        float r = __builtin_amdgcn_rcpf(mb);
+        float ma = __builtin_amdgcn_frexp_mantf(a);
+        int ea = __builtin_amdgcn_frexp_expf(a);
+        return __builtin_ldexpf(ma * r, ea - eb);
+    }
+
     __device__ static __hip_fp8_storage_t cvt_float_to_fp8(float f, __hip_fp8_interpretation_t interp)
     {
         const uint32_t bits = reinterpret_cast<uint32_t &>(f);
@@ -722,6 +818,26 @@ extern "C"
     uint32_t FUNC(vote_sync_ballot_b32_negate)(bool value, uint32_t membermask __attribute__((unused)))
     {
         return ballot(value, true);
+    }
+
+    uint32_t FUNC(vote_ballot_b32)(bool value)
+    {
+        return ballot(value, false);
+    }
+
+    uint32_t FUNC(vote_ballot_b32_negate)(bool value)
+    {
+        return ballot(value, true);
+    }
+
+    uint32_t FUNC(match_any_sync_b32)(uint32_t value, uint32_t membermask __attribute__((unused)))
+    {
+        return uint32_t(__match_any<uint32_t>(value));
+    }
+
+    uint32_t FUNC(match_any_sync_b64)(uint64_t value, uint32_t membermask __attribute__((unused)))
+    {
+        return uint32_t(__match_any<uint64_t>(value));
     }
 
 #define REDUX_SYNC_TYPE_IMPL(reducer, ptx_type, amd_type, cpp_type)                                             \
@@ -846,12 +962,13 @@ extern "C"
         return output.u32;
     }
 
-    int FUNC(vprintf)(const char *format __attribute__((unused)), void *vlist __attribute__((unused)))
+    [[clang::noinline]]
+    int FUNC(vprintf)(const char *format, void *vlist __attribute__((unused)))
     {
         // TODO: replace calls to vprintf with a raising pass to printf when we have a mechanism
         // to write SSA passes
         // Use https://github.com/ROCm/llvm-project/blob/99a81d16b9d811cadd420190bed16981a0a57bc6/llvm/lib/Transforms/Utils/AMDGPUEmitPrintf.cpp#L426
-        return -1;
+        return printf("%s", format);
     }
 
     // ===================== SURFACE LOAD/STORE =====================
@@ -1414,7 +1531,7 @@ __device__ static void mma_load_col(T upper_row[16], T lower_row[16], T left_col
 }
 
 template <typename Acc, typename T>
-__device__ HIP_vector_base<Acc, 4> fallback_mma_sync_aligned(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, HIP_vector_base<Acc, 4> c_reg)
+__device__ HIP_vector_base<Acc, 4>::Native_vec_ fallback_mma_sync_aligned(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, HIP_vector_base<Acc, 4> c_reg)
 {
     uint8_t laneid = uint8_t(FUNC_CALL(sreg_laneid)());
     uint8_t quad_index = laneid % 4;
@@ -1476,7 +1593,7 @@ extern "C"
 {
     float4::Native_vec_ FUNC(mma_sync_aligned_m16n8k16_row_col_f32_f16_f16_f32)(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
     {
-        return fallback_mma_sync_aligned<float, f16x2>(a_reg, b_reg, HIP_vector_base<float, 4>(c_reg.x, c_reg.y, c_reg.z, c_reg.w)).data;
+        return fallback_mma_sync_aligned<float, f16x2>(a_reg, b_reg, HIP_vector_base<float, 4>(c_reg.x, c_reg.y, c_reg.z, c_reg.w));
     }
 
     // We wrap the intrinsic in an optnone function to prevent ZLUDA-specific
@@ -1495,7 +1612,7 @@ extern "C"
         }
         else
         {
-            return fallback_mma_sync_aligned<float, bf16x2>(a_reg, b_reg, HIP_vector_base<float, 4>(c_reg.x, c_reg.y, c_reg.z, c_reg.w)).data;
+            return fallback_mma_sync_aligned<float, bf16x2>(a_reg, b_reg, HIP_vector_base<float, 4>(c_reg.x, c_reg.y, c_reg.z, c_reg.w));
         }
     }
 
@@ -1680,4 +1797,16 @@ extern "C"
     tex_3d_obj(s32, int, f32, float);
     tex_3d_obj(f32, float, s32, int);
     tex_3d_obj(f32, float, f32, float);
+
+    __device__ half __ocml_tanh_f16(half);
+    half FUNC(tanh_f16)(half a)
+    {
+        return __ocml_tanh_f16(a);
+    }
+
+    __device__ float __ocml_tanh_f32(float);
+    float FUNC(tanh_f32)(float a)
+    {
+        return __ocml_tanh_f32(a);
+    }
 }

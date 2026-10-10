@@ -23,8 +23,8 @@ fn run_directive<'input>(
 
 fn run_method<'input>(
     resolver: &mut GlobalStringIdentResolver2,
-    method: Function2<ast::Instruction<SpirvWord>, SpirvWord>,
-) -> Result<Function2<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
+    method: Function<ast::Instruction<SpirvWord>, SpirvWord>,
+) -> Result<Function<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
     let mut new_statements = Vec::new();
     let body = method
         .body
@@ -35,7 +35,7 @@ fn run_method<'input>(
             Ok::<_, TranslateError>(new_statements)
         })
         .transpose()?;
-    Ok(Function2 { body, ..method })
+    Ok(Function { body, ..method })
 }
 
 fn run_statement<'input>(
@@ -182,8 +182,8 @@ fn run_instruction<'input>(
         | ast::Instruction::SetBool { .. }
         | ast::Instruction::Setp { .. }
         | ast::Instruction::SetpBool { .. }
-        | ast::Instruction::ShflSync { .. }
         | ast::Instruction::Shfl { .. }
+        | ast::Instruction::MatchSync { .. }
         | ast::Instruction::Shf { .. }
         | ast::Instruction::Shl { .. }
         | ast::Instruction::Shr { .. }
@@ -203,6 +203,7 @@ fn run_instruction<'input>(
         }
         | ast::Instruction::Tanh { .. }
         | ast::Instruction::Trap {}
+        | ast::Instruction::Exit {}
         | ast::Instruction::Xor { .. }
         | ast::Instruction::Vote { .. }
         | ast::Instruction::VotePreSync { .. }
@@ -215,7 +216,8 @@ fn run_instruction<'input>(
         | ast::Instruction::Mma { .. }
         | ast::Instruction::Tex { .. }
         | ast::Instruction::Sust { .. }
-        | ast::Instruction::Suld { .. } => result.push(Statement::Instruction(instruction)),
+        | ast::Instruction::Suld { .. }
+        | ast::Instruction::Vshr { .. } => result.push(Statement::Instruction(instruction)),
         ast::Instruction::Add {
             data:
                 ast::ArithDetails::Float(ast::ArithFloat {

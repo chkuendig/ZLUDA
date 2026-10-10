@@ -25,11 +25,11 @@ fn run_directive<'input>(
 
 fn run_method<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
-    method: Function2<
+    method: Function<
         ast::Instruction<ast::ParsedOperand<SpirvWord>>,
         ast::ParsedOperand<SpirvWord>,
     >,
-) -> Result<Function2<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
+) -> Result<Function<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
     let body = method
         .body
         .map(|statements| {
@@ -40,7 +40,7 @@ fn run_method<'input>(
             Ok::<_, TranslateError>(result)
         })
         .transpose()?;
-    Ok(Function2 {
+    Ok(Function {
         body,
         return_arguments: method.return_arguments,
         name: method.name,
@@ -49,6 +49,7 @@ fn run_method<'input>(
         tuning: method.tuning,
         linkage: method.linkage,
         kernel_attributes: method.kernel_attributes,
+        kernel_meta32: method.kernel_meta32,
     })
 }
 
@@ -233,7 +234,7 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
 
     fn vec_pack(
         &mut self,
-        vector_elements: Vec<ast::RegOrImmediate<SpirvWord>>,
+        vector_elements: Vec<Option<ast::RegOrImmediate<SpirvWord>>>,
         type_space: Option<(&ast::Type, ast::StateSpace)>,
         is_dst: bool,
         relaxed_type_check: bool,
@@ -253,11 +254,15 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
         let vector_elements = vector_elements
             .into_iter()
             .map(|element| match element {
-                ast::RegOrImmediate::Reg(name) => self.reg(name),
-                ast::RegOrImmediate::Imm(immediate_value) => self.immediate(
-                    immediate_value,
-                    Some((&ast::Type::Scalar(scalar_t), state_space)),
-                ),
+                Some(ast::RegOrImmediate::Reg(name)) => self.reg(name).map(Some),
+                Some(ast::RegOrImmediate::Imm(immediate_value)) => self
+                    .immediate(
+                        immediate_value,
+                        Some((&ast::Type::Scalar(scalar_t), state_space)),
+                    )
+                    .map(Some),
+                None if is_dst => Ok(None),
+                None => Err(error_mismatched_type()),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let temporary_vector = self
