@@ -69,6 +69,7 @@ macro_rules! test_ptx {
 
 macro_rules! test_ptx_with_32 {
     ($fn_name:ident, $input:expr, $output:expr) => {
+        #[cfg(feature = "has_rocm")]
         paste::item! {
             #[test]
             fn [<$fn_name _amdgpu>]() -> Result<(), Box<dyn std::error::Error>> {
@@ -1182,6 +1183,10 @@ fn shfl_up_lower_half_active_one_warp_amdgpu() -> Result<(), Box<dyn error::Erro
     )
 }
 
+/// Retention audit 2026-10-09: legacy compatibility experiment, not an ISA
+/// correctness gate. PTX makes this inactive-source-lane result undefined;
+/// expecting 15 rather than 0 does not establish a translator defect.
+/// Historical investigation notes below retain their original terminology.
 /// 2026-06-11: the BUG direction — an ACTIVE high lane reads an INACTIVE
 /// low (in-range) lane. Lanes 16..31 active; lane 16 does shfl.up(1) and
 /// reads lane 15 (inactive). Lockstep-correct (what CUB's warp-synchronous

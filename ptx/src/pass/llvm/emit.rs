@@ -756,13 +756,15 @@ impl<'a> MethodEmitContext<'a> {
             // Empty scope string is what AMDGPU LLVM expects for system
             // scope (matches `get_scope_membar` for `ast::MemScope::Sys`
             // and matches the `emit_ret` exit fence).
-            unsafe {
-                LLVMZludaBuildFence(
-                    self.builder,
-                    LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
-                    c"".as_ptr(),
-                    LLVM_UNNAMED.as_ptr(),
-                );
+            if llvm_zluda::legacy_workaround_enabled("ZLUDA_KERNEL_FENCES") {
+                unsafe {
+                    LLVMZludaBuildFence(
+                        self.builder,
+                        LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                        c"".as_ptr(),
+                        LLVM_UNNAMED.as_ptr(),
+                    );
+                }
             }
             // 2026-06-08 SRD cache hypothesis (env-gated, default OFF):
             // LLVM's SIMemoryLegalizer does NOT emit scalar cache
@@ -976,7 +978,9 @@ impl<'a> MethodEmitContext<'a> {
         // smoke regression is the D3D11 SubResource hipArray path
         // (commit 70683673), gated off by default via
         // ZLUDA_D3D11_SUBRESOURCE=0.
-        if data.state_space == ast::StateSpace::Shared {
+        if data.state_space == ast::StateSpace::Shared
+            && llvm_zluda::legacy_workaround_enabled("ZLUDA_VOLATILE_SHARED")
+        {
             unsafe { LLVMSetVolatile(load, 1) };
         }
         unsafe {
@@ -1529,14 +1533,18 @@ impl<'a> MethodEmitContext<'a> {
         // project_batman_30_run_dataset.md). Empty scope string is what
         // AMDGPU LLVM expects for system-scope fence (matches the trick
         // in get_scope_membar for ast::MemScope::Sys).
+        if llvm_zluda::legacy_workaround_enabled("ZLUDA_KERNEL_FENCES") {
+            unsafe {
+                LLVMZludaBuildFence(
+                    self.builder,
+                    LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                    c"".as_ptr(),
+                    LLVM_UNNAMED.as_ptr(),
+                );
+            }
+        }
         unsafe {
-            LLVMZludaBuildFence(
-                self.builder,
-                LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
-                c"".as_ptr(),
-                LLVM_UNNAMED.as_ptr(),
-            );
-            LLVMBuildRetVoid(self.builder)
+            LLVMBuildRetVoid(self.builder);
         };
     }
 
@@ -4286,7 +4294,13 @@ fn get_pointer_type<'ctx>(
 fn get_scope(scope: ast::MemScope) -> Result<*const i8, TranslateError> {
     Ok(match scope {
         ast::MemScope::Cta => c"workgroup-one-as",
-        ast::MemScope::Gpu => c"one-as",
+        ast::MemScope::Gpu => {
+            if llvm_zluda::legacy_workaround_enabled("ZLUDA_STRONG_ATOMICS") {
+                c"one-as"
+            } else {
+                c"agent-one-as"
+            }
+        }
         ast::MemScope::Sys => c"one-as",
         ast::MemScope::Cluster => return Err(error_todo()),
     }
@@ -4314,7 +4328,13 @@ fn get_ordering(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
         // the AMDGPU backend emits s_waitcnt (drain stores before atomic)
         // and cache invalidation (fresh reads after atomic).
         // See: NVIDIA/cccl#3827, LLVM SIMemoryLegalizer, GPUHarbor ISSTA'23.
-        ast::AtomSemantics::Relaxed => LLVMAtomicOrdering::LLVMAtomicOrderingAcquireRelease,
+        ast::AtomSemantics::Relaxed => {
+            if llvm_zluda::legacy_workaround_enabled("ZLUDA_STRONG_ATOMICS") {
+                LLVMAtomicOrdering::LLVMAtomicOrderingAcquireRelease
+            } else {
+                LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic
+            }
+        }
         ast::AtomSemantics::Acquire => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::Release => LLVMAtomicOrdering::LLVMAtomicOrderingRelease,
         ast::AtomSemantics::AcqRel => LLVMAtomicOrdering::LLVMAtomicOrderingAcquireRelease,
@@ -4324,7 +4344,13 @@ fn get_ordering(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
 fn get_ordering_failure(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
     match semantics {
         // CAS failure ordering must be Acquire (not Release/AcqRel per LLVM rules)
-        ast::AtomSemantics::Relaxed => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
+        ast::AtomSemantics::Relaxed => {
+            if llvm_zluda::legacy_workaround_enabled("ZLUDA_STRONG_ATOMICS") {
+                LLVMAtomicOrdering::LLVMAtomicOrderingAcquire
+            } else {
+                LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic
+            }
+        }
         ast::AtomSemantics::Acquire => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::Release => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::AcqRel => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,

@@ -2585,13 +2585,15 @@ fn get_best_ptx_and_compile(
     let (text, module) = match maybe_module {
         ControlFlow::Break((ast, module)) | ControlFlow::Continue(Some((ast, module))) => {
             super::driver::zluda_log("[ZLUDA]   selected PTX module for compilation");
-            // Dump each PTX module with a unique counter for offline debugging
-            static PTX_DUMP_CTR: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = PTX_DUMP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dump_path = format!("/tmp/zluda_ptx_{:03}.ptx", n);
-            let _ = std::fs::write(&dump_path, ast.as_bytes());
-            super::driver::zluda_log(&format!("[ZLUDA]   dumped PTX to {}", dump_path));
+            // Explicit debug output only; normal module loads do not write PTX.
+            if std::env::var("ZLUDA_DUMP_PTX").map_or(false, |value| value == "1") {
+                static PTX_DUMP_CTR: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = PTX_DUMP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let dump_path = format!("/tmp/zluda_ptx_{:03}.ptx", n);
+                let _ = std::fs::write(&dump_path, ast.as_bytes());
+                super::driver::zluda_log(&format!("[ZLUDA]   dumped PTX to {}", dump_path));
+            }
             (Some(ast), module)
         }
         ControlFlow::Continue(None) => {
@@ -2693,7 +2695,19 @@ fn get_cache_key<'a, 'b>(
     // fields in the order of their declaration. It's not explictly guaranteed
     // by serde, but it is the only sensible thing to do, so I feel safe
     // to rely on it
-    let serialized_attributes = serde_json::to_string(attributes).ok()?;
+    // PTX text does not encode the optional emitter/backend mitigations.
+    // Include their settings so retirement comparisons cannot reuse legacy code.
+    let compiler_options = [
+        "ZLUDA_KERNEL_FENCES",
+        "ZLUDA_STRONG_ATOMICS",
+        "ZLUDA_VOLATILE_SHARED",
+        "ZLUDA_ZERO_UNDEF",
+        "ZLUDA_SCALAR_CACHE_INV",
+        "ZLUDA_LLVM_ARGS",
+        "ZLUDA_CODEGEN_OPT_LEVEL",
+    ]
+    .map(|name| (name, std::env::var(name).ok()));
+    let serialized_attributes = serde_json::to_string(&(attributes, compiler_options)).ok()?;
     Some(zluda_cache::ModuleKey {
         hash: blake3::hash(text.as_bytes()).to_hex(),
         compiler_version: "builtin",
@@ -2705,7 +2719,8 @@ fn get_cache_key<'a, 'b>(
 }
 
 fn should_dump_radixsort_downsweep_module(text: &str) -> bool {
-    text.contains("RadixSortDownsweepKernel") && text.contains("GridEvenShare")
+    std::env::var("ZLUDA_DUMP_IR").map_or(false, |value| value == "1")
+        && text.contains("RadixSortDownsweepKernel") && text.contains("GridEvenShare")
 }
 
 fn maybe_dump_radixsort_downsweep_module(text: Option<&str>, elf_module: &[u8], from_cache: bool) {
@@ -2789,7 +2804,7 @@ fn compile_and_cache(
     static COMPILE_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COMPILE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Direct test: write a marker file to confirm this code path runs
-    {
+    if std::env::var("ZLUDA_DUMP_IR").map_or(false, |value| value == "1") {
         let _ = std::fs::create_dir_all("/tmp/zluda_ir_dump");
         let _ = std::fs::write(
             format!("/tmp/zluda_ir_dump/MARKER_{}", n),
@@ -2891,7 +2906,11 @@ fn compile_in_subprocess(
                 m.attributes_ir,
                 m.metadata,
                 m.metadata32,
-                Some(&hook),
+                if std::env::var("ZLUDA_DUMP_IR").map_or(false, |value| value == "1") {
+                    Some(&hook)
+                } else {
+                    None
+                },
             );
             match result {
                 Ok(elf_module) => {

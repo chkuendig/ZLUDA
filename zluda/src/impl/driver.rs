@@ -1311,7 +1311,9 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     // The HSA runtime sends SIGABRT on GPU page faults — our normal
     // hipDeviceSynchronize error check doesn't run in time.
     #[cfg(not(windows))]
-    install_fault_signal_handler();
+    if std::env::var("ZLUDA_FAULT_CAPTURE").map_or(false, |value| value == "1") {
+        install_fault_signal_handler();
+    }
     // 2026-06-04 Class B coredump enrichment: by default the kernel's
     // /proc/self/coredump_filter is 0x33 which omits file-backed mappings
     // (private+shared). Wine PE-loaded heap and PE-mapped DLL data live
