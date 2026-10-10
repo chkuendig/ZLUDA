@@ -263,6 +263,11 @@ pub(crate) unsafe fn ref_set_address_v2(
 ) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
     if dptr.0.is_null() {
+        // An unbind destroys the texref's HIP texture object (descriptor and
+        // sampler released, object freed) immediately. A kernel launched
+        // before it may still be reading that object; CUDA snapshots the
+        // binding at launch. Drain first, like every non-null bind below.
+        texref_pre_sync_if_enabled();
         hipUnbindTexture(tex_ref)?;
         return Ok(());
     }
