@@ -1703,7 +1703,7 @@ extern "C"
         struct textureReference GLOBAL_SPACE * ptr, HIP_COORD_TYPE##1 ::Native_vec_ x)                              \
     {                                                                                                               \
         hipTextureObject_t textureObject = ptr->textureObject;                                                      \
-        return TEX_FN<HIP_CHANNEL_TYPE##4>(textureObject, x.x).data;                                                \
+        auto texel = TEX_FN<HIP_CHANNEL_TYPE##4>(textureObject, x.x); return {texel.x, texel.y, texel.z, texel.w};                                                \
     }
 
     tex_1d(u32, uint, s32, int, tex1Dfetch);
@@ -1730,7 +1730,7 @@ extern "C"
     HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_1d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##1 ::Native_vec_ x)                                        \
     {                                                                                                               \
-        return TEX_FN<HIP_CHANNEL_TYPE##4>(strip_tex_shift(textureObject), x.x).data;                               \
+        auto texel = TEX_FN<HIP_CHANNEL_TYPE##4>(strip_tex_shift(textureObject), x.x); return {texel.x, texel.y, texel.z, texel.w};                               \
     }
 
     tex_1d_obj(u32, uint, s32, int, tex1Dfetch);
@@ -1745,7 +1745,7 @@ extern "C"
         struct textureReference GLOBAL_SPACE * ptr, HIP_COORD_TYPE##2 ::Native_vec_ coord)                          \
     {                                                                                                               \
         hipTextureObject_t textureObject = ptr->textureObject;                                                      \
-        return tex2D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y)).data;                       \
+        auto texel = tex2D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y)); return {texel.x, texel.y, texel.z, texel.w};                       \
     }
 
     tex_2d(u32, uint, s32, int);
@@ -1759,7 +1759,7 @@ extern "C"
     HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_2d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##2 ::Native_vec_ coord)                                    \
     {                                                                                                               \
-        return tex2D<HIP_CHANNEL_TYPE##4>(strip_tex_shift(textureObject), float(coord.x), float(coord.y)).data;      \
+        auto texel = tex2D<HIP_CHANNEL_TYPE##4>(strip_tex_shift(textureObject), float(coord.x), float(coord.y)); return {texel.x, texel.y, texel.z, texel.w};      \
     }
 
     tex_2d_obj(u32, uint, s32, int);
@@ -1774,7 +1774,7 @@ extern "C"
         struct textureReference GLOBAL_SPACE * ptr, HIP_COORD_TYPE##4 ::Native_vec_ coord)                          \
     {                                                                                                               \
         hipTextureObject_t textureObject = ptr->textureObject;                                                      \
-        return tex3D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y), float(coord.z)).data;       \
+        auto texel = tex3D<HIP_CHANNEL_TYPE##4>(textureObject, float(coord.x), float(coord.y), float(coord.z)); return {texel.x, texel.y, texel.z, texel.w};       \
     }
 
     tex_3d(u32, uint, s32, int);
@@ -1788,7 +1788,7 @@ extern "C"
     HIP_CHANNEL_TYPE##4 ::Native_vec_ FUNC(tex_3d_v4_##CHANNEL_TYPE##_##COORD_TYPE##_obj)(                          \
         hipTextureObject_t textureObject, HIP_COORD_TYPE##4 ::Native_vec_ coord)                                    \
     {                                                                                                               \
-        return tex3D<HIP_CHANNEL_TYPE##4>(strip_tex_shift(textureObject), float(coord.x), float(coord.y), float(coord.z)).data; \
+        auto texel = tex3D<HIP_CHANNEL_TYPE##4>(strip_tex_shift(textureObject), float(coord.x), float(coord.y), float(coord.z)); return {texel.x, texel.y, texel.z, texel.w}; \
     }
 
     tex_3d_obj(u32, uint, s32, int);

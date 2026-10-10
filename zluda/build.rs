@@ -1,6 +1,14 @@
 use vergen_gix::{Emitter, Gix};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=ZLUDA_HIP_SDK_ROOT");
+    println!("cargo:rerun-if-env-changed=ZLUDA_MATHCOMPAT_OBJECT");
+    if let Some(object) = std::env::var_os("ZLUDA_MATHCOMPAT_OBJECT") {
+        let object = std::path::PathBuf::from(object);
+        assert!(object.is_file(), "math compatibility object is missing");
+        println!("cargo:rerun-if-changed={}", object.display());
+        println!("cargo:rustc-link-arg={}", object.display());
+    }
     if cfg!(windows) {
         println!("cargo:rustc-link-arg=delayimp.lib");
         println!("cargo:rustc-link-arg=/DELAYLOAD:amdhip64_7.dll");
@@ -17,10 +25,12 @@ fn main() {
 
     // Forward HIP compile-time version to our crate for the runtime mismatch check.
     // Try DEP_ metadata from hip_runtime-sys first, fall back to parsing the header directly.
-    let hip_major = std::env::var("DEP_AMDHIP64_VERSION_MAJOR")
+    let hip_major = std::env::var("DEP_AMDHIP_VERSION_MAJOR")
+        .or_else(|_| std::env::var("DEP_AMDHIP64_VERSION_MAJOR"))
         .or_else(|_| std::env::var("DEP_HIP_RUNTIME_SYS_VERSION_MAJOR"))
         .ok();
-    let hip_minor = std::env::var("DEP_AMDHIP64_VERSION_MINOR")
+    let hip_minor = std::env::var("DEP_AMDHIP_VERSION_MINOR")
+        .or_else(|_| std::env::var("DEP_AMDHIP64_VERSION_MINOR"))
         .or_else(|_| std::env::var("DEP_HIP_RUNTIME_SYS_VERSION_MINOR"))
         .ok();
 
@@ -28,8 +38,11 @@ fn main() {
     let (hip_major, hip_minor) = match (hip_major, hip_minor) {
         (Some(maj), Some(min)) => (maj, min),
         _ => {
-            let header = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../ext/rocm/include/hip/hip_version.h");
+            let header = std::env::var_os("ZLUDA_HIP_SDK_ROOT")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../ext/rocm"))
+                .join("include/hip/hip_version.h");
             println!("cargo:rerun-if-changed={}", header.display());
             let mut maj = String::from("0");
             let mut min = String::from("0");

@@ -1750,7 +1750,7 @@ fn parsed_operand_reg<'a>(
         ptx_parser::ParsedOperand::VecPack(elems) => {
             if elems.len() == 1 {
                 match &elems[0] {
-                    ptx_parser::RegOrImmediate::Reg(id) => Some(*id),
+                    Some(ptx_parser::RegOrImmediate::Reg(id)) => Some(*id),
                     _ => None,
                 }
             } else {

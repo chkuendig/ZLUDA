@@ -1,4 +1,7 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=ZLUDA_HIP_SDK_ROOT");
+    println!("cargo:rerun-if-env-changed=LIBRARY_PATH");
+    let explicit_sdk = std::env::var_os("ZLUDA_HIP_SDK_ROOT").map(std::path::PathBuf::from);
     if cfg!(windows) {
         println!("cargo:rustc-link-arg=/DELAYLOAD:amdhip64_7.dll");
     } else {
@@ -7,9 +10,11 @@ fn main() {
         let library_path = std::env::var("LIBRARY_PATH").unwrap_or_default();
         let ext_rocm = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../rocm/lib");
-        let candidates: Vec<String> = library_path
+        let candidates: Vec<String> = explicit_sdk.iter()
+            .map(|root| root.join("lib").to_string_lossy().into_owned())
+            .chain(library_path
             .split(':')
-            .map(String::from)
+            .map(String::from))
             .chain(std::iter::once("/opt/rocm/lib".to_string()))
             .chain(std::iter::once(ext_rocm.to_string_lossy().to_string()))
             .collect();
@@ -29,8 +34,9 @@ fn main() {
     // Parse HIP version from hip_version.h and expose as DEP_HIP_RUNTIME_SYS_*
     // env vars to downstream crates (standard Rust -sys crate pattern).
     // Any crate with `hip_runtime-sys` in its dep tree gets these automatically.
-    let header = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../rocm/include/hip/hip_version.h");
+    let header = explicit_sdk.unwrap_or_else(||
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rocm"))
+        .join("include/hip/hip_version.h");
     println!("cargo:rerun-if-changed={}", header.display());
     if let Ok(contents) = std::fs::read_to_string(&header) {
         for line in contents.lines() {
