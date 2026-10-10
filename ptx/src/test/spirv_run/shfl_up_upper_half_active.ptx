@@ -2,6 +2,12 @@
 .target sm_30
 .address_size 64
 
+// Retention audit 2026-10-09: this is a legacy compatibility experiment,
+// not a PTX conformance test. PTX defines an active lane sourcing an inactive
+// lane in divergent shfl control flow as undefined, even if the index is in
+// range. The historical expected value 15 below is not an ISA guarantee.
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-shfl
+// Historical investigation notes follow; "correct/bug" labels are hypotheses.
 // Repro for the NRSS scatter residual (2026-06-11): an ACTIVE high lane
 // reads an INACTIVE low lane via shfl.up. CUB's warp-synchronous radix
 // scan assumes lockstep (the source lane's register is readable even when
