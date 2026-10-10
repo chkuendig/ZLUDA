@@ -1,7 +1,7 @@
 [submodule "ext/llvm-project"]
 	path = ext/llvm-project
 	url = https://github.com/chkuendig/llvm-project
-	branch = proton-zluda-rocm72
+	branch = proton-zluda
 
 [submodule "ext/HiGHS"]
 	path = ext/HiGHS
