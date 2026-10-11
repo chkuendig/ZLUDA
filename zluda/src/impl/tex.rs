@@ -19,9 +19,6 @@ pub(crate) unsafe fn sync_synthetic_texref(tex_ref: *mut textureReference) {
             tex_obj, device_global.0
         ));
         {
-            let _guard = super::stream::null_stream_sync(
-                hipStream_t(std::ptr::null_mut()),
-            );
             let _ = hipMemcpyHtoD(
                 device_global,
                 &tex_obj as *const _ as *mut std::ffi::c_void,
@@ -134,7 +131,6 @@ fn texref_sync_enabled() -> bool {
 unsafe fn texref_pre_sync_all_mutators_if_enabled() {
     if texref_sync_level() >= 2 {
         let _ = hipDeviceSynchronize();
-        super::stream::clear_dirty_flag_after_device_sync();
     }
 }
 
@@ -179,7 +175,6 @@ fn texref_post_sync_mode() -> u8 {
 unsafe fn texref_pre_sync_if_enabled() {
     if texref_sync_enabled() {
         let _ = hipDeviceSynchronize();
-        super::stream::clear_dirty_flag_after_device_sync();
     }
 }
 
@@ -208,7 +203,6 @@ unsafe fn texref_post_sync_if_enabled(dptr: u64, bytes: usize) {
         }
     }
     let _ = hipDeviceSynchronize();
-    super::stream::clear_dirty_flag_after_device_sync();
 }
 
 // 2026-06-15 Class-4 use-after-free probe. The Class-4 GPU fault is a

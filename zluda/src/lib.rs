@@ -332,6 +332,8 @@ cuda_macros::cuda_function_declarations!(
             cuStreamCreate,
             cuStreamCreateWithPriority,
             cuStreamDestroy_v2,
+            cuStreamGetFlags,
+            cuStreamGetFlags_ptsz,
             cuStreamEndCapture,
             cuStreamGetCaptureInfo_v2,
             cuStreamGetCaptureInfo_v3,
