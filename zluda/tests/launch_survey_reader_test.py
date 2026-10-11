@@ -31,17 +31,29 @@ def case(a):
    server=subprocess.Popen([str(a.reader),'survey',str(pid),'123','f'*40 if a.child=='wrong-build' else a.build,game,str(library),'0'*64 if a.child=='wrong-hash' else digest,temp],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
    def snapshot():
     ready,_,_=select.select([server.stdout],[],[],4)
-    require(ready,'snapshot timeout');line=server.stdout.readline();require(line,'reader stopped: '+server.stderr.read().decode());return json.loads(line)
+    require(ready,'snapshot timeout');line=server.stdout.readline()
+    if not line:
+     server.wait(timeout=1);raise RuntimeError('reader stopped: '+server.stderr.read().decode())
+    return json.loads(line)
+   def counted(expected):
+    deadline=time.monotonic()+4;previous=0
+    while time.monotonic()<deadline:
+     current=snapshot();value=current['total_success']
+     require(value>=previous,'counter regressed');previous=value
+     if value==expected:return current
+    raise RuntimeError('count deadline')
    def ended(expected):
     server.wait(timeout=4);require(server.returncode==expected,f'exit {server.returncode}, expected {expected}: '+server.stderr.read().decode())
     # Every published record must be complete JSON, even after invalidation.
-    for line in server.stdout.read().splitlines():json.loads(line)
+    output=server.stdout.read().splitlines()
+    if a.child in ('wrong-hash','wrong-build','stale-only','malformed-row'):require(not output,'rejected source published snapshots')
+    for line in output:json.loads(line)
    if a.child in ('wrong-hash','wrong-build','stale-only','concurrent-publication','process-death'):ended(2)
    else:
     first=snapshot();require(first['total_success']==0 and first['rows']==[],'initial snapshot differs')
     if a.child=='live':
      for _ in range(17):lib.survey_observe()
-     current=snapshot();require(current['total_success']==17 and len(current['rows'])==1,'counts differ')
+     current=counted(17);require(current['total_success']==17 and len(current['rows'])==1,'counts differ')
      require(current['rows'][0]['name']=='TurbulenceFS_test' and current['rows'][0]['success']==17,'published name/count differs')
     elif a.child=='concurrent-publication':
      barrier=threading.Barrier(4);lib.survey_observe_id.argtypes=[C.c_uint]
@@ -49,7 +61,7 @@ def case(a):
       barrier.wait(timeout=3)
       for i in range(worker*32,(worker+1)*32):lib.survey_observe_id(i)
      with ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(publish,range(4)))
-     current=snapshot();require(current['total_success']==128 and len(current['rows'])==128,'concurrent publication differs')
+     current=counted(128);require(current['total_success']==128 and len(current['rows'])==128,'concurrent publication differs')
      require(len({r['name'] for r in current['rows']})==128 and all(r['success']==1 for r in current['rows']),'published metadata differs')
     elif a.child=='process-death':
      producer.kill();producer.wait(timeout=3);ended(0)
