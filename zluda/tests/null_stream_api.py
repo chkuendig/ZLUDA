@@ -120,10 +120,12 @@ class Driver:
             args.append(0)
         self.call("cuStreamCreateWithPriority" if priority else "cuStreamCreate", types, *args)
         self.streams.append(stream)
+        return stream
+
+    def flags(self, stream):
         actual = C.c_uint(0xFFFFFFFF)
         self.call("cuStreamGetFlags", [C.c_void_p, C.POINTER(C.c_uint)], stream, C.byref(actual))
-        assert actual.value == flags, (flags, actual.value)
-        return stream
+        return actual.value
 
     def event(self):
         event = C.c_void_p()
@@ -177,7 +179,7 @@ def run_case(d, case):
     if case == "flags":
         for priority in (False, True):
             for flags in (0, 1):
-                d.stream(flags, priority)
+                assert d.flags(d.stream(flags, priority)) == flags
     elif case.startswith("nonblocking_"):
         for priority in (False, True):
             stream = d.stream(1, priority)
