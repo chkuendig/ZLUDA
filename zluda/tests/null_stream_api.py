@@ -92,12 +92,18 @@ class InsufficientWork(RuntimeError):
 
 
 class Driver:
-    def __init__(self, library):
+    def __init__(self, library, primary_context=False):
         self.lib = C.CDLL(str(Path(library).resolve()))
         self.call("cuInit", [C.c_uint], 0)
         self.context = C.c_void_p()
-        self.call("cuCtxCreate_v2", [C.POINTER(C.c_void_p), C.c_uint, C.c_int],
-                  C.byref(self.context), 0, 0)
+        self.primary_context = primary_context
+        if primary_context:
+            self.call("cuDevicePrimaryCtxRetain", [C.POINTER(C.c_void_p), C.c_int],
+                      C.byref(self.context), 0)
+            self.call("cuCtxSetCurrent", [C.c_void_p], self.context)
+        else:
+            self.call("cuCtxCreate_v2", [C.POINTER(C.c_void_p), C.c_uint, C.c_int],
+                      C.byref(self.context), 0, 0)
         self.module = C.c_void_p()
         text = C.create_string_buffer(PTX)
         self.call("cuModuleLoadData", [C.POINTER(C.c_void_p), C.c_void_p],
@@ -206,7 +212,11 @@ class Driver:
         for pointer in self.allocations:
             self.call("cuMemFree_v2", [C.c_uint64], pointer)
         self.call("cuModuleUnload", [C.c_void_p], self.module)
-        self.call("cuCtxDestroy_v2", [C.c_void_p], self.context)
+        if self.primary_context:
+            self.call("cuCtxSetCurrent", [C.c_void_p], None)
+            self.call("cuDevicePrimaryCtxRelease_v2", [C.c_int], 0)
+        else:
+            self.call("cuCtxDestroy_v2", [C.c_void_p], self.context)
 
 
 def run_case(d, case):
@@ -480,7 +490,13 @@ def main():
     if args.child_case:
         assert not any(key.startswith("ZLUDA_") for key in os.environ), "ZLUDA switches must be unset"
         try:
-            driver = Driver(args.library)
+            # In the validated HIP four-queue configuration, an extra context's
+            # allocation stream made PTDS share the producer's hardware queue.
+            # The poll expired from that serialization. Reusing the primary
+            # context avoided the observed sharing in these progress cases;
+            # this is not a guarantee of concurrent scheduling on every GPU.
+            driver = Driver(args.library, primary_context=args.child_case in
+                            ("per_thread_handle", "per_thread_entry_point"))
             run_case(driver, args.child_case)
             driver.close()
         except AssertionError as exc:
