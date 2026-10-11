@@ -207,16 +207,15 @@ pub(crate) fn destroy_v2(stream: hipStream_t) -> hipError_t {
     result
 }
 
-pub(crate) fn get_flags(stream: hipStream_t, flags: *mut u32) -> hipError_t {
-    if flags.is_null() {
-        return hipError_t::ErrorInvalidValue;
-    }
+// The generated CUDA wrapper converts this output pointer to a reference and
+// rejects null with CUDA_ERROR_INVALID_VALUE before entering this function.
+pub(crate) fn get_flags(stream: hipStream_t, flags: &mut u32) -> hipError_t {
     if let Some(value) = STREAM_FLAGS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(stream)
     {
-        unsafe { *flags = value };
+        *flags = value;
         return Ok(());
     }
     // The per-thread default stream is created lazily inside HIP.
@@ -226,7 +225,7 @@ pub(crate) fn get_flags(stream: hipStream_t, flags: *mut u32) -> hipError_t {
     hipError_t::ErrorInvalidHandle
 }
 
-pub(crate) fn get_flags_ptsz(stream: hipStream_t, flags: *mut u32) -> hipError_t {
+pub(crate) fn get_flags_ptsz(stream: hipStream_t, flags: &mut u32) -> hipError_t {
     get_flags(per_thread_stream(stream), flags)
 }
 
