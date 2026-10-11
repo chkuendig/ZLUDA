@@ -4,6 +4,46 @@ use super::hipfix;
 use cuda_types::cuda::*;
 use hip_runtime_sys::*;
 
+// HIP stores some CUDA formats as unsigned integers and strips
+// SURFACE_LDST. Keep the caller's descriptor metadata separate from those
+// internal choices. Never hold this lock across a HIP call.
+#[derive(Clone, Copy)]
+struct ArrayMetadata {
+    format: u32,
+    flags: u32,
+    generation: u64,
+    parent: Option<(usize, u64)>,
+}
+
+static ARRAY_METADATA: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(bool, usize), ArrayMetadata>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static ARRAY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn metadata(key: (bool, usize)) -> Option<ArrayMetadata> {
+    ARRAY_METADATA.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied()
+}
+
+fn remember_metadata(key: (bool, usize), format: u32, flags: u32, parent: Option<(usize, u64)>) {
+    let generation = ARRAY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ARRAY_METADATA.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        key, ArrayMetadata { format, flags, generation, parent },
+    );
+}
+
+fn forget_metadata(key: (bool, usize), old: Option<ArrayMetadata>) {
+    let Some(old) = old else { return };
+    let mut table = ARRAY_METADATA.lock().unwrap_or_else(|e| e.into_inner());
+    // HIP can release the address before destruction returns. A different
+    // thread may already have created a new object at the same address.
+    if table.get(&key).is_some_and(|current| current.generation == old.generation) {
+        table.remove(&key);
+    }
+    if key.0 {
+        table.retain(|_, entry| entry.parent != Some((key.1, old.generation)));
+    }
+}
+
 fn format_byte_size(fmt: hipArray_Format) -> usize {
     match fmt {
         hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT8
@@ -61,13 +101,17 @@ pub(crate) unsafe fn create_v2(
         hip_array,
         hack_flag
     ));
+    remember_metadata((false, hip_array as usize), p_allocate_array.Format.0, 0, None);
     *p_handle = hip_array.cast();
     Ok(())
 }
 
 pub(crate) unsafe fn destroy(h_array: CUarray) -> CUresult {
+    let key = (false, h_array as usize);
+    let old = metadata(key);
     hipfix::forget_array_hack(h_array as hipArray_t);
     hipArrayDestroy(h_array as hipArray_t)?;
+    forget_metadata(key, old);
     Ok(())
 }
 
@@ -93,6 +137,9 @@ pub(crate) unsafe fn get_descriptor_v2(
     }
     let mut desc: HIP_ARRAY_DESCRIPTOR = mem::zeroed();
     hipArrayGetDescriptor(&mut desc, h_array as hipArray_t)?;
+    if let Some(original) = metadata((false, h_array as usize)) {
+        desc.Format = hipArray_Format(original.format);
+    }
     *p_array_descriptor = *((&desc) as *const HIP_ARRAY_DESCRIPTOR as *const CUDA_ARRAY_DESCRIPTOR);
     Ok(())
 }
@@ -143,6 +190,9 @@ pub(crate) unsafe fn _3d_create_v2(
         hip_array,
         hack_flag
     ));
+    remember_metadata(
+        (false, hip_array as usize), p_allocate_array.Format.0, p_allocate_array.Flags, None,
+    );
     *p_handle = hip_array as CUarray;
     Ok(())
 }
@@ -174,6 +224,10 @@ pub(crate) unsafe fn _3d_get_descriptor_v2(
     }
     let mut desc: HIP_ARRAY3D_DESCRIPTOR = mem::zeroed();
     hipArray3DGetDescriptor(&mut desc, h_array as hipArray_t)?;
+    if let Some(original) = metadata((false, h_array as usize)) {
+        desc.Format = hipArray_Format(original.format);
+        desc.Flags = original.flags;
+    }
     *p_array_descriptor =
         *((&desc) as *const HIP_ARRAY3D_DESCRIPTOR as *const CUDA_ARRAY3D_DESCRIPTOR);
     Ok(())
@@ -209,13 +263,19 @@ pub(crate) unsafe fn mipmapped_create(
             },
         );
     }
+    remember_metadata(
+        (true, hip_array as usize), p_mipmapped_array_desc.Format.0, p_mipmapped_array_desc.Flags, None,
+    );
     *p_handle = hip_array.cast();
     Ok(())
 }
 
 pub(crate) unsafe fn mipmapped_destroy(h_mipmapped_array: CUmipmappedArray) -> CUresult {
+    let key = (true, h_mipmapped_array as usize);
+    let old = metadata(key);
     hipfix::forget_mipmapped_hack(h_mipmapped_array as hipMipmappedArray_t);
     hipMipmappedArrayDestroy(h_mipmapped_array as hipMipmappedArray_t)?;
+    forget_metadata(key, old);
     Ok(())
 }
 
@@ -230,6 +290,12 @@ pub(crate) unsafe fn mipmapped_get_level(
         h_mipmapped_array as hipMipmappedArray_t,
         level,
     )?;
+    if let Some(parent) = metadata((true, h_mipmapped_array as usize)) {
+        remember_metadata(
+            (false, hip_array as usize), parent.format, parent.flags,
+            Some((h_mipmapped_array as usize, parent.generation)),
+        );
+    }
     *p_level_array = hip_array as CUarray;
     Ok(())
 }
@@ -240,6 +306,31 @@ mod tests {
     use cuda_macros::test_cuda;
     use cuda_types::cuda::*;
     use std::mem;
+
+    #[test]
+    fn array_metadata_preserves_reused_handles() {
+        use super::{forget_metadata, metadata, remember_metadata};
+        let array = (false, 0x123);
+        let parent = (true, 0x123);
+        let child = (false, 0x456);
+        remember_metadata(array, 16, 2, None);
+        let old_array = metadata(array);
+        remember_metadata(array, 9, 0, None);
+        forget_metadata(array, old_array);
+        assert_eq!(metadata(array).unwrap().format, 9);
+        remember_metadata(parent, 16, 2, None);
+        let old_parent = metadata(parent).unwrap();
+        remember_metadata(child, 16, 2, Some((parent.1, old_parent.generation)));
+        remember_metadata(parent, 8, 0, None);
+        forget_metadata(parent, Some(old_parent));
+        assert!(metadata(child).is_none());
+        assert_eq!(metadata(parent).unwrap().format, 8);
+        assert_eq!(metadata(array).unwrap().flags, 0);
+        forget_metadata(array, metadata(array));
+        forget_metadata(parent, metadata(parent));
+        assert!(metadata(array).is_none());
+        assert!(metadata(parent).is_none());
+    }
 
     #[test_cuda]
     unsafe fn array_create_destroy(api: impl CudaApi) {
