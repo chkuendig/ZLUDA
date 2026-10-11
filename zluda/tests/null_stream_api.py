@@ -79,7 +79,16 @@ CASES = (
 MISMATCH_EXIT = 10
 TIMEOUT_EXIT = 11
 CRASH_EXIT = 12
+INSUFFICIENT_WORK_EXIT = 13
 NOT_READY = 600
+
+
+class FixtureTimeout(TimeoutError):
+    pass
+
+
+class InsufficientWork(RuntimeError):
+    pass
 
 
 class Driver:
@@ -306,44 +315,71 @@ def run_case(d, case):
         # reordered operations rather than only checking API return codes.
         workers = 4
         duration = 3.0
+        min_iterations = 32
+        batch_size = 16
         shared = case == "concurrent_blocking_legacy"
         streams = (d.stream(0),) if shared else tuple(d.stream(1) for _ in range(workers))
         legacy = None
         events = [d.event() for _ in range(workers)]
         lanes = []
         for worker in range(workers):
-            lanes.append(tuple(d.alloc() for _ in range(3)))
+            # Keep every iteration's result live until checked. A batch
+            # queues 16 * (2 launches + 2 memsets + 1 copy + 1 event) before
+            # synchronizing; the nonblocking case puts all 96 on one queue.
+            lanes.append([tuple(d.alloc() for _ in range(3)) for _ in range(batch_size)])
         d.sync(None)
         barrier = threading.Barrier(workers + 1)
         failures = []
-        final_seeds = [None] * workers
+        stats = [{"iterations": 0, "launches": 0, "events": 0, "copies": 0} for _ in range(workers)]
+        deadline = time.monotonic() + duration
 
         def stress(worker):
+            bound = False
             try:
-                a, b, c = lanes[worker]
+                d.call("cuCtxSetCurrent", [C.c_void_p], d.context)
+                bound = True
                 event = events[worker]
                 barrier.wait(timeout=5)
-                deadline = time.monotonic() + duration
                 iteration = 0
+                first = streams[0] if shared else streams[worker]
+                second = legacy if shared else first
                 while time.monotonic() < deadline:
-                    seed = 0x5100 + worker * 0x100 + iteration % 127
-                    first = streams[0] if shared else streams[worker]
-                    second = legacy if shared else first
-                    d.memset(a, seed, first)
-                    d.launch("step", first, a, b, 0)
-                    d.copy(c, b, second)
-                    d.record(event, second)
-                    d.memset(a, seed, second)
-                    d.launch("step", second, c, a, 0)
-                    # Query APIs may report not-ready while work is queued.
-                    d.event_query(event)
-                    d.query(first)
-                    d.query(second)
-                    if iteration % 32 == 0:
-                        d.sync(first)
-                        d.call("cuEventSynchronize", [C.c_void_p], event)
-                    iteration += 1
-                final_seeds[worker] = 0x5100 + worker * 0x100 + (iteration - 1) % 127
+                    batch_count = min(batch_size, max(1, min_iterations - iteration))
+                    if iteration >= min_iterations:
+                        batch_count = batch_size
+                    batch_start = iteration
+                    for slot in range(batch_count):
+                        a, b, c = lanes[worker][slot]
+                        seed = 0x5100 + worker * 0x100 + iteration % 127
+                        d.memset(a, seed, first)
+                        d.launch("step", first, a, b, 0)
+                        d.copy(c, b, second)
+                        d.record(event, second)
+                        d.memset(a, seed, second)
+                        d.launch("step", second, c, a, 0)
+                        d.event_query(event)
+                        d.query(first)
+                        d.query(second)
+                        iteration += 1
+                    d.sync(first)
+                    if shared:
+                        d.sync(None)
+                    d.call("cuEventSynchronize", [C.c_void_p], event)
+                    # Check every result in the bounded batch, so a transient
+                    # bad iteration cannot be overwritten by later work.
+                    for offset in range(batch_count):
+                        index = batch_start + offset
+                        a, b, c = lanes[worker][offset]
+                        seed = 0x5100 + worker * 0x100 + index % 127
+                        expected = (seed + 2, seed + 1, seed + 1)
+                        actual = tuple(d.read(pointer) for pointer in (a, b, c))
+                        if actual != expected:
+                            raise AssertionError(
+                                f"worker {worker} iteration {index}: expected {expected}, got {actual}")
+                    stats[worker]["iterations"] = iteration
+                    stats[worker]["launches"] += batch_count * 2
+                    stats[worker]["events"] += batch_count
+                    stats[worker]["copies"] += batch_count
                 d.sync(first)
                 if shared:
                     d.sync(None)
@@ -353,23 +389,38 @@ def run_case(d, case):
                     barrier.abort()
                 except Exception:
                     pass
+            finally:
+                if bound:
+                    try:
+                        d.call("cuCtxSetCurrent", [C.c_void_p], C.c_void_p())
+                    except BaseException as exc:
+                        failures.append((worker, RuntimeError(f"context cleanup failed: {exc}")))
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(stress, worker) for worker in range(workers)]
-            barrier.wait(timeout=5)
-            for future in futures:
-                future.result(timeout=45)
+            try:
+                barrier.wait(timeout=5)
+            except (threading.BrokenBarrierError, TimeoutError) as exc:
+                raise FixtureTimeout(f"start barrier timed out: {exc}") from exc
+            for worker, future in enumerate(futures):
+                try:
+                    future.result(timeout=45)
+                except TimeoutError as exc:
+                    raise FixtureTimeout(f"worker {worker} future timed out: {exc}") from exc
         if failures:
             worker, exc = failures[0]
+            if isinstance(exc, (TimeoutError, threading.BrokenBarrierError)):
+                raise FixtureTimeout(f"worker {worker} timed out: {exc}") from exc
             raise RuntimeError(f"worker {worker} failed: {exc}") from exc
-        for worker, (a, _b, _c) in enumerate(lanes):
-            seed = final_seeds[worker]
-            if seed is None:
-                raise AssertionError(f"worker {worker}: no stress iterations ran")
-            expected = (seed + 2, seed + 1, seed + 1)
-            actual = tuple(d.read(pointer) for pointer in lanes[worker])
-            if actual != expected:
-                raise AssertionError(f"worker {worker}: expected {expected}, got {actual}")
+        totals = {key: sum(item[key] for item in stats) for key in ("launches", "events", "copies")}
+        depth = "96 async operations per queue" if not shared else "32 blocking + 64 legacy async operations"
+        print(f"WORKLOAD {case}: iterations/worker={[item['iterations'] for item in stats]}, "
+              f"queued launches={totals['launches']} events={totals['events']} copies={totals['copies']}; "
+              f"batch={batch_size} ({depth} before sync)", flush=True)
+        for worker, item in enumerate(stats):
+            if item["iterations"] < min_iterations:
+                raise InsufficientWork(
+                    f"worker {worker} completed {item['iterations']} iterations; minimum {min_iterations}")
     elif case in ("per_thread_handle", "per_thread_entry_point"):
         stream = d.stream(0)
         flag, output = d.alloc(), d.alloc()
@@ -412,6 +463,13 @@ def main():
         except AssertionError as exc:
             print(f"DATA MISMATCH {args.child_case}: {exc}", file=sys.stderr, flush=True)
             raise SystemExit(MISMATCH_EXIT) from None
+        except FixtureTimeout as exc:
+            print(f"TIMEOUT {args.child_case}: {exc} (exit {TIMEOUT_EXIT})", file=sys.stderr, flush=True)
+            raise SystemExit(TIMEOUT_EXIT) from None
+        except InsufficientWork as exc:
+            print(f"INSUFFICIENT WORK {args.child_case}: {exc} (exit {INSUFFICIENT_WORK_EXIT})",
+                  file=sys.stderr, flush=True)
+            raise SystemExit(INSUFFICIENT_WORK_EXIT) from None
         print(f"PASS {args.child_case} (all ZLUDA_* unset)", flush=True)
         return
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ZLUDA_")}
@@ -427,8 +485,8 @@ def main():
                 print(f"TIMEOUT {case}: exceeded {timeout:g}s (exit {TIMEOUT_EXIT})", file=sys.stderr)
                 raise SystemExit(TIMEOUT_EXIT) from None
             except subprocess.CalledProcessError as exc:
-                if exc.returncode in (MISMATCH_EXIT,):
-                    raise SystemExit(MISMATCH_EXIT) from None
+                if exc.returncode in (MISMATCH_EXIT, TIMEOUT_EXIT, INSUFFICIENT_WORK_EXIT):
+                    raise SystemExit(exc.returncode) from None
                 if exc.returncode < 0:
                     signum = -exc.returncode
                     try:
