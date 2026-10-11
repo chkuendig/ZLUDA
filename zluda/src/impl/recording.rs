@@ -117,9 +117,9 @@ mod linux {
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
         if fd < 0 { return Err(io::Error::last_os_error()); }
         let file = unsafe { File::from_raw_fd(fd) };
-        let identity = file.metadata()?;
         // The inode is private and unpublished while its length and contents change.
         let initialized = (|| {
+            let identity = file.metadata()?;
             if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 { return Err(io::Error::last_os_error()); }
             file.set_len(BYTES as u64)?;
             // ftruncate alone does not reserve tmpfs backing. Without this,
@@ -148,10 +148,10 @@ mod linux {
                 unsafe { libc::munmap(mapping, BYTES); }
                 return Err(error);
             }
-            Ok(header)
+            Ok((header, identity))
         })();
         unsafe { libc::unlinkat(directory.as_raw_fd(), pending.as_ptr(), 0); }
-        let header = initialized?;
+        let (header, identity) = initialized?;
         Ok(Recording { header, owner, directory: directory.into_raw_fd(), name,
             device: identity.dev(), inode: identity.ino() })
     }
