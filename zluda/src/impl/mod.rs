@@ -16,6 +16,7 @@ pub(super) mod library;
 pub(super) mod memory;
 pub(super) mod module;
 pub(super) mod pointer;
+mod signal;
 pub(super) mod stream;
 pub(super) mod surf;
 pub(super) mod tex;

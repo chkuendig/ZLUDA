@@ -2666,8 +2666,12 @@ fn cow_bytes_to_str<'a>(data: Cow<'a, [u8]>) -> Option<Cow<'a, str>> {
 pub(crate) fn load_hip_module(
     library: CodeLibraryRef,
 ) -> Result<(hipModule_t, u32, Option<Metadata32Bit>), CUerror> {
-    let global_state = driver::global_state()?;
-    get_best_ptx_and_compile(global_state, library)
+    // All implemented CUDA module/library loads converge here. Include LLVM
+    // linking and HIP/comgr work; comgr restores sigactions but not sigaltstack.
+    super::signal::with_preserved_state(|| {
+        let global_state = driver::global_state()?;
+        get_best_ptx_and_compile(global_state, library)
+    })
 }
 
 #[derive(serde::Serialize)]
