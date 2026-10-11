@@ -27,10 +27,11 @@ def case(a):
    producer=None;pid=os.getpid()
    if a.child=='process-death':
     producer=subprocess.Popen([sys.executable,__file__,'--reader',str(a.reader),'--shim',str(library),'--build',a.build,'--producer'],stdout=subprocess.PIPE,stdin=subprocess.PIPE,env=os.environ.copy())
+    require(select.select([producer.stdout],[],[],3)[0],'producer readiness timeout')
     require(producer.stdout.readline()==b'READY\n','child producer failed');pid=producer.pid
    server=subprocess.Popen([str(a.reader),'survey',str(pid),'123','f'*40 if a.child=='wrong-build' else a.build,game,str(library),'0'*64 if a.child=='wrong-hash' else digest,temp],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-   def snapshot():
-    ready,_,_=select.select([server.stdout],[],[],4)
+   def snapshot(timeout=4):
+    ready,_,_=select.select([server.stdout],[],[],max(0,timeout))
     require(ready,'snapshot timeout');line=server.stdout.readline()
     if not line:
      server.wait(timeout=1);raise RuntimeError('reader stopped: '+server.stderr.read().decode())
@@ -38,17 +39,17 @@ def case(a):
    def counted(expected):
     deadline=time.monotonic()+4;previous=0
     while time.monotonic()<deadline:
-     current=snapshot();value=current['total_success']
+     current=snapshot(deadline-time.monotonic());value=current['total_success']
      require(value>=previous,'counter regressed');previous=value
      if value==expected:return current
     raise RuntimeError('count deadline')
    def ended(expected):
-    server.wait(timeout=4);require(server.returncode==expected,f'exit {server.returncode}, expected {expected}: '+server.stderr.read().decode())
+    stdout,stderr=server.communicate(timeout=4);require(server.returncode==expected,f'exit {server.returncode}, expected {expected}: '+stderr.decode())
     # Every published record must be complete JSON, even after invalidation.
-    output=server.stdout.read().splitlines()
+    output=stdout.splitlines()
     if a.child in ('wrong-hash','wrong-build','stale-only','malformed-row'):require(not output,'rejected source published snapshots')
     for line in output:json.loads(line)
-   if a.child in ('wrong-hash','wrong-build','stale-only','concurrent-publication','process-death'):ended(2)
+   if a.child in ('wrong-hash','wrong-build','stale-only','malformed-row'):ended(2)
    else:
     first=snapshot();require(first['total_success']==0 and first['rows']==[],'initial snapshot differs')
     if a.child=='live':
@@ -76,11 +77,25 @@ def case(a):
     elif a.child!='pending':raise RuntimeError('unknown case')
    print('PASS survey reader '+a.child,flush=True)
   finally:
+   errors=[]
    if server and server.poll() is None:
-    server.terminate();server.wait(timeout=4);require(server.returncode==0,'reader termination failed')
-   if 'producer' in locals() and producer and producer.poll() is None:producer.kill();producer.wait(timeout=3)
-   if aux:_ctypes.dlclose(aux._handle)
-   if lib:_ctypes.dlclose(lib._handle)
+    try:
+     server.terminate();stdout,stderr=server.communicate(timeout=4)
+     require(server.returncode==0,'reader termination failed: '+stderr.decode())
+     for line in stdout.splitlines():json.loads(line)
+    except Exception as exc:
+     errors.append(str(exc))
+     if server.poll() is None:
+      server.kill();server.communicate(timeout=2)
+   try:
+    if 'producer' in locals() and producer and producer.poll() is None:producer.kill();producer.communicate(timeout=3)
+   except Exception as exc:errors.append(str(exc))
+   for owned in (aux,lib):
+    try:
+     if owned:_ctypes.dlclose(owned._handle)
+    except Exception as exc:errors.append(str(exc))
+   require(not errors,'cleanup: '+repr(errors))
+
 def main():
  p=argparse.ArgumentParser();p.add_argument('--reader',type=Path,required=True);p.add_argument('--shim',type=Path,required=True);p.add_argument('--build',required=True);p.add_argument('--child',choices=CASES);p.add_argument('--producer',action='store_true');a=p.parse_args()
  if a.producer:
