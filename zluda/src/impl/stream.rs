@@ -429,12 +429,13 @@ mod tests {
 
     #[test]
     fn stream_flags_reject_invalid_arguments_without_entering_hip() {
+        let null_stream = cuda_types::cuda::CUstream(std::ptr::null_mut());
         assert_eq!(
-            unsafe { crate::cuStreamGetFlags(std::ptr::null_mut(), std::ptr::null_mut()) },
+            unsafe { crate::cuStreamGetFlags(null_stream, std::ptr::null_mut()) },
             Err(cuda_types::cuda::CUerror::INVALID_VALUE)
         );
         assert_eq!(
-            unsafe { crate::cuStreamGetFlags_ptsz(std::ptr::null_mut(), std::ptr::null_mut()) },
+            unsafe { crate::cuStreamGetFlags_ptsz(null_stream, std::ptr::null_mut()) },
             Err(cuda_types::cuda::CUerror::INVALID_VALUE)
         );
         let mut flags = 0;
