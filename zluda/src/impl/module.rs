@@ -2668,10 +2668,10 @@ pub(crate) fn load_hip_module(
 ) -> Result<(hipModule_t, u32, Option<Metadata32Bit>), CUerror> {
     // All implemented CUDA module/library loads converge here. Include LLVM
     // linking and HIP/comgr work; comgr restores sigactions but not sigaltstack.
-    super::signal::with_preserved_state(|| {
-        let global_state = driver::global_state()?;
-        get_best_ptx_and_compile(global_state, library)
-    })
+    // Finish lazy context initialization before taking the compiler-state lock;
+    // Context::new uses the same guard around its HIP stream creation.
+    let global_state = driver::global_state()?;
+    super::signal::with_preserved_state(|| get_best_ptx_and_compile(global_state, library))
 }
 
 #[derive(serde::Serialize)]

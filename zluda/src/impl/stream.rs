@@ -1,3 +1,4 @@
+use cuda_types::cuda::CUresult;
 use hip_runtime_sys::*;
 use std::sync::Mutex;
 
@@ -220,8 +221,11 @@ pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
     result
 }
 
-pub(crate) fn create(stream: *mut hipStream_t, flags: ::core::ffi::c_uint) -> hipError_t {
-    let result = unsafe { hipStreamCreateWithFlags(stream, flags) };
+pub(crate) fn create(stream: *mut hipStream_t, flags: ::core::ffi::c_uint) -> CUresult {
+    let result = super::signal::with_preserved_state(|| {
+        unsafe { hipStreamCreateWithFlags(stream, flags) }?;
+        Ok(())
+    });
     super::driver::zluda_log_err(&format!(
         "cuStreamCreate(flags={:#x}) -> {:?} stream={:?}",
         flags,
@@ -235,8 +239,11 @@ pub(crate) fn create_with_priority(
     stream: *mut hipStream_t,
     flags: ::core::ffi::c_uint,
     priority: ::core::ffi::c_int,
-) -> hipError_t {
-    unsafe { hipStreamCreateWithPriority(stream, flags, priority) }
+) -> CUresult {
+    super::signal::with_preserved_state(|| {
+        unsafe { hipStreamCreateWithPriority(stream, flags, priority) }?;
+        Ok(())
+    })
 }
 
 pub(crate) fn destroy_v2(stream: hipStream_t) -> hipError_t {
