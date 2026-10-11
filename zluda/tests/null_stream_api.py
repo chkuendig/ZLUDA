@@ -330,8 +330,17 @@ def run_case(d, case):
         d.sync(None)
         barrier = threading.Barrier(workers + 1)
         failures = []
+        failure_lock = threading.Lock()
         stats = [{"iterations": 0, "launches": 0, "events": 0, "copies": 0} for _ in range(workers)]
         deadline = time.monotonic() + duration
+
+        def record_failure(worker, exc):
+            # Keep the first failure intact. Barrier waiters observe
+            # BrokenBarrierError after another worker aborts the barrier; that
+            # is a consequence of the root error, not a replacement for it.
+            with failure_lock:
+                if not failures:
+                    failures.append((worker, exc))
 
         def stress(worker):
             bound = False
@@ -339,7 +348,14 @@ def run_case(d, case):
                 d.call("cuCtxSetCurrent", [C.c_void_p], d.context)
                 bound = True
                 event = events[worker]
-                barrier.wait(timeout=5)
+                try:
+                    barrier.wait(timeout=5)
+                except threading.BrokenBarrierError as exc:
+                    with failure_lock:
+                        root_failure = failures[0] if failures else None
+                    if root_failure is None:
+                        raise FixtureTimeout(f"worker {worker} start barrier timed out: {exc}") from exc
+                    raise
                 iteration = 0
                 first = streams[0] if shared else streams[worker]
                 second = legacy if shared else first
@@ -384,7 +400,7 @@ def run_case(d, case):
                 if shared:
                     d.sync(None)
             except BaseException as exc:
-                failures.append((worker, exc))
+                record_failure(worker, exc)
                 try:
                     barrier.abort()
                 except Exception:
@@ -394,14 +410,17 @@ def run_case(d, case):
                     try:
                         d.call("cuCtxSetCurrent", [C.c_void_p], C.c_void_p())
                     except BaseException as exc:
-                        failures.append((worker, RuntimeError(f"context cleanup failed: {exc}")))
+                        record_failure(worker, RuntimeError(f"context cleanup failed: {exc}"))
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(stress, worker) for worker in range(workers)]
             try:
                 barrier.wait(timeout=5)
-            except (threading.BrokenBarrierError, TimeoutError) as exc:
-                raise FixtureTimeout(f"start barrier timed out: {exc}") from exc
+            except threading.BrokenBarrierError as exc:
+                with failure_lock:
+                    root_failure = failures[0] if failures else None
+                if root_failure is None:
+                    raise FixtureTimeout(f"start barrier timed out: {exc}") from exc
             for worker, future in enumerate(futures):
                 try:
                     future.result(timeout=45)
@@ -409,9 +428,13 @@ def run_case(d, case):
                     raise FixtureTimeout(f"worker {worker} future timed out: {exc}") from exc
         if failures:
             worker, exc = failures[0]
-            if isinstance(exc, (TimeoutError, threading.BrokenBarrierError)):
+            if isinstance(exc, FixtureTimeout):
                 raise FixtureTimeout(f"worker {worker} timed out: {exc}") from exc
-            raise RuntimeError(f"worker {worker} failed: {exc}") from exc
+            if isinstance(exc, threading.BrokenBarrierError):
+                raise FixtureTimeout(f"worker {worker} start barrier timed out: {exc}") from exc
+            # Preserve AssertionError so the child classifies data mismatches
+            # as exit 10; API/runtime errors keep their call and return code.
+            raise type(exc)(f"worker {worker} failed: {exc}") from exc
         totals = {key: sum(item[key] for item in stats) for key in ("launches", "events", "copies")}
         depth = "96 async operations per queue" if not shared else "32 blocking + 64 legacy async operations"
         print(f"WORKLOAD {case}: iterations/worker={[item['iterations'] for item in stats]}, "
