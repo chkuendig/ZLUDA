@@ -1431,6 +1431,7 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log("[ZLUDA] cuInit -> SUCCESS");
     zluda_log_err("=== ZLUDA cuInit -> SUCCESS ===");
     crate::r#impl::recording::initialize();
+    crate::r#impl::launch_survey::initialize();
     Ok(())
 }
 

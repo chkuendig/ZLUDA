@@ -15142,6 +15142,7 @@ pub(crate) fn launch_kernel(
     if result.is_ok() {
         crate::r#impl::recording::submitted();
     }
+    crate::r#impl::launch_survey::observed(&name, f.base.0 as usize, f.module.0 as usize, stream.0 as usize, result.as_ref().err().map_or(0, |e| e.0.get()));
     // 2026-06-08 Class A upper-bound diagnostic: hipDeviceSync after
     // EVERY successful kernel launch. The hypothesis is that Class A's
     // GPU TCP wild-write category may be an HDP-coherency issue that

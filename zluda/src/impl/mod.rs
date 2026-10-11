@@ -18,6 +18,7 @@ pub(super) mod module;
 pub(super) mod pointer;
 mod signal;
 pub(crate) mod recording;
+pub(crate) mod launch_survey;
 pub(super) mod stream;
 pub(super) mod surf;
 pub(super) mod tex;

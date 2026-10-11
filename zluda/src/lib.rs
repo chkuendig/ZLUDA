@@ -87,6 +87,7 @@ pub(crate) fn initialized() -> bool {
 fn deinitialize() {
     INITIALIZED.store(false, Ordering::SeqCst);
     r#impl::recording::shutdown();
+    r#impl::launch_survey::shutdown();
 }
 
 macro_rules! unimplemented {
