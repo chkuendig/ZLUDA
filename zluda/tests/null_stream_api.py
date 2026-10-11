@@ -13,6 +13,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import signal
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -69,8 +72,14 @@ wait:
 CASES = (
     "flags", "nonblocking_before_legacy", "nonblocking_after_legacy",
     "blocking_order", "cross_thread_null", "event_order",
-    "per_thread_handle", "per_thread_entry_point",
+    "per_thread_handle", "per_thread_entry_point", "concurrent_blocking_legacy",
+    "concurrent_nonblocking",
 )
+
+MISMATCH_EXIT = 10
+TIMEOUT_EXIT = 11
+CRASH_EXIT = 12
+NOT_READY = 600
 
 
 class Driver:
@@ -142,6 +151,22 @@ class Driver:
 
     def sync(self, stream):
         self.call("cuStreamSynchronize", [C.c_void_p], stream)
+
+    def query(self, stream):
+        fn = self.lib.cuStreamQuery
+        fn.argtypes, fn.restype = [C.c_void_p], C.c_int
+        result = fn(stream)
+        if result not in (0, NOT_READY):
+            raise RuntimeError(f"cuStreamQuery returned {result}")
+        return result == 0
+
+    def event_query(self, event):
+        fn = self.lib.cuEventQuery
+        fn.argtypes, fn.restype = [C.c_void_p], C.c_int
+        result = fn(event)
+        if result not in (0, NOT_READY):
+            raise RuntimeError(f"cuEventQuery returned {result}")
+        return result == 0
 
     def memset(self, pointer, value, stream):
         self.call("cuMemsetD32Async", [C.c_uint64, C.c_uint, C.c_size_t, C.c_void_p],
@@ -274,6 +299,77 @@ def run_case(d, case):
         d.launch("step", blocking, c, a, 0)
         d.sync(blocking)
         assert d.read(a) == 42
+    elif case in ("concurrent_blocking_legacy", "concurrent_nonblocking"):
+        # Each host thread owns a private data lane. The legacy variant shares
+        # one blocking and one null queue; the progress variant gives each
+        # worker a separate nonblocking queue. Final values expose lost or
+        # reordered operations rather than only checking API return codes.
+        workers = 4
+        duration = 3.0
+        shared = case == "concurrent_blocking_legacy"
+        streams = (d.stream(0),) if shared else tuple(d.stream(1) for _ in range(workers))
+        legacy = None
+        events = [d.event() for _ in range(workers)]
+        lanes = []
+        for worker in range(workers):
+            lanes.append(tuple(d.alloc() for _ in range(3)))
+        d.sync(None)
+        barrier = threading.Barrier(workers + 1)
+        failures = []
+        final_seeds = [None] * workers
+
+        def stress(worker):
+            try:
+                a, b, c = lanes[worker]
+                event = events[worker]
+                barrier.wait(timeout=5)
+                deadline = time.monotonic() + duration
+                iteration = 0
+                while time.monotonic() < deadline:
+                    seed = 0x5100 + worker * 0x100 + iteration % 127
+                    first = streams[0] if shared else streams[worker]
+                    second = legacy if shared else first
+                    d.memset(a, seed, first)
+                    d.launch("step", first, a, b, 0)
+                    d.copy(c, b, second)
+                    d.record(event, second)
+                    d.memset(a, seed, second)
+                    d.launch("step", second, c, a, 0)
+                    # Query APIs may report not-ready while work is queued.
+                    d.event_query(event)
+                    d.query(first)
+                    d.query(second)
+                    if iteration % 32 == 0:
+                        d.sync(first)
+                        d.call("cuEventSynchronize", [C.c_void_p], event)
+                    iteration += 1
+                final_seeds[worker] = 0x5100 + worker * 0x100 + (iteration - 1) % 127
+                d.sync(first)
+                if shared:
+                    d.sync(None)
+            except BaseException as exc:
+                failures.append((worker, exc))
+                try:
+                    barrier.abort()
+                except Exception:
+                    pass
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(stress, worker) for worker in range(workers)]
+            barrier.wait(timeout=5)
+            for future in futures:
+                future.result(timeout=45)
+        if failures:
+            worker, exc = failures[0]
+            raise RuntimeError(f"worker {worker} failed: {exc}") from exc
+        for worker, (a, _b, _c) in enumerate(lanes):
+            seed = final_seeds[worker]
+            if seed is None:
+                raise AssertionError(f"worker {worker}: no stress iterations ran")
+            expected = (seed + 2, seed + 1, seed + 1)
+            actual = tuple(d.read(pointer) for pointer in lanes[worker])
+            if actual != expected:
+                raise AssertionError(f"worker {worker}: expected {expected}, got {actual}")
     elif case in ("per_thread_handle", "per_thread_entry_point"):
         stream = d.stream(0)
         flag, output = d.alloc(), d.alloc()
@@ -309,9 +405,13 @@ def main():
     args = parser.parse_args()
     if args.child_case:
         assert not any(key.startswith("ZLUDA_") for key in os.environ), "ZLUDA switches must be unset"
-        driver = Driver(args.library)
-        run_case(driver, args.child_case)
-        driver.close()
+        try:
+            driver = Driver(args.library)
+            run_case(driver, args.child_case)
+            driver.close()
+        except AssertionError as exc:
+            print(f"DATA MISMATCH {args.child_case}: {exc}", file=sys.stderr, flush=True)
+            raise SystemExit(MISMATCH_EXIT) from None
         print(f"PASS {args.child_case} (all ZLUDA_* unset)", flush=True)
         return
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ZLUDA_")}
@@ -319,11 +419,26 @@ def main():
         with tempfile.TemporaryDirectory(prefix="zluda-null-stream-") as cache:
             environment["XDG_CACHE_HOME"] = cache
             print(f"RUN {case} (all ZLUDA_* unset)", flush=True)
+            timeout = min(args.timeout, 55) if case.startswith("concurrent_") else args.timeout
             try:
                 subprocess.run([sys.executable, __file__, "--library", str(args.library.resolve()),
-                                "--child-case", case], env=environment, check=True, timeout=args.timeout)
+                                "--child-case", case], env=environment, check=True, timeout=timeout)
             except subprocess.TimeoutExpired:
-                raise SystemExit(f"FAIL {case}: exceeded {args.timeout:g}s") from None
+                print(f"TIMEOUT {case}: exceeded {timeout:g}s (exit {TIMEOUT_EXIT})", file=sys.stderr)
+                raise SystemExit(TIMEOUT_EXIT) from None
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode in (MISMATCH_EXIT,):
+                    raise SystemExit(MISMATCH_EXIT) from None
+                if exc.returncode < 0:
+                    signum = -exc.returncode
+                    try:
+                        signal_name = signal.Signals(signum).name
+                    except ValueError:
+                        signal_name = f"signal {signum}"
+                    print(f"CRASH {case}: child terminated by {signal_name} (exit {CRASH_EXIT})",
+                          file=sys.stderr, flush=True)
+                    raise SystemExit(CRASH_EXIT) from None
+                raise SystemExit(f"FAIL {case}: child exit {exc.returncode}") from None
     print("PASS native null-stream fixtures", flush=True)
 
 
