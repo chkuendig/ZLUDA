@@ -5,7 +5,6 @@ define amdgpu_kernel void @trap(ptr addrspace(4) byref(i64) %"37", ptr addrspace
   br label %"35"
 
 "35":                                             ; preds = %1
-  fence seq_cst
   call void @llvm.trap()
   unreachable
 }

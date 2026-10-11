@@ -15,7 +15,6 @@ define amdgpu_kernel void @tex_obj_stub(ptr addrspace(4) byref(i64) %"48") #1 {
   br label %"47"
 
 "47":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"48", align 8
   store i64 %2, ptr addrspace(5) %"49", align 8
   store i64 0, ptr addrspace(5) %"50", align 8
@@ -39,7 +38,6 @@ define amdgpu_kernel void @tex_obj_stub(ptr addrspace(4) byref(i64) %"48") #1 {
   %8 = load float, ptr addrspace(5) %"53", align 4
   %"70" = inttoptr i64 %7 to ptr addrspace(1)
   store float %8, ptr addrspace(1) %"70", align 4
-  fence seq_cst
   ret void
 }
 

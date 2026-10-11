@@ -18,7 +18,6 @@ define amdgpu_kernel void @bar_red_and_pred(ptr addrspace(4) byref(i64) %"81", p
   br label %"79"
 
 "79":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"82", align 8
   store i64 %2, ptr addrspace(5) %"83", align 8
   %"53" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -112,7 +111,6 @@ define amdgpu_kernel void @bar_red_and_pred(ptr addrspace(4) byref(i64) %"81", p
   %26 = load i32, ptr addrspace(5) %"89", align 4
   %"134" = inttoptr i64 %25 to ptr
   store i32 %26, ptr %"134", align 4
-  fence seq_cst
   ret void
 }
 

@@ -9,7 +9,6 @@ define amdgpu_kernel void @non_scalar_ptr_offset(ptr addrspace(4) byref(i64) %"4
   br label %"42"
 
 "42":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"43", align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
   %3 = load i64, ptr addrspace(4) %"44", align 8
@@ -30,7 +29,6 @@ define amdgpu_kernel void @non_scalar_ptr_offset(ptr addrspace(4) byref(i64) %"4
   %9 = load i32, ptr addrspace(5) %"47", align 4
   %"60" = inttoptr i64 %8 to ptr addrspace(1)
   store i32 %9, ptr addrspace(1) %"60", align 4
-  fence seq_cst
   ret void
 }
 

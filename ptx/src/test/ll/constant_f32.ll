@@ -8,7 +8,6 @@ define amdgpu_kernel void @constant_f32(ptr addrspace(4) byref(i64) %"40", ptr a
   br label %"39"
 
 "39":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"40", align 8
   store i64 %2, ptr addrspace(5) %"42", align 8
   %3 = load i64, ptr addrspace(4) %"41", align 8
@@ -24,7 +23,6 @@ define amdgpu_kernel void @constant_f32(ptr addrspace(4) byref(i64) %"40", ptr a
   %8 = load float, ptr addrspace(5) %"44", align 4
   %"54" = inttoptr i64 %7 to ptr
   store float %8, ptr %"54", align 4
-  fence seq_cst
   ret void
 }
 

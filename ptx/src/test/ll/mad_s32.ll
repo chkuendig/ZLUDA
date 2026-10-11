@@ -11,7 +11,6 @@ define amdgpu_kernel void @mad_s32(ptr addrspace(4) byref(i64) %"46", ptr addrsp
   br label %"45"
 
 "45":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"46", align 8
   store i64 %2, ptr addrspace(5) %"48", align 8
   %3 = load i64, ptr addrspace(4) %"47", align 8
@@ -40,7 +39,6 @@ define amdgpu_kernel void @mad_s32(ptr addrspace(4) byref(i64) %"46", ptr addrsp
   %15 = load i32, ptr addrspace(5) %"50", align 4
   %"71" = inttoptr i64 %14 to ptr
   store i32 %15, ptr %"71", align 4
-  fence seq_cst
   ret void
 }
 

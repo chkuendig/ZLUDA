@@ -11,7 +11,6 @@ define amdgpu_kernel void @atom_add(ptr addrspace(4) byref(i64) %"45", ptr addrs
   br label %"44"
 
 "44":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"45", align 8
   store i64 %2, ptr addrspace(5) %"47", align 8
   %3 = load i64, ptr addrspace(4) %"46", align 8
@@ -28,9 +27,9 @@ define amdgpu_kernel void @atom_add(ptr addrspace(4) byref(i64) %"45", ptr addrs
   %8 = load i32, ptr addrspace(5) %"49", align 4
   store i32 %8, ptr addrspace(3) @shared_mem, align 4
   %9 = load i32, ptr addrspace(5) %"50", align 4
-  %10 = atomicrmw add ptr addrspace(3) @shared_mem, i32 %9 syncscope("one-as") acq_rel, align 4
+  %10 = atomicrmw add ptr addrspace(3) @shared_mem, i32 %9 syncscope("agent-one-as") monotonic, align 4
   store i32 %10, ptr addrspace(5) %"49", align 4
-  %11 = load volatile i32, ptr addrspace(3) @shared_mem, align 4
+  %11 = load i32, ptr addrspace(3) @shared_mem, align 4
   store i32 %11, ptr addrspace(5) %"50", align 4
   %12 = load i64, ptr addrspace(5) %"48", align 8
   %13 = load i32, ptr addrspace(5) %"49", align 4
@@ -41,7 +40,6 @@ define amdgpu_kernel void @atom_add(ptr addrspace(4) byref(i64) %"45", ptr addrs
   %"43" = getelementptr inbounds i8, ptr %"71", i64 4
   %15 = load i32, ptr addrspace(5) %"50", align 4
   store i32 %15, ptr %"43", align 4
-  fence seq_cst
   ret void
 }
 

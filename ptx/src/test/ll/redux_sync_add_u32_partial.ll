@@ -15,7 +15,6 @@ define amdgpu_kernel void @redux_sync_add_u32_partial(ptr addrspace(4) byref(i64
   br label %"49"
 
 "49":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"51", align 8
   store i64 %2, ptr addrspace(5) %"54", align 8
   %"43" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -49,7 +48,6 @@ define amdgpu_kernel void @redux_sync_add_u32_partial(ptr addrspace(4) byref(i64
   %13 = load i32, ptr addrspace(5) %"53", align 4
   %"75" = inttoptr i64 %12 to ptr
   store i32 %13, ptr %"75", align 4
-  fence seq_cst
   ret void
 }
 

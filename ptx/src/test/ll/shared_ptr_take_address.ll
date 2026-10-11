@@ -12,7 +12,6 @@ define amdgpu_kernel void @shared_ptr_take_address(ptr addrspace(4) byref(i64) %
   br label %"41"
 
 "41":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"42", align 8
   store i64 %2, ptr addrspace(5) %"44", align 8
   %3 = load i64, ptr addrspace(4) %"43", align 8
@@ -31,13 +30,12 @@ define amdgpu_kernel void @shared_ptr_take_address(ptr addrspace(4) byref(i64) %
   %9 = load i64, ptr addrspace(5) %"46", align 8
   %10 = trunc i64 %9 to i32
   %"63" = inttoptr i32 %10 to ptr addrspace(3)
-  %11 = load volatile i64, ptr addrspace(3) %"63", align 8
+  %11 = load i64, ptr addrspace(3) %"63", align 8
   store i64 %11, ptr addrspace(5) %"48", align 8
   %12 = load i64, ptr addrspace(5) %"45", align 8
   %13 = load i64, ptr addrspace(5) %"48", align 8
   %"64" = inttoptr i64 %12 to ptr addrspace(1)
   store i64 %13, ptr addrspace(1) %"64", align 8
-  fence seq_cst
   ret void
 }
 

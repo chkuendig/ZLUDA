@@ -9,7 +9,6 @@ define amdgpu_kernel void @selp_true(ptr addrspace(4) byref(i64) %"43", ptr addr
   br label %"42"
 
 "42":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"43", align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
   %3 = load i64, ptr addrspace(4) %"44", align 8
@@ -31,7 +30,6 @@ define amdgpu_kernel void @selp_true(ptr addrspace(4) byref(i64) %"43", ptr addr
   %11 = load i16, ptr addrspace(5) %"47", align 2
   %"62" = inttoptr i64 %10 to ptr
   store i16 %11, ptr %"62", align 2
-  fence seq_cst
   ret void
 }
 

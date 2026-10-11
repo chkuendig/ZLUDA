@@ -8,7 +8,6 @@ define amdgpu_kernel void @red_add_f32(ptr addrspace(4) byref(i64) %"39", ptr ad
   br label %"38"
 
 "38":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"39", align 8
   store i64 %2, ptr addrspace(5) %"41", align 8
   %3 = load i64, ptr addrspace(4) %"40", align 8
@@ -20,8 +19,7 @@ define amdgpu_kernel void @red_add_f32(ptr addrspace(4) byref(i64) %"39", ptr ad
   %6 = load i64, ptr addrspace(5) %"42", align 8
   %7 = load float, ptr addrspace(5) %"43", align 4
   %"51" = inttoptr i64 %6 to ptr addrspace(1)
-  %8 = atomicrmw fadd ptr addrspace(1) %"51", float %7 syncscope("one-as") acq_rel, align 4
-  fence seq_cst
+  %8 = atomicrmw fadd ptr addrspace(1) %"51", float %7 syncscope("agent-one-as") monotonic, align 4
   ret void
 }
 

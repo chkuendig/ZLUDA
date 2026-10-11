@@ -17,7 +17,6 @@ define amdgpu_kernel void @assertfail(ptr addrspace(4) byref(i64) %"95", ptr add
   br label %"93"
 
 "93":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"95", align 8
   store i64 %2, ptr addrspace(5) %"97", align 8
   %3 = load i64, ptr addrspace(4) %"96", align 8
@@ -58,7 +57,6 @@ define amdgpu_kernel void @assertfail(ptr addrspace(4) byref(i64) %"95", ptr add
   %18 = load i64, ptr addrspace(5) %"100", align 8
   %"132" = inttoptr i64 %17 to ptr
   store i64 %18, ptr %"132", align 8
-  fence seq_cst
   ret void
 }
 

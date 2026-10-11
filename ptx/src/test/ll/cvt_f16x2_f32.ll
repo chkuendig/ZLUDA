@@ -10,7 +10,6 @@ define amdgpu_kernel void @cvt_f16x2_f32(ptr addrspace(4) byref(i64) %"43", ptr 
   br label %"42"
 
 "42":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"43", align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
   %3 = load i64, ptr addrspace(4) %"44", align 8
@@ -40,7 +39,6 @@ define amdgpu_kernel void @cvt_f16x2_f32(ptr addrspace(4) byref(i64) %"43", ptr 
   %"67" = inttoptr i64 %13 to ptr addrspace(1)
   %"68" = bitcast <2 x half> %14 to i32
   store i32 %"68", ptr addrspace(1) %"67", align 4
-  fence seq_cst
   ret void
 }
 

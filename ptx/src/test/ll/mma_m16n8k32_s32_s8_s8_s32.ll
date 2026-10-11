@@ -97,7 +97,6 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   br label %"118"
 
 "118":                                            ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"152", align 8
   store i64 %2, ptr addrspace(5) %"153", align 8
   %"76" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -317,7 +316,6 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32(ptr addrspace(4) byref(i64
   %100 = load i32, ptr addrspace(5) %"185", align 4
   %"342" = bitcast i32 %100 to float
   store float %"342", ptr %"116", align 4
-  fence seq_cst
   ret void
 }
 

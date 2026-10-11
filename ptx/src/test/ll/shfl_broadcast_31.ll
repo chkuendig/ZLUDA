@@ -15,7 +15,6 @@ define amdgpu_kernel void @shfl_broadcast_31(ptr addrspace(4) byref(i64) %"49") 
   br label %"47"
 
 "47":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"49", align 8
   store i64 %2, ptr addrspace(5) %"50", align 8
   %"41" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -27,24 +26,23 @@ define amdgpu_kernel void @shfl_broadcast_31(ptr addrspace(4) byref(i64) %"49") 
   %"75" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_idx_b32_pred(i32 %4, i32 31, i32 31, i32 -1)
   %"72" = extractelement <2 x i32> %"75", i8 0
   %"76" = extractelement <2 x i32> %"75", i8 1
-  %5 = trunc i32 %"76" to i1
+  %"61" = trunc i32 %"76" to i1
   store i32 %"72", ptr addrspace(5) %"54", align 4
-  store i1 %5, ptr addrspace(5) %"55", align 1
-  %6 = load i32, ptr addrspace(5) %"52", align 4
-  %7 = zext i32 %6 to i64
-  store i64 %7, ptr addrspace(5) %"51", align 8
-  %8 = load i64, ptr addrspace(5) %"51", align 8
-  %"65" = mul i64 %8, 4
+  store i1 %"61", ptr addrspace(5) %"55", align 1
+  %5 = load i32, ptr addrspace(5) %"52", align 4
+  %"63" = zext i32 %5 to i64
+  store i64 %"63", ptr addrspace(5) %"51", align 8
+  %6 = load i64, ptr addrspace(5) %"51", align 8
+  %"65" = mul i64 %6, 4
   store i64 %"65", ptr addrspace(5) %"51", align 8
-  %9 = load i64, ptr addrspace(5) %"50", align 8
-  %10 = load i64, ptr addrspace(5) %"51", align 8
-  %"67" = add i64 %9, %10
+  %7 = load i64, ptr addrspace(5) %"50", align 8
+  %8 = load i64, ptr addrspace(5) %"51", align 8
+  %"67" = add i64 %7, %8
   store i64 %"67", ptr addrspace(5) %"50", align 8
-  %11 = load i64, ptr addrspace(5) %"50", align 8
-  %12 = load i32, ptr addrspace(5) %"54", align 4
-  %"74" = inttoptr i64 %11 to ptr
-  store i32 %12, ptr %"74", align 4
-  fence seq_cst
+  %9 = load i64, ptr addrspace(5) %"50", align 8
+  %10 = load i32, ptr addrspace(5) %"54", align 4
+  %"74" = inttoptr i64 %9 to ptr
+  store i32 %10, ptr %"74", align 4
   ret void
 }
 

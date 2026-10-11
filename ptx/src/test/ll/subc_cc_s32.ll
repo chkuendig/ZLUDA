@@ -12,7 +12,6 @@ define amdgpu_kernel void @subc_cc_s32(ptr addrspace(4) byref(i64) %"49", ptr ad
   br label %"48"
 
 "48":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"49", align 8
   store i64 %2, ptr addrspace(5) %"51", align 8
   %3 = load i64, ptr addrspace(4) %"50", align 8
@@ -53,7 +52,6 @@ define amdgpu_kernel void @subc_cc_s32(ptr addrspace(4) byref(i64) %"49", ptr ad
   %24 = load i64, ptr addrspace(5) %"55", align 8
   %"81" = inttoptr i64 %23 to ptr
   store i64 %24, ptr %"81", align 8
-  fence seq_cst
   ret void
 }
 

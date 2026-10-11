@@ -10,7 +10,6 @@ define amdgpu_kernel void @global_array_f32(ptr addrspace(4) byref(i64) %"42", p
   br label %"41"
 
 "41":                                             ; preds = %1
-  fence seq_cst
   store i64 ptrtoint (ptr addrspace(1) @foobar to i64), ptr addrspace(5) %"44", align 8
   %2 = load i64, ptr addrspace(4) %"43", align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
@@ -23,7 +22,6 @@ define amdgpu_kernel void @global_array_f32(ptr addrspace(4) byref(i64) %"42", p
   %6 = load float, ptr addrspace(5) %"46", align 4
   %"55" = inttoptr i64 %5 to ptr
   store float %6, ptr %"55", align 4
-  fence seq_cst
   ret void
 }
 

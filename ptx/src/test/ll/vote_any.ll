@@ -15,7 +15,6 @@ define amdgpu_kernel void @vote_any(ptr addrspace(4) byref(i64) %"49") #1 {
   br label %"47"
 
 "47":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"49", align 8
   store i64 %2, ptr addrspace(5) %"54", align 8
   %"41" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -41,7 +40,6 @@ define amdgpu_kernel void @vote_any(ptr addrspace(4) byref(i64) %"49") #1 {
   %12 = load i32, ptr addrspace(5) %"53", align 4
   %"71" = inttoptr i64 %11 to ptr
   store i32 %12, ptr %"71", align 4
-  fence seq_cst
   ret void
 }
 

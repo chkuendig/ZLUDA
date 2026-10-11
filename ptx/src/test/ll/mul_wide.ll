@@ -10,7 +10,6 @@ define amdgpu_kernel void @mul_wide(ptr addrspace(4) byref(i64) %"43", ptr addrs
   br label %"42"
 
 "42":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"43", align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
   %3 = load i64, ptr addrspace(4) %"44", align 8
@@ -34,7 +33,6 @@ define amdgpu_kernel void @mul_wide(ptr addrspace(4) byref(i64) %"43", ptr addrs
   %13 = load i64, ptr addrspace(5) %"49", align 8
   %"63" = inttoptr i64 %12 to ptr
   store i64 %13, ptr %"63", align 8
-  fence seq_cst
   ret void
 }
 

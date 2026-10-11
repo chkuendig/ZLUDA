@@ -10,7 +10,6 @@ define amdgpu_kernel void @shr_u64_32(ptr addrspace(4) byref(i64) %"42", ptr add
   br label %"41"
 
 "41":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"42", align 8
   store i64 %2, ptr addrspace(5) %"44", align 8
   %3 = load i64, ptr addrspace(4) %"43", align 8
@@ -24,13 +23,12 @@ define amdgpu_kernel void @shr_u64_32(ptr addrspace(4) byref(i64) %"42", ptr add
   %"53" = select i1 false, i64 0, i64 %7
   store i64 %"53", ptr addrspace(5) %"47", align 8
   %8 = load i64, ptr addrspace(5) %"47", align 8
-  %9 = trunc i64 %8 to i32
-  store i32 %9, ptr addrspace(5) %"48", align 4
-  %10 = load i64, ptr addrspace(5) %"45", align 8
-  %11 = load i32, ptr addrspace(5) %"48", align 4
-  %"60" = inttoptr i64 %10 to ptr
-  store i32 %11, ptr %"60", align 4
-  fence seq_cst
+  %"55" = trunc i64 %8 to i32
+  store i32 %"55", ptr addrspace(5) %"48", align 4
+  %9 = load i64, ptr addrspace(5) %"45", align 8
+  %10 = load i32, ptr addrspace(5) %"48", align 4
+  %"60" = inttoptr i64 %9 to ptr
+  store i32 %10, ptr %"60", align 4
   ret void
 }
 

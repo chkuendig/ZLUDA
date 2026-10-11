@@ -16,7 +16,6 @@ define amdgpu_kernel void @vector8(ptr addrspace(4) byref(i64) %"48", ptr addrsp
   br label %"47"
 
 "47":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"48", align 8
   store i64 %2, ptr addrspace(5) %"50", align 8
   %3 = load i64, ptr addrspace(4) %"49", align 8
@@ -46,7 +45,6 @@ define amdgpu_kernel void @vector8(ptr addrspace(4) byref(i64) %"48", ptr addrsp
   %8 = load i32, ptr addrspace(5) %"60", align 4
   %"79" = inttoptr i64 %7 to ptr
   store i32 %8, ptr %"79", align 4
-  fence seq_cst
   ret void
 }
 

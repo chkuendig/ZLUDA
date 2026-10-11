@@ -8,7 +8,6 @@ define amdgpu_kernel void @clz(ptr addrspace(4) byref(i64) %"39", ptr addrspace(
   br label %"38"
 
 "38":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"39", align 8
   store i64 %2, ptr addrspace(5) %"41", align 8
   %3 = load i64, ptr addrspace(4) %"40", align 8
@@ -24,7 +23,6 @@ define amdgpu_kernel void @clz(ptr addrspace(4) byref(i64) %"39", ptr addrspace(
   %9 = load i32, ptr addrspace(5) %"43", align 4
   %"54" = inttoptr i64 %8 to ptr
   store i32 %9, ptr %"54", align 4
-  fence seq_cst
   ret void
 }
 

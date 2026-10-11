@@ -36,7 +36,6 @@ define amdgpu_kernel void @mma_m16n8k16_f32_bf16_bf16_f32_2x(ptr addrspace(4) by
   br label %"94"
 
 "94":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"96", align 8
   store i64 %2, ptr addrspace(5) %"97", align 8
   %"62" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -239,7 +238,6 @@ define amdgpu_kernel void @mma_m16n8k16_f32_bf16_bf16_f32_2x(ptr addrspace(4) by
   %"93" = getelementptr inbounds i8, ptr %"246", i64 28
   %105 = load float, ptr addrspace(5) %"123", align 4
   store float %105, ptr %"93", align 4
-  fence seq_cst
   ret void
 }
 

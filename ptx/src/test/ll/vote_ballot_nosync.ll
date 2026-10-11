@@ -14,7 +14,6 @@ define amdgpu_kernel void @vote_ballot_nosync(ptr addrspace(4) byref(i64) %"45")
   br label %"43"
 
 "43":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"45", align 8
   store i64 %2, ptr addrspace(5) %"49", align 8
   %"40" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -37,7 +36,6 @@ define amdgpu_kernel void @vote_ballot_nosync(ptr addrspace(4) byref(i64) %"45")
   %11 = load i32, ptr addrspace(5) %"48", align 4
   %"65" = inttoptr i64 %10 to ptr
   store i32 %11, ptr %"65", align 4
-  fence seq_cst
   ret void
 }
 

@@ -14,7 +14,6 @@ define amdgpu_kernel void @cp_async(ptr addrspace(4) byref(i64) %"57", ptr addrs
   br label %"56"
 
 "56":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"57", align 8
   store i64 %2, ptr addrspace(5) %"59", align 8
   %3 = load i64, ptr addrspace(4) %"58", align 8
@@ -49,7 +48,6 @@ define amdgpu_kernel void @cp_async(ptr addrspace(4) byref(i64) %"57", ptr addrs
   %"55" = getelementptr inbounds i8, ptr %"88", i64 12
   %17 = load i32, ptr addrspace(5) %"64", align 4
   store i32 %17, ptr %"55", align 4
-  fence seq_cst
   ret void
 }
 

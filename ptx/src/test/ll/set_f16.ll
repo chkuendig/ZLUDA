@@ -13,7 +13,6 @@ define amdgpu_kernel void @set_f16(ptr addrspace(4) byref(i64) %"52", ptr addrsp
   br label %"51"
 
 "51":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"52", align 8
   store i64 %2, ptr addrspace(5) %"54", align 8
   %3 = load i64, ptr addrspace(4) %"53", align 8
@@ -69,7 +68,6 @@ define amdgpu_kernel void @set_f16(ptr addrspace(4) byref(i64) %"52", ptr addrsp
   %"50" = getelementptr inbounds i8, ptr %"94", i64 4
   %32 = load i32, ptr addrspace(5) %"61", align 4
   store i32 %32, ptr %"50", align 4
-  fence seq_cst
   ret void
 }
 

@@ -30,7 +30,6 @@ define amdgpu_kernel void @ldmatrix_trans(ptr addrspace(4) byref(i64) %"91") #1 
   br label %"89"
 
 "89":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"91", align 8
   store i64 %2, ptr addrspace(5) %"92", align 8
   %"58" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -155,7 +154,6 @@ define amdgpu_kernel void @ldmatrix_trans(ptr addrspace(4) byref(i64) %"91") #1 
   br label %"14"
 
 "14":                                             ; preds = %"34", %"89"
-  fence seq_cst
   ret void
 }
 

@@ -11,7 +11,6 @@ define amdgpu_kernel void @prmt(ptr addrspace(4) byref(i64) %"43", ptr addrspace
   br label %"42"
 
 "42":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"43", align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
   %3 = load i64, ptr addrspace(4) %"44", align 8
@@ -33,7 +32,6 @@ define amdgpu_kernel void @prmt(ptr addrspace(4) byref(i64) %"43", ptr addrspace
   %11 = load i32, ptr addrspace(5) %"48", align 4
   %"65" = inttoptr i64 %10 to ptr
   store i32 %11, ptr %"65", align 4
-  fence seq_cst
   ret void
 }
 

@@ -12,7 +12,6 @@ define amdgpu_kernel void @shared_ptr_32(ptr addrspace(4) byref(i64) %"44", ptr 
   br label %"43"
 
 "43":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"44", align 8
   store i64 %2, ptr addrspace(5) %"46", align 8
   %3 = load i64, ptr addrspace(4) %"45", align 8
@@ -29,13 +28,12 @@ define amdgpu_kernel void @shared_ptr_32(ptr addrspace(4) byref(i64) %"44", ptr 
   %8 = load i32, ptr addrspace(5) %"48", align 4
   %"65" = inttoptr i32 %8 to ptr addrspace(3)
   %"42" = getelementptr inbounds i8, ptr addrspace(3) %"65", i32 0
-  %9 = load volatile i64, ptr addrspace(3) %"42", align 8
+  %9 = load i64, ptr addrspace(3) %"42", align 8
   store i64 %9, ptr addrspace(5) %"50", align 8
   %10 = load i64, ptr addrspace(5) %"47", align 8
   %11 = load i64, ptr addrspace(5) %"50", align 8
   %"66" = inttoptr i64 %10 to ptr addrspace(1)
   store i64 %11, ptr addrspace(1) %"66", align 8
-  fence seq_cst
   ret void
 }
 

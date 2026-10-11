@@ -9,7 +9,6 @@ define amdgpu_kernel void @add_non_coherent(ptr addrspace(4) byref(i64) %"41", p
   br label %"40"
 
 "40":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"41", align 8
   store i64 %2, ptr addrspace(5) %"43", align 8
   %3 = load i64, ptr addrspace(4) %"42", align 8
@@ -25,7 +24,6 @@ define amdgpu_kernel void @add_non_coherent(ptr addrspace(4) byref(i64) %"41", p
   %8 = load i64, ptr addrspace(5) %"46", align 8
   %"56" = inttoptr i64 %7 to ptr addrspace(1)
   store i64 %8, ptr addrspace(1) %"56", align 8
-  fence seq_cst
   ret void
 }
 

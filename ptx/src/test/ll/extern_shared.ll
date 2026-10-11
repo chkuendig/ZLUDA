@@ -10,7 +10,6 @@ define amdgpu_kernel void @extern_shared(ptr addrspace(4) byref(i64) %"40", ptr 
   br label %"39"
 
 "39":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"40", align 8
   store i64 %2, ptr addrspace(5) %"42", align 8
   %3 = load i64, ptr addrspace(4) %"41", align 8
@@ -21,13 +20,12 @@ define amdgpu_kernel void @extern_shared(ptr addrspace(4) byref(i64) %"40", ptr 
   store i64 %5, ptr addrspace(5) %"44", align 8
   %6 = load i64, ptr addrspace(5) %"44", align 8
   store i64 %6, ptr addrspace(3) @shared_mem, align 8
-  %7 = load volatile i64, ptr addrspace(3) @shared_mem, align 8
+  %7 = load i64, ptr addrspace(3) @shared_mem, align 8
   store i64 %7, ptr addrspace(5) %"44", align 8
   %8 = load i64, ptr addrspace(5) %"43", align 8
   %9 = load i64, ptr addrspace(5) %"44", align 8
   %"56" = inttoptr i64 %8 to ptr addrspace(1)
   store i64 %9, ptr addrspace(1) %"56", align 8
-  fence seq_cst
   ret void
 }
 

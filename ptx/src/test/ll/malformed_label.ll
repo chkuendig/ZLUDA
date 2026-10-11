@@ -9,7 +9,6 @@ define amdgpu_kernel void @malformed_label(ptr addrspace(4) byref(i64) %"43", pt
   br label %"41"
 
 "41":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"43", align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
   %3 = load i64, ptr addrspace(4) %"44", align 8
@@ -28,7 +27,6 @@ define amdgpu_kernel void @malformed_label(ptr addrspace(4) byref(i64) %"43", pt
   %8 = load i64, ptr addrspace(5) %"48", align 8
   %"58" = inttoptr i64 %7 to ptr
   store i64 %8, ptr %"58", align 8
-  fence seq_cst
   ret void
 }
 

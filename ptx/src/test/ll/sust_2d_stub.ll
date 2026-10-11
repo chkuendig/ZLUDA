@@ -12,7 +12,6 @@ define amdgpu_kernel void @sust_2d_stub(ptr addrspace(4) byref(i64) %"47") #1 {
   br label %"46"
 
 "46":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"47", align 8
   store i64 %2, ptr addrspace(5) %"48", align 8
   store i64 0, ptr addrspace(5) %"49", align 8
@@ -33,7 +32,6 @@ define amdgpu_kernel void @sust_2d_stub(ptr addrspace(4) byref(i64) %"47") #1 {
   %9 = load i32, ptr addrspace(5) %"52", align 4
   %"66" = inttoptr i64 %8 to ptr addrspace(1)
   store i32 %9, ptr addrspace(1) %"66", align 4
-  fence seq_cst
   ret void
 }
 

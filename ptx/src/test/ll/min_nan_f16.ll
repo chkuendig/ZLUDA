@@ -9,7 +9,6 @@ define amdgpu_kernel void @min_nan_f16(ptr addrspace(4) byref(i64) %"42", ptr ad
   br label %"41"
 
 "41":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"42", align 8
   store i64 %2, ptr addrspace(5) %"44", align 8
   %3 = load i64, ptr addrspace(4) %"43", align 8
@@ -34,7 +33,6 @@ define amdgpu_kernel void @min_nan_f16(ptr addrspace(4) byref(i64) %"42", ptr ad
   %"63" = inttoptr i64 %11 to ptr
   %"64" = bitcast half %12 to i16
   store i16 %"64", ptr %"63", align 2
-  fence seq_cst
   ret void
 }
 

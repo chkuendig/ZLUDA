@@ -9,7 +9,6 @@ define amdgpu_kernel void @local_align(ptr addrspace(4) byref(i64) %"40", ptr ad
   br label %"39"
 
 "39":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"40", align 8
   store i64 %2, ptr addrspace(5) %"42", align 8
   %3 = load i64, ptr addrspace(4) %"41", align 8
@@ -22,7 +21,6 @@ define amdgpu_kernel void @local_align(ptr addrspace(4) byref(i64) %"40", ptr ad
   %7 = load i64, ptr addrspace(5) %"44", align 8
   %"52" = inttoptr i64 %6 to ptr
   store i64 %7, ptr %"52", align 8
-  fence seq_cst
   ret void
 }
 

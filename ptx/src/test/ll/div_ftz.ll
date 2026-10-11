@@ -19,7 +19,6 @@ define amdgpu_kernel void @div_ftz(ptr addrspace(4) byref(i64) %"84", ptr addrsp
   br label %"78"
 
 "78":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"84", align 8
   store i64 %2, ptr addrspace(5) %"86", align 8
   %3 = load i64, ptr addrspace(4) %"85", align 8
@@ -58,7 +57,6 @@ define amdgpu_kernel void @div_ftz(ptr addrspace(4) byref(i64) %"84", ptr addrsp
   %"43" = getelementptr inbounds i8, ptr %"112", i64 4
   %18 = load float, ptr addrspace(5) %"90", align 4
   store float %18, ptr %"43", align 4
-  fence seq_cst
   ret void
 }
 

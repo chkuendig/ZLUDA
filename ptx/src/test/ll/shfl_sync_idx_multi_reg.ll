@@ -18,7 +18,6 @@ define amdgpu_kernel void @shfl_sync_idx_multi_reg(ptr addrspace(4) byref(i64) %
   br label %"57"
 
 "57":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"59", align 8
   store i64 %2, ptr addrspace(5) %"60", align 8
   %"44" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -36,36 +35,35 @@ define amdgpu_kernel void @shfl_sync_idx_multi_reg(ptr addrspace(4) byref(i64) %
   %"100" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_idx_b32_pred(i32 %6, i32 0, i32 31, i32 -1)
   %"94" = extractelement <2 x i32> %"100", i8 0
   %"101" = extractelement <2 x i32> %"100", i8 1
-  %7 = trunc i32 %"101" to i1
+  %"78" = trunc i32 %"101" to i1
   store i32 %"94", ptr addrspace(5) %"65", align 4
-  store i1 %7, ptr addrspace(5) %"67", align 1
-  %8 = load i32, ptr addrspace(5) %"64", align 4
-  %"108" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_idx_b32_pred(i32 %8, i32 0, i32 31, i32 -1)
+  store i1 %"78", ptr addrspace(5) %"67", align 1
+  %7 = load i32, ptr addrspace(5) %"64", align 4
+  %"108" = call <2 x i32> @__zluda_ptx_impl_shfl_sync_idx_b32_pred(i32 %7, i32 0, i32 31, i32 -1)
   %"96" = extractelement <2 x i32> %"108", i8 0
   %"109" = extractelement <2 x i32> %"108", i8 1
-  %9 = trunc i32 %"109" to i1
+  %"81" = trunc i32 %"109" to i1
   store i32 %"96", ptr addrspace(5) %"66", align 4
-  store i1 %9, ptr addrspace(5) %"68", align 1
-  %10 = load i32, ptr addrspace(5) %"62", align 4
-  %11 = zext i32 %10 to i64
-  store i64 %11, ptr addrspace(5) %"61", align 8
-  %12 = load i64, ptr addrspace(5) %"61", align 8
-  %"85" = mul i64 %12, 8
+  store i1 %"81", ptr addrspace(5) %"68", align 1
+  %8 = load i32, ptr addrspace(5) %"62", align 4
+  %"83" = zext i32 %8 to i64
+  store i64 %"83", ptr addrspace(5) %"61", align 8
+  %9 = load i64, ptr addrspace(5) %"61", align 8
+  %"85" = mul i64 %9, 8
   store i64 %"85", ptr addrspace(5) %"61", align 8
-  %13 = load i64, ptr addrspace(5) %"60", align 8
-  %14 = load i64, ptr addrspace(5) %"61", align 8
-  %"87" = add i64 %13, %14
+  %10 = load i64, ptr addrspace(5) %"60", align 8
+  %11 = load i64, ptr addrspace(5) %"61", align 8
+  %"87" = add i64 %10, %11
   store i64 %"87", ptr addrspace(5) %"60", align 8
-  %15 = load i64, ptr addrspace(5) %"60", align 8
-  %16 = load i32, ptr addrspace(5) %"65", align 4
-  %"98" = inttoptr i64 %15 to ptr
-  store i32 %16, ptr %"98", align 4
-  %17 = load i64, ptr addrspace(5) %"60", align 8
-  %"99" = inttoptr i64 %17 to ptr
+  %12 = load i64, ptr addrspace(5) %"60", align 8
+  %13 = load i32, ptr addrspace(5) %"65", align 4
+  %"98" = inttoptr i64 %12 to ptr
+  store i32 %13, ptr %"98", align 4
+  %14 = load i64, ptr addrspace(5) %"60", align 8
+  %"99" = inttoptr i64 %14 to ptr
   %"56" = getelementptr inbounds i8, ptr %"99", i64 4
-  %18 = load i32, ptr addrspace(5) %"66", align 4
-  store i32 %18, ptr %"56", align 4
-  fence seq_cst
+  %15 = load i32, ptr addrspace(5) %"66", align 4
+  store i32 %15, ptr %"56", align 4
   ret void
 }
 

@@ -8,7 +8,6 @@ define amdgpu_kernel void @bfind(ptr addrspace(4) byref(i64) %"39", ptr addrspac
   br label %"38"
 
 "38":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"39", align 8
   store i64 %2, ptr addrspace(5) %"41", align 8
   %3 = load i64, ptr addrspace(4) %"40", align 8
@@ -27,7 +26,6 @@ define amdgpu_kernel void @bfind(ptr addrspace(4) byref(i64) %"39", ptr addrspac
   %12 = load i32, ptr addrspace(5) %"43", align 4
   %"53" = inttoptr i64 %11 to ptr
   store i32 %12, ptr %"53", align 4
-  fence seq_cst
   ret void
 }
 

@@ -30,7 +30,6 @@ define amdgpu_kernel void @histogram_word1(ptr addrspace(4) byref(i64) %"86", pt
   br label %"85"
 
 "85":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"86", align 8
   store i64 %2, ptr addrspace(5) %"88", align 8
   %3 = load i64, ptr addrspace(4) %"87", align 8
@@ -177,7 +176,6 @@ define amdgpu_kernel void @histogram_word1(ptr addrspace(4) byref(i64) %"86", pt
   %73 = load i32, ptr addrspace(5) %"110", align 4
   %"252" = inttoptr i64 %72 to ptr
   store i32 %73, ptr %"252", align 4
-  fence seq_cst
   ret void
 }
 

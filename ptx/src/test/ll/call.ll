@@ -35,7 +35,6 @@ define amdgpu_kernel void @call(ptr addrspace(4) byref(i64) %"57", ptr addrspace
   br label %"53"
 
 "53":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"57", align 8
   store i64 %2, ptr addrspace(5) %"59", align 8
   %3 = load i64, ptr addrspace(4) %"58", align 8
@@ -58,7 +57,6 @@ define amdgpu_kernel void @call(ptr addrspace(4) byref(i64) %"57", ptr addrspace
   %10 = load i64, ptr addrspace(5) %"61", align 8
   %"84" = inttoptr i64 %9 to ptr addrspace(1)
   store i64 %10, ptr addrspace(1) %"84", align 8
-  fence seq_cst
   ret void
 }
 

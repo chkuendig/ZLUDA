@@ -11,9 +11,9 @@ define hidden i64 @add() #0 {
   br label %"50"
 
 "50":                                             ; preds = %1
-  %2 = load volatile i64, ptr addrspace(3) @shared_mod, align 8
+  %2 = load i64, ptr addrspace(3) @shared_mod, align 8
   store i64 %2, ptr addrspace(5) %"56", align 8
-  %3 = load volatile i64, ptr addrspace(3) @shared_ex, align 8
+  %3 = load i64, ptr addrspace(3) @shared_ex, align 8
   store i64 %3, ptr addrspace(5) %"57", align 8
   %4 = load i64, ptr addrspace(5) %"57", align 8
   %5 = load i64, ptr addrspace(5) %"56", align 8
@@ -52,7 +52,6 @@ define amdgpu_kernel void @shared_unify_extern(ptr addrspace(4) byref(i64) %"65"
   br label %"53"
 
 "53":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"65", align 8
   store i64 %2, ptr addrspace(5) %"67", align 8
   %3 = load i64, ptr addrspace(4) %"66", align 8
@@ -78,7 +77,6 @@ define amdgpu_kernel void @shared_unify_extern(ptr addrspace(4) byref(i64) %"65"
   %11 = load i64, ptr addrspace(5) %"70", align 8
   %"92" = inttoptr i64 %10 to ptr
   store i64 %11, ptr %"92", align 8
-  fence seq_cst
   ret void
 }
 

@@ -109,7 +109,6 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32_interleave(ptr addrspace(4
   br label %"166"
 
 "166":                                            ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"200", align 8
   store i64 %2, ptr addrspace(5) %"201", align 8
   %"88" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -472,7 +471,6 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32_interleave(ptr addrspace(4
   %"164" = getelementptr inbounds i8, ptr %"506", i64 60
   %175 = load i32, ptr addrspace(5) %"245", align 4
   store i32 %175, ptr %"164", align 4
-  fence seq_cst
   ret void
 }
 

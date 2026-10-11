@@ -20,7 +20,6 @@ define amdgpu_kernel void @shl_packed(ptr addrspace(4) byref(i64) %"72", ptr add
   br label %"71"
 
 "71":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"72", align 8
   store i64 %2, ptr addrspace(5) %"74", align 8
   %3 = load i64, ptr addrspace(4) %"73", align 8
@@ -116,7 +115,6 @@ define amdgpu_kernel void @shl_packed(ptr addrspace(4) byref(i64) %"72", ptr add
   %"70" = getelementptr inbounds i8, ptr %"167", i64 12
   %47 = load i32, ptr addrspace(5) %"87", align 4
   store i32 %47, ptr %"70", align 4
-  fence seq_cst
   ret void
 }
 

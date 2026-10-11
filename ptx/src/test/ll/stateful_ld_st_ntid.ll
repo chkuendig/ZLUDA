@@ -12,7 +12,6 @@ define amdgpu_kernel void @stateful_ld_st_ntid(ptr addrspace(4) byref(i64) %"44"
   br label %"42"
 
 "42":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"44", align 8
   store i64 %2, ptr addrspace(5) %"46", align 8
   %3 = load i64, ptr addrspace(4) %"45", align 8
@@ -48,7 +47,6 @@ define amdgpu_kernel void @stateful_ld_st_ntid(ptr addrspace(4) byref(i64) %"44"
   %18 = load i64, ptr addrspace(5) %"50", align 8
   %"77" = inttoptr i64 %17 to ptr addrspace(1)
   store i64 %18, ptr addrspace(1) %"77", align 8
-  fence seq_cst
   ret void
 }
 

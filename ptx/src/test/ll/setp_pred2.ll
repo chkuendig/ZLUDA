@@ -20,7 +20,6 @@ define amdgpu_kernel void @setp_pred2(ptr addrspace(4) byref(i64) %"71", ptr add
   br label %"70"
 
 "70":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"71", align 8
   store i64 %2, ptr addrspace(5) %"73", align 8
   %3 = load i64, ptr addrspace(4) %"72", align 8
@@ -94,7 +93,6 @@ define amdgpu_kernel void @setp_pred2(ptr addrspace(4) byref(i64) %"71", ptr add
   %"69" = getelementptr inbounds i8, ptr %"133", i64 16
   %37 = load i32, ptr addrspace(5) %"81", align 4
   store i32 %37, ptr %"69", align 4
-  fence seq_cst
   ret void
 }
 

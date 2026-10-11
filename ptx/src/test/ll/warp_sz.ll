@@ -6,13 +6,11 @@ define amdgpu_kernel void @warp_sz(ptr addrspace(4) byref(i64) %"38", ptr addrsp
   br label %"37"
 
 "37":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"39", align 8
   store i64 %2, ptr addrspace(5) %"40", align 8
   %3 = load i64, ptr addrspace(5) %"40", align 8
   %"43" = inttoptr i64 %3 to ptr
   store i8 32, ptr %"43", align 1
-  fence seq_cst
   ret void
 }
 

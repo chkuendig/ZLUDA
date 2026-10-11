@@ -8,7 +8,6 @@ define amdgpu_kernel void @rsqrt(ptr addrspace(4) byref(i64) %"39", ptr addrspac
   br label %"38"
 
 "38":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"39", align 8
   store i64 %2, ptr addrspace(5) %"41", align 8
   %3 = load i64, ptr addrspace(4) %"40", align 8
@@ -24,7 +23,6 @@ define amdgpu_kernel void @rsqrt(ptr addrspace(4) byref(i64) %"39", ptr addrspac
   %8 = load double, ptr addrspace(5) %"43", align 8
   %"53" = inttoptr i64 %7 to ptr
   store double %8, ptr %"53", align 8
-  fence seq_cst
   ret void
 }
 

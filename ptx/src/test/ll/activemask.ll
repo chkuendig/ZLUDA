@@ -9,7 +9,6 @@ define amdgpu_kernel void @activemask(ptr addrspace(4) byref(i64) %"38", ptr add
   br label %"37"
 
 "37":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"39", align 8
   store i64 %2, ptr addrspace(5) %"40", align 8
   %"43" = call i32 @__zluda_ptx_impl_activemask()
@@ -18,7 +17,6 @@ define amdgpu_kernel void @activemask(ptr addrspace(4) byref(i64) %"38", ptr add
   %4 = load i32, ptr addrspace(5) %"41", align 4
   %"46" = inttoptr i64 %3 to ptr
   store i32 %4, ptr %"46", align 4
-  fence seq_cst
   ret void
 }
 

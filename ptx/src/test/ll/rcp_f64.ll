@@ -17,7 +17,6 @@ define amdgpu_kernel void @rcp_f64(ptr addrspace(4) byref(i64) %"79", ptr addrsp
   br label %"73"
 
 "73":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"79", align 8
   store i64 %2, ptr addrspace(5) %"81", align 8
   %3 = load i64, ptr addrspace(4) %"80", align 8
@@ -40,7 +39,6 @@ define amdgpu_kernel void @rcp_f64(ptr addrspace(4) byref(i64) %"79", ptr addrsp
   %10 = load double, ptr addrspace(5) %"83", align 8
   %"94" = inttoptr i64 %9 to ptr
   store double %10, ptr %"94", align 8
-  fence seq_cst
   ret void
 }
 

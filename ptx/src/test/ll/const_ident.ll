@@ -18,7 +18,6 @@ define amdgpu_kernel void @const_ident(ptr addrspace(4) byref(i64) %"55", ptr ad
   br label %"54"
 
 "54":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"55", align 8
   store i64 %2, ptr addrspace(5) %"57", align 8
   %3 = load i64, ptr addrspace(4) %"56", align 8
@@ -51,7 +50,6 @@ define amdgpu_kernel void @const_ident(ptr addrspace(4) byref(i64) %"55", ptr ad
   %"53" = getelementptr inbounds i8, ptr %"95", i64 8
   %15 = load i64, ptr addrspace(5) %"64", align 8
   store i64 %15, ptr %"53", align 8
-  fence seq_cst
   ret void
 }
 

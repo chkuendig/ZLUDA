@@ -88,7 +88,6 @@ define amdgpu_kernel void @call_rnd(ptr addrspace(4) byref(i64) %"101", ptr addr
   br label %"93"
 
 "93":                                             ; preds = %1
-  fence seq_cst
   call void @llvm.amdgcn.s.setreg(i32 6145, i32 1)
   %2 = load i64, ptr addrspace(4) %"101", align 8
   store i64 %2, ptr addrspace(5) %"103", align 8
@@ -148,7 +147,6 @@ define amdgpu_kernel void @call_rnd(ptr addrspace(4) byref(i64) %"101", ptr addr
   %"74" = getelementptr inbounds i8, ptr %"168", i64 4
   %25 = load float, ptr addrspace(5) %"110", align 4
   store float %25, ptr %"74", align 4
-  fence seq_cst
   ret void
 }
 

@@ -9,7 +9,6 @@ define amdgpu_kernel void @xor(ptr addrspace(4) byref(i64) %"42", ptr addrspace(
   br label %"41"
 
 "41":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"42", align 8
   store i64 %2, ptr addrspace(5) %"44", align 8
   %3 = load i64, ptr addrspace(4) %"43", align 8
@@ -31,7 +30,6 @@ define amdgpu_kernel void @xor(ptr addrspace(4) byref(i64) %"42", ptr addrspace(
   %11 = load i32, ptr addrspace(5) %"46", align 4
   %"61" = inttoptr i64 %10 to ptr
   store i32 %11, ptr %"61", align 4
-  fence seq_cst
   ret void
 }
 

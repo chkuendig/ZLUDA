@@ -15,7 +15,6 @@ define amdgpu_kernel void @vector8_extract(ptr addrspace(4) byref(i64) %"50", pt
   br label %"49"
 
 "49":                                             ; preds = %1
-  fence seq_cst
   %2 = load i64, ptr addrspace(4) %"50", align 8
   store i64 %2, ptr addrspace(5) %"52", align 8
   %3 = load i64, ptr addrspace(4) %"51", align 8
@@ -106,7 +105,6 @@ define amdgpu_kernel void @vector8_extract(ptr addrspace(4) byref(i64) %"50", pt
   %36 = load i64, ptr addrspace(5) %"53", align 8
   %"115" = inttoptr i64 %36 to ptr addrspace(1)
   store <8 x i8> %"48", ptr addrspace(1) %"115", align 8
-  fence seq_cst
   ret void
 }
 

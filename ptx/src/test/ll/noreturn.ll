@@ -5,7 +5,6 @@ define amdgpu_kernel void @noreturn() #0 {
   br label %"33"
 
 "33":                                             ; preds = %1
-  fence seq_cst
   call void @llvm.trap()
   unreachable
 }
