@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import null_stream_api as fixture
 
@@ -47,10 +48,12 @@ def main():
         for _ in range(7): d.launch('produce', None, flag)
         for _ in range(11): d.launch('produce', None, flag, ptsz=True)
         streams = [d.stream(1), d.stream(1)]
+        barrier = threading.Barrier(2)
 
         def worker(stream):
             d.call('cuCtxSetCurrent', [C.c_void_p], d.context)
             try:
+                barrier.wait(timeout=10)
                 for i in range(40): d.launch('produce', stream, flag, ptsz=bool(i%2))
                 d.sync(stream)
             finally: d.call('cuCtxSetCurrent', [C.c_void_p], None)

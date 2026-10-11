@@ -22,7 +22,7 @@ import time
 BUILD = '2b591706924dd0d88aa82a12827caf26fc79a417'
 CASES = ('live', 'unload-reload', 'daemon-stall', 'replace-record',
          'modify-library', 'duplicate', 'wrong-hash', 'wrong-build',
-         'wrong-app', 'stale-start', 'partial-publication', 'process-death')
+         'wrong-app', 'stale-start', 'stale-only', 'partial-publication', 'process-death')
 
 
 def require(value, message):
@@ -76,17 +76,25 @@ def case(args):
                 raise RuntimeError(server.stderr.read())
             wait_until(lambda: get() != 'unavailable')
 
-        def rejected():
+        def rejected(expected=0):
             wait_until(lambda: server.poll() is not None)
+            require(server.returncode == expected, f'unexpected reader exit {server.returncode}: '+server.stderr.read())
             require(get() == 'unavailable', 'invalid source was displayed as idle')
 
         try:
             if args.child == 'wrong-hash':
-                start(sha='0'*64); rejected()
+                start(sha='0'*64); rejected(2)
             elif args.child == 'wrong-build':
-                start(build='f'*40); rejected()
+                start(build='f'*40); rejected(2)
             elif args.child == 'wrong-app':
-                start(app='124'); rejected()
+                start(app='124'); rejected(2)
+            elif args.child == 'stale-only':
+                stale = bytearray(record.read_bytes())
+                ticks = int.from_bytes(stale[24:32], 'little')
+                stale[24:32] = (ticks-1).to_bytes(8, 'little')
+                stale_file = directory/'stale.rec'; stale_file.write_bytes(stale); stale_file.chmod(0o600)
+                record.unlink()
+                start(); rejected(2)
             elif args.child == 'process-death':
                 # A separate producer process dies without running its destructor.
                 crashed = subprocess.Popen([sys.executable, __file__, '--reader', str(args.reader),
@@ -145,6 +153,9 @@ def case(args):
         finally:
             if server and server.poll() is None:
                 server.terminate(); server.wait(timeout=3)
+            if server:
+                expected = 2 if args.child in ('wrong-hash','wrong-build','wrong-app','stale-only') else 0
+                require(server.returncode == expected, f'reader exit {server.returncode}: '+server.stderr.read())
             if crashed and crashed.poll() is None: crashed.kill(); crashed.wait(timeout=3)
             if auxiliary: _ctypes.dlclose(auxiliary._handle)
             if lib: _ctypes.dlclose(lib._handle)
@@ -166,7 +177,7 @@ def main():
     for name in CASES:
         subprocess.run([sys.executable, __file__, '--reader', str(args.reader.resolve()),
             '--shim', str(args.shim.resolve()), '--child', name], env=env, check=True, timeout=15)
-    print('PASS reader suite: 12 isolated cases', flush=True)
+    print('PASS reader suite: 13 isolated cases', flush=True)
 
 
 if __name__ == '__main__': main()
