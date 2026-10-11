@@ -141,17 +141,6 @@ pub(crate) unsafe fn destroy_v2(event: hipEvent_t) -> hipError_t {
 }
 
 pub(crate) unsafe fn record(event: hipEvent_t, stream: hipStream_t) -> hipError_t {
-    // CUDA NULL-stream semantics (verified against NVIDIA docs 2026-05-15):
-    // "When an action is taken in the legacy stream such as a kernel launch
-    // or cudaStreamWaitEvent(), the legacy stream first waits on all blocking
-    // streams, the action is queued in the legacy stream, and then all
-    // blocking streams wait on the legacy stream." cuEventRecord on NULL
-    // qualifies as an action on the legacy stream.
-    //
-    // HIP does NOT enforce this. We reuse null_stream_sync (which
-    // hipDeviceSynchronize's on NULL stream) to add the pre-action barrier.
-    // Env-disable with ZLUDA_NULL_STREAM_BARRIER=0 for A/B testing.
-    let _guard = super::stream::null_stream_sync_for_event(stream);
     // Plan v25 Phase B.2: drain DEV5/6/7 dump queue. cuEventRecord fires
     // ~91k times/run (vs ~120k for cuEventSynchronize); adding the drain
     // here shrinks the worst-case "MS_4 launched but its dump hasn't run"
@@ -194,8 +183,6 @@ pub(crate) unsafe fn record_with_flags(
         return hipError_t::ErrorInvalidValue;
     }
 
-    // Same NULL-stream barrier as cuEventRecord above.
-    let _guard = super::stream::null_stream_sync_for_event(stream);
     super::stream::force_system_scope(stream);
     hipEventRecord(event, stream)
 }
@@ -242,7 +229,6 @@ pub(crate) unsafe fn synchronize(event: hipEvent_t) -> hipError_t {
         .get_or_init(|| std::env::var("ZLUDA_EVENT_HDP_FLUSH").map_or(false, |v| v == "1"));
     if hdp_flush {
         let _ = hipDeviceSynchronize();
-        super::stream::clear_dirty_flag_after_device_sync();
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
     super::driver::zluda_log_err(&format!(

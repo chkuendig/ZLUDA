@@ -1,22 +1,15 @@
 use hip_runtime_sys::*;
 use std::sync::Mutex;
 
-/// Global lock implementing CUDA's NULL-stream implicit synchronization.
-///
-/// CUDA semantics: the NULL stream (stream 0) serializes with ALL other streams.
-/// An operation on the NULL stream cannot begin until all prior operations on all
-/// streams complete, and no operation on any stream can begin until the NULL-stream
-/// operation completes.
-///
-/// HIP/ROCm 6.2.4 does NOT implement this. We enforce it with:
-/// - Before any NULL-stream operation (kernel launch, memcpy, memset): acquire this
-///   lock + hipDeviceSynchronize (drain all pending work)
-/// - The lock is held until the operation is submitted, preventing another thread
-///   from submitting work between our sync and our operation
-///
-/// This lock is shared between kernel launches (function.rs) and memory operations
-/// (memory.rs) so that ALL NULL-stream operations serialize with each other.
-pub(crate) static NULL_STREAM_LOCK: Mutex<()> = Mutex::new(());
+// ROCm 7.2.4 implements legacy default-stream ordering in hip::getStream:
+// null/legacy submissions enqueue waits on prior blocking streams, and blocking
+// streams enqueue waits on prior legacy work. Nonblocking streams are exempt.
+// Use those queued dependencies for kernels, copies, memsets and events. A
+// hipDeviceSynchronize before/after a legacy operation can deadlock when an
+// exempt stream waits for a value that the legacy operation will produce.
+// The legacy queue is shared across host threads on the selected HIP device.
+// Distinct CUDA contexts on one HIP device already share that queue; context
+// isolation requires a separate context/stream mapping change.
 
 /// Cross-kernel L1 visibility fix ("Bug A") — default ON.
 ///
@@ -75,119 +68,54 @@ pub(crate) fn force_system_scope(stream: hipStream_t) {
     }
 }
 
-/// Dirty flag: set when a kernel launches on a non-default stream.
-/// Cleared after hipDeviceSynchronize in null_stream_sync.
-/// When false, null-stream memops skip the expensive device sync
-/// because no cross-stream work is outstanding.
-static NON_DEFAULT_STREAM_DIRTY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn mark_non_default_stream_dirty() {
-    NON_DEFAULT_STREAM_DIRTY.store(true, std::sync::atomic::Ordering::Release);
-    NULL_STREAM_HAD_BLOCKING_WORK.store(true, std::sync::atomic::Ordering::Release);
+/// Resolve stream zero for the implemented CUDA _ptsz entry points.
+/// Explicit legacy (1), per-thread (2) and user-created handles are preserved.
+/// HIP's headers define hipStreamPerThread as the same pointer sentinel (2).
+pub(crate) fn per_thread_stream(stream: hipStream_t) -> hipStream_t {
+    if stream.0.is_null() {
+        hipStream_t(2usize as *mut _)
+    } else {
+        stream
+    }
 }
 
-fn non_default_stream_is_dirty() -> bool {
-    NON_DEFAULT_STREAM_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+// Track the flags passed to both creation APIs. HIP keeps the same flags for
+// its dependency filtering; the registry also serves cuStreamGetFlags without
+// dereferencing a possibly stale HIP handle after a successful destroy.
+#[derive(Default)]
+struct StreamFlags {
+    streams: std::collections::HashMap<usize, (u32, u64)>,
+    generation: u64,
 }
 
-fn clear_non_default_stream_dirty() {
-    NON_DEFAULT_STREAM_DIRTY.store(false, std::sync::atomic::Ordering::Release);
-}
+impl StreamFlags {
+    fn created(&mut self, stream: hipStream_t, flags: u32) {
+        self.generation += 1;
+        self.streams
+            .insert(stream.0 as usize, (flags, self.generation));
+    }
 
-pub(crate) fn clear_dirty_flag_after_device_sync() {
-    clear_non_default_stream_dirty();
-}
-
-fn strict_null_stream_barrier_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let raw = std::env::var("ZLUDA_NULL_STREAM_STRICT").ok();
-        let v = raw.as_deref().map_or(true, |s| s != "0");
-        super::driver::zluda_log_err(&format!(
-            "[ZLUDA] ZLUDA_NULL_STREAM_STRICT env={:?} → strict={}",
-            raw, v
-        ));
-        v
-    })
-}
-
-fn null_stream_uses_global_lock(stream: hipStream_t, strict: bool) -> bool {
-    strict || stream.0.is_null()
-}
-
-fn null_stream_needs_pre_sync(stream: hipStream_t) -> bool {
-    stream.0.is_null() && non_default_stream_is_dirty()
-}
-
-fn null_stream_needs_post_sync(stream: hipStream_t, strict: bool) -> bool {
-    strict && stream.0.is_null()
-}
-
-pub(crate) struct NullStreamGuard {
-    guard: Option<std::sync::MutexGuard<'static, ()>>,
-    post_sync: bool,
-}
-
-impl Drop for NullStreamGuard {
-    fn drop(&mut self) {
-        if self.post_sync {
-            let _ = unsafe { hipDeviceSynchronize() };
+    fn destroyed(&mut self, stream: hipStream_t, generation: Option<u64>) {
+        if generation.is_some() && self.generation_of(stream) == generation {
+            self.streams.remove(&(stream.0 as usize));
         }
     }
-}
 
-/// Synchronize for CUDA NULL-stream semantics before performing a GPU operation.
-/// Call this before hipModuleLaunchKernel, hipMemcpyAsync, hipMemsetAsync, etc.
-///
-/// If `stream` is NULL (0x0): acquires the global lock and waits for ALL pending
-/// work on all streams. Returns a guard that must be held until the HIP operation
-/// is submitted — this prevents another thread from submitting work in between.
-///
-/// If `ZLUDA_NULL_STREAM_STRICT=1` is set, we also enforce the missing postlaunch
-/// half of CUDA's NULL-stream barrier by:
-/// - keeping the lock held until the NULL-stream operation completes, and
-/// - briefly taking the same lock for non-NULL submissions so they cannot race
-///   ahead of an in-flight NULL-stream operation.
-/// This gate is kept opt-in because it fixed Batman's earlier late `n=8827`
-/// CreateGrid corruption but still exposes a different later `n=4688` family.
-pub(crate) fn null_stream_sync(stream: hipStream_t) -> NullStreamGuard {
-    let strict = strict_null_stream_barrier_enabled();
-    let guard = if null_stream_uses_global_lock(stream, strict) {
-        Some(NULL_STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
-    } else {
-        None
-    };
-    if null_stream_needs_pre_sync(stream) {
-        let _ = unsafe { hipDeviceSynchronize() };
-        clear_non_default_stream_dirty();
+    fn get(&self, stream: hipStream_t) -> Option<u32> {
+        self.streams
+            .get(&(stream.0 as usize))
+            .map(|&(flags, _)| flags)
     }
-    NullStreamGuard {
-        guard,
-        post_sync: null_stream_needs_post_sync(stream, strict),
+
+    fn generation_of(&self, stream: hipStream_t) -> Option<u64> {
+        self.streams
+            .get(&(stream.0 as usize))
+            .map(|&(_, generation)| generation)
     }
 }
 
-/// 2026-05-15 Plan v6 Step A: NULL-stream barrier for cuEventRecord and
-/// cuStreamWaitEvent. Per NVIDIA docs, NULL-stream actions (including
-/// kernel launches, cuEventRecord, cuStreamWaitEvent) first wait on all
-/// blocking streams. HIP doesn't enforce this. We provide the
-/// pre-action sync via the same null_stream_sync mechanism.
-///
-/// Env-disable with `ZLUDA_NULL_STREAM_BARRIER=0` for A/B testing.
-/// Default ON (matches CUDA spec).
-pub(crate) fn null_stream_sync_for_event(stream: hipStream_t) -> NullStreamGuard {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let disabled = *DISABLED
-        .get_or_init(|| std::env::var("ZLUDA_NULL_STREAM_BARRIER").map_or(false, |v| v == "0"));
-    if disabled || !stream.0.is_null() {
-        return NullStreamGuard {
-            guard: None,
-            post_sync: false,
-        };
-    }
-    null_stream_sync(stream)
-}
+static STREAM_FLAGS: std::sync::LazyLock<Mutex<StreamFlags>> =
+    std::sync::LazyLock::new(|| Mutex::new(StreamFlags::default()));
 
 pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
     super::driver::sync_timeline_log("stream", stream.0 as usize);
@@ -213,7 +141,6 @@ pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
         .get_or_init(|| std::env::var("ZLUDA_HDP_FLUSH_ON_SYNC").map_or(false, |v| v == "1"));
     if hdp_flush {
         let _ = unsafe { hipDeviceSynchronize() };
-        clear_non_default_stream_dirty();
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
     super::driver::zluda_log(&format!("[ZLUDA] cuStreamSynchronize -> {:?}", result));
@@ -222,11 +149,21 @@ pub(crate) fn synchronize(stream: hipStream_t) -> hipError_t {
 
 pub(crate) fn create(stream: *mut hipStream_t, flags: ::core::ffi::c_uint) -> hipError_t {
     let result = unsafe { hipStreamCreateWithFlags(stream, flags) };
+    if result.is_ok() {
+        STREAM_FLAGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .created(unsafe { *stream }, flags);
+    }
     super::driver::zluda_log_err(&format!(
         "cuStreamCreate(flags={:#x}) -> {:?} stream={:?}",
         flags,
         result,
-        unsafe { *stream }
+        if result.is_ok() {
+            unsafe { *stream }
+        } else {
+            hipStream_t(std::ptr::null_mut())
+        }
     ));
     result
 }
@@ -236,11 +173,54 @@ pub(crate) fn create_with_priority(
     flags: ::core::ffi::c_uint,
     priority: ::core::ffi::c_int,
 ) -> hipError_t {
-    unsafe { hipStreamCreateWithPriority(stream, flags, priority) }
+    let result = unsafe { hipStreamCreateWithPriority(stream, flags, priority) };
+    if result.is_ok() {
+        STREAM_FLAGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .created(unsafe { *stream }, flags);
+    }
+    result
 }
 
 pub(crate) fn destroy_v2(stream: hipStream_t) -> hipError_t {
-    unsafe { hipStreamDestroy(stream) }
+    let generation = STREAM_FLAGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .generation_of(stream);
+    // Do not hold our metadata lock across a HIP call. A new stream may reuse
+    // this address before hipStreamDestroy returns; remove only this generation.
+    let result = unsafe { hipStreamDestroy(stream) };
+    if result.is_ok() {
+        STREAM_FLAGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .destroyed(stream, generation);
+    }
+    result
+}
+
+pub(crate) fn get_flags(stream: hipStream_t, flags: *mut u32) -> hipError_t {
+    if flags.is_null() {
+        return hipError_t::ErrorInvalidValue;
+    }
+    if let Some(value) = STREAM_FLAGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(stream)
+    {
+        unsafe { *flags = value };
+        return Ok(());
+    }
+    // The per-thread default stream is created lazily inside HIP.
+    if stream.0 as usize == 2 {
+        return unsafe { hipStreamGetFlags(stream, flags) };
+    }
+    hipError_t::ErrorInvalidHandle
+}
+
+pub(crate) fn get_flags_ptsz(stream: hipStream_t, flags: *mut u32) -> hipError_t {
+    get_flags(per_thread_stream(stream), flags)
 }
 
 pub(crate) fn begin_capture_v2(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t {
@@ -304,39 +284,11 @@ pub(crate) fn get_capture_info_v3(
 
 static QUERY_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// 2026-06-04 Option A Fix: track whether any blocking-stream work has occurred.
-/// This is set when mark_non_default_stream_dirty() is called (i.e., first non-NULL-stream
-/// kernel launch or async memop). This flag is the proper predicate for cuStreamQuery(NULL)
-/// because CUDA semantics require the query to know whether blocking streams have work.
-/// Before this flag is set, cuStreamQuery(NULL) should return NotReady to keep PhysX's
-/// dispatch loop alive. AFTER this flag is set, pass through the real hipStreamQuery result.
-pub(crate) static NULL_STREAM_HAD_BLOCKING_WORK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// 2026-05-15 Plan v6 Step C: track whether PhysX has launched its first real
-/// kernel. Before the first launch, return NotReady for cuStreamQuery(NULL)
-/// to keep PhysX's dispatch loop alive during startup (the original masking
-/// rationale). AFTER first launch, pass through the real hipStreamQuery
-/// result — matches NVIDIA CUDA spec ("all operations in the stream have
-/// completed"; for NULL legacy stream, that means all blocking-stream work).
-/// DEPRECATED 2026-06-04: replaced by NULL_STREAM_HAD_BLOCKING_WORK which
-/// tracks blocking-stream activity instead of any kernel launch.
-pub(crate) static FIRST_REAL_LAUNCH_SEEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub(crate) fn query(stream: hipStream_t) -> hipError_t {
     let hip_result = unsafe { hipStreamQuery(stream) };
-    // PhysX uses cuStreamQuery(NULL) as a push-buffer flush / dispatch heartbeat.
-    // On real NVIDIA, this returns NOT_READY when there's pending GPU work and
-    // SUCCESS when idle. Our previous behavior was hardcoded NotReady (poisoned
-    // PhysX dispatch logic). Now: NotReady ONLY before first blocking-stream work
-    // (PhysX startup race), then real result.
-    //
-    // CUDA semantics (verified 2026-06-04): cuStreamQuery(NULL/legacy) returns SUCCESS
-    // only when all BLOCKING-STREAM work is idle. Non-blocking streams do NOT affect
-    // the result. NULL_STREAM_HAD_BLOCKING_WORK tracks the first non-NULL-stream
-    // kernel launch or async memop, which is the real blocking-stream marker.
-    //
+    // HIP queries the legacy queue after queuing dependencies on blocking
+    // streams only. Pass that result through by default; retain the old
+    // always-NotReady override solely for diagnostic comparisons.
     // Env overrides:
     //   ZLUDA_STREAM_QUERY_LEGACY=1 → restore old always-NotReady behavior
     //   ZLUDA_STREAM_QUERY_REAL=1 → always pass through real result (no startup mask)
@@ -347,7 +299,7 @@ pub(crate) fn query(stream: hipStream_t) -> hipError_t {
         } else if std::env::var("ZLUDA_STREAM_QUERY_LEGACY").map_or(false, |v| v == "1") {
             0 // always-NotReady (old behavior)
         } else {
-            1 // refined: NotReady before first blocking-stream work, real after
+            1 // default: pass through HIP
         }
     });
     let returned = if stream.0.is_null() {
@@ -382,7 +334,6 @@ pub(crate) fn query(stream: hipStream_t) -> hipError_t {
         {
             unsafe {
                 let _ = hipDeviceSynchronize();
-                clear_dirty_flag_after_device_sync();
                 std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -411,15 +362,6 @@ pub(crate) fn wait_event(
     event: hipEvent_t,
     flags: ::core::ffi::c_uint,
 ) -> hipError_t {
-    // CUDA NULL-stream semantics (NVIDIA docs verified 2026-05-15):
-    // "When an action is taken in the legacy stream such as a kernel launch
-    // or cudaStreamWaitEvent(), the legacy stream first waits on all blocking
-    // streams, the action is queued in the legacy stream, and then all
-    // blocking streams wait on the legacy stream."
-    //
-    // HIP doesn't enforce the pre-action global barrier. Use null_stream_sync
-    // (env-disable via ZLUDA_NULL_STREAM_BARRIER=0).
-    let _guard = null_stream_sync_for_event(stream);
     let result = unsafe { hipStreamWaitEvent(stream, event, flags) };
     super::driver::zluda_log_err(&format!(
         "cuStreamWaitEvent(stream={:?}, event={:?}, flags={:#x}) -> {:?}",
@@ -439,30 +381,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn null_stream_policy_default_mode_only_locks_null_stream() {
-        let null = hipStream_t(std::ptr::null_mut());
-        let other = hipStream_t(1usize as *mut _);
-        let strict = false;
-
-        assert!(null_stream_uses_global_lock(null, strict));
-        assert!(!null_stream_uses_global_lock(other, strict));
-        assert!(null_stream_needs_pre_sync(null));
-        assert!(!null_stream_needs_pre_sync(other));
-        assert!(!null_stream_needs_post_sync(null, strict));
-        assert!(!null_stream_needs_post_sync(other, strict));
+    fn per_thread_entry_points_resolve_only_stream_zero() {
+        let resolved = per_thread_stream(hipStream_t(std::ptr::null_mut()));
+        assert_eq!(resolved.0 as usize, 2);
+        for handle in [1, 2, 0x1000] {
+            let resolved = per_thread_stream(hipStream_t(handle as *mut _));
+            assert_eq!(resolved.0 as usize, handle);
+        }
     }
 
     #[test]
-    fn null_stream_policy_strict_mode_blocks_all_submissions_and_postsyncs_null() {
-        let null = hipStream_t(std::ptr::null_mut());
-        let other = hipStream_t(1usize as *mut _);
-        let strict = true;
+    fn stream_flags_distinguish_blocking_and_nonblocking_streams() {
+        let blocking = hipStream_t(0x1000usize as *mut _);
+        let nonblocking = hipStream_t(0x2000usize as *mut _);
+        let mut flags = StreamFlags::default();
+        flags.created(blocking, hipStreamDefault);
+        flags.created(nonblocking, hipStreamNonBlocking);
+        assert_eq!(flags.get(blocking), Some(0));
+        assert_eq!(flags.get(nonblocking), Some(1));
+        let generation = flags.generation_of(nonblocking);
+        flags.destroyed(nonblocking, generation);
+        assert_eq!(flags.get(nonblocking), None);
+        // A reused HIP address must carry the new stream's flags.
+        flags.created(nonblocking, hipStreamDefault);
+        assert_eq!(flags.get(nonblocking), Some(0));
+        assert_eq!(flags.get(blocking), Some(0));
+    }
 
-        assert!(null_stream_uses_global_lock(null, strict));
-        assert!(null_stream_uses_global_lock(other, strict));
-        assert!(null_stream_needs_pre_sync(null));
-        assert!(!null_stream_needs_pre_sync(other));
-        assert!(null_stream_needs_post_sync(null, strict));
-        assert!(!null_stream_needs_post_sync(other, strict));
+    #[test]
+    fn delayed_destroy_does_not_forget_reused_stream_flags() {
+        let stream = hipStream_t(0x1000usize as *mut _);
+        let mut flags = StreamFlags::default();
+        flags.created(stream, hipStreamDefault);
+        let destroyed_generation = flags.generation_of(stream);
+        flags.created(stream, hipStreamNonBlocking);
+        flags.destroyed(stream, destroyed_generation);
+        assert_eq!(flags.get(stream), Some(hipStreamNonBlocking));
+        flags.destroyed(stream, None);
+        assert_eq!(flags.get(stream), Some(hipStreamNonBlocking));
+    }
+
+    #[test]
+    fn stream_flags_reject_invalid_arguments_without_entering_hip() {
+        assert_eq!(
+            get_flags(hipStream_t(std::ptr::null_mut()), std::ptr::null_mut()),
+            hipError_t::ErrorInvalidValue
+        );
+        let mut flags = 0;
+        assert_eq!(
+            get_flags(hipStream_t(0x1234usize as *mut _), &mut flags),
+            hipError_t::ErrorInvalidHandle
+        );
     }
 }

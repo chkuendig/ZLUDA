@@ -13423,7 +13423,6 @@ pub(crate) fn launch_kernel(
         {
             unsafe {
                 let _ = hipDeviceSynchronize();
-                super::stream::clear_dirty_flag_after_device_sync();
             }
         }
     }
@@ -14843,15 +14842,6 @@ pub(crate) fn launch_kernel(
     if name == "MemCopyBatchedAsync" {
         unsafe { dump_mcb_scratch(kernel_params, extra, grid_dim_y); }
     }
-    // NULL-stream synchronization: CUDA guarantees that operations on the NULL
-    // stream (stream 0) serialize with ALL other streams. HIP/ROCm 6.2.4 doesn't
-    // enforce this. We call hipDeviceSynchronize only for NULL-stream launches
-    // (which is what CUDA semantics require) instead of the previous blanket sync
-    // that drained all streams before every single launch.
-    //
-    // The guard holds a lock to prevent other threads from submitting work between
-    // our sync and our launch. Dropped after hipModuleLaunchKernel returns.
-    let _null_stream_guard = super::stream::null_stream_sync(stream);
     let sort_downsweep_args = if (creategrid_safe_validator_enabled()
         || creategrid_snapshot_log_start().is_some())
         && name.contains("RadixSortDownsweepKernel")
@@ -15122,14 +15112,6 @@ pub(crate) fn launch_kernel(
             )
         }
     };
-    // 2026-06-04 Option A: NULL-stream query now uses NULL_STREAM_HAD_BLOCKING_WORK instead
-    // of FIRST_REAL_LAUNCH_SEEN. The flag is set via mark_non_default_stream_dirty(),
-    // which is only called for non-NULL streams. So we no longer set FIRST_REAL_LAUNCH_SEEN here.
-    if result.is_ok() {
-        if !stream.0.is_null() {
-            super::stream::mark_non_default_stream_dirty();
-        }
-    }
     // 2026-06-08 Class A use-after-free hypothesis check: free_v2
     // scans the existing KERNEL_RING (populated below by
     // record_kernel_launch via per-kernel capture intercepts) for
@@ -15154,7 +15136,6 @@ pub(crate) fn launch_kernel(
         }) {
             unsafe {
                 let _ = hipDeviceSynchronize();
-                super::stream::clear_dirty_flag_after_device_sync();
             }
         }
     }
@@ -15188,7 +15169,6 @@ pub(crate) fn launch_kernel(
         match post_sync_mode {
             1 => unsafe {
                 let _ = hipDeviceSynchronize();
-                super::stream::clear_dirty_flag_after_device_sync();
             },
             2 => unsafe {
                 let _ = hipStreamSynchronize(stream);
@@ -15677,10 +15657,7 @@ pub(crate) fn launch_kernel(
     result
 }
 
-// _ptsz = per-thread default stream variant of cuLaunchKernel.
-// cuGetProcAddress returns this for cuLaunchKernel with certain version/flags.
-// Behavior is identical to launch_kernel — the stream difference is already
-// handled by HIP's stream semantics.
+// _ptsz resolves implicit stream zero to HIP's per-thread default stream.
 pub(crate) fn launch_kernel_ptsz(
     f: &Function,
     grid_dim_x: ::core::ffi::c_uint,
@@ -15703,7 +15680,7 @@ pub(crate) fn launch_kernel_ptsz(
         block_dim_y,
         block_dim_z,
         shared_mem_bytes,
-        stream,
+        super::stream::per_thread_stream(stream),
         kernel_params,
         extra,
     )
@@ -16963,10 +16940,6 @@ mod tests {
         assert!(
             std::ptr::eq(lock, &LAUNCH_LOCK),
             "launch mutex mode should use the dedicated launch lock"
-        );
-        assert!(
-            !std::ptr::eq(lock, &crate::r#impl::stream::NULL_STREAM_LOCK),
-            "launch mutex mode must not reuse NULL_STREAM_LOCK or NULL-stream launches can deadlock"
         );
     }
 

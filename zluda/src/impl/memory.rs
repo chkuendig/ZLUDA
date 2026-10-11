@@ -1059,7 +1059,6 @@ pub(crate) fn copy_dto_h_v2(
     src_device: hipDeviceptr_t,
     byte_count: usize,
 ) -> hipError_t {
-    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     let result = unsafe { hipMemcpyDtoH(dst_host, src_device, byte_count) };
     if result.is_ok() && dtoh_log_enabled() {
         let dwords = unsafe { format_dtoh_dwords(dst_host as *const u8, byte_count) };
@@ -1079,7 +1078,6 @@ pub(crate) fn copy_hto_d_v2(
     src_host: *const ::core::ffi::c_void,
     byte_count: usize,
 ) -> hipError_t {
-    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     // Plan v14.next.next: H2D into a tracked mapped buffer = CPU directly
     // overwriting a slot. PhysX's per-frame counter bookkeeping may take
     // this path (set values from CPU-side state).
@@ -1260,7 +1258,6 @@ fn log_memset(kind: &str, dst: u64, value: u64, n: usize) {
 }
 
 pub(crate) fn set_d8_v2(dst: hipDeviceptr_t, value: ::core::ffi::c_uchar, n: usize) -> hipError_t {
-    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     log_memset("d8", dst.0 as u64, value as u64, n);
     if let Some(rd5) = super::function::check_memset_hits_rd5_counter(dst.0 as u64, n as u64) {
         super::driver::zluda_log_err(&format!(
@@ -1284,11 +1281,7 @@ pub(crate) fn set_d8_async(
             dst.0 as u64, value, n, stream.0 as u64, rd5
         ));
     }
-    let _guard = super::stream::null_stream_sync(stream);
     let result = unsafe { hipMemsetD8Async(dst, value, n, stream) };
-    if result.is_ok() && !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     result
 }
 
@@ -1297,7 +1290,6 @@ pub(crate) fn set_d16_v2(
     value: ::core::ffi::c_ushort,
     n: usize,
 ) -> hipError_t {
-    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     log_memset("d16", dst.0 as u64, value as u64, n);
     if let Some(rd5) =
         super::function::check_memset_hits_rd5_counter(dst.0 as u64, (n as u64) * 2)
@@ -1325,16 +1317,11 @@ pub(crate) fn set_d16_async(
             dst.0 as u64, value, n, stream.0 as u64, rd5
         ));
     }
-    let _guard = super::stream::null_stream_sync(stream);
     let result = unsafe { hipMemsetD16Async(dst, value, n, stream) };
-    if result.is_ok() && !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     result
 }
 
 pub(crate) fn set_d32_v2(dst: hipDeviceptr_t, value: ::core::ffi::c_uint, n: usize) -> hipError_t {
-    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     log_memset("d32", dst.0 as u64, value as u64, n);
     if let Some(rd5) =
         super::function::check_memset_hits_rd5_counter(dst.0 as u64, (n as u64) * 4)
@@ -1384,7 +1371,6 @@ pub(crate) fn set_d32_async(
             value as u32,
         );
     }
-    let _guard = super::stream::null_stream_sync(stream);
     // 2026-06-09 Class A counter-coherency fix candidate. n9 trace showed
     // small `set_d32_async` calls (size 64 = 16 × u32 = a 16-counter
     // array) hitting the same alloc from 3 different streams over a
@@ -1427,16 +1413,12 @@ pub(crate) fn set_d32_async(
                     }
                     _ => {
                         let _ = hipDeviceSynchronize();
-                        super::stream::clear_dirty_flag_after_device_sync();
                     }
                 }
             }
         }
     }
     let result = unsafe { hipMemsetD32Async(dst, value as _, n, stream) };
-    if result.is_ok() && !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     result
 }
 
@@ -1654,7 +1636,6 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
             }
         ));
     }
-    let _guard = super::stream::null_stream_sync(stream);
     let result = hipMemcpyHtoDAsync(dst_device, src_host.cast_mut(), byte_count, stream);
     if result.is_err() {
         // hipMemcpyHtoDAsync failed — try hipMemcpyAsync with Default kind.
@@ -1672,9 +1653,6 @@ pub(crate) unsafe fn copy_hto_d_async_v2(
             stream,
         )?;
     }
-    if !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     Ok(())
 }
 
@@ -1684,7 +1662,6 @@ pub(crate) unsafe fn copy_dto_h_async_v2(
     byte_count: usize,
     stream: hipStream_t,
 ) -> hipError_t {
-    let _guard = super::stream::null_stream_sync(stream);
     let result = hipMemcpyDtoHAsync(dst_host, src_device, byte_count, stream);
     if result.is_ok() && dtoh_log_enabled() {
         // The async copy may not have completed by the time the call
@@ -1703,9 +1680,6 @@ pub(crate) unsafe fn copy_dto_h_async_v2(
         // pay the sync cost when trace is actually on AND size is in range.
         let _ = hipStreamSynchronize(stream);
         log_dtoh_trace("async", dst_host, src_device, byte_count);
-    }
-    if result.is_ok() && !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
     }
     result
 }
@@ -1773,11 +1747,7 @@ pub(crate) unsafe fn copy_dto_d_async_v2(
             dst_device.0 as u64, src_device.0 as u64, byte_count, stream.0 as u64, rd5
         ));
     }
-    let _guard = super::stream::null_stream_sync(stream);
     let result = hipMemcpyDtoDAsync(dst_device, src_device, byte_count, stream);
-    if result.is_ok() && !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     result
 }
 
@@ -2366,7 +2336,6 @@ pub(crate) unsafe fn copy_async(
             dst.0 as u64, src.0 as u64, byte_count, stream.0 as u64, rd5
         ));
     }
-    let _guard = super::stream::null_stream_sync(stream);
     let result = hipMemcpyAsync(
         dst.0,
         src.0,
@@ -2374,9 +2343,6 @@ pub(crate) unsafe fn copy_async(
         hipMemcpyKind::hipMemcpyDefault,
         stream,
     );
-    if result.is_ok() && !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     result
 }
 
@@ -2424,7 +2390,6 @@ pub(crate) unsafe fn copy_2d_v2(memcpy: hip_Memcpy2D) -> CUresult {
 }
 
 pub(crate) unsafe fn copy_2d_async_v2(memcpy: hip_Memcpy2D, stream: hipStream_t) -> CUresult {
-    let _guard = super::stream::null_stream_sync(stream);
     // 2026-05-09 Phase E (plan fluttering-waddling-zephyr.md):
     // APEX TurbulenceFS calls cuMemcpy2DAsync_v2 with our D3D11
     // sentinel as `dstArray` (confirmed in run_20260509_phaseA_diag).
@@ -2436,9 +2401,6 @@ pub(crate) unsafe fn copy_2d_async_v2(memcpy: hip_Memcpy2D, stream: hipStream_t)
     log_memcpy_sentinel_2d("cuMemcpy2DAsync_v2", &memcpy);
     let memcpy = rewrite_2d_for_sentinel(memcpy);
     hipMemcpyParam2DAsync(&memcpy, stream)?;
-    if !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     Ok(())
 }
 
@@ -2603,9 +2565,6 @@ pub(crate) unsafe fn copy_ato_h_async_v2(
             byte_count,
             stream,
         )?;
-        if !stream.0.is_null() {
-            super::stream::mark_non_default_stream_dirty();
-        }
         return Ok(());
     }
     hipMemcpyAtoHAsync(
@@ -2615,9 +2574,6 @@ pub(crate) unsafe fn copy_ato_h_async_v2(
         byte_count,
         stream,
     )?;
-    if !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     Ok(())
 }
 
@@ -2671,9 +2627,6 @@ pub(crate) unsafe fn copy_hto_a_async_v2(
             byte_count,
             stream,
         )?;
-        if !stream.0.is_null() {
-            super::stream::mark_non_default_stream_dirty();
-        }
         return Ok(());
     }
     hipMemcpyHtoAAsync(
@@ -2683,9 +2636,6 @@ pub(crate) unsafe fn copy_hto_a_async_v2(
         byte_count,
         stream,
     )?;
-    if !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     Ok(())
 }
 
@@ -2823,9 +2773,6 @@ pub(crate) unsafe fn copy_3d_async_v2(memcpy: HIP_MEMCPY3D, stream: hipStream_t)
     log_memcpy_sentinel_3d("cuMemcpy3DAsync_v2", &memcpy);
     let memcpy = rewrite_3d_for_sentinel(memcpy);
     hipDrvMemcpy3DAsync(&memcpy, stream)?;
-    if !stream.0.is_null() {
-        super::stream::mark_non_default_stream_dirty();
-    }
     Ok(())
 }
 
@@ -2852,7 +2799,6 @@ pub(crate) unsafe fn set_d_2d32_v2(
     width: usize,
     height: usize,
 ) -> hipError_t {
-    let _guard = super::stream::null_stream_sync(hipStream_t(std::ptr::null_mut()));
     hipMemset2D(dst_device.0, dst_pitch, value as _, width, height)
 }
 #[cfg(test)]
@@ -2982,6 +2928,5 @@ pub(crate) unsafe fn set_d_2d32_async(
     height: usize,
     stream: hipStream_t,
 ) -> hipError_t {
-    let _guard = super::stream::null_stream_sync(stream);
     hipMemset2DAsync(dst_device.0, dst_pitch, value as _, width, height, stream)
 }
