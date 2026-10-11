@@ -313,6 +313,7 @@ mod tests {
         let array = (false, 0x123);
         let parent = (true, 0x123);
         let child = (false, 0x456);
+        let replacement_child = (false, 0x789);
         remember_metadata(array, 16, 2, None);
         let old_array = metadata(array);
         remember_metadata(array, 9, 0, None);
@@ -322,14 +323,18 @@ mod tests {
         let old_parent = metadata(parent).unwrap();
         remember_metadata(child, 16, 2, Some((parent.1, old_parent.generation)));
         remember_metadata(parent, 8, 0, None);
+        let new_parent = metadata(parent).unwrap();
+        remember_metadata(replacement_child, 8, 0, Some((parent.1, new_parent.generation)));
         forget_metadata(parent, Some(old_parent));
         assert!(metadata(child).is_none());
+        assert_eq!(metadata(replacement_child).unwrap().format, 8);
         assert_eq!(metadata(parent).unwrap().format, 8);
         assert_eq!(metadata(array).unwrap().flags, 0);
         forget_metadata(array, metadata(array));
         forget_metadata(parent, metadata(parent));
         assert!(metadata(array).is_none());
         assert!(metadata(parent).is_none());
+        assert!(metadata(replacement_child).is_none());
     }
 
     #[test_cuda]
