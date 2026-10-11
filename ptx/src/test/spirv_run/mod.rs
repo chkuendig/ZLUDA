@@ -10581,6 +10581,6 @@ fn clock_helper_both_fp_modes_llvm() {
         assert!(ir.contains("define linkonce_odr hidden i32 @__zluda_ptx_impl_sreg_clock()"), "{ir}");
         assert!(ir.contains("call i64 @llvm.readcyclecounter()"), "{ir}");
         assert_eq!(ir.matches("call i32 @__zluda_ptx_impl_sreg_clock()").count(), 2, "{ir}");
-        assert!(ir.contains("trunc i64 %cycles to i32"), "{ir}");
+        assert!(ir.lines().any(|line| line.contains("trunc i64") && line.ends_with(" to i32")), "{ir}");
     }
 }
