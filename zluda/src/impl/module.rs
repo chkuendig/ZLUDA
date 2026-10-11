@@ -2721,9 +2721,13 @@ fn get_cache_key<'a, 'b>(
     })
 }
 
+fn is_radixsort_downsweep_module(text: &str) -> bool {
+    text.contains("RadixSortDownsweepKernel") && text.contains("GridEvenShare")
+}
+
 fn should_dump_radixsort_downsweep_module(text: &str) -> bool {
     std::env::var("ZLUDA_DUMP_IR").map_or(false, |value| value == "1")
-        && text.contains("RadixSortDownsweepKernel") && text.contains("GridEvenShare")
+        && is_radixsort_downsweep_module(text)
 }
 
 fn maybe_dump_radixsort_downsweep_module(text: Option<&str>, elf_module: &[u8], from_cache: bool) {
@@ -4438,13 +4442,13 @@ mod tests {
 
     #[test]
     fn detects_radixsort_downsweep_modules() {
-        assert!(super::should_dump_radixsort_downsweep_module(
+        assert!(super::is_radixsort_downsweep_module(
             ".visible .entry _ZN3cub24RadixSortDownsweepKernel(...)\nGridEvenShare"
         ));
-        assert!(!super::should_dump_radixsort_downsweep_module(
+        assert!(!super::is_radixsort_downsweep_module(
             ".visible .entry SomeOtherKernel(...)\nGridEvenShare"
         ));
-        assert!(!super::should_dump_radixsort_downsweep_module(
+        assert!(!super::is_radixsort_downsweep_module(
             ".visible .entry _ZN3cub24RadixSortDownsweepKernel(...)"
         ));
     }
