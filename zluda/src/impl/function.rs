@@ -12846,6 +12846,10 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
+    static FIRST_KERNEL_LAUNCH_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let first_kernel_launch_logged =
+        FIRST_KERNEL_LAUNCH_LOGGED.load(std::sync::atomic::Ordering::Relaxed);
     // Resolve ZLUDA_LAUNCH_MUTEX mode once per process (see LAUNCH_LOCK docs).
     // Also logs the resolved mode on first launch so we can confirm the env var
     // propagated through Steam → Proton → Wine → libcuda.so.
@@ -15508,6 +15512,23 @@ pub(crate) fn launch_kernel(
         }
     }
     // Log launch failures with full context for diagnosis
+    if result.is_ok()
+        && !first_kernel_launch_logged
+        && FIRST_KERNEL_LAUNCH_LOGGED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        if name.is_empty() {
+            eprintln!("ZLUDA: first kernel launch ({:p})", f.base.0);
+        } else {
+            eprintln!("ZLUDA: first kernel launch ({})", name);
+        }
+    }
     if result.is_err() {
         super::driver::zluda_log_err(&format!(
             "cuLaunchKernel FAILED '{}' func={:p} grid=[{},{},{}] block=[{},{},{}] shared={} -> {:?}",

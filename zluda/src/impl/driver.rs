@@ -1367,6 +1367,35 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
         }
     }
     global_state()?;
+    static STARTUP_LOG: std::sync::Once = std::sync::Once::new();
+    STARTUP_LOG.call_once(|| {
+        let mut props = unsafe { mem::zeroed() };
+        let device_name = if unsafe { hipGetDevicePropertiesR0600(&mut props, 0) }.is_ok() {
+            unsafe { CStr::from_ptr(props.name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            "unknown".to_owned()
+        };
+        let mut runtime_ver = 0i32;
+        let hip_version =
+            if unsafe { hip_runtime_sys::hipRuntimeGetVersion(&mut runtime_ver) }.is_ok() {
+                format!(
+                    "{}.{}.{}",
+                    runtime_ver / 10_000_000,
+                    (runtime_ver / 100_000) % 100,
+                    runtime_ver % 100_000
+                )
+            } else {
+                "unknown".to_owned()
+            };
+        eprintln!(
+            "ZLUDA: cuInit ok ({}, HIP {}, ZLUDA {})",
+            device_name,
+            hip_version,
+            env!("VERGEN_GIT_SHA")
+        );
+    });
     zluda_log("[ZLUDA] cuInit -> SUCCESS");
     zluda_log_err("=== ZLUDA cuInit -> SUCCESS ===");
     Ok(())
