@@ -15139,6 +15139,9 @@ pub(crate) fn launch_kernel(
     // notes generic scanning segfaults for short arg lists). The
     // recording happens in record_kernel_launch; the scan happens in
     // memory.rs::free_v2.
+    if result.is_ok() {
+        crate::r#impl::recording::submitted();
+    }
     // 2026-06-08 Class A upper-bound diagnostic: hipDeviceSync after
     // EVERY successful kernel launch. The hypothesis is that Class A's
     // GPU TCP wild-write category may be an HDP-coherency issue that

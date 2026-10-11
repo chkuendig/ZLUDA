@@ -17,6 +17,7 @@ pub(super) mod memory;
 pub(super) mod module;
 pub(super) mod pointer;
 mod signal;
+pub(crate) mod recording;
 pub(super) mod stream;
 pub(super) mod surf;
 pub(super) mod tex;

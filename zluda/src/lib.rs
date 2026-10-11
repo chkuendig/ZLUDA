@@ -86,6 +86,7 @@ pub(crate) fn initialized() -> bool {
 #[cfg_attr(not(windows), dtor::dtor)]
 fn deinitialize() {
     INITIALIZED.store(false, Ordering::SeqCst);
+    r#impl::recording::shutdown();
 }
 
 macro_rules! unimplemented {
