@@ -36,12 +36,12 @@ def case(a):
     if not line:
      server.wait(timeout=1);raise RuntimeError('reader stopped: '+server.stderr.read().decode())
     return json.loads(line)
-   def counted(expected):
+   def counted(expected,predicate=lambda snapshot:True):
     deadline=time.monotonic()+4;previous=0
     while time.monotonic()<deadline:
      current=snapshot(deadline-time.monotonic());value=current['total_success']
      require(value>=previous,'counter regressed');previous=value
-     if value==expected:return current
+     if value==expected and predicate(current):return current
     raise RuntimeError('count deadline')
    def ended(expected):
     stdout,stderr=server.communicate(timeout=4);require(server.returncode==expected,f'exit {server.returncode}, expected {expected}: '+stderr.decode())
@@ -62,7 +62,7 @@ def case(a):
       barrier.wait(timeout=3)
       for i in range(worker*32,(worker+1)*32):lib.survey_observe_id(i)
      with ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(publish,range(4)))
-     current=counted(128);require(current['total_success']==128 and len(current['rows'])==128,'concurrent publication differs')
+     current=counted(128,lambda r:len(r['rows'])==128 and sum(row['success'] for row in r['rows'])==128);require(current['total_success']==128 and len(current['rows'])==128,'concurrent publication differs')
      require(len({r['name'] for r in current['rows']})==128 and all(r['success']==1 for r in current['rows']),'published metadata differs')
     elif a.child=='process-death':
      producer.kill();producer.wait(timeout=3);ended(0)
@@ -87,6 +87,9 @@ def case(a):
      errors.append(str(exc))
      if server.poll() is None:
       server.kill();server.communicate(timeout=2)
+   if server is not None:
+    expected=2 if a.child in ('wrong-hash','wrong-build','stale-only','malformed-row','replace','duplicate','modify-library') else 0
+    if server.returncode!=expected:errors.append(f'final reader exit {server.returncode}, expected {expected}')
    try:
     if 'producer' in locals() and producer and producer.poll() is None:producer.kill();producer.communicate(timeout=3)
    except Exception as exc:errors.append(str(exc))
