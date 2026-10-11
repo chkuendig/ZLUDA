@@ -7402,6 +7402,17 @@ fn nrss_ring_dump(tag: &str) {
     }
 }
 
+fn nrss_validation_mode() -> u32 {
+    // 0=off, 1=final-pass-only, 2=every scatter pass.
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("ZLUDA_NRSS_VALIDATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// 2026-06-10 IOFX-mode writer hunt: in-game NRSS output validation.
 /// The lab exonerates IOFX_newRadixSortStepKernel under every reproducible
 /// configuration (solo / NRSS+NRSS / cub+NRSS / degenerate keys), yet the
@@ -7423,13 +7434,7 @@ unsafe fn validate_nrss_output_after_launch(
 ) {
     // 0=off, 1=final-pass-only (whose-fault), 2=EVERY scatter pass
     // (which-pass localization: 2 D2H per phase-3 launch).
-    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let mode = *MODE.get_or_init(|| {
-        std::env::var("ZLUDA_NRSS_VALIDATE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    });
+    let mode = nrss_validation_mode();
     if mode == 0 {
         return;
     }
@@ -12833,6 +12838,20 @@ unsafe fn zero_sort_downsweep_input_slack(
     }
 }
 
+// These opt-in readers need a completed kernel before inspecting its output.
+// Their shared device drain must stay disabled during ordinary asynchronous
+// launches: a nonblocking stream may need a later launch to make progress.
+fn post_launch_diagnostics_enabled(name: &str) -> bool {
+    let ms1 = name.contains("CreateParticleShapesIncremental_MultiStage_1");
+    (ms4_capture_enabled() && f6_tracker_enabled())
+        || ms2_rd6_kernel_trace_enabled()
+        || counter_snapshot_enabled()
+        || (nrss_validation_mode() != 0 && name == "IOFX_newRadixSortStepKernel")
+        || super::memory::mapped_write_trace_enabled()
+        || (flag_count_probe_enabled() && (name == "ParticleCollisionStaticBox" || ms1))
+        || (ms1_gate_trace_enabled() && ms1)
+}
+
 pub(crate) fn launch_kernel(
     f: &Function,
     grid_dim_x: ::core::ffi::c_uint,
@@ -15589,13 +15608,9 @@ pub(crate) fn launch_kernel(
             capture_ms2b_post(slot_index);
         }
     }
-    // F.4: per-launch counter mutation tracker. Snapshots all tracked counter
-    // pointers and diffs vs the previous snapshot. Logs a `*** COUNTER ...`
-    // line whenever ANY kernel mutates the counter buffer, with the kernel's
-    // name. The "shift-and-zero" pattern from F.3b gets a SHIFT_ZERO tag.
-    // Gated by ZLUDA_MS4_CAPTURE=1 AND TRACKED_COUNTER_PTRS being non-empty
-    // — pre-PhysX init kernels skip the snapshot entirely.
-    if result.is_ok() {
+    // Shared completion wait for opt-in post-launch readers. Keep it inside
+    // their gate so ordinary nonblocking launches can return before completion.
+    if result.is_ok() && post_launch_diagnostics_enabled(&name) {
         unsafe {
             let _ = hip_runtime_sys::hipDeviceSynchronize();
             check_counter_mutation(&name);
@@ -15621,15 +15636,17 @@ pub(crate) fn launch_kernel(
             // [MAPPED_WRITE] lines per changed u32 attributing the change
             // to this kernel. Used to identify which kernel grows / shrinks
             // each MS_4 n_threads slot at {host+663552, +663640, +663728}.
-            static MAPPED_WRITE_SEQ: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let seq = MAPPED_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            super::memory::mapped_write_diff_post(seq, &name);
+            if super::memory::mapped_write_trace_enabled() {
+                static MAPPED_WRITE_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let seq = MAPPED_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::memory::mapped_write_diff_post(seq, &name);
+            }
             // v8 Step 2: POST_PCSB flag probe — after ParticleCollisionStaticBox
             // returns, count bit 4 (0x10) distribution. NOTE: PCSB writes to a
             // DIFFERENT buffer than MS_4's flags (verified run #19), so this
             // probe is informational; bit-4 changes here don't affect MS_4.
-            if name == "ParticleCollisionStaticBox" {
+            if flag_count_probe_enabled() && name == "ParticleCollisionStaticBox" {
                 let flags_ptr: u64 = read_kernel_arg(kernel_params, extra, 56, 2).unwrap_or(0);
                 let n_particles: u32 = read_kernel_arg(kernel_params, extra, 96, 6).unwrap_or(0);
                 let probe_n = n_particles.min(256);
@@ -15640,11 +15657,13 @@ pub(crate) fn launch_kernel(
             // at module_10:1001 has the bit-4-set site we suspect fails on
             // ZLUDA. If bit-4-set stays ~0% after MS_1, this site is the bug.
             if name.contains("CreateParticleShapesIncremental_MultiStage_1") {
-                let flags_ptr = MS4_FLAGS_PTR_LATCHED.load(std::sync::atomic::Ordering::Acquire);
-                let n = MS4_N_LATCHED.load(std::sync::atomic::Ordering::Acquire);
-                if flags_ptr != 0 && n != 0 {
-                    let probe_n = n.min(1024);
-                    snapshot_flag_bit4_at("POST_MS1", flags_ptr, probe_n);
+                if flag_count_probe_enabled() {
+                    let flags_ptr = MS4_FLAGS_PTR_LATCHED.load(std::sync::atomic::Ordering::Acquire);
+                    let n = MS4_N_LATCHED.load(std::sync::atomic::Ordering::Acquire);
+                    if flags_ptr != 0 && n != 0 {
+                        let probe_n = n.min(1024);
+                        snapshot_flag_bit4_at("POST_MS1", flags_ptr, probe_n);
+                    }
                 }
                 // v11: dump + reset MS_1 gate-trace counters. Captures per-
                 // launch outcomes of the bit-4-set gate predicates.
@@ -16949,6 +16968,55 @@ mod tests {
             launch_mutex(0).is_none(),
             "mode 0 should leave launch serialization disabled"
         );
+    }
+
+    #[test]
+    fn post_launch_diagnostic_gates() {
+        // A fresh test process gives each case fresh OnceLocks, without changing
+        // the environment seen by other tests in this process.
+        const MARKER: &str = "ZLUDA_UNIT_POST_LAUNCH_GATE";
+        if let Ok(scope) = std::env::var(MARKER) {
+            for (name, enabled) in [
+                ("produce", scope == "all"),
+                ("IOFX_newRadixSortStepKernel", scope == "all" || scope == "nrss"),
+                ("ParticleCollisionStaticBox", scope == "all" || scope == "flag"),
+                ("CreateParticleShapesIncremental_MultiStage_1", scope == "all" || scope == "flag" || scope == "ms1"),
+            ] {
+                assert_eq!(post_launch_diagnostics_enabled(name), enabled, "{scope}: {name}");
+            }
+            return;
+        }
+        let cases: &[(&[(&str, &str)], &str)] = &[
+            (&[], "off"),
+            (&[("ZLUDA_MS4_CAPTURE", "1")], "off"),
+            (&[("ZLUDA_F6_TRACK", "1")], "off"),
+            (&[("ZLUDA_MS4_CAPTURE", "1"), ("ZLUDA_F6_TRACK", "1")], "all"),
+            (&[("ZLUDA_MS2_RD6_KERNEL_TRACE", "1")], "all"),
+            (&[("ZLUDA_COUNTER_SNAPSHOT", "1")], "all"),
+            (&[("ZLUDA_NRSS_VALIDATE", "1")], "nrss"),
+            (&[("ZLUDA_NRSS_VALIDATE", "2")], "nrss"),
+            (&[("ZLUDA_NRSS_VALIDATE", "0")], "off"),
+            (&[("ZLUDA_NRSS_VALIDATE", "invalid")], "off"),
+            (&[("ZLUDA_MAPPED_WRITE_TRACE", "1")], "all"),
+            (&[("ZLUDA_FLAG_COUNT_PROBE", "1")], "flag"),
+            (&[("ZLUDA_MS1_GATE_TRACE", "1")], "ms1"),
+        ];
+        for &(vars, scope) in cases {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["post_launch_diagnostic_gates", "--test-threads=1"]);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("ZLUDA_") {
+                    cmd.env_remove(key);
+                }
+            }
+            cmd.env(MARKER, scope);
+            for &(key, value) in vars {
+                cmd.env(key, value);
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{vars:?}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+        }
     }
 
     #[test]
