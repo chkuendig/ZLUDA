@@ -1281,6 +1281,37 @@ fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> Result<(), cuda_type
     init_hip_and_state(flags)
 }
 
+fn configure_hip_fence_scope() -> CUresult {
+    static CONFIGURED: std::sync::OnceLock<CUresult> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        let inherited = std::env::var_os("AMD_OPT_FLUSH");
+        // ROCclr reads this at runtime initialization and retains it in device
+        // settings/queues. With 7.2.4 on gfx1030, concurrent same-stream chains
+        // reproduced stale values with agent scopes and passed with SYSTEM
+        // acquire/release. Stronger packet fences do not drain the device.
+        // Configure before our first HIP initialization; an unrelated HIP user
+        // may already have initialized the runtime. Preserve explicit overrides.
+        if unsafe { libc::setenv(c"AMD_OPT_FLUSH".as_ptr(), c"0".as_ptr(), 0) } != 0 {
+            eprintln!(
+                "ZLUDA: setting AMD_OPT_FLUSH failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return Err(CUerror::UNKNOWN);
+        }
+        let value = std::env::var_os("AMD_OPT_FLUSH").unwrap_or_default();
+        eprintln!(
+            "ZLUDA: HIP AMD_OPT_FLUSH={} ({})",
+            value.to_string_lossy(),
+            if inherited.is_some() {
+                "inherited"
+            } else {
+                "ZLUDA default"
+            }
+        );
+        Ok(())
+    })
+}
+
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     zluda_log(&format!("[ZLUDA] cuInit({})", flags));
     zluda_log_err(&format!(
@@ -1288,6 +1319,7 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
         flags,
         crate::is_log_all_enabled()
     ));
+    configure_hip_fence_scope()?;
     // Disable SDMA before HIP init. On Steam Deck / gfx10.3 we now see SDMA
     // queue exhaustion ("No more SDMA queue to allocate") and follow-on copy
     // hangs in module/copy probes; Wine's SIGUSR1 APC delivery can also

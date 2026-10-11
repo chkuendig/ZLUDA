@@ -12,28 +12,21 @@ use std::sync::Mutex;
 // Distinct CUDA contexts on one HIP device already share that queue; context
 // isolation requires a separate context/stream mapping change.
 
-/// Cross-kernel L1 visibility fix ("Bug A") — default ON.
+/// Historical cross-kernel visibility workaround ("Bug A") — default ON.
 ///
-/// On gfx10 RDNA, rocclr's default AQL `release_fence_scope = AGENT` does NOT
-/// trigger the Command Processor's inter-dispatch L1 invalidation. A reader
-/// kernel on a different CU can therefore read STALE L1 lines for data a writer
-/// kernel stored on another stream — reproduced by `bug_a_xkernel_coherency`
-/// (5/50k stale reads). In PhysX this surfaces as wild indices/counters →
-/// `(u32)-N × 4` wild VA → GPU page fault.
+/// Historical cross-stream visibility workaround: inject a small async D2D copy
+/// at event handoffs. Earlier game runs improved with it, but it is not an
+/// unconditional SYSTEM fence. In pinned ROCclr 7.2.4, copyBuffer requests
+/// SYSTEM scope only for particular source-memory properties or synchronous
+/// copies; the selected copy path also matters (rocblit.cpp).
 ///
-/// The CP inter-dispatch L1 invalidation only runs at `HSA_FENCE_SCOPE_SYSTEM`,
-/// which rocclr sets after memcpy/image ops (`gpu().addSystemScope()` in
-/// rocblit.cpp). So a tiny `hipMemcpyDtoDAsync` on a stream forces the NEXT AQL
-/// packet on that stream to SYSTEM scope. We inject it at the cross-stream
-/// dependency points (`cuEventRecord` producer-release, `cuStreamWaitEvent`
-/// consumer-acquire) so PhysX's producer→consumer hand-offs become coherent.
+/// Concurrent native fixtures reproduced stale values even with this injection.
+/// driver::init now defaults AMD_OPT_FLUSH=0 before HIP initialization to request
+/// SYSTEM acquire/release dispatch headers directly. Explicit AMD_OPT_FLUSH=0
+/// runs passed on Deck/gfx1030; this does not identify a game's faulting operation.
 ///
-/// Validated by a decisive same-session A/B (2026-05-28): fix OFF crashed with
-/// 10 GPU page faults; fix ON ran 3/3 clean (~1.5M kernels, 0 faults).
-///
-/// Default ON. Set `ZLUDA_XKERNEL_SYSTEM_SCOPE=0` to disable (e.g. for A/B).
-/// NOTE: the D2D-to-force-SYSTEM-scope is a pragmatic mechanism; see the active
-/// plan for a less hacky replacement (direct AQL fence scope / cache invalidate).
+/// Retain the existing injection separately from the runtime-default correction.
+/// Default ON; ZLUDA_XKERNEL_SYSTEM_SCOPE=0 disables it for diagnostics.
 fn xkernel_system_scope_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -41,7 +34,7 @@ fn xkernel_system_scope_enabled() -> bool {
     })
 }
 
-/// Lazily-allocated 8-byte device scratch for the system-scope D2D.
+/// Lazily-allocated 8-byte device scratch for the historical handoff copy.
 /// Stored as usize so the OnceLock is Send+Sync.
 fn system_scope_scratch() -> Option<hipDeviceptr_t> {
     static SCRATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -56,8 +49,8 @@ fn system_scope_scratch() -> Option<hipDeviceptr_t> {
     (p != 0).then(|| hipDeviceptr_t(p as *mut std::ffi::c_void))
 }
 
-/// Force the next AQL packet on `stream` to SYSTEM fence scope via a 4-byte
-/// device-to-device copy (routes through rocblit → `gpu().addSystemScope()`).
+/// Inject the historical 4-byte D2D handoff copy. Its fence-scope effect depends
+/// on ROCclr's copy path and memory properties; it is not a guaranteed fence.
 /// Active by default; no-op if `ZLUDA_XKERNEL_SYSTEM_SCOPE=0`. See `xkernel_system_scope_enabled`.
 pub(crate) fn force_system_scope(stream: hipStream_t) {
     if !xkernel_system_scope_enabled() {
@@ -373,11 +366,8 @@ pub(crate) fn wait_event(
         "cuStreamWaitEvent(stream={:?}, event={:?}, flags={:#x}) -> {:?}",
         stream, event, flags, result
     ));
-    // Consumer-acquire side of the Bug A fix (cherry-picked from 49414873):
-    // after waiting on a producer stream's event, force SYSTEM scope so the
-    // consumer's next kernel invalidates stale L1 lines and sees the
-    // producer's stores. Env-gated ZLUDA_XKERNEL_SYSTEM_SCOPE (default-ON
-    // per a9427b04 — fixes the IOFX_actorRange / TFS wild-VA TCP faults).
+    // Preserve the historical consumer-side handoff injection. Its scope
+    // effect is conditional; see xkernel_system_scope_enabled above.
     force_system_scope(stream);
     result
 }

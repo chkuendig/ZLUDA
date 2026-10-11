@@ -156,11 +156,8 @@ pub(crate) unsafe fn record(event: hipEvent_t, stream: hipStream_t) -> hipError_
     // races with the ROCm 6.2.4 ProfilingSignal pool on Wine 10.0) onto
     // this host-thread call site. No-op when ZLUDA_MS1_RD5_RESET=0.
     super::memory::drain_ms1_rd5_reset_queue();
-    // Producer-release side of the Bug A fix (cherry-picked from 49414873):
-    // force SYSTEM scope before recording the event so the producer stream's
-    // stores are flushed to the system-visible level before downstream
-    // waiters observe completion. Env-gated (ZLUDA_XKERNEL_SYSTEM_SCOPE=1
-    // default-ON per a9427b04 — 3/3 runs reached 1.5M clean with this).
+    // Preserve the historical producer-side handoff injection. This async
+    // D2D copy is not an unconditional SYSTEM fence; see stream.rs.
     super::stream::force_system_scope(stream);
     let result = hipEventRecord(event, stream);
     super::driver::zluda_log_err(&format!(
