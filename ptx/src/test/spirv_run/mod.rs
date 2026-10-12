@@ -1083,6 +1083,28 @@ fn shfl_segmented_min_halfwarp_boundary_amdgpu() -> Result<(), Box<dyn error::Er
     )
 }
 
+// One warp, six label-guarded mins per shfl.down stage (IOFX_bboxKernel shape).
+// Output k*32+lane is component k: lanes 0..7 keep their own segment
+// (k*1000 + 100 + lane), lanes 8..31 reduce to k*1000 + lane. NVIDIA P400
+// produced exactly these 192 values; ZLUDA 33516382 returned k*1000 + 8 for
+// lanes 0..7 because the guarded mins were re-executed in strict WWM.
+#[cfg(feature = "has_rocm")]
+#[test]
+fn shfl_down_guarded_segment_min_amdgpu() -> Result<(), Box<dyn error::Error>> {
+    let ptx = read_test_file!("shfl_down_guarded_segment_min.ptx");
+    let expected: Vec<u32> = (0..6u32)
+        .flat_map(|k| (0..32u32).map(move |lane| k * 1000 + if lane < 8 { 100 + lane } else { lane }))
+        .collect();
+    assert_eq!(expected.len(), 192);
+    test_hip_assert(
+        "shfl_down_guarded_segment_min",
+        &ptx,
+        None::<&[u8]>,
+        &expected,
+        32,
+    )
+}
+
 
 
 

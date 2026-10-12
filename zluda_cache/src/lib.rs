@@ -22,8 +22,16 @@ pub struct ModuleCache(SqliteConnection);
 
 impl ModuleCache {
     pub fn create_cache_dir_and_get_path() -> Option<String> {
-        let mut cache_dir = dirs::cache_dir()?;
-        cache_dir.extend(["zluda", "ComputeCache"]);
+        // An explicit ZLUDA_CACHE_DIR lets a run own its compute cache
+        // instead of sharing (and reusing code objects from) the per-user one.
+        let mut cache_dir = match std::env::var_os("ZLUDA_CACHE_DIR") {
+            Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+            _ => {
+                let mut dir = dirs::cache_dir()?;
+                dir.extend(["zluda", "ComputeCache"]);
+                dir
+            }
+        };
         // We ensure that the cache directory exists
         std::fs::create_dir_all(&cache_dir).ok()?;
         // No need to create the file, it will be created by SQLite on first access

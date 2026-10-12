@@ -2717,7 +2717,10 @@ fn get_cache_key<'a, 'b>(
     let serialized_attributes = serde_json::to_string(&(attributes, compiler_options)).ok()?;
     Some(zluda_cache::ModuleKey {
         hash: blake3::hash(text.as_bytes()).to_hex(),
-        compiler_version: "builtin",
+        // Experimental LLVM change (amdgpu-wwm-strict-block-local) is not
+        // reflected in VERGEN_GIT_SHA; keep its code objects apart from the
+        // stock 33516382 cache entries.
+        compiler_version: "builtin+wwm-strict-block-local-20261012",
         zluda_version: env!("VERGEN_GIT_SHA"),
         device: isa,
         backend_key: serialized_attributes,

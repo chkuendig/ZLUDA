@@ -1,0 +1,160 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Shape of the IOFX_bboxKernel segmented min reduction (Batman: Arkham Knight
+// smoke bounds). All 32 lanes execute each shfl.down; a lane merges the values
+// from lane+delta only when both lanes carry the same segment label, branching
+// around a block of six mins (min xyz and negated max xyz in the original).
+// Lanes 0..7 form segment 0 with values 100+lane, lanes 8..31 form segment 1
+// with values equal to their lane id, so any merge across the boundary pulls
+// lanes 0..7 below 100. Output k*32+lane holds component k (offset k*1000).
+//
+// With the shfl input wrapped in strict whole-wave mode, LLVM re-executed the
+// guarded mins of the previous stage for every lane, including lanes that had
+// branched around them, and lanes 0..7 returned values below 100.
+.visible .entry shfl_down_guarded_segment_min(
+    .param .u64 output
+)
+{
+    .reg .pred %p<2>;
+    .reg .u32  %r<16>;
+    .reg .u32  %v<6>;
+    .reg .u32  %s<6>;
+    .reg .u64  %rd<6>;
+    .shared .align 4 .u32 labels[33];
+
+    ld.param.u64 %rd0, [output];
+    cvta.to.global.u64 %rd1, %rd0;
+
+    mov.u32 %r0, %tid.x;
+    and.b32 %r1, %r0, 31;
+    setp.ge.u32 %p0, %r1, 8;
+    selp.u32 %r3, 1, 0, %p0;
+    add.u32 %r8, %r1, 100;
+    selp.u32 %r8, %r1, %r8, %p0;
+    add.u32 %v0, %r8, 0;
+    add.u32 %v1, %r8, 1000;
+    add.u32 %v2, %r8, 2000;
+    add.u32 %v3, %r8, 3000;
+    add.u32 %v4, %r8, 4000;
+    add.u32 %v5, %r8, 5000;
+
+    mov.u64 %rd2, labels;
+    mul.wide.u32 %rd3, %r0, 4;
+    add.u64 %rd4, %rd2, %rd3;
+    st.volatile.shared.u32 [%rd4], %r3;
+    bar.sync 0;
+
+    shfl.down.b32 %s0, %v0, 1, 31;
+    shfl.down.b32 %s1, %v1, 1, 31;
+    shfl.down.b32 %s2, %v2, 1, 31;
+    shfl.down.b32 %s3, %v3, 1, 31;
+    shfl.down.b32 %s4, %v4, 1, 31;
+    shfl.down.b32 %s5, %v5, 1, 31;
+    add.u32 %r10, %r1, 1;
+    setp.gt.u32 %p0, %r10, 31;
+    @%p0 bra SKIP_1;
+    ld.volatile.shared.u32 %r13, [%rd4];
+    ld.volatile.shared.u32 %r14, [%rd4+4];
+    setp.ne.s32 %p1, %r14, %r13;
+    @%p1 bra SKIP_1;
+    min.s32 %v0, %v0, %s0;
+    min.s32 %v1, %v1, %s1;
+    min.s32 %v2, %v2, %s2;
+    min.s32 %v3, %v3, %s3;
+    min.s32 %v4, %v4, %s4;
+    min.s32 %v5, %v5, %s5;
+SKIP_1:
+    shfl.down.b32 %s0, %v0, 2, 31;
+    shfl.down.b32 %s1, %v1, 2, 31;
+    shfl.down.b32 %s2, %v2, 2, 31;
+    shfl.down.b32 %s3, %v3, 2, 31;
+    shfl.down.b32 %s4, %v4, 2, 31;
+    shfl.down.b32 %s5, %v5, 2, 31;
+    add.u32 %r10, %r1, 2;
+    setp.gt.u32 %p0, %r10, 31;
+    @%p0 bra SKIP_2;
+    ld.volatile.shared.u32 %r13, [%rd4];
+    ld.volatile.shared.u32 %r14, [%rd4+8];
+    setp.ne.s32 %p1, %r14, %r13;
+    @%p1 bra SKIP_2;
+    min.s32 %v0, %v0, %s0;
+    min.s32 %v1, %v1, %s1;
+    min.s32 %v2, %v2, %s2;
+    min.s32 %v3, %v3, %s3;
+    min.s32 %v4, %v4, %s4;
+    min.s32 %v5, %v5, %s5;
+SKIP_2:
+    shfl.down.b32 %s0, %v0, 4, 31;
+    shfl.down.b32 %s1, %v1, 4, 31;
+    shfl.down.b32 %s2, %v2, 4, 31;
+    shfl.down.b32 %s3, %v3, 4, 31;
+    shfl.down.b32 %s4, %v4, 4, 31;
+    shfl.down.b32 %s5, %v5, 4, 31;
+    add.u32 %r10, %r1, 4;
+    setp.gt.u32 %p0, %r10, 31;
+    @%p0 bra SKIP_4;
+    ld.volatile.shared.u32 %r13, [%rd4];
+    ld.volatile.shared.u32 %r14, [%rd4+16];
+    setp.ne.s32 %p1, %r14, %r13;
+    @%p1 bra SKIP_4;
+    min.s32 %v0, %v0, %s0;
+    min.s32 %v1, %v1, %s1;
+    min.s32 %v2, %v2, %s2;
+    min.s32 %v3, %v3, %s3;
+    min.s32 %v4, %v4, %s4;
+    min.s32 %v5, %v5, %s5;
+SKIP_4:
+    shfl.down.b32 %s0, %v0, 8, 31;
+    shfl.down.b32 %s1, %v1, 8, 31;
+    shfl.down.b32 %s2, %v2, 8, 31;
+    shfl.down.b32 %s3, %v3, 8, 31;
+    shfl.down.b32 %s4, %v4, 8, 31;
+    shfl.down.b32 %s5, %v5, 8, 31;
+    add.u32 %r10, %r1, 8;
+    setp.gt.u32 %p0, %r10, 31;
+    @%p0 bra SKIP_8;
+    ld.volatile.shared.u32 %r13, [%rd4];
+    ld.volatile.shared.u32 %r14, [%rd4+32];
+    setp.ne.s32 %p1, %r14, %r13;
+    @%p1 bra SKIP_8;
+    min.s32 %v0, %v0, %s0;
+    min.s32 %v1, %v1, %s1;
+    min.s32 %v2, %v2, %s2;
+    min.s32 %v3, %v3, %s3;
+    min.s32 %v4, %v4, %s4;
+    min.s32 %v5, %v5, %s5;
+SKIP_8:
+    shfl.down.b32 %s0, %v0, 16, 31;
+    shfl.down.b32 %s1, %v1, 16, 31;
+    shfl.down.b32 %s2, %v2, 16, 31;
+    shfl.down.b32 %s3, %v3, 16, 31;
+    shfl.down.b32 %s4, %v4, 16, 31;
+    shfl.down.b32 %s5, %v5, 16, 31;
+    add.u32 %r10, %r1, 16;
+    setp.gt.u32 %p0, %r10, 31;
+    @%p0 bra SKIP_16;
+    ld.volatile.shared.u32 %r13, [%rd4];
+    ld.volatile.shared.u32 %r14, [%rd4+64];
+    setp.ne.s32 %p1, %r14, %r13;
+    @%p1 bra SKIP_16;
+    min.s32 %v0, %v0, %s0;
+    min.s32 %v1, %v1, %s1;
+    min.s32 %v2, %v2, %s2;
+    min.s32 %v3, %v3, %s3;
+    min.s32 %v4, %v4, %s4;
+    min.s32 %v5, %v5, %s5;
+SKIP_16:
+
+    cvt.u64.u32 %rd5, %r0;
+    mul.lo.u64 %rd5, %rd5, 4;
+    add.u64 %rd5, %rd1, %rd5;
+    st.global.u32 [%rd5+0], %v0;
+    st.global.u32 [%rd5+128], %v1;
+    st.global.u32 [%rd5+256], %v2;
+    st.global.u32 [%rd5+384], %v3;
+    st.global.u32 [%rd5+512], %v4;
+    st.global.u32 [%rd5+640], %v5;
+    ret;
+}
