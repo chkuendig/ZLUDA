@@ -83,6 +83,7 @@ pub(crate) fn run<'input>(
             Directive2::Method(method) => emit_ctx.emit_method(method)?,
         }
     }
+    emit_ctx.emit_clock_helper()?;
     // Add preserved globals (e.g. .texref/.surfref, .const) to @llvm.used so they survive
     // -amdgpu-internalize-symbols and O3 optimization during per-kernel emission
     if !emit_ctx.preserved_globals.is_empty() {
@@ -132,6 +133,7 @@ struct ModuleEmitContext<'a, 'input> {
     /// These get added to @llvm.used so -amdgpu-internalize-symbols doesn't strip them.
     preserved_globals: Vec<LLVMValueRef>,
     fp_mode: FloatingPointMode,
+    clock_helper: Option<LLVMValueRef>,
 }
 
 impl<'a, 'input> ModuleEmitContext<'a, 'input> {
@@ -149,6 +151,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             resolver: ResolveIdent::new(&id_defs),
             preserved_globals: Vec::new(),
             fp_mode,
+            clock_helper: None,
         }
     }
 
@@ -197,6 +200,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         &mut self,
         method: Function<ast::Instruction<SpirvWord>, SpirvWord>,
     ) -> Result<(), TranslateError> {
+        let generated_clock_import = method.body.is_none()
+            && method.import_as.as_deref() == Some("__zluda_ptx_impl_sreg_clock");
         let name = method
             .import_as
             .as_deref()
@@ -293,6 +298,9 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             Self::func_call_convention()
         };
         unsafe { LLVMSetFunctionCallConv(fn_, call_conv) };
+        if generated_clock_import {
+            self.clock_helper = Some(fn_);
+        }
         for directive in method.tuning {
             match directive {
                 ptx_parser::TuningDirective::NoReturn => {
@@ -334,6 +342,40 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             }
             unsafe { LLVMBuildBr(method_emitter.variables_builder.get(), real_bb) };
         }
+        Ok(())
+    }
+
+    fn emit_clock_helper(&self) -> Result<(), TranslateError> {
+        let Some(function) = self.clock_helper else { return Ok(()); };
+        unsafe {
+            // Leave unused imports as declarations, preserving unrelated IR.
+            if LLVMGetFirstUse(function).is_null() || LLVMCountBasicBlocks(function) != 0 {
+                return Ok(());
+            }
+            let i32_type = LLVMInt32TypeInContext(self.context);
+            if LLVMCountParams(function) != 0
+                || LLVMGetReturnType(LLVMGlobalGetValueType(function)) != i32_type
+            {
+                return Err(error_unreachable());
+            }
+            let name = c"llvm.readcyclecounter";
+            let id = LLVMLookupIntrinsicID(name.as_ptr(), name.to_bytes().len());
+            if id == 0 { return Err(error_unreachable()); }
+            let intrinsic = LLVMGetIntrinsicDeclaration(self.module, id, ptr::null_mut(), 0);
+            let builder = Builder::new_raw(self.context);
+            let block = LLVMAppendBasicBlockInContext(self.context, function, c"entry".as_ptr());
+            LLVMPositionBuilderAtEnd(builder.get(), block);
+            let cycles = LLVMBuildCall2(
+                builder.get(), LLVMGlobalGetValueType(intrinsic), intrinsic,
+                ptr::null_mut(), 0, c"cycles".as_ptr(),
+            );
+            let low = LLVMBuildTrunc(builder.get(), cycles, i32_type, c"low".as_ptr());
+            LLVMBuildRet(builder.get(), low);
+            LLVMSetLinkage(function, LLVMLinkage::LLVMLinkOnceODRLinkage);
+        }
+        // PTX %clock wraps at 32 bits. On the pinned gfx1030 backend this
+        // intrinsic reads s_memtime. It is neither a fence nor wall time;
+        // other AMD targets need separate counter-width validation.
         Ok(())
     }
 
