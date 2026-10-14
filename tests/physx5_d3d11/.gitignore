@@ -1,0 +1,5 @@
+# Build output
+build/
+
+# Wine test results (machine-specific)
+wine_results/
