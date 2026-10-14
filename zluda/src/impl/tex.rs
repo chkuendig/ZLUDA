@@ -2,6 +2,65 @@ use cuda_types::cuda::*;
 use hip_runtime_sys::*;
 use std::mem;
 
+/// Preserve the CUDA resource view requested by the caller while filling in
+/// the logical format needed for arrays whose storage format was rewritten by
+/// `hipfix`. CUDA and HIP use the same numeric resource-view format values;
+/// copy fields explicitly rather than relying on the structs having the same
+/// layout.
+fn build_resource_view_desc(
+    caller: Option<&CUDA_RESOURCE_VIEW_DESC>,
+    synthesized: Option<HIP_RESOURCE_VIEW_DESC>,
+) -> Option<HIP_RESOURCE_VIEW_DESC> {
+    let Some(caller) = caller else {
+        return synthesized;
+    };
+    let has_caller_view = caller.format.0 != CUresourceViewFormat_enum::CU_RES_VIEW_FORMAT_NONE.0
+        || caller.width != 0
+        || caller.height != 0
+        || caller.depth != 0
+        || caller.firstMipmapLevel != 0
+        || caller.lastMipmapLevel != 0
+        || caller.firstLayer != 0
+        || caller.lastLayer != 0
+        || caller.reserved.iter().any(|value| *value != 0);
+    if !has_caller_view {
+        return synthesized;
+    }
+
+    let mut view = HIP_RESOURCE_VIEW_DESC {
+        format: HIPresourceViewFormat(caller.format.0),
+        width: caller.width,
+        height: caller.height,
+        depth: caller.depth,
+        firstMipmapLevel: caller.firstMipmapLevel,
+        lastMipmapLevel: caller.lastMipmapLevel,
+        firstLayer: caller.firstLayer,
+        lastLayer: caller.lastLayer,
+        reserved: caller.reserved,
+    };
+
+    // A caller can specify a subresource while leaving the format at NONE.
+    // If the backing array was rewritten, keep that subresource selection but
+    // supply the original format so HIP reads the same logical elements CUDA
+    // would. A zeroed descriptor remains equivalent to a null pointer above.
+    if view.format.0 == HIPresourceViewFormat_enum::HIP_RES_VIEW_FORMAT_NONE.0 {
+        if let Some(synthesized) = synthesized {
+            view.format = synthesized.format;
+            if view.width == 0 {
+                view.width = synthesized.width;
+            }
+            if view.height == 0 {
+                view.height = synthesized.height;
+            }
+            if view.depth == 0 {
+                view.depth = synthesized.depth;
+            }
+        }
+    }
+
+    Some(view)
+}
+
 /// After a texture object is created on a synthetic texref, copy the handle
 /// to the device global variable so the kernel can read it at runtime.
 pub(crate) unsafe fn sync_synthetic_texref(tex_ref: *mut textureReference) {
@@ -188,8 +247,7 @@ unsafe fn texref_post_sync_if_enabled(dptr: u64, bytes: usize) {
         0 => return,
         1 => {
             // TARGETED: only sync for bf000-shaped binds.
-            let is_bf000_shaped =
-                bytes == 1_040_000 && (dptr & 0xFF000) == 0xBF000;
+            let is_bf000_shaped = bytes == 1_040_000 && (dptr & 0xFF000) == 0xBF000;
             if !is_bf000_shaped {
                 return;
             }
@@ -496,11 +554,11 @@ pub(crate) unsafe fn object_create(
     p_tex_object: &mut CUtexObject,
     p_res_desc: &CUDA_RESOURCE_DESC,
     p_tex_desc: &CUDA_TEXTURE_DESC,
-    _p_res_view_desc: *const CUDA_RESOURCE_VIEW_DESC,
+    p_res_view_desc: *const CUDA_RESOURCE_VIEW_DESC,
 ) -> CUresult {
     super::driver::zluda_log_err(&format!(
         "cuTexObjectCreate ENTER resType={:?} viewDesc={:p}",
-        p_res_desc.resType, _p_res_view_desc
+        p_res_desc.resType, p_res_view_desc
     ));
     // Build HIP resource desc
     let mut hip_res_desc: HIP_RESOURCE_DESC = mem::zeroed();
@@ -548,22 +606,28 @@ pub(crate) unsafe fn object_create(
     hip_tex_desc.borderColor = p_tex_desc.borderColor;
 
     // If the underlying array was created with a transformed format
-    // (HALF→UINT16 etc. via hipfix::get_non_broken_format), build a
-    // HIP_RESOURCE_VIEW_DESC that tells the sampler the ORIGINAL format so
-    // tex.3d/tex.2d reads interpret the bytes correctly. Without this the
-    // sampler reads e.g. half-float bytes as raw integers, which silently
-    // corrupts kernels that read TurbulenceFS density/velocity grids.
+    // (HALF→UINT16 etc. via hipfix::get_non_broken_format), synthesize a
+    // HIP_RESOURCE_VIEW_DESC that tells the sampler the ORIGINAL format.
+    // An explicit CUDA view descriptor takes precedence, with the synthesized
+    // format filling in only when the caller leaves its format as NONE.
     // See plan snug-launching-milner.md Phase D and the missing-from-us
     // lsh helpers in hipfix.rs::maybe_build_view_desc.
-    let view_desc = super::hipfix::maybe_build_view_desc(p_res_desc);
+    let synthesized_view_desc = super::hipfix::maybe_build_view_desc(p_res_desc);
+    let caller_view_desc = if p_res_view_desc.is_null() {
+        None
+    } else {
+        Some(&*p_res_view_desc)
+    };
+    let view_desc = build_resource_view_desc(caller_view_desc, synthesized_view_desc);
     let view_desc_ptr: *const HIP_RESOURCE_VIEW_DESC = match &view_desc {
         Some(v) => v as *const _,
         None => std::ptr::null(),
     };
-    if view_desc.is_some() {
+    if let Some(view_desc) = &view_desc {
+        let caller_format = caller_view_desc.map(|caller| caller.format.0);
         super::driver::zluda_log_err(&format!(
-            "texObj: applying format-hack view desc for array={:?}",
-            p_res_desc.res.array.hArray
+            "texObj: applying resource view desc resType={:?} caller_format={:?} format={}",
+            p_res_desc.resType, caller_format, view_desc.format.0
         ));
     }
 
@@ -758,10 +822,105 @@ fn from_channel_format_desc(desc: hipChannelFormatDesc) -> Result<(hipArray_Form
 
 #[cfg(test)]
 mod tests {
+    use super::build_resource_view_desc;
     use crate::tests::CudaApi;
     use cuda_macros::test_cuda;
     use cuda_types::cuda::*;
+    use hip_runtime_sys::{HIPresourceViewFormat_enum, HIP_RESOURCE_VIEW_DESC};
     use std::mem;
+
+    fn synthesized_half4_view() -> HIP_RESOURCE_VIEW_DESC {
+        HIP_RESOURCE_VIEW_DESC {
+            format: HIPresourceViewFormat_enum::HIP_RES_VIEW_FORMAT_FLOAT_4X16,
+            width: 64,
+            height: 32,
+            depth: 16,
+            firstMipmapLevel: 0,
+            lastMipmapLevel: 0,
+            firstLayer: 0,
+            lastLayer: 0,
+            reserved: [0; 16],
+        }
+    }
+
+    #[test]
+    fn explicit_resource_view_desc_is_preserved() {
+        let caller = CUDA_RESOURCE_VIEW_DESC {
+            // Deliberately differs from the synthesized FLOAT_4X16 format:
+            // an explicit caller format must win.
+            format: CUresourceViewFormat_enum::CU_RES_VIEW_FORMAT_UINT_4X16,
+            width: 32,
+            height: 16,
+            depth: 8,
+            firstMipmapLevel: 2,
+            lastMipmapLevel: 4,
+            firstLayer: 3,
+            lastLayer: 7,
+            reserved: [0; 16],
+        };
+        assert_eq!(
+            caller.format.0,
+            HIPresourceViewFormat_enum::HIP_RES_VIEW_FORMAT_UINT_4X16.0
+        );
+
+        let view = build_resource_view_desc(Some(&caller), Some(synthesized_half4_view()))
+            .expect("caller view descriptor should be forwarded");
+
+        assert_eq!(
+            view.format,
+            HIPresourceViewFormat_enum::HIP_RES_VIEW_FORMAT_UINT_4X16
+        );
+        assert_eq!((view.width, view.height, view.depth), (32, 16, 8));
+        assert_eq!(
+            (
+                view.firstMipmapLevel,
+                view.lastMipmapLevel,
+                view.firstLayer,
+                view.lastLayer,
+            ),
+            (2, 4, 3, 7)
+        );
+    }
+
+    #[test]
+    fn unspecified_caller_format_keeps_subresource_and_uses_hack_format() {
+        let caller = CUDA_RESOURCE_VIEW_DESC {
+            format: CUresourceViewFormat_enum::CU_RES_VIEW_FORMAT_NONE,
+            width: 0,
+            height: 0,
+            depth: 0,
+            firstMipmapLevel: 0,
+            lastMipmapLevel: 0,
+            firstLayer: 2,
+            lastLayer: 5,
+            reserved: [0; 16],
+        };
+
+        let view = build_resource_view_desc(Some(&caller), Some(synthesized_half4_view()))
+            .expect("subresource descriptor should be forwarded");
+
+        assert_eq!(
+            view.format,
+            HIPresourceViewFormat_enum::HIP_RES_VIEW_FORMAT_FLOAT_4X16
+        );
+        assert_eq!((view.width, view.height, view.depth), (64, 32, 16));
+        assert_eq!((view.firstLayer, view.lastLayer), (2, 5));
+    }
+
+    #[test]
+    fn null_or_zeroed_caller_view_keeps_synthesized_hack_view() {
+        let synthesized = synthesized_half4_view();
+        assert_eq!(
+            build_resource_view_desc(None, Some(synthesized)),
+            Some(synthesized)
+        );
+
+        let zeroed: CUDA_RESOURCE_VIEW_DESC = unsafe { mem::zeroed() };
+        assert_eq!(
+            build_resource_view_desc(Some(&zeroed), Some(synthesized)),
+            Some(synthesized)
+        );
+    }
 
     // Helper: create a context for texture tests
     unsafe fn setup(api: &impl CudaApi) {
