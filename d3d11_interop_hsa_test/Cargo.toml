@@ -1,0 +1,25 @@
+[package]
+name = "d3d11_interop_hsa_test"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Integration tests for the D3D11 → CUDA texture interop path.
+#
+# These tests validate the HSA/HIP primitives we plan to use to fabricate
+# a hipArray that aliases an externally-imported memory object. Goal: prove
+# the round-trip "kernel writes via surface object → bytes visible to the
+# original buffer" works in isolation, before integrating into ZLUDA's
+# d3d11_interop.rs.
+#
+# See ~/.claude/plans/resilient-sprouting-pie.md (Phase A.HSA.*).
+#
+# Tests are tagged `_amdgpu` so they require the GPU + ROCm runtime.
+# Run with:
+#   LD_LIBRARY_PATH=$(pwd)/ext/rocm/lib LIBRARY_PATH=/tmp/stub_libs:ext/rocm/lib \
+#     cargo test -p d3d11_interop_hsa_test
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+hip_runtime-sys = { path = "../ext/hip_runtime-sys" }
