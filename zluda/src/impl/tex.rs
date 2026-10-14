@@ -376,6 +376,76 @@ pub(crate) unsafe fn ref_set_address_2d_v3(
     Ok(())
 }
 
+/// HIP's override-format bind replaces any requested HALF/SIGNED format with
+/// the rewritten array's unsigned storage format. Repair the resulting object
+/// with the same logical resource view used by the texture-object API, then
+/// publish the corrected handle/reference to the device. Rewritten arrays
+/// bypass the override-format bind; ordinary arrays retain the HIP path.
+unsafe fn bind_legacy_array(
+    tex_ref: *mut textureReference,
+    array: hipArray_t,
+) -> CUresult {
+    let mut cuda_resource: CUDA_RESOURCE_DESC = mem::zeroed();
+    cuda_resource.resType = CUresourcetype::CU_RESOURCE_TYPE_ARRAY;
+    cuda_resource.res.array.hArray = array as CUarray;
+    let Some(view) = super::hipfix::maybe_build_view_desc(&cuda_resource) else {
+        hipTexRefSetArray(tex_ref, array, CU_TRSA_OVERRIDE_FORMAT)?;
+        return Ok(());
+    };
+    let (global, full_reference) = super::module::get_texref_device_global(tex_ref)
+        .ok_or(CUerror::NOT_SUPPORTED)?;
+    let original_format = super::hipfix::broken_format_for_array(array).0
+        .ok_or(CUerror::INVALID_VALUE)?;
+    let mut array_desc: HIP_ARRAY_DESCRIPTOR = mem::zeroed();
+    hipArrayGetDescriptor(&mut array_desc, array)?;
+    let mut resource: hipResourceDesc = mem::zeroed();
+    resource.resType = hipResourceType::hipResourceTypeArray;
+    resource.res.array.array = array;
+    // Match HIP's textureReference -> hipTextureDesc conversion. Border color
+    // has no field in textureReference, so HIP also uses zero for it.
+    let reference = &*tex_ref;
+    let sampler = hipTextureDesc {
+        addressMode: reference.addressMode,
+        filterMode: reference.filterMode,
+        readMode: reference.readMode,
+        sRGB: reference.sRGB,
+        borderColor: [0.0; 4],
+        normalizedCoords: reference.normalized,
+        maxAnisotropy: reference.maxAnisotropy,
+        mipmapFilterMode: reference.mipmapFilterMode,
+        mipmapLevelBias: reference.mipmapLevelBias,
+        minMipmapLevelClamp: reference.minMipmapLevelClamp,
+        maxMipmapLevelClamp: reference.maxMipmapLevelClamp,
+    };
+    let runtime_view = hipResourceViewDesc {
+        format: hipResourceViewFormat(view.format.0),
+        width: view.width, height: view.height, depth: view.depth,
+        firstMipmapLevel: view.firstMipmapLevel, lastMipmapLevel: view.lastMipmapLevel,
+        firstLayer: view.firstLayer, lastLayer: view.lastLayer,
+    };
+    let mut corrected = std::ptr::null_mut();
+    hipCreateTextureObject(&mut corrected, &resource, &sampler, &runtime_view)?;
+    let previous = ((*tex_ref).textureObject, (*tex_ref).format, (*tex_ref).numChannels);
+    (*tex_ref).textureObject = corrected;
+    (*tex_ref).format = original_format;
+    (*tex_ref).numChannels = array_desc.NumChannels as i32;
+    let (source, bytes) = if full_reference {
+        (tex_ref as *mut std::ffi::c_void, mem::size_of::<textureReference>())
+    } else {
+        (&mut corrected as *mut hipTextureObject_t as *mut std::ffi::c_void,
+         mem::size_of::<hipTextureObject_t>())
+    };
+    if let Err(error) = hipMemcpyHtoD(global, source, bytes) {
+        ((*tex_ref).textureObject, (*tex_ref).format, (*tex_ref).numChannels) = previous;
+        let _ = hipDestroyTextureObject(corrected);
+        return Err(error.into());
+    }
+    if !previous.0.is_null() {
+        hipDestroyTextureObject(previous.0)?;
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn ref_set_array(h_tex_ref: CUtexref, h_array: CUarray, flags: u32) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
     if (flags & !1u32) != 0 {
@@ -400,12 +470,10 @@ pub(crate) unsafe fn ref_set_array(h_tex_ref: CUtexref, h_array: CUarray, flags:
     // Get array descriptor to know the format and channel count
     let mut desc: HIP_ARRAY_DESCRIPTOR = mem::zeroed();
     hipArrayGetDescriptor(&mut desc, h_array as hipArray_t)?;
-    // 2026-04-27: lsh-style inverse-format. If the array was created with the
-    // HALF/SIGNED_INT substitution (stored as UNSIGNED_INT*), tell the texref
-    // the ORIGINAL format so the HIP sampler converts bytes correctly. Without
-    // this, the sampler returns raw bits as garbage floats — the missing-fog
-    // regression for TurbulenceFS HALF4 velocity textures.
-    // See lshqqytiger/ZLUDA v3.9.6 zluda/src/impl/texref.rs::set_array.
+    // Preserve the logical format for rewritten arrays. Setting the texref's
+    // format alone is insufficient: HIP's subsequent override-format bind
+    // replaces it with the physical unsigned format. bind_legacy_array also
+    // repairs the texture object's view and its device-side reference.
     let original_format = super::hipfix::broken_format_for_array(h_array as hipArray_t)
         .0
         .unwrap_or(desc.Format);
@@ -416,6 +484,7 @@ pub(crate) unsafe fn ref_set_array(h_tex_ref: CUtexref, h_array: CUarray, flags:
             tex_ref, h_array, desc.Format.0, original_format.0, desc.NumChannels, flags, hack
         ));
     }
+    texref_pre_sync_if_enabled();
     let set_fmt_res = hipTexRefSetFormat(tex_ref, original_format, desc.NumChannels as i32);
     if set_fmt_res.is_err() && texref_log_enabled() {
         super::driver::zluda_log_err(&format!(
@@ -424,8 +493,7 @@ pub(crate) unsafe fn ref_set_array(h_tex_ref: CUtexref, h_array: CUarray, flags:
         ));
     }
     set_fmt_res?;
-    texref_pre_sync_if_enabled();
-    hipTexRefSetArray(tex_ref, h_array as hipArray_t, CU_TRSA_OVERRIDE_FORMAT)?;
+    bind_legacy_array(tex_ref, h_array as hipArray_t)?;
     // Sync the newly created texture object to device global if synthetic
     sync_synthetic_texref(tex_ref);
     Ok(())
@@ -741,7 +809,7 @@ unsafe fn reset(tex_ref: *mut textureReference) -> CUresult {
         hipResourceType::hipResourceTypeArray => {
             let array = res_desc.res.array.array;
             if !array.is_null() {
-                hipTexRefSetArray(tex_ref, array, CU_TRSA_OVERRIDE_FORMAT)?;
+                bind_legacy_array(tex_ref, array)?;
             }
         }
         hipResourceType::hipResourceTypeLinear => {
@@ -928,15 +996,67 @@ mod tests {
         api.cuCtxCreate_v2(&mut mem::zeroed(), 0, 0);
     }
 
+    // Exercise actual reads, including a negative channel: inspecting a host
+    // descriptor alone misses the unsigned-normalization failure in HIP's bind.
     #[test_cuda]
-    unsafe fn texref_set_format(api: impl CudaApi) {
-        setup(&api);
-
-        // Load a module with a texture reference to get a valid CUtexref
-        // Since we can't easily get a texref without a module, test that
-        // cuTexRefSetFormat returns success with a module texref
-        // For now, verify the API path compiles and links correctly
-        // Real validation happens in end-to-end game test
+    unsafe fn legacy_half4_array_survives_rebinding(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let ptx = concat!(include_str!("test_ptx/texref_half4_rebind.ptx"), "\0");
+        let mut module = mem::zeroed();
+        api.cuModuleLoadData(&mut module, ptx.as_ptr().cast());
+        let mut texref = mem::zeroed();
+        api.cuModuleGetTexRef(&mut texref, module, c"legacy_half".as_ptr());
+        let mut function = mem::zeroed();
+        api.cuModuleGetFunction(&mut function, module, c"sample_half".as_ptr());
+        let desc = CUDA_ARRAY3D_DESCRIPTOR {
+            Width: 4, Height: 4, Depth: 2,
+            Format: CUarray_format::CU_AD_FORMAT_HALF,
+            NumChannels: 4, Flags: 0,
+        };
+        let mut array = mem::zeroed();
+        api.cuArray3DCreate_v2(&mut array, &desc);
+        // Half encodings of0.5,1,2,-3, repeated for every texel.
+        let pixels = [0x3800u16, 0x3c00, 0x4000, 0xc200].repeat(32);
+        let mut copy: CUDA_MEMCPY3D = mem::zeroed();
+        copy.srcMemoryType = CUmemorytype::CU_MEMORYTYPE_HOST;
+        copy.srcHost = pixels.as_ptr().cast();
+        copy.srcPitch = 32;
+        copy.srcHeight = 4;
+        copy.dstMemoryType = CUmemorytype::CU_MEMORYTYPE_ARRAY;
+        copy.dstArray = array;
+        copy.WidthInBytes = 32;
+        copy.Height = 4;
+        copy.Depth = 2;
+        api.cuMemcpy3D_v2(&copy);
+        api.cuTexRefSetFormat(texref, CUarray_format::CU_AD_FORMAT_HALF, 4);
+        api.cuTexRefSetFlags(texref, 0);
+        api.cuTexRefSetArray(texref, array, CU_TRSA_OVERRIDE_FORMAT);
+        let mut output = mem::zeroed();
+        api.cuMemAlloc_v2(&mut output, 16);
+        for state in 0..6 {
+            match state {
+                0 => {},
+                1 => api.cuTexRefSetFilterMode(texref, CUfilter_mode::CU_TR_FILTER_MODE_POINT),
+                2 => api.cuTexRefSetAddressMode(texref, 0, CUaddress_mode::CU_TR_ADDRESS_MODE_CLAMP),
+                3 => api.cuTexRefSetFlags(texref, 0),
+                4 => api.cuTexRefSetFormat(texref, CUarray_format::CU_AD_FORMAT_HALF, 4),
+                5 => api.cuTexRefSetArray(texref, array, CU_TRSA_OVERRIDE_FORMAT),
+                _ => unreachable!(),
+            }
+            let mut params = [&mut output as *mut CUdeviceptr as *mut std::ffi::c_void];
+            api.cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0,
+                CUstream(std::ptr::null_mut()), params.as_mut_ptr(), std::ptr::null_mut());
+            api.cuCtxSynchronize();
+            let mut actual = [0.0f32; 4];
+            api.cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), output, 16);
+            assert_eq!(actual, [0.5, 1.0, 2.0, -3.0], "texref rebuild state {state}");
+        }
+        api.cuMemFree_v2(output);
+        api.cuModuleUnload(module);
+        api.cuArrayDestroy(array);
+        api.cuCtxDestroy_v2(context);
     }
 
     #[test_cuda]
@@ -987,22 +1107,5 @@ mod tests {
         api.cuMemFree_v2(dptr);
     }
 
-    #[test_cuda]
-    unsafe fn texref_set_array_and_format(api: impl CudaApi) {
-        setup(&api);
 
-        // Create a simple 2D array (like PhysX does for turbulence textures)
-        let desc = CUDA_ARRAY_DESCRIPTOR {
-            Width: 256,
-            Height: 256,
-            Format: CUarray_format::CU_AD_FORMAT_FLOAT,
-            NumChannels: 4,
-        };
-        let mut array: CUarray = mem::zeroed();
-        api.cuArrayCreate_v2(&mut array, &desc);
-        assert!(!array.is_null());
-
-        // Clean up
-        api.cuArrayDestroy(array);
-    }
 }

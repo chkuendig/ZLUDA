@@ -2112,6 +2112,7 @@ pub(crate) struct SyntheticTexRefLinearBinding {
 #[derive(Clone, Copy)]
 struct SyntheticTexRefState {
     device_global: hipDeviceptr_t,
+    native_device_global: Option<hipDeviceptr_t>,
     linear_binding: Option<SyntheticTexRefLinearBinding>,
 }
 
@@ -2122,6 +2123,21 @@ pub(crate) fn get_synthetic_texref_global(
     SYNTHETIC_TEXREFS.lock().ok().and_then(|map| {
         map.get(&(tex_ref as usize))
             .and_then(|state| (!state.device_global.0.is_null()).then_some(state.device_global))
+    })
+}
+
+/// Device representation of a registered texref: native HIP references contain
+/// the complete textureReference, while synthetic references contain one handle.
+pub(crate) fn get_texref_device_global(
+    tex_ref: *const textureReference,
+) -> Option<(hipDeviceptr_t, bool)> {
+    SYNTHETIC_TEXREFS.lock().ok().and_then(|map| {
+        let state = map.get(&(tex_ref as usize))?;
+        if !state.device_global.0.is_null() {
+            Some((state.device_global, false))
+        } else {
+            state.native_device_global.map(|global| (global, true))
+        }
     })
 }
 
@@ -2157,6 +2173,7 @@ fn register_texref(
     if let Ok(mut map) = SYNTHETIC_TEXREFS.lock() {
         map.entry(tex_ref as usize).or_insert(SyntheticTexRefState {
             device_global: device_global.unwrap_or(hipDeviceptr_t(std::ptr::null_mut())),
+            native_device_global: None,
             linear_binding: None,
         });
     }
@@ -3139,6 +3156,24 @@ pub(crate) fn get_tex_ref(
                 name_str, tex_ref
             ));
             register_texref(hmod.base, &name_str, tex_ref, None);
+            // HIP's legacy bind rebuilds its texture object using the physical
+            // array format. Rewritten arrays need a logical view and an updated
+            // device-side reference after that rebuild. Record only a verified
+            // full textureReference global; do not guess a device layout.
+            let mut global = hipDeviceptr_t(std::ptr::null_mut());
+            let mut bytes = 0usize;
+            let native_global = if unsafe {
+                hipModuleGetGlobal(&mut global, &mut bytes, hmod.base, name)
+            }.is_ok() && bytes == mem::size_of::<textureReference>() && !global.0.is_null() {
+                Some(global)
+            } else {
+                None
+            };
+            if let Ok(mut map) = SYNTHETIC_TEXREFS.lock() {
+                if let Some(state) = map.get_mut(&(tex_ref as usize)) {
+                    state.native_device_global = native_global;
+                }
+            }
             *p_tex_ref = tex_ref as CUtexref;
             Ok(())
         }
@@ -3229,6 +3264,7 @@ pub(crate) fn get_surf_ref(
                         tex_ref_ptr as usize,
                         SyntheticTexRefState {
                             device_global: dptr,
+                            native_device_global: None,
                             linear_binding: None,
                         },
                     );
