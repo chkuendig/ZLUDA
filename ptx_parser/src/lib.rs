@@ -313,12 +313,14 @@ fn f64<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<f64> {
     .parse_next(stream)
 }
 
-fn s32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<i32> {
+// PTX ISA allows 64-bit signed offsets in memory operands; nvcc generates
+// offsets exceeding i32 range (e.g. [%rd1+17179869180]) for PhysX fluid kernels.
+fn s32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<i64> {
     take_error((opt(Token::Minus), num).map(|(sign, x)| {
         let (text, radix, _) = x;
-        match i32::from_str_radix(text, radix) {
+        match i64::from_str_radix(text, radix) {
             Ok(x) => Ok(if sign.is_some() { -x } else { x }),
-            Err(err) => Err((0, PtxError::from(err))),
+            Err(err) => Err((0i64, PtxError::from(err))),
         }
     }))
     .parse_next(stream)
@@ -497,6 +499,23 @@ pub fn parse_module_unchecked<'input>(text: &'input str) -> ast::Module<'input> 
             .parse(parser)
             .map_err(|err| PtxError::Parser(err.into_inner()))
     };
+    if !errors.is_empty() {
+        eprintln!(
+            "[ZLUDA PTX PARSER] WARNING: {} parse errors in module:",
+            errors.len()
+        );
+        for err in &errors {
+            match err {
+                PtxError::UnrecognizedStatement(text) => {
+                    let preview: String = text.chars().take(80).collect();
+                    eprintln!("[ZLUDA PTX PARSER]   Unrecognized: {}", preview);
+                }
+                other => {
+                    eprintln!("[ZLUDA PTX PARSER]   {:?}", other);
+                }
+            }
+        }
+    }
     parse_result.unwrap_or(ast::Module::empty())
 }
 
@@ -588,6 +607,7 @@ fn directive<'a, 'input>(
                 function.map(|(linking, func)| Some(ast::Directive::Method(linking, func))),
                 file.map(|_| None),
                 section.map(|_| None),
+                texref_surfref.map(|(linking, var)| Some(ast::Directive::Variable(linking, var))),
                 (module_variable, Token::Semicolon)
                     .map(|((linking, var), _)| Some(ast::Directive::Variable(linking, var))),
             )),
@@ -601,7 +621,9 @@ fn directive<'a, 'input>(
             // module variables
             | Token::DotGlobal | Token::DotConst | Token::DotShared
             // other sections
-            | Token::DotFile | Token::DotSection => true,
+            | Token::DotFile | Token::DotSection
+            // texture/surface references (skip)
+            | Token::DotTexref | Token::DotSurfref => true,
             _ => false,
         }),
             )
@@ -644,6 +666,45 @@ fn file<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
             opt((Token::Comma, u32, Token::Comma, u32)),
         )
             .void(),
+    )
+    .parse_next(stream)
+}
+
+/// Parse .texref/.surfref global declarations and emit as Variable directives.
+/// Format: [.extern] .global .texref name;
+///         [.extern] .global .surfref name;
+fn texref_surfref<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<(ast::LinkingDirective, ast::Variable<&'input str>)> {
+    trace(
+        "texref_surfref",
+        (
+            opt(Token::DotExtern),
+            Token::DotGlobal,
+            alt((
+                Token::DotTexref.map(|_| ast::Type::Texref),
+                Token::DotSurfref.map(|_| ast::Type::Surfref),
+            )),
+            ident,
+            Token::Semicolon,
+        )
+            .map(|(is_extern, _, v_type, name, _)| {
+                let linking = if is_extern.is_some() {
+                    ast::LinkingDirective::EXTERN
+                } else {
+                    ast::LinkingDirective::NONE
+                };
+                let var = ast::Variable {
+                    info: ast::VariableInfo {
+                        align: None,
+                        v_type,
+                        state_space: StateSpace::Global,
+                        array_init: Vec::new(),
+                    },
+                    name,
+                };
+                (linking, var)
+            }),
     )
     .parse_next(stream)
 }
@@ -860,6 +921,7 @@ fn statement<'a, 'input>(
 ) -> PResult<Option<Statement<ParsedOperandStr<'input>>>> {
     with_recovery(
         alt((
+            callprototype_directive.map(|_| None),
             label.map(Some),
             debug_directive.map(|_| None),
             terminated(
@@ -954,6 +1016,24 @@ fn pragma<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
     trace(
         "pragma",
         (Token::DotPragma, Token::String, Token::Semicolon).void(),
+    )
+    .parse_next(stream)
+}
+
+// Parse and skip .callprototype directives (used for indirect function calls).
+// Format: label : .callprototype (ret-params) _ (input-params) ;
+// We consume the entire directive up to the semicolon so it doesn't trigger
+// error recovery which would corrupt surrounding kernel instructions.
+fn callprototype_directive<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
+    trace(
+        "callprototype",
+        (
+            ident, // prototype label name
+            Token::Colon,
+            token::any.verify(|(t, _)| matches!(t, Token::DotIdent(".callprototype"))),
+            take_till_end_of_statement(),
+        )
+            .void(),
     )
     .parse_next(stream)
 }
@@ -1697,6 +1777,84 @@ impl<'input, X, I: Stream<Token = (Self, X)> + StreamIsPartial, E: ParserError<I
     }
 }
 
+// Parse vote instruction: both vote.sync.* (sm_70+) and vote.* (pre-sm_70)
+// Forms:
+//   vote.sync.{all,any}.pred  d, {!}a, membermask
+//   vote.sync.ballot.b32      d, {!}a, membermask
+//   vote.{all,any}.pred       d, {!}a             (pre-sync)
+//   vote.ballot.b32           d, {!}a             (pre-sync)
+fn vote_instruction<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    use winnow::combinator::*;
+
+    // Check if first modifier is .sync
+    let has_sync = opt(token::any.verify_map(
+        |(t, _): (Token<'input>, _)| {
+            if t == Token::DotSync {
+                Some(())
+            } else {
+                None
+            }
+        },
+    ))
+    .parse_next(stream)?
+    .is_some();
+
+    // Parse mode: .all, .any, or .ballot. These lex as DotIdent unless a grammar
+    // rule generates their token; match.any.sync generates DotAny.
+    let mode = token::any
+        .verify_map(|(t, _): (Token<'input>, _)| match t {
+            Token::DotIdent(".all") => Some(VoteMode::All),
+            Token::DotIdent(".any") | Token::DotAny => Some(VoteMode::Any),
+            Token::DotIdent(".ballot") => Some(VoteMode::Ballot),
+            _ => None,
+        })
+        .parse_next(stream)?;
+
+    // Parse type: .pred or .b32
+    let _type_token = token::any
+        .verify(|(t, _): &(Token<'input>, _)| *t == Token::DotPred || *t == Token::DotB32)
+        .parse_next(stream)?;
+
+    // Parse destination operand
+    let dst = ParsedOperandStr::parse.parse_next(stream)?;
+
+    // Parse comma + optional negate + source predicate
+    token::any.verify(|(t, _): &(Token<'input>, _)| *t == Token::Comma)
+        .parse_next(stream)?;
+
+    let negate = opt(token::any.verify_map(|(t, _): (Token<'input>, _)| {
+        if t == Token::Exclamation {
+            Some(())
+        } else {
+            None
+        }
+    }))
+    .parse_next(stream)?
+    .is_some();
+
+    let src1 = ParsedOperandStr::parse.parse_next(stream)?;
+
+    if has_sync {
+        // Sync form: parse comma + membermask
+        token::any.verify(|(t, _): &(Token<'input>, _)| *t == Token::Comma)
+            .parse_next(stream)?;
+        let src2 = ParsedOperandStr::parse.parse_next(stream)?;
+
+        Ok(ast::Instruction::Vote {
+            data: ast::VoteDetails { mode, negate },
+            arguments: VoteArgs { dst, src1, src2: Some(src2) },
+        })
+    } else {
+        // Pre-sync form: no membermask
+        Ok(ast::Instruction::VotePreSync {
+            data: ast::VoteDetails { mode, negate },
+            arguments: VotePreSyncArgs { dst, src1 },
+        })
+    }
+}
+
 fn bra<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
@@ -1715,7 +1873,7 @@ fn bra<'a, 'input>(
 fn call<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
-    let (uni, return_arguments, name, input_arguments) = trace(
+    let (uni, return_arguments, name, input_arguments, _prototype) = trace(
         "call",
         (
             opt(Token::DotUni),
@@ -1735,6 +1893,8 @@ fn call<'a, 'input>(
                 Token::RParen.void(),
             )
                 .map(|(_, _, arguments, _)| arguments)),
+            // Optional trailing ", prototype_name" for indirect calls via .callprototype
+            opt((Token::Comma, ident).map(|(_, proto)| proto)),
         ),
     )
     .parse_next(stream)?;
@@ -1742,7 +1902,12 @@ fn call<'a, 'input>(
     let recorded_fn = match stream.state.function_declarations.get(name) {
         Some(decl) => decl,
         None => {
-            stream.state.errors.push(PtxError::UnknownFunction);
+            // Indirect calls through function pointers (e.g. call %rd212, (...), prototype)
+            // are not yet fully supported. Don't push UnknownFunction error for register-based
+            // calls since they're valid PTX — just emit an empty call stub.
+            if !name.starts_with('%') {
+                stream.state.errors.push(PtxError::UnknownFunction);
+            }
             return Ok(empty_call(uniform, name));
         }
     };
@@ -1784,6 +1949,148 @@ fn empty_call<'input>(
             is_external: false,
         },
     }
+}
+
+// Parse texture geometry modifier: .1d, .2d, .3d
+fn tex_geometry<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::TextureGeometry> {
+    token::any.verify_map(|(t, _)| match t {
+        Token::Dot1d => Some(ast::TextureGeometry::Dim1d),
+        Token::Dot2d => Some(ast::TextureGeometry::Dim2d),
+        Token::Dot3d => Some(ast::TextureGeometry::Dim3d),
+        _ => None,
+    })
+    .parse_next(stream)
+}
+
+// Parse surface clamp mode: .zero, .clamp, .trap
+fn surf_clamp_mode<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::SurfClampMode> {
+    token::any.verify_map(|(t, _)| match t {
+        Token::DotZero => Some(ast::SurfClampMode::Zero),
+        Token::DotClamp => Some(ast::SurfClampMode::Clamp),
+        Token::DotTrap => Some(ast::SurfClampMode::Trap),
+        _ => None,
+    })
+    .parse_next(stream)
+}
+
+// Parse a vector operand in braces: {%r1, %r2, ...}
+fn brace_vec_operand<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ParsedOperandStr<'input>> {
+    delimited(
+        Token::LBrace,
+        separated(1..=8, reg_or_immediate.map(Some), Token::Comma)
+            .map(|v: Vec<_>| ast::ParsedOperand::VecPack(v)),
+        Token::RBrace,
+    )
+    .parse_next(stream)
+}
+
+// tex.{geometry}.v4.{dtype}.{ctype} {dst_v4}, [tex_handle, {coord_vec}]
+fn tex<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    let (geometry, _, channel_type, coord_type) =
+        (tex_geometry, Token::DotV4, scalar_type, scalar_type).parse_next(stream)?;
+
+    let dst = brace_vec_operand.parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    // [tex_handle, {coords}]
+    Token::LBracket.parse_next(stream)?;
+    let src_texture = ident.map(ast::ParsedOperand::Reg).parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let src_coords = brace_vec_operand.parse_next(stream)?;
+    Token::RBracket.parse_next(stream)?;
+
+    Ok(ast::Instruction::Tex {
+        data: ast::TexDetails {
+            geometry,
+            channel_type,
+            coord_type,
+            is_texref: false,
+        },
+        arguments: ast::TexArgs {
+            dst,
+            src_texture,
+            src_coords,
+        },
+    })
+}
+
+// sust.b.{geometry}{.vec}.{dtype}.{clamp} [surf_handle, {coords}], {values}
+fn sust<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    Token::DotB.parse_next(stream)?;
+    let geometry = tex_geometry.parse_next(stream)?;
+    let vector: Option<VectorPrefix> = opt(alt((
+        Token::DotV2.value(VectorPrefix::V2),
+        Token::DotV4.value(VectorPrefix::V4),
+    )))
+    .parse_next(stream)?;
+    let data_type = scalar_type.parse_next(stream)?;
+    let clamp = surf_clamp_mode.parse_next(stream)?;
+
+    // [surf_handle, {coords}]
+    Token::LBracket.parse_next(stream)?;
+    let src_surface = ident.map(ast::ParsedOperand::Reg).parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let src_coords = brace_vec_operand.parse_next(stream)?;
+    Token::RBracket.parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let src_val = brace_vec_operand.parse_next(stream)?;
+
+    Ok(ast::Instruction::Sust {
+        data: ast::SustDetails {
+            geometry,
+            vector,
+            data_type,
+            clamp,
+        },
+        arguments: ast::SustArgs {
+            src_surface,
+            src_coords,
+            src_val,
+        },
+    })
+}
+
+// suld.b.{geometry}{.vec}.{dtype}.{clamp} {dst}, [surf_handle, {coords}]
+fn suld<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    Token::DotB.parse_next(stream)?;
+    let geometry = tex_geometry.parse_next(stream)?;
+    let vector: Option<VectorPrefix> = opt(alt((
+        Token::DotV2.value(VectorPrefix::V2),
+        Token::DotV4.value(VectorPrefix::V4),
+    )))
+    .parse_next(stream)?;
+    let data_type = scalar_type.parse_next(stream)?;
+    let clamp = surf_clamp_mode.parse_next(stream)?;
+
+    let dst = brace_vec_operand.parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    // [surf_handle, {coords}]
+    Token::LBracket.parse_next(stream)?;
+    let src_surface = ident.map(ast::ParsedOperand::Reg).parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let src_coords = brace_vec_operand.parse_next(stream)?;
+    Token::RBracket.parse_next(stream)?;
+
+    Ok(ast::Instruction::Suld {
+        data: ast::SuldDetails {
+            geometry,
+            vector,
+            data_type,
+            clamp,
+        },
+        arguments: ast::SuldArgs {
+            dst,
+            src_surface,
+            src_coords,
+        },
+    })
 }
 
 fn vshr<'a, 'input>(
@@ -1946,7 +2253,7 @@ derive_parser!(
         Semicolon,
         #[token("@")]
         At,
-        #[regex(r"[a-zA-Z][a-zA-Z0-9_$]*|[_$%][a-zA-Z0-9_$]+", |lex| lex.slice(), priority = 0)]
+        #[regex(r"[a-zA-Z][a-zA-Z0-9_$]*|[_$%][a-zA-Z0-9_$]*", |lex| lex.slice(), priority = 0)]
         Ident(&'input str),
         #[token("_")]
         Sink,
@@ -2033,7 +2340,19 @@ derive_parser!(
         #[token(".texref")]
         DotTexref,
         #[token(".surfref")]
-        DotSurfref
+        DotSurfref,
+        #[token(".1d")]
+        Dot1d,
+        #[token(".2d")]
+        Dot2d,
+        #[token(".3d")]
+        Dot3d,
+        #[token(".zero")]
+        DotZero,
+        #[token(".trap")]
+        DotTrap,
+        #[token(".b")]
+        DotB
     }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
@@ -2072,9 +2391,7 @@ derive_parser!(
     pub enum FunnelShiftMode { }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
-    pub enum VoteMode {
-        Ballot
-    }
+    pub enum VoteMode { }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
     pub enum MatrixShape { }
@@ -3649,6 +3966,27 @@ derive_parser!(
     StateSpace =                    { .global };
     RawAtomicOp =                   { .exch };
 
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-red
+    red{.sem}{.scope}{.space}.op.type  [a], b => {
+        ast::Instruction::Red {
+            data: AtomDetails {
+                semantics: sem.map(Into::into).unwrap_or(AtomSemantics::Relaxed),
+                scope: scope.unwrap_or(MemScope::Gpu),
+                space: space.unwrap_or(StateSpace::Generic),
+                op: ast::AtomicOp::new(op, type_.kind()),
+                type_: type_.into()
+            },
+            arguments: RedArgs { src1: a, src2: b }
+        }
+    }
+    .space: StateSpace =            { .global, .shared{::cta, ::cluster} };
+    .sem: AtomSemantics =           { .relaxed, .acquire, .release, .acq_rel };
+    .scope: MemScope =              { .cta, .cluster, .gpu, .sys };
+    .op: RawAtomicOp =              { .and, .or, .xor,
+                                      .add, .inc, .dec,
+                                      .min, .max };
+    .type: ScalarType =             { .b32, .b64, .u32, .u64, .s32, .s64, .f32, .f64 };
+
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-div
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-div
     div.type  d, a, b => {
@@ -3857,6 +4195,21 @@ derive_parser!(
     .atype: ScalarType = { .f16,  .f16x2 };
     .btype: ScalarType = { .bf16, .bf16x2 };
     ScalarType = { .f32 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-bfind
+    bfind.shiftamt.type  d, a => {
+        ast::Instruction::Bfind {
+            data: ast::BfindDetails { shift: true, type_ },
+            arguments: BfindArgs { dst: d, src: a, },
+        }
+    }
+    bfind.type  d, a => {
+        ast::Instruction::Bfind {
+            data: ast::BfindDetails { shift: false, type_ },
+            arguments: BfindArgs { dst: d, src: a, },
+        }
+    }
+    .type: ScalarType = { .u32, .u64 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-clz
     clz.type  d, a => {
@@ -4117,40 +4470,11 @@ derive_parser!(
     .btype: ScalarType = { .u32, .s32 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-vote-sync
-
-    vote.sync.mode.pred  d, {!}a, membermask => {
-        let (negate, a) = a;
-        Instruction::Vote {
-            data: VoteDetails {
-                mode,
-                negate
-            },
-            arguments: VoteArgs { dst: d, src1: a, src2: Some(membermask) }
-        }
-    }
-    vote.ballot.b32 d, {!}a => {
-        let (negate, a) = a;
-        Instruction::Vote {
-            data: VoteDetails {
-                mode: VoteMode::Ballot,
-                negate
-            },
-            arguments: VoteArgs { dst: d, src1: a, src2: None }
-        }
-    }
-    vote.sync.ballot.b32 d, {!}a, membermask => {
-        let (negate, a) = a;
-        Instruction::Vote {
-            data: VoteDetails {
-                mode: VoteMode::Ballot,
-                negate
-            },
-            arguments: VoteArgs { dst: d, src1: a, src2: Some(membermask) }
-        }
-    }
+    // Also handles pre-sm_70 vote without .sync
+    vote <= { vote_instruction(stream) }
 
     // .mode: VoteMode = { .all, .any, .uni };
-    .mode: VoteMode = { .all, .any };
+    .mode: VoteMode = { .all, .any, .ballot };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-redux-sync
 
@@ -4411,43 +4735,10 @@ derive_parser!(
         })
     }
 
-    // https://docs.nvidia.com/cuda/parallel-thread-execution/#texture-instructions-tex
-    tex.1d.v4.dtype.ctype  d, [a, c] => {
-        Instruction::Tex {
-            data: TexData {
-                dtype,
-                ctype,
-                dims: TexDimensions::D1,
-                type_: TexType::Texref
-            },
-            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
-        }
-    }
-    tex.2d.v4.dtype.ctype  d, [a, c] => {
-        Instruction::Tex {
-            data: TexData {
-                dtype,
-                ctype,
-                dims: TexDimensions::D2,
-                type_: TexType::Texref
-            },
-            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
-        }
-    }
-    tex.3d.v4.dtype.ctype  d, [a, c] => {
-        Instruction::Tex {
-            data: TexData {
-                dtype,
-                ctype,
-                dims: TexDimensions::D3,
-                type_: TexType::Texref
-            },
-            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
-        }
-    }
-
-    .dtype: ScalarType = { .u32, .s32, .f32 };
-    .ctype: ScalarType = { .s32, .f32 };
+    // Texture and surface instructions (custom-parsed due to complex operand layout)
+    tex <= { tex(stream) }
+    sust <= { sust(stream) }
+    suld <= { suld(stream) }
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/
     match.any.sync.type  d, a, membermask => {
@@ -4458,14 +4749,6 @@ derive_parser!(
     }
 
     .type: ScalarType = { .b32, .b64 };
-
-    // https://docs.nvidia.com/cuda/parallel-thread-execution/
-    bfind.shiftamt.u32  d, a => {
-        Instruction::Bfind {
-            data: (),
-            arguments: BfindArgs { dst: d, src: a }
-        }
-    }
 );
 
 #[cfg(test)]
@@ -4957,6 +5240,152 @@ mod tests {
         assert_eq!(
             result.array_init,
             vec![crate::RegOrImmediate::Imm(crate::ImmediateValue::U64(0))]
+        );
+    }
+
+    #[test]
+    fn vote_presync_any_pred() {
+        let text = "
+            .version 3.2
+            .target sm_30
+            .address_size 64
+
+            .visible .entry test_vote()
+            {
+                .reg .pred %p1, %p2;
+                vote.any.pred %p2, %p1;
+                ret;
+            }";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let module = module.parse(stream).unwrap();
+        assert_eq!(module.directives.len(), 1);
+        assert_eq!(module.invalid_directives, 0);
+    }
+
+    #[test]
+    fn vote_presync_ballot_b32() {
+        let text = "
+            .version 3.2
+            .target sm_30
+            .address_size 64
+
+            .visible .entry test_vote()
+            {
+                .reg .pred %p1;
+                .reg .b32 %r1;
+                vote.ballot.b32 %r1, %p1;
+                ret;
+            }";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let module = module.parse(stream).unwrap();
+        assert_eq!(module.directives.len(), 1);
+        assert_eq!(module.invalid_directives, 0);
+    }
+
+    #[test]
+    fn vote_sync_any_pred() {
+        let text = "
+            .version 6.5
+            .target sm_70
+            .address_size 64
+
+            .visible .entry test_vote()
+            {
+                .reg .pred %p1, %p2;
+                .reg .b32 %r1;
+                vote.sync.any.pred %p2, %p1, %r1;
+                ret;
+            }";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let module = module.parse(stream).unwrap();
+        assert_eq!(module.directives.len(), 1);
+        assert_eq!(module.invalid_directives, 0);
+    }
+
+    // The custom vote parser sees `.all`, `.any` and `.ballot` as DotIdent
+    // unless a grammar rule names them and turns them into tokens
+    // (match.any.sync did that to `.any`; upstream's own vote rules, which
+    // this fork replaces, would do it to `.ballot`). A statement that fails
+    // to parse only shows up in the error list, so the tests above that count
+    // directives would still pass: check that every form parses cleanly and
+    // into the right instruction.
+    #[test]
+    fn vote_all_forms_parse_without_errors() {
+        let text = "
+            .version 6.5
+            .target sm_70
+            .address_size 64
+
+            .visible .entry test_vote()
+            {
+                .reg .pred %p1, %p2;
+                .reg .b32 %r1, %r2;
+                vote.ballot.b32 %r1, %p1;
+                vote.ballot.b32 %r1, !%p1;
+                vote.any.pred %p2, %p1;
+                vote.all.pred %p2, %p1;
+                vote.sync.ballot.b32 %r1, %p1, %r2;
+                vote.sync.any.pred %p2, %p1, %r2;
+                vote.sync.all.pred %p2, !%p1, %r2;
+                ret;
+            }";
+        let module = parse_module_checked(text).unwrap_or_else(|errors| {
+            panic!("{} parse errors", errors.len());
+        });
+        let body = match &module.directives[0] {
+            crate::ast::Directive::Method(_, func) => func.body.as_ref().unwrap(),
+            _ => panic!("expected a method"),
+        };
+        let votes = body
+            .iter()
+            .filter_map(|statement| match statement {
+                crate::ast::Statement::Instruction(
+                    _,
+                    crate::ast::Instruction::VotePreSync { data, .. },
+                ) => Some((data.mode, data.negate, false)),
+                crate::ast::Statement::Instruction(
+                    _,
+                    crate::ast::Instruction::Vote { data, arguments },
+                ) => Some((data.mode, data.negate, arguments.src2.is_some())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        use crate::VoteMode::{All, Any, Ballot};
+        assert!(
+            votes
+                == vec![
+                    (Ballot, false, false),
+                    (Ballot, true, false),
+                    (Any, false, false),
+                    (All, false, false),
+                    (Ballot, false, true),
+                    (Any, false, true),
+                    (All, true, true),
+                ]
         );
     }
 }

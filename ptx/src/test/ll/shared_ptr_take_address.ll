@@ -16,24 +16,27 @@ define amdgpu_kernel void @shared_ptr_take_address(ptr addrspace(4) byref(i64) %
   store i64 %2, ptr addrspace(5) %"44", align 8
   %3 = load i64, ptr addrspace(4) %"43", align 8
   store i64 %3, ptr addrspace(5) %"45", align 8
-  store i64 ptrtoint (ptr addrspace(3) @shared_mem to i64), ptr addrspace(5) %"46", align 8
+  %"60" = zext i32 ptrtoint (ptr addrspace(3) @shared_mem to i32) to i64
+  store i64 %"60", ptr addrspace(5) %"46", align 8
   %4 = load i64, ptr addrspace(5) %"44", align 8
   %"61" = inttoptr i64 %4 to ptr addrspace(1)
   %5 = load i64, ptr addrspace(1) %"61", align 8
   store i64 %5, ptr addrspace(5) %"47", align 8
   %6 = load i64, ptr addrspace(5) %"46", align 8
   %7 = load i64, ptr addrspace(5) %"47", align 8
-  %"62" = inttoptr i64 %6 to ptr addrspace(3)
+  %8 = trunc i64 %6 to i32
+  %"62" = inttoptr i32 %8 to ptr addrspace(3)
   store i64 %7, ptr addrspace(3) %"62", align 8
-  %8 = load i64, ptr addrspace(5) %"46", align 8
-  %"63" = inttoptr i64 %8 to ptr addrspace(3)
-  %9 = load i64, ptr addrspace(3) %"63", align 8
-  store i64 %9, ptr addrspace(5) %"48", align 8
-  %10 = load i64, ptr addrspace(5) %"45", align 8
-  %11 = load i64, ptr addrspace(5) %"48", align 8
-  %"64" = inttoptr i64 %10 to ptr addrspace(1)
-  store i64 %11, ptr addrspace(1) %"64", align 8
+  %9 = load i64, ptr addrspace(5) %"46", align 8
+  %10 = trunc i64 %9 to i32
+  %"63" = inttoptr i32 %10 to ptr addrspace(3)
+  %11 = load i64, ptr addrspace(3) %"63", align 8
+  store i64 %11, ptr addrspace(5) %"48", align 8
+  %12 = load i64, ptr addrspace(5) %"45", align 8
+  %13 = load i64, ptr addrspace(5) %"48", align 8
+  %"64" = inttoptr i64 %12 to ptr addrspace(1)
+  store i64 %13, ptr addrspace(1) %"64", align 8
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

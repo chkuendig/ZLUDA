@@ -1,0 +1,37 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Test: sust instruction compiles with stub generation (no real surface data).
+// Verifies that __zluda_ptx_impl_sust_b_* gets a stub body during compilation.
+
+.visible .entry sust_stub(
+	.param .u64 output
+)
+{
+	.reg .u64	out_addr;
+	.reg .u64	surf_handle;
+	.reg .s32	coord1;
+	.reg .s32	coord2;
+	.reg .s32	coord3;
+	.reg .s32	coord4;
+	.reg .b32	val;
+
+	ld.param.u64	out_addr, [output];
+
+	// Set up dummy values
+	mov.u64		surf_handle, 0;
+	mov.s32		coord1, 0;
+	mov.s32		coord2, 0;
+	mov.s32		coord3, 0;
+	mov.s32		coord4, 0;
+	mov.b32		val, 42;
+
+	// Surface store — will become __zluda_ptx_impl_sust_b_3d_b32_trap
+	sust.b.3d.b32.trap	[surf_handle, {coord1, coord2, coord3, coord4}], {val};
+
+	// Write a marker to confirm the kernel ran
+	mov.b32		val, 1;
+	st.global.b32	[out_addr], val;
+	ret;
+}

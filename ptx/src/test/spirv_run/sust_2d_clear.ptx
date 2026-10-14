@@ -1,0 +1,35 @@
+.version 6.5
+.target sm_50
+.address_size 64
+
+// Reproduces TurbulenceFS_dynamicGridClear2DKernel from Batman Arkham Knight.
+// Writes clear_value to every (x,y) in the grid via sust.b.2d.b32.zero.
+// Byte-addressing: x_byte = thread_x * 4.
+// With surf_validate bug, most writes are silently dropped due to unit mismatch.
+
+.visible .entry sust_2d_clear(
+    .param .u64 sust_2d_clear_param_0,
+    .param .u32 sust_2d_clear_param_1
+)
+{
+    .reg .s32 %r<8>;
+    .reg .s64 %rd<2>;
+
+    ld.param.u64 %rd1, [sust_2d_clear_param_0];
+    ld.param.u32 %r3, [sust_2d_clear_param_1];
+
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r1, %r5, %r4, %r6;
+
+    mov.u32 %r4, %ctaid.y;
+    mov.u32 %r5, %ntid.y;
+    mov.u32 %r7, %tid.y;
+    mad.lo.s32 %r2, %r5, %r4, %r7;
+
+    shl.b32 %r1, %r1, 2;
+
+    sust.b.2d.b32.zero [%rd1, {%r1, %r2}], {%r3};
+    ret;
+}

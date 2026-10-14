@@ -1,6 +1,7 @@
-@x = addrspace(4) externally_initialized global i64 1
-@y = addrspace(4) externally_initialized global [4 x i64] [i64 4, i64 5, i64 6, i64 0]
-@constparams = addrspace(4) externally_initialized global [2 x i64] [i64 ptrtoint (ptr addrspace(4) @x to i64), i64 ptrtoint (ptr addrspace(4) @y to i64)]
+@x = addrspace(1) externally_initialized global i64 1
+@y = addrspace(1) externally_initialized global [4 x i64] [i64 4, i64 5, i64 6, i64 0]
+@constparams = addrspace(1) externally_initialized global [2 x i64] [i64 ptrtoint (ptr addrspace(1) @x to i64), i64 ptrtoint (ptr addrspace(1) @y to i64)]
+@llvm.used = appending global [3 x ptr] [ptr addrspacecast (ptr addrspace(1) @x to ptr), ptr addrspacecast (ptr addrspace(1) @y to ptr), ptr addrspacecast (ptr addrspace(1) @constparams to ptr)], section "llvm.metadata"
 
 define amdgpu_kernel void @const_ident(ptr addrspace(4) byref(i64) %"55", ptr addrspace(4) byref(i64) %"56") #0 {
   %"57" = alloca i64, align 8, addrspace(5)
@@ -21,11 +22,11 @@ define amdgpu_kernel void @const_ident(ptr addrspace(4) byref(i64) %"55", ptr ad
   store i64 %2, ptr addrspace(5) %"57", align 8
   %3 = load i64, ptr addrspace(4) %"56", align 8
   store i64 %3, ptr addrspace(5) %"58", align 8
-  store i64 ptrtoint (ptr addrspace(4) @x to i64), ptr addrspace(5) %"59", align 8
-  store i64 ptrtoint (ptr addrspace(4) @y to i64), ptr addrspace(5) %"60", align 8
-  %4 = load i64, ptr addrspace(4) @constparams, align 8
+  store i64 ptrtoint (ptr addrspace(1) @x to i64), ptr addrspace(5) %"59", align 8
+  store i64 ptrtoint (ptr addrspace(1) @y to i64), ptr addrspace(5) %"60", align 8
+  %4 = load i64, ptr addrspace(1) @constparams, align 8
   store i64 %4, ptr addrspace(5) %"61", align 8
-  %5 = load i64, ptr addrspace(4) getelementptr inbounds (i8, ptr addrspace(4) @constparams, i64 8), align 8
+  %5 = load i64, ptr addrspace(1) getelementptr inbounds (i8, ptr addrspace(1) @constparams, i64 8), align 8
   store i64 %5, ptr addrspace(5) %"62", align 8
   %6 = load i64, ptr addrspace(5) %"59", align 8
   %7 = load i64, ptr addrspace(5) %"61", align 8
@@ -52,4 +53,4 @@ define amdgpu_kernel void @const_ident(ptr addrspace(4) byref(i64) %"55", ptr ad
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

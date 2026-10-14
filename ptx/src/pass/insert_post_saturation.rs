@@ -77,6 +77,7 @@ fn run_instruction<'input>(
         | ast::Instruction::And { .. }
         | ast::Instruction::Atom { .. }
         | ast::Instruction::AtomCas { .. }
+        | ast::Instruction::Red { .. }
         | ast::Instruction::BarWarp { .. }
         | ast::Instruction::Bar { .. }
         | ast::Instruction::BarRed { .. }
@@ -85,9 +86,9 @@ fn run_instruction<'input>(
         | ast::Instruction::Bmsk { .. }
         | ast::Instruction::Bra { .. }
         | ast::Instruction::Brev { .. }
+        | ast::Instruction::Bfind { .. }
         | ast::Instruction::Call { .. }
         | ast::Instruction::Clz { .. }
-        | ast::Instruction::Bfind { .. }
         | ast::Instruction::Cos { .. }
         | ast::Instruction::Copysign { .. }
         | ast::Instruction::CpAsync { .. }
@@ -205,14 +206,17 @@ fn run_instruction<'input>(
         | ast::Instruction::Exit {}
         | ast::Instruction::Xor { .. }
         | ast::Instruction::Vote { .. }
+        | ast::Instruction::VotePreSync { .. }
         | ast::Instruction::ReduxSync { .. }
         | ast::Instruction::GridDepControl { .. }
         | ast::Instruction::LdMatrix { .. }
         | ast::Instruction::Prefetch { .. }
         | ast::Instruction::Sad { .. }
         | ast::Instruction::Dp2a { .. }
-        | ast::Instruction::Tex { .. }
         | ast::Instruction::Mma { .. }
+        | ast::Instruction::Tex { .. }
+        | ast::Instruction::Sust { .. }
+        | ast::Instruction::Suld { .. }
         | ast::Instruction::Vshr { .. } => result.push(Statement::Instruction(instruction)),
         ast::Instruction::Add {
             data:

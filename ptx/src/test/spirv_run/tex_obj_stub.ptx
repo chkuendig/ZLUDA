@@ -1,0 +1,34 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Test: tex instruction with bindless texture object (u64 handle, not .texref).
+// Verifies _obj code path from da80082e.
+
+.visible .entry tex_obj_stub(
+	.param .u64 output
+)
+{
+	.reg .u64	out_addr;
+	.reg .u64	tex_handle;
+	.reg .f32	coord1;
+	.reg .f32	coord2;
+	.reg .f32	r;
+	.reg .f32	g;
+	.reg .f32	b;
+	.reg .f32	a;
+
+	ld.param.u64	out_addr, [output];
+
+	// Dummy texture handle as u64 register (NOT .texref — triggers _obj path)
+	mov.u64		tex_handle, 0;
+	mov.f32		coord1, 0f00000000;
+	mov.f32		coord2, 0f00000000;
+
+	// Bindless texture sample — will become __zluda_ptx_impl_tex_2d_v4_f32_f32_obj
+	tex.2d.v4.f32.f32	{r, g, b, a}, [tex_handle, {coord1, coord2}];
+
+	// Store first channel to output as marker
+	st.global.f32	[out_addr], r;
+	ret;
+}

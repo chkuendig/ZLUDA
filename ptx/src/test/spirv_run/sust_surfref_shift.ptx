@@ -1,0 +1,45 @@
+.version 6.5
+.target sm_50
+.address_size 64
+
+// Test that surface reference (surfref) surface stores write to the correct
+// x-byte-offset. The kernel writes value 0x42 at position (1,0,0) via sust.
+// With correct shift (2 for FLOAT): byte offset = 1 << 2 = 4 → element [1]
+// With wrong shift (0): byte offset = 1 << 0 = 1 → byte [1], NOT element [1]
+// The test reads back element [1] from the array to verify correctness.
+
+.global .surfref testSurf;
+
+.visible .entry sust_surfref_shift(
+    .param .u64 output
+)
+{
+    .reg .u64   out_addr;
+    .reg .u64   surf_handle;
+    .reg .s32   x, y, z, w;
+    .reg .b32   val;
+
+    ld.param.u64    out_addr, [output];
+
+    // Load surface handle from the surfref global
+    mov.u64     surf_handle, testSurf;
+
+    // First: clear position (0,0,0) and (1,0,0) by writing 0
+    mov.s32     x, 0;
+    mov.s32     y, 0;
+    mov.s32     z, 0;
+    mov.s32     w, 0;
+    mov.b32     val, 0;
+    sust.b.3d.b32.trap  [surf_handle, {x, y, z, w}], {val};
+
+    // Write at x=4 bytes (element 1 for FLOAT): sust uses BYTE addressing
+    // shifted by the pixel shift. With shift=2: x_byte = 1 << 2 = 4 → element [1]
+    mov.s32     x, 4;
+    mov.b32     val, 0x42424242;
+    sust.b.3d.b32.trap  [surf_handle, {x, y, z, w}], {val};
+
+    // Write completion marker
+    mov.b32     val, 1;
+    st.global.b32   [out_addr], val;
+    ret;
+}

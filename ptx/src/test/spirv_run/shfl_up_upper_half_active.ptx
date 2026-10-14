@@ -1,0 +1,54 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Retention audit 2026-10-09: this is a legacy compatibility experiment,
+// not a PTX conformance test. PTX defines an active lane sourcing an inactive
+// lane in divergent shfl control flow as undefined, even if the index is in
+// range. The historical expected value 15 below is not an ISA guarantee.
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-shfl
+// Historical investigation notes follow; "correct/bug" labels are hypotheses.
+// Repro for the NRSS scatter residual (2026-06-11): an ACTIVE high lane
+// reads an INACTIVE low lane via shfl.up. CUB's warp-synchronous radix
+// scan assumes lockstep (the source lane's register is readable even when
+// "inactive"); AMD `ds_bpermute` returns 0 for EXEC-off source lanes.
+//
+// Lanes 16..31 active, lanes 0..15 inactive during the shfl. Lane 16 does
+// shfl.up(delta=1) -> reads lane 15 (inactive). Each lane sets its input =
+// thread_id BEFORE diverging. Lockstep-correct: out[16] = 15. The
+// ds_bpermute-returns-0 bug: out[16] = 0.
+.visible .entry shfl_up_upper_half_active(
+    .param .u64 output
+)
+{
+    .reg .u64       out_addr;
+    .reg .u64       out_index;
+    .reg .u32       thread_id;
+    .reg .u32       lane_id;
+    .reg .u32       result;
+    .reg .pred      active;
+    .reg .pred      in_range;
+
+    ld.param.u64    out_addr, [output];
+    mov.u32         thread_id, %tid.x;
+    mov.u32         lane_id, %laneid;
+    mov.u32         result, thread_id;
+
+    // Upper half (lanes 16..31) stays active; lower half skips to STORE
+    // (inactive during the shfl below).
+    setp.ge.u32     active, lane_id, 16;
+    @!active add.u32 result, result, 2000;
+    @!active bra STORE;
+
+    // Lane 16 reads lane 15 (inactive). mask=0 => width 32, so lane 15 is
+    // in-bounds (not out_of_bounds) — the bug bites.
+    shfl.up.b32     result|in_range, thread_id, 1, 0;
+    @!in_range add.u32 result, result, 1000;
+
+STORE:
+    cvt.u64.u32     out_index, thread_id;
+    mul.lo.u64      out_index, out_index, 4;
+    add.u64         out_addr, out_addr, out_index;
+    st.u32          [out_addr], result;
+    ret;
+}

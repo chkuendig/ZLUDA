@@ -1066,15 +1066,17 @@ fn apply_global_mode_controls(
                             },
                     }) = post_call_bra
                     {
-                        let node_exit_mode = global_modes
-                            .functions_exit_modes
-                            .get(&call_target)
-                            .ok_or_else(error_unreachable)?;
-                        redirect_jump_impl(
-                            &bb_state.global_modes,
-                            node_exit_mode,
-                            post_call_label,
-                        )?;
+                        // For indirect calls (function pointers), the target may not
+                        // be in functions_exit_modes. Use default mode in that case.
+                        if let Some(node_exit_mode) =
+                            global_modes.functions_exit_modes.get(&call_target)
+                        {
+                            redirect_jump_impl(
+                                &bb_state.global_modes,
+                                node_exit_mode,
+                                post_call_label,
+                            )?;
+                        }
                         result.push(post_call_bra);
                     } else {
                         return Err(error_unreachable());
@@ -2146,8 +2148,8 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::And { .. }
         | ast::Instruction::Bra { .. }
         | ast::Instruction::Clz { .. }
-        | ast::Instruction::Bfind { .. }
         | ast::Instruction::Brev { .. }
+        | ast::Instruction::Bfind { .. }
         | ast::Instruction::Dp4a { .. }
         | ast::Instruction::Popc { .. }
         | ast::Instruction::Xor { .. }
@@ -2172,10 +2174,12 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::CvtPack { .. }
         | ast::Instruction::Cvta { .. }
         | ast::Instruction::Atom { .. }
+        | ast::Instruction::Red { .. }
         | ast::Instruction::Mul24 { .. }
         | ast::Instruction::Nanosleep { .. }
         | ast::Instruction::AtomCas { .. }
         | ast::Instruction::Vote { .. }
+        | ast::Instruction::VotePreSync { .. }
         | ast::Instruction::ReduxSync { .. }
         | ast::Instruction::GridDepControl { .. }
         | ast::Instruction::LdMatrix { .. }
@@ -2184,8 +2188,10 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::CreatePolicyFractional { .. }
         | ast::Instruction::Dp2a { .. }
         | ast::Instruction::Sad { .. }
+        | ast::Instruction::Copysign { .. }
         | ast::Instruction::Tex { .. }
-        | ast::Instruction::Copysign { .. } => InstructionModes::none(),
+        | ast::Instruction::Sust { .. }
+        | ast::Instruction::Suld { .. } => InstructionModes::none(),
         ast::Instruction::Add {
             data: ast::ArithDetails::Integer(_),
             ..

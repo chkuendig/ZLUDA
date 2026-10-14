@@ -1,0 +1,50 @@
+.version 3.2
+.target sm_30
+.address_size 64
+
+// Minimal LDS exchange test: 128 threads each write their value to LDS[tid],
+// barrier, then read from LDS[(tid + 1) % 128] and store to global output.
+// Tests that shared memory exchange (the core of CUB's block exchange) works.
+.visible .entry lds_exchange_test(
+    .param .u64 lds_exchange_test_param_0,
+    .param .u64 lds_exchange_test_param_1
+)
+.maxntid 128, 1, 1
+{
+    .reg .u32 %r<10>;
+    .reg .u64 %rd<10>;
+    .shared .align 4 .u32 smem[128];
+
+    ld.param.u64 %rd0, [lds_exchange_test_param_0];  // input
+    ld.param.u64 %rd1, [lds_exchange_test_param_1];  // output
+    cvta.to.global.u64 %rd2, %rd0;
+    cvta.to.global.u64 %rd3, %rd1;
+
+    mov.u32 %r0, %tid.x;
+
+    // Load input[tid]
+    mul.wide.u32 %rd4, %r0, 4;
+    add.u64 %rd5, %rd2, %rd4;
+    ld.global.u32 %r1, [%rd5];
+
+    // Write to smem[tid]
+    mul.lo.u32 %r2, %r0, 4;
+    mov.u32 %r3, smem;
+    add.u32 %r4, %r3, %r2;
+    st.shared.u32 [%r4], %r1;
+
+    bar.sync 0;
+
+    // Read from smem[(tid + 1) % 128]
+    add.u32 %r5, %r0, 1;
+    and.b32 %r6, %r5, 127;
+    mul.lo.u32 %r7, %r6, 4;
+    add.u32 %r8, %r3, %r7;
+    ld.shared.u32 %r9, [%r8];
+
+    // Store to output[tid]
+    add.u64 %rd6, %rd3, %rd4;
+    st.global.u32 [%rd6], %r9;
+
+    ret;
+}
