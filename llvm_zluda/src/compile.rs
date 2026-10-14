@@ -4,8 +4,8 @@ use crate::{ffi::LLVMZludaLinkWithLLD, utils::Module};
 use llvm_sys::{
     core::*,
     target::{
-        LLVMInitializeAMDGPUAsmPrinter, LLVMInitializeAMDGPUTarget, LLVMInitializeAMDGPUTargetInfo,
-        LLVMInitializeAMDGPUTargetMC,
+        LLVMInitializeAMDGPUAsmParser, LLVMInitializeAMDGPUAsmPrinter, LLVMInitializeAMDGPUTarget,
+        LLVMInitializeAMDGPUTargetInfo, LLVMInitializeAMDGPUTargetMC,
     },
     target_machine::{
         LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMGetTargetFromTriple,
@@ -123,7 +123,26 @@ pub fn compile(
 
     let triple = c"amdgcn-amd-amdhsa";
     let cpu = std::ffi::CString::new(gcn_arch).map_err(|_| ("invalid gcn_arch").to_string())?;
-    let features = c"-wavefrontsize64,+cumode";
+    /* Disable FeatureBackOffBarrier when ZLUDA_DISABLE_BACK_OFF_BARRIER=1.
+     * The feature (added by upstream D120544) lets gfx10.x hardware omit
+     * the implicit s_waitcnt before s_barrier — fine for graphics
+     * workloads that emit explicit fences but breaks CUDA's implicit
+     * `bar.sync 0` LDS-commit semantic. We compensate via an explicit
+     * `s_waitcnt(0)` in `__zluda_ptx_impl_bar_sync` (commit 579bcc05),
+     * but that's only invoked from PTX-translated `bar.sync`, not from
+     * any other LDS-fence path the LLVM codegen might emit. Disabling
+     * the optimisation entirely makes the codegen always emit the wait,
+     * which should make residual TFS/IOFX races go away if they're
+     * caused by some non-bar.sync LDS visibility gap. */
+    let features_static: &CStr = if std::env::var("ZLUDA_DISABLE_BACK_OFF_BARRIER")
+        .ok()
+        .as_deref() == Some("1")
+    {
+        c"-wavefrontsize64,+cumode,-back-off-barrier"
+    } else {
+        c"-wavefrontsize64,+cumode"
+    };
+    let features = features_static;
 
     let mut target = unsafe { std::mem::zeroed() };
     let mut err = std::ptr::null_mut();
@@ -133,12 +152,27 @@ pub fn compile(
         return Err(message.to_str().to_string());
     }
 
+    // Backend (register-allocation / scheduling) opt level. Normally
+    // Aggressive. A few pathologically large kernels (e.g. Batman:AK's
+    // _Z14simulateClothsv, 80k PTX lines with hundreds of strict.wwm shfl
+    // regions) hit an LLVM AMDGPU greedy-RA/WWM MIR-corruption SIGSEGV in
+    // `SIPreAllocateWWMRegs` at -O1+; the same module codegens correctly at
+    // -O0 (fast RA). `module.rs::compile_in_subprocess` retries a crashed
+    // module with ZLUDA_CODEGEN_OPT_LEVEL=0 so it still compiles (correct,
+    // just less-optimized codegen) instead of failing the whole module.
+    // The middle-end default<O3> pipeline above is unaffected.
+    let codegen_level = match std::env::var("ZLUDA_CODEGEN_OPT_LEVEL").ok().as_deref() {
+        Some("0") | Some("none") => LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,
+        Some("1") => LLVMCodeGenOptLevel::LLVMCodeGenLevelLess,
+        Some("2") => LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
+        _ => LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+    };
     let target_machine = TargetMachine::new(
         target,
         triple,
         &cpu,
         features,
-        LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+        codegen_level,
         LLVMRelocMode::LLVMRelocDefault,
         LLVMCodeModel::LLVMCodeModelDefault,
     );
@@ -157,6 +191,38 @@ pub fn compile(
         let err_msg = unsafe { llvm_sys::error::LLVMGetErrorMessage(error) };
         let message = Message::new(unsafe { CStr::from_ptr(err_msg) });
         return Err(message.to_str().to_string());
+    }
+
+    // Legacy experiment: choose zero for undef phi inputs after optimization.
+    // This is not a PTX guarantee that uninitialized registers are zero, nor
+    // proof of an optimizer bug. The original experiment did not fix MS_4.
+    // Keep the old control available; retirement comparisons disable it.
+    if crate::legacy_workaround_enabled("ZLUDA_ZERO_UNDEF") {
+        unsafe {
+            let mut func = LLVMGetFirstFunction(linked.get());
+            while !func.is_null() {
+                let mut bb = LLVMGetFirstBasicBlock(func);
+                while !bb.is_null() {
+                    let mut inst = LLVMGetFirstInstruction(bb);
+                    while !inst.is_null() {
+                        if !LLVMIsAPHINode(inst).is_null() {
+                            let count = LLVMCountIncoming(inst);
+                            for i in 0..count {
+                                let val = LLVMGetIncomingValue(inst, i);
+                                if LLVMIsUndef(val) != 0 {
+                                    let ty = LLVMTypeOf(val);
+                                    let zero = LLVMConstNull(ty);
+                                    LLVMSetOperand(inst, i, zero);
+                                }
+                            }
+                        }
+                        inst = LLVMGetNextInstruction(inst);
+                    }
+                    bb = LLVMGetNextBasicBlock(bb);
+                }
+                func = LLVMGetNextFunction(func);
+            }
+        }
     }
 
     if let Some(hook) = compiler_hook {
@@ -288,8 +354,27 @@ fn init_globals() -> Result<(), String> {
                 ]
             };
             */
+            // ZLUDA_LLVM_ARGS: whitespace-separated extra LLVM cl::opt flags,
+            // injected at first-compile init. Diagnostic-only — used to bisect
+            // AMDGPU codegen passes (e.g. "-amdgpu-enable-whole-quad-mode=0")
+            // against the deterministic nrss_replay GPU A/B without rebuilding
+            // LLVM. The CStrings must outlive ParseCommandLineOptions, so leak
+            // them (one-shot init, negligible).
+            let extra_args: Vec<&'static CStr> = match std::env::var("ZLUDA_LLVM_ARGS") {
+                Ok(s) if !s.trim().is_empty() => s
+                    .split_whitespace()
+                    .map(|tok| {
+                        let cs = std::ffi::CString::new(tok).unwrap();
+                        &*Box::leak(cs.into_boxed_c_str())
+                    })
+                    .collect(),
+                // Default: the AMDGPU zero-VGPR prolog stays off, as in the
+                // configuration validated in games.
+                _ => vec![c"-amdgpu-zero-vgpr-prolog=false"],
+            };
             let llvm_args_ptrs: Vec<*const i8> = common_options
                 //.chain(opt_options)
+                .chain(extra_args.into_iter())
                 .map(|s| s.as_ptr())
                 .collect();
             let mut err_msg = std::ptr::null_mut();
@@ -307,6 +392,7 @@ fn init_globals() -> Result<(), String> {
             unsafe { LLVMInitializeAMDGPUTarget() };
             unsafe { LLVMInitializeAMDGPUTargetMC() };
             unsafe { LLVMInitializeAMDGPUAsmPrinter() };
+            unsafe { LLVMInitializeAMDGPUAsmParser() };
             Ok(())
         })
         .as_ref()
