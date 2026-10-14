@@ -225,6 +225,10 @@ int LLVMZludaLinkWithLLD(uint32_t inputs, const char **input_paths, const char *
     args.push_back(output_path);
     args.push_back("--threads=1");
     args.push_back("--no-undefined");
+    // In our pinned LLVM, F_mmap selects FileOutputBuffer's InMemoryBuffer.
+    // Avoid TempFile::create -> RemoveFileOnSignal: an embedded compiler must
+    // not replace the host's signal handlers or its per-thread alternate stack.
+    args.push_back("--mmap-output-file");
 
     std::string log_out_str;
     std::string log_err_str;
