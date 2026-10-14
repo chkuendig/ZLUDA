@@ -7,6 +7,7 @@ members = [
     "cuda_check",
     "cuda_macros",
     "cuda_types",
+    "d3d11_interop_hsa_test",
     "dark_api",
     "detours-sys",
     "ext/highs-sys",
@@ -57,6 +58,9 @@ members = [
 
 default-members = ["zluda", "zluda_ml", "zluda_inject", "zluda_redirect", "compiler"]
 
+[profile.release]
+debug = 1
+
 [profile.release-lto]
 inherits = "release"
 codegen-units = 1
@@ -73,6 +77,25 @@ inherits = "dev"
 opt-level = 2
 
 [profile.dev.package.xtask]
+opt-level = 2
+
+# Optimize compute-heavy crates even in dev/test builds.
+# GPU tests call LLVM O3 via these crates; without optimization,
+# a single _amdgpu test takes ~170s vs ~10s with opt-level=2.
+[profile.dev.package.ptx]
+opt-level = 2
+
+[profile.dev.package.llvm_zluda]
+opt-level = 2
+
+# Also optimize the zluda runtime crate in dev so the game doesn't trip
+# Steam's IPC watchdog. Debug assertions are INTENTIONALLY LEFT ON — ZLUDA has
+# `#[cfg(debug_assertions)] fn unimplemented() { unimplemented!() }` which
+# panics on any unimplemented CUDA API call. That's our early-warning system
+# for newly-hit UNIMPL paths. When an UNIMPL crash happens, the correct fix
+# is to implement the function (e.g. cuFuncSetCacheConfig → no-op on AMD),
+# not to suppress the assertion.
+[profile.dev.package.zluda]
 opt-level = 2
 
 [patch.crates-io]
