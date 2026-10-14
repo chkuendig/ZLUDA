@@ -10564,3 +10564,23 @@ fn blockscan_merge_race_stress_amdgpu() -> Result<(), Box<dyn error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn clock_helper_both_fp_modes_llvm() {
+    for constrained in [false, true] {
+        let mut source = include_str!("../../../../zluda/tests/clock_advance.ptx").to_owned();
+        if constrained {
+            source.push_str(include_str!("../../../../zluda/tests/clock_constrained_probe.ptx"));
+        }
+        let ast = ptx_parser::parse_module_checked(&source).unwrap();
+        let module = pass::to_llvm_module(ast, pass::Attributes { clock_rate: 2124000 }, |_| {}).unwrap();
+        assert_eq!(module.constrained_fp, constrained);
+        module.llvm_ir.verify().unwrap();
+        let ir = module.llvm_ir.print_module_to_string();
+        let ir = ir.to_str();
+        assert!(ir.contains("define linkonce_odr hidden i32 @__zluda_ptx_impl_sreg_clock()"), "{ir}");
+        assert!(ir.contains("call i64 @llvm.readcyclecounter()"), "{ir}");
+        assert_eq!(ir.matches("call i32 @__zluda_ptx_impl_sreg_clock()").count(), 2, "{ir}");
+        assert!(ir.lines().any(|line| line.contains("trunc i64") && line.ends_with(" to i32")), "{ir}");
+    }
+}

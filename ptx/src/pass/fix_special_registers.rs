@@ -16,7 +16,11 @@ pub(super) fn run<'a, 'input>(
                 name,
                 input_arguments,
                 body: None,
-                import_as: None,
+                // Mark our generated clock import so the LLVM emitter can
+                // supply the intrinsic implementation without matching a
+                // user-defined function by its spelling alone.
+                import_as: (sreg == PtxSpecialRegister::Clock)
+                    .then(|| format!("{}sreg_clock", ZLUDA_PTX_PREFIX)),
                 tuning: Vec::new(),
                 linkage: ast::LinkingDirective::EXTERN,
                 kernel_attributes: None,
