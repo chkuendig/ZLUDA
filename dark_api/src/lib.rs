@@ -233,6 +233,8 @@ dark_api! {
             pctx: *mut cuda_types::cuda::CUcontext,
             dev: cuda_types::cuda::CUdevice
         ) -> cuda_types::cuda::CUresult,
+        [4] = set_device_flags(dev: cuda_types::cuda::CUdevice, flags: std::ffi::c_uint) -> cuda_types::cuda::CUresult,
+        [5] = set_device(dev: cuda_types::cuda::CUdevice) -> cuda_types::cuda::CUresult,
         [6] = get_module_from_cubin_ext1(
             result: *mut cuda_types::cuda::CUmodule,
             fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper,
