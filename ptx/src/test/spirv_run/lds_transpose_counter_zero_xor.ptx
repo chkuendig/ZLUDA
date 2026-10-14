@@ -1,0 +1,133 @@
+.version 3.2
+.target sm_30
+.address_size 64
+
+// Composed Downsweep-key probe:
+// 1. Store 13x32 values through the row-view LDS layout.
+// 2. Reload them through the transposed 13*lane view into registers.
+// 3. Reuse the same shared region for packed-counter zeroing.
+// 4. Write the previously loaded values back out with the key xor flipback.
+//
+// If the translated key path is accidentally rereading clobbered LDS data instead of
+// keeping the reloaded keys in registers, this should disturb the output.
+.visible .entry lds_transpose_counter_zero_xor_test(
+    .param .u64 lds_transpose_counter_zero_xor_test_param_0,
+    .param .u64 lds_transpose_counter_zero_xor_test_param_1
+)
+.maxntid 32, 1, 1
+{
+    .reg .pred %p<2>;
+    .reg .u32 %r<40>;
+    .reg .u64 %rd<8>;
+    .shared .align 4 .u32 smem[512];
+
+    ld.param.u64 %rd0, [lds_transpose_counter_zero_xor_test_param_0];
+    ld.param.u64 %rd1, [lds_transpose_counter_zero_xor_test_param_1];
+    cvta.to.global.u64 %rd2, %rd0;
+    cvta.to.global.u64 %rd3, %rd1;
+
+    mov.u32 %r0, %tid.x;
+    setp.ge.u32 %p0, %r0, 32;
+    @%p0 bra DONE;
+
+    mov.u32 %r1, smem;
+    mul.lo.u32 %r2, %r0, 4;
+    cvt.u64.u32 %rd4, %r2;
+    add.u64 %rd5, %rd2, %rd4;
+
+    add.u32 %r3, %r1, %r2;
+    add.u32 %r3, %r3, 136;
+
+    // Store 13 blocked items through the row-major LDS view.
+    ld.global.u32 %r4, [%rd5+0];
+    st.shared.u32 [%r3+0], %r4;
+    ld.global.u32 %r5, [%rd5+128];
+    st.shared.u32 [%r3+128], %r5;
+    ld.global.u32 %r6, [%rd5+256];
+    st.shared.u32 [%r3+256], %r6;
+    ld.global.u32 %r7, [%rd5+384];
+    st.shared.u32 [%r3+384], %r7;
+    ld.global.u32 %r8, [%rd5+512];
+    st.shared.u32 [%r3+512], %r8;
+    ld.global.u32 %r9, [%rd5+640];
+    st.shared.u32 [%r3+640], %r9;
+    ld.global.u32 %r10, [%rd5+768];
+    st.shared.u32 [%r3+768], %r10;
+    ld.global.u32 %r11, [%rd5+896];
+    st.shared.u32 [%r3+896], %r11;
+    ld.global.u32 %r12, [%rd5+1024];
+    st.shared.u32 [%r3+1024], %r12;
+    ld.global.u32 %r13, [%rd5+1152];
+    st.shared.u32 [%r3+1152], %r13;
+    ld.global.u32 %r14, [%rd5+1280];
+    st.shared.u32 [%r3+1280], %r14;
+    ld.global.u32 %r15, [%rd5+1408];
+    st.shared.u32 [%r3+1408], %r15;
+    ld.global.u32 %r16, [%rd5+1536];
+    st.shared.u32 [%r3+1536], %r16;
+
+    bar.sync 0;
+
+    // Reload through the transposed [13 * lane + item] view into registers.
+    mul.lo.u32 %r17, %r0, 52;
+    add.u32 %r18, %r1, %r17;
+    add.u32 %r18, %r18, 136;
+
+    ld.shared.u32 %r4, [%r18+0];
+    ld.shared.u32 %r5, [%r18+4];
+    ld.shared.u32 %r6, [%r18+8];
+    ld.shared.u32 %r7, [%r18+12];
+    ld.shared.u32 %r8, [%r18+16];
+    ld.shared.u32 %r9, [%r18+20];
+    ld.shared.u32 %r10, [%r18+24];
+    ld.shared.u32 %r11, [%r18+28];
+    ld.shared.u32 %r12, [%r18+32];
+    ld.shared.u32 %r13, [%r18+36];
+    ld.shared.u32 %r14, [%r18+40];
+    ld.shared.u32 %r15, [%r18+44];
+    ld.shared.u32 %r16, [%r18+48];
+
+    // Reuse the same shared region like the packed histogram setup does.
+    mov.u32 %r19, 0;
+    st.shared.u32 [%r1+72], %r19;
+    st.shared.u32 [%r1+160], %r19;
+    st.shared.u32 [%r1+584], %r19;
+    st.shared.u32 [%r1+672], %r19;
+    st.shared.u32 [%r1+1096], %r19;
+    st.shared.u32 [%r1+1184], %r19;
+    st.shared.u32 [%r1+1608], %r19;
+    st.shared.u32 [%r1+1696], %r19;
+
+    // Write the register-held keys back out with the signed-key xor flipback.
+    xor.b32 %r4, %r4, 0x80000000;
+    xor.b32 %r5, %r5, 0x80000000;
+    xor.b32 %r6, %r6, 0x80000000;
+    xor.b32 %r7, %r7, 0x80000000;
+    xor.b32 %r8, %r8, 0x80000000;
+    xor.b32 %r9, %r9, 0x80000000;
+    xor.b32 %r10, %r10, 0x80000000;
+    xor.b32 %r11, %r11, 0x80000000;
+    xor.b32 %r12, %r12, 0x80000000;
+    xor.b32 %r13, %r13, 0x80000000;
+    xor.b32 %r14, %r14, 0x80000000;
+    xor.b32 %r15, %r15, 0x80000000;
+    xor.b32 %r16, %r16, 0x80000000;
+
+    add.u64 %rd6, %rd3, %rd4;
+    st.global.u32 [%rd6+0], %r4;
+    st.global.u32 [%rd6+128], %r5;
+    st.global.u32 [%rd6+256], %r6;
+    st.global.u32 [%rd6+384], %r7;
+    st.global.u32 [%rd6+512], %r8;
+    st.global.u32 [%rd6+640], %r9;
+    st.global.u32 [%rd6+768], %r10;
+    st.global.u32 [%rd6+896], %r11;
+    st.global.u32 [%rd6+1024], %r12;
+    st.global.u32 [%rd6+1152], %r13;
+    st.global.u32 [%rd6+1280], %r14;
+    st.global.u32 [%rd6+1408], %r15;
+    st.global.u32 [%rd6+1536], %r16;
+
+DONE:
+    ret;
+}

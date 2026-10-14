@@ -1,0 +1,44 @@
+.version 3.2
+.target sm_30
+.address_size 64
+
+// Single-thread fixed-word probe: update the low and high halves of the same
+// shared dword via separate u16 ld/st operations, then reread the full word.
+.visible .entry lds_u16_split_halves_single_word_test(
+    .param .u64 lds_u16_split_halves_single_word_test_param_0
+)
+.maxntid 1, 1, 1
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<3>;
+    .shared .align 4 .u32 smem[64];
+
+    ld.param.u64 %rd0, [lds_u16_split_halves_single_word_test_param_0];
+    cvta.to.global.u64 %rd1, %rd0;
+
+    mov.u32 %r0, smem;
+    add.u32 %r1, %r0, 160;
+    add.u32 %r2, %r1, 2;
+
+    mov.u32 %r3, 0;
+    st.shared.u32 [%r1], %r3;
+    bar.sync 0;
+
+    ld.shared.u16 %r4, [%r1];
+    add.u32 %r4, %r4, 1;
+    st.shared.u16 [%r1], %r4;
+
+    ld.shared.u16 %r5, [%r2];
+    add.u32 %r5, %r5, 1;
+    st.shared.u16 [%r2], %r5;
+
+    ld.shared.u16 %r6, [%r1];
+    add.u32 %r6, %r6, 1;
+    st.shared.u16 [%r1], %r6;
+
+    bar.sync 0;
+
+    ld.shared.u32 %r7, [%r1];
+    st.global.u32 [%rd1], %r7;
+    ret;
+}

@@ -1,0 +1,283 @@
+.version 6.5
+.target sm_50
+.address_size 64
+
+.const .align 8 .b8 gTestParams[64];
+.const .align 4 .b8 gTestBounds[16];
+
+.func (.reg .u32 result) helper(.reg .u32 x)
+{
+    add.u32 result, x, 1;
+    ret;
+}
+
+.visible .entry kernel_0(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (0);
+    ret;
+}
+
+.visible .entry kernel_1(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (1);
+    ret;
+}
+
+.visible .entry kernel_2(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (2);
+    ret;
+}
+
+.visible .entry kernel_3(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (3);
+    ret;
+}
+
+.visible .entry kernel_4(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (4);
+    ret;
+}
+
+.visible .entry kernel_5(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (5);
+    ret;
+}
+
+.visible .entry kernel_6(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (6);
+    ret;
+}
+
+.visible .entry kernel_7(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (7);
+    ret;
+}
+
+.visible .entry kernel_8(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (8);
+    ret;
+}
+
+.visible .entry kernel_9(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (9);
+    ret;
+}
+
+.visible .entry kernel_10(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (10);
+    ret;
+}
+
+.visible .entry kernel_11(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (11);
+    ret;
+}
+
+.visible .entry kernel_12(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (12);
+    ret;
+}
+
+.visible .entry kernel_13(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (13);
+    ret;
+}
+
+.visible .entry kernel_14(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (14);
+    ret;
+}
+
+.visible .entry kernel_15(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (15);
+    ret;
+}
+
+.visible .entry kernel_16(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (16);
+    ret;
+}
+
+.visible .entry kernel_17(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (17);
+    ret;
+}
+
+.visible .entry kernel_18(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (18);
+    ret;
+}
+
+.visible .entry kernel_19(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (19);
+    ret;
+}
+
+.visible .entry kernel_20(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (20);
+    ret;
+}
+
+.visible .entry kernel_21(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (21);
+    ret;
+}
+
+.visible .entry kernel_22(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (22);
+    ret;
+}
+
+.visible .entry kernel_23(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (23);
+    ret;
+}
+
+.visible .entry kernel_24(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (24);
+    ret;
+}
+
+.visible .entry kernel_25(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (25);
+    ret;
+}
+
+.visible .entry kernel_26(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (26);
+    ret;
+}
+
+.visible .entry kernel_27(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (27);
+    ret;
+}
+
+.visible .entry kernel_28(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (28);
+    ret;
+}
+
+.visible .entry kernel_29(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (29);
+    ret;
+}
+
+.visible .entry kernel_30(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (30);
+    ret;
+}
+
+.visible .entry kernel_31(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (31);
+    ret;
+}
+
+.visible .entry kernel_32(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (32);
+    ret;
+}
+
+.visible .entry kernel_33(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (33);
+    ret;
+}
+
+.visible .entry kernel_34(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (34);
+    ret;
+}
+
+.visible .entry kernel_35(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (35);
+    ret;
+}
+
+.visible .entry kernel_36(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (36);
+    ret;
+}
+
+.visible .entry kernel_37(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (37);
+    ret;
+}
+
+.visible .entry kernel_38(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (38);
+    ret;
+}
+
+.visible .entry kernel_39(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (39);
+    ret;
+}
+
+.visible .entry kernel_40(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (40);
+    ret;
+}
+
+.visible .entry kernel_41(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (41);
+    ret;
+}
+
+.visible .entry kernel_42(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (42);
+    ret;
+}
+
+.visible .entry kernel_43(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (43);
+    ret;
+}
+
+.visible .entry kernel_44(.param .u64 out) {
+    .reg .u32 tmp;
+    call (tmp), helper, (44);
+    ret;
+}
+

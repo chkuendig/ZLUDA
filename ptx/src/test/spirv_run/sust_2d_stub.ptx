@@ -1,0 +1,33 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Test: sust.b.2d instruction compiles with stub generation.
+// Verifies 2D VGPR narrowing (e072dbf1) and sust_b_2d implementation (89d8a297).
+
+.visible .entry sust_2d_stub(
+	.param .u64 output
+)
+{
+	.reg .u64	out_addr;
+	.reg .u64	surf_handle;
+	.reg .s32	coord1;
+	.reg .s32	coord2;
+	.reg .b32	val;
+
+	ld.param.u64	out_addr, [output];
+
+	// Set up dummy values
+	mov.u64		surf_handle, 0;
+	mov.s32		coord1, 0;
+	mov.s32		coord2, 0;
+	mov.b32		val, 42;
+
+	// Surface store 2D — will become __zluda_ptx_impl_sust_b_2d_b32_trap
+	sust.b.2d.b32.trap	[surf_handle, {coord1, coord2}], {val};
+
+	// Write a marker to confirm the kernel ran
+	mov.b32		val, 1;
+	st.global.b32	[out_addr], val;
+	ret;
+}

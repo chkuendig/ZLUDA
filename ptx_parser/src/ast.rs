@@ -121,6 +121,17 @@ ptx_parser_macros::generate_instruction_type!(
                 src3: T,
             }
         },
+        Red {
+            type: &data.type_,
+            data: AtomDetails,
+            arguments<T>: {
+                src1: {
+                    repr: T,
+                    space: { data.space },
+                },
+                src2: T,
+            }
+        },
         BarWarp {
             type: Type::Scalar(ScalarType::U32),
             data: (),
@@ -210,6 +221,17 @@ ptx_parser_macros::generate_instruction_type!(
             data: ScalarType,
             arguments<T>: {
                 dst: T,
+                src: T
+            }
+        },
+        Bfind {
+            type: Type::Scalar(data.type_.clone()),
+            data: BfindDetails,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: Type::Scalar(ScalarType::U32)
+                },
                 src: T
             }
         },
@@ -794,6 +816,18 @@ ptx_parser_macros::generate_instruction_type!(
             }
 
         },
+        // Pre-sm_70 vote without .sync and without membermask
+        VotePreSync {
+            type: Type::Scalar(data.mode.type_()),
+            data: VoteDetails,
+            arguments<T>: {
+                dst: T,
+                src1: {
+                    repr: T,
+                    type: { Type::Scalar(ScalarType::Pred) },
+                }
+            }
+        },
         ReduxSync {
             type: Type::Scalar(data.type_),
             data: ReduxSyncData,
@@ -911,53 +945,57 @@ ptx_parser_macros::generate_instruction_type!(
                 src3: T
             }
         },
+        // tex.{geometry}.v4.{dtype}.{ctype} {dst_v4}, [tex_handle, {coords}]
         Tex {
-            type: !,
-            data: TexData,
+            data: TexDetails,
+            type: { data.typ() },
             arguments<T>: {
-                dst: {
+                dst: T,
+                src_texture: {
                     repr: T,
-                    type: { Type::Vector(4, data.dtype) },
-
+                    type: { Type::Scalar(ScalarType::U64) },
                 },
-                src_ptr:  {
+                src_coords: {
                     repr: T,
-                    type: {
-                        if data.type_ == TexType::Texref {
-                            Type::Texref
-                        } else {
-                            Type::Scalar(ScalarType::U64)
-                        }
-                    },
-                    space: {
-                        if data.type_ == TexType::Texref {
-                            StateSpace::Global
-                        } else {
-                            StateSpace::Reg
-                        }
-                    },
-
-                },
-                src_coord:  {
-                    repr: T,
-                    type: { data.coord_type() },
-
-                },
+                    type: { data.coord_vec_type() },
+                }
             }
         },
-        Bfind {
+        // sust.b.{geometry}{.vec}.{dtype}.{clamp} [surf_handle, {coords}], {values}
+        Sust {
+            data: SustDetails,
             type: !,
-            data: (),
+            arguments<T>: {
+                src_surface: {
+                    repr: T,
+                    type: { Type::Scalar(ScalarType::U64) },
+                },
+                src_coords: {
+                    repr: T,
+                    type: { data.coord_vec_type() },
+                },
+                src_val: {
+                    repr: T,
+                    type: { data.val_type() },
+                }
+            }
+        },
+        // suld.b.{geometry}{.vec}.{dtype}.{clamp} {dst}, [surf_handle, {coords}]
+        Suld {
+            data: SuldDetails,
+            type: !,
             arguments<T>: {
                 dst: {
                     repr: T,
-                    type: { Type::Scalar(ScalarType::U32) }
-
+                    type: { data.val_type() },
                 },
-                src:  {
+                src_surface: {
                     repr: T,
-                    type: { Type::Scalar(ScalarType::U32) }
-
+                    type: { Type::Scalar(ScalarType::U64) },
+                },
+                src_coords: {
+                    repr: T,
+                    type: { data.coord_vec_type() },
                 }
             }
         },
@@ -1247,15 +1285,19 @@ impl<ID: std::fmt::Display> std::fmt::Display for Variable<ID> {
             write!(f, " .align {}", align)?;
         }
 
+        match &self.info.v_type {
+            Type::Texref => return write!(f, " .texref {}", self.name),
+            Type::Surfref => return write!(f, " .surfref {}", self.name),
+            _ => {}
+        }
+
         let (vector_size, scalar_type, array_dims) = match &self.info.v_type {
             Type::Scalar(scalar_type) => (None, *scalar_type, &vec![]),
             Type::Vector(size, scalar_type) => (Some(*size), *scalar_type, &vec![]),
             Type::Array(vector_size, scalar_type, array_dims) => {
                 (vector_size.map(|s| s.get()), *scalar_type, array_dims)
             }
-            Type::Texref => {
-                return write!(f, " .texref");
-            }
+            Type::Texref | Type::Surfref => unreachable!(),
         };
 
         if let Some(size) = vector_size {
@@ -1289,7 +1331,10 @@ pub enum Type {
     Vector(u8, ScalarType),
     // .param.b32 foo[4];
     Array(Option<NonZeroU8>, ScalarType, Vec<u32>),
+    // .global .texref name;
     Texref,
+    // .global .surfref name;
+    Surfref,
 }
 
 impl std::fmt::Display for Type {
@@ -1350,7 +1395,8 @@ impl Type {
                     )
                 }
             }
-            Type::Texref => return None,
+            // sizeof(textureReference) = 88, align 8
+            Type::Texref | Type::Surfref => unsafe { Layout::from_size_align_unchecked(88, 8) },
         })
     }
 }
@@ -1512,6 +1558,133 @@ pub struct ShflDetails {
     pub mode: ShuffleMode,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum TextureGeometry {
+    Dim1d,
+    Dim2d,
+    Dim3d,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum SurfClampMode {
+    Zero,
+    Clamp,
+    Trap,
+}
+
+#[derive(Copy, Clone)]
+pub struct TexDetails {
+    pub geometry: TextureGeometry,
+    pub channel_type: ScalarType,
+    pub coord_type: ScalarType,
+    pub is_texref: bool,
+}
+
+impl TextureGeometry {
+    pub fn coord_width(self) -> u8 {
+        match self {
+            TextureGeometry::Dim1d => 1,
+            TextureGeometry::Dim2d => 2,
+            TextureGeometry::Dim3d => 4, // 3D uses 4-element coords (padded)
+        }
+    }
+
+    pub fn as_ptx(self) -> &'static str {
+        match self {
+            TextureGeometry::Dim1d => "1d",
+            TextureGeometry::Dim2d => "2d",
+            TextureGeometry::Dim3d => "3d",
+        }
+    }
+}
+
+impl SurfClampMode {
+    pub fn as_ptx(self) -> &'static str {
+        match self {
+            SurfClampMode::Zero => "zero",
+            SurfClampMode::Clamp => "clamp",
+            SurfClampMode::Trap => "trap",
+        }
+    }
+}
+
+impl TexDetails {
+    pub fn typ(&self) -> Type {
+        Type::Vector(4, self.channel_type)
+    }
+
+    pub fn coord_vec_type(&self) -> Type {
+        // Always use Vector, even for 1D — the parser wraps coords in braces (VecPack)
+        Type::Vector(self.geometry.coord_width(), self.coord_type)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct SustDetails {
+    pub geometry: TextureGeometry,
+    pub vector: Option<VectorPrefix>,
+    pub data_type: ScalarType,
+    pub clamp: SurfClampMode,
+}
+
+impl SustDetails {
+    pub fn coord_vec_type(&self) -> Type {
+        // Always use Vector — the parser wraps coords in braces (VecPack)
+        Type::Vector(self.geometry.coord_width(), ScalarType::S32)
+    }
+
+    pub fn val_type(&self) -> Type {
+        match self.vector {
+            Some(v) => Type::Vector(v.len().get(), self.data_type),
+            None => Type::Scalar(self.data_type),
+        }
+    }
+
+    pub fn vector_ptx(&self) -> &'static str {
+        match self.vector {
+            Some(v) => match v.len().get() {
+                2 => "_v2",
+                4 => "_v4",
+                _ => "",
+            },
+            None => "",
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct SuldDetails {
+    pub geometry: TextureGeometry,
+    pub vector: Option<VectorPrefix>,
+    pub data_type: ScalarType,
+    pub clamp: SurfClampMode,
+}
+
+impl SuldDetails {
+    pub fn coord_vec_type(&self) -> Type {
+        // Always use Vector — the parser wraps coords in braces (VecPack)
+        Type::Vector(self.geometry.coord_width(), ScalarType::S32)
+    }
+
+    pub fn val_type(&self) -> Type {
+        match self.vector {
+            Some(v) => Type::Vector(v.len().get(), self.data_type),
+            None => Type::Scalar(self.data_type),
+        }
+    }
+
+    pub fn vector_ptx(&self) -> &'static str {
+        match self.vector {
+            Some(v) => match v.len().get() {
+                2 => "_v2",
+                4 => "_v4",
+                _ => "",
+            },
+            None => "",
+        }
+    }
+}
+
 pub enum CpAsyncCpSize {
     Bytes4,
     Bytes8,
@@ -1537,6 +1710,11 @@ impl CpAsyncCpSize {
     }
 }
 
+pub struct BfindDetails {
+    pub shift: bool,
+    pub type_: ScalarType,
+}
+
 pub struct CpAsyncDetails {
     pub caching: CpAsyncCacheOperator,
     pub space: StateSpace,
@@ -1558,7 +1736,7 @@ pub enum RegOrImmediate<Ident> {
 #[derive(Clone)]
 pub enum ParsedOperand<Ident> {
     Reg(Ident),
-    RegOffset(Ident, i32),
+    RegOffset(Ident, i64),
     Imm(ImmediateValue),
     VecMember(Ident, u8),
     // None denotes a sink; retain its position in the vector.
@@ -2877,37 +3055,6 @@ impl Dp2aData {
 pub enum Dp2aControl {
     Low,
     High,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum TexDimensions {
-    D1,
-    D2,
-    D3,
-}
-
-pub struct TexData {
-    pub type_: TexType,
-    pub dtype: ScalarType,
-    pub ctype: ScalarType,
-    pub dims: TexDimensions,
-}
-
-impl TexData {
-    pub fn coord_type(&self) -> Type {
-        let dims = match self.dims {
-            TexDimensions::D1 => 1,
-            TexDimensions::D2 => 2,
-            TexDimensions::D3 => 4,
-        };
-        Type::Vector(dims, self.ctype)
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum TexType {
-    Texref,
-    Texobj,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

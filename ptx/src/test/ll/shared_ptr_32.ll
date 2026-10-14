@@ -1,4 +1,4 @@
-@shared_mem1 = external addrspace(3) global [128 x i8], align 4
+@shared_mem1 = internal addrspace(3) global [128 x i8] undef, align 4
 
 define amdgpu_kernel void @shared_ptr_32(ptr addrspace(4) byref(i64) %"44", ptr addrspace(4) byref(i64) %"45") #0 {
   %"46" = alloca i64, align 8, addrspace(5)
@@ -27,7 +27,7 @@ define amdgpu_kernel void @shared_ptr_32(ptr addrspace(4) byref(i64) %"44", ptr 
   store i64 %7, ptr addrspace(3) %"64", align 8
   %8 = load i32, ptr addrspace(5) %"48", align 4
   %"65" = inttoptr i32 %8 to ptr addrspace(3)
-  %"42" = getelementptr inbounds i8, ptr addrspace(3) %"65", i64 0
+  %"42" = getelementptr inbounds i8, ptr addrspace(3) %"65", i32 0
   %9 = load i64, ptr addrspace(3) %"42", align 8
   store i64 %9, ptr addrspace(5) %"50", align 8
   %10 = load i64, ptr addrspace(5) %"47", align 8
@@ -37,4 +37,4 @@ define amdgpu_kernel void @shared_ptr_32(ptr addrspace(4) byref(i64) %"44", ptr 
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

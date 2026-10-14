@@ -113,19 +113,19 @@ define amdgpu_kernel void @mma_m16n8k16_f32_bf16_bf16_f32(ptr addrspace(4) byref
   %43 = load i32, ptr addrspace(5) %"91", align 4
   %44 = load i32, ptr addrspace(5) %"92", align 4
   %45 = load i32, ptr addrspace(5) %"93", align 4
-  %46 = insertelement <4 x i32> undef, i32 %42, i8 0
+  %46 = insertelement <4 x i32> zeroinitializer, i32 %42, i8 0
   %47 = insertelement <4 x i32> %46, i32 %43, i8 1
   %48 = insertelement <4 x i32> %47, i32 %44, i8 2
   %"66" = insertelement <4 x i32> %48, i32 %45, i8 3
   %49 = load i32, ptr addrspace(5) %"94", align 4
   %50 = load i32, ptr addrspace(5) %"95", align 4
-  %51 = insertelement <2 x i32> undef, i32 %49, i8 0
+  %51 = insertelement <2 x i32> zeroinitializer, i32 %49, i8 0
   %"67" = insertelement <2 x i32> %51, i32 %50, i8 1
   %52 = load float, ptr addrspace(5) %"82", align 4
   %53 = load float, ptr addrspace(5) %"83", align 4
   %54 = load float, ptr addrspace(5) %"84", align 4
   %55 = load float, ptr addrspace(5) %"85", align 4
-  %56 = insertelement <4 x float> undef, float %52, i8 0
+  %56 = insertelement <4 x float> zeroinitializer, float %52, i8 0
   %57 = insertelement <4 x float> %56, float %53, i8 1
   %58 = insertelement <4 x float> %57, float %54, i8 2
   %"68" = insertelement <4 x float> %58, float %55, i8 3
@@ -171,4 +171,4 @@ define amdgpu_kernel void @mma_m16n8k16_f32_bf16_bf16_f32(ptr addrspace(4) byref
 }
 
 attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="ieee" "denormal-fp-math-f32"="ieee" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="ieee" "denormal-fp-math-f32"="ieee" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

@@ -1,4 +1,4 @@
-@shared_mem1 = external addrspace(3) global [128 x i8], align 4
+@shared_mem1 = internal addrspace(3) global [128 x i8] undef, align 4
 
 define amdgpu_kernel void @shared_variable(ptr addrspace(4) byref(i64) %"41", ptr addrspace(4) byref(i64) %"42") #0 {
   %"43" = alloca i64, align 8, addrspace(5)
@@ -30,4 +30,4 @@ define amdgpu_kernel void @shared_variable(ptr addrspace(4) byref(i64) %"41", pt
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

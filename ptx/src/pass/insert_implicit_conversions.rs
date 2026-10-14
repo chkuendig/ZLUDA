@@ -61,27 +61,9 @@ fn insert_implicit_conversions_impl<'input>(
     is_32bit: bool,
     resolver: &mut GlobalStringIdentResolver2<'input>,
     func: &mut Vec<ExpandedStatement>,
-    mut stmt: ExpandedStatement,
+    stmt: ExpandedStatement,
 ) -> Result<(), TranslateError> {
     let mut post_conv = Vec::new();
-    if let ExpandedStatement::Instruction(ast::Instruction::Tex {
-        ref mut data,
-        ref arguments,
-    }) = stmt
-    {
-        let (type_, space) = resolver.get_typed(arguments.src_ptr)?;
-        if matches!(
-            (type_, space),
-            (
-                ast::Type::Scalar(
-                    ast::ScalarType::B64 | ast::ScalarType::U64 | ast::ScalarType::S64
-                ),
-                ast::StateSpace::Reg
-            )
-        ) {
-            data.type_ = ast::TexType::Texobj;
-        }
-    }
     let statement = stmt.visit_map::<SpirvWord, TranslateError>(
         &mut |operand,
               type_state: Option<(&ast::Type, ast::StateSpace)>,

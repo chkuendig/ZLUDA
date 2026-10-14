@@ -1,5 +1,5 @@
 @shared_ex = external addrspace(3) global [0 x i32]
-@shared_mod = external addrspace(3) global [4 x i32]
+@shared_mod = internal addrspace(3) global [4 x i32] undef
 
 define hidden i64 @add() #0 {
   %"55" = alloca i64, align 8, addrspace(5)
@@ -81,4 +81,4 @@ define amdgpu_kernel void @shared_unify_extern(ptr addrspace(4) byref(i64) %"65"
 }
 
 attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

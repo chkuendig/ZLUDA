@@ -24,7 +24,7 @@
 // shows it fails inside amdgpu-isel. You can get a little bit furthr with "-mllvm -global-isel",
 // but it will too fail similarly, but with "unable to legalize instruction"
 
-use std::ffi::{CStr, NulError};
+use std::ffi::{CStr, CString, NulError};
 use std::{i8, ptr, u64};
 
 use super::*;
@@ -70,11 +70,27 @@ pub(crate) fn run<'input>(
 ) -> Result<llvm::Module, TranslateError> {
     let module = llvm::Module::new(context, LLVM_UNNAMED);
     let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs, fp_mode);
+    // Forward-declare all functions so that FunctionPointer statements can
+    // reference functions that appear later in the directive list.
+    for directive in &directives {
+        if let Directive2::Method(method) = directive {
+            emit_ctx.forward_declare_method(method)?;
+        }
+    }
     for directive in directives {
         match directive {
             Directive2::Variable(linking, variable) => emit_ctx.emit_global(linking, variable)?,
             Directive2::Method(method) => emit_ctx.emit_method(method)?,
         }
+    }
+    // Add preserved globals (e.g. .texref/.surfref, .const) to @llvm.used so they survive
+    // -amdgpu-internalize-symbols and O3 optimization during per-kernel emission
+    if !emit_ctx.preserved_globals.is_empty() {
+        emit_llvm_used(
+            emit_ctx.context,
+            emit_ctx.module,
+            &emit_ctx.preserved_globals,
+        );
     }
     if cfg!(debug_assertions) {
         if let Err(err) = module.verify() {
@@ -84,12 +100,37 @@ pub(crate) fn run<'input>(
     Ok(module)
 }
 
+/// Emit @llvm.used = appending global [N x ptr] [...], section "llvm.metadata"
+/// This prevents LLVM from stripping the listed globals during optimization.
+fn emit_llvm_used(context: LLVMContextRef, module: LLVMModuleRef, globals: &[LLVMValueRef]) {
+    unsafe {
+        let ptr_type = LLVMPointerTypeInContext(context, 0);
+        let array_type = LLVMArrayType2(ptr_type, globals.len() as u64);
+        let mut values: Vec<LLVMValueRef> = globals
+            .iter()
+            .map(|&g| {
+                // Globals are in address space 1 (AMDGPU global), @llvm.used needs AS 0
+                LLVMConstAddrSpaceCast(g, ptr_type)
+            })
+            .collect();
+        let const_array = LLVMConstArray2(ptr_type, values.as_mut_ptr(), values.len() as u64);
+        let llvm_used = LLVMAddGlobal(module, array_type, c"llvm.used".as_ptr());
+        LLVMSetInitializer(llvm_used, const_array);
+        LLVMSetLinkage(llvm_used, LLVMLinkage::LLVMAppendingLinkage);
+        LLVMSetSection(llvm_used, c"llvm.metadata".as_ptr());
+    }
+}
+
 struct ModuleEmitContext<'a, 'input> {
     context: LLVMContextRef,
     module: LLVMModuleRef,
     builder: Builder,
     id_defs: &'a GlobalStringIdentResolver2<'input>,
     resolver: ResolveIdent,
+    /// Globals that must survive optimization (e.g. .texref/.surfref compiled as .global .u64,
+    /// and .const globals that need to be visible to hipModuleGetGlobal).
+    /// These get added to @llvm.used so -amdgpu-internalize-symbols doesn't strip them.
+    preserved_globals: Vec<LLVMValueRef>,
     fp_mode: FloatingPointMode,
 }
 
@@ -106,6 +147,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             builder: Builder::new(context),
             id_defs,
             resolver: ResolveIdent::new(&id_defs),
+            preserved_globals: Vec::new(),
             fp_mode,
         }
     }
@@ -116,6 +158,39 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
 
     fn func_call_convention() -> u32 {
         LLVMCallConv::LLVMCCallConv as u32
+    }
+
+    /// Forward-declare a method: create the LLVM function and register it in
+    /// the resolver so that FunctionPointer statements can reference it before
+    /// it's fully emitted.
+    fn forward_declare_method(
+        &mut self,
+        method: &Function<ast::Instruction<SpirvWord>, SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        if method.is_kernel() {
+            return Ok(()); // Kernels don't need forward declaration (not called via ptrs)
+        }
+        let name = method
+            .import_as
+            .as_deref()
+            .or_else(|| self.id_defs.ident_map[&method.name].name.as_deref())
+            .ok_or_else(|| error_unreachable())?;
+        let c_name = CString::new(name).map_err(|_| error_unreachable())?;
+        let existing = unsafe { LLVMGetNamedFunction(self.module, c_name.as_ptr()) };
+        if !existing.is_null() {
+            return Ok(()); // Already declared
+        }
+        let fn_type = get_function_type(
+            self.context,
+            method.return_arguments.iter().map(|v| &v.info.v_type),
+            method
+                .input_arguments
+                .iter()
+                .map(|v| get_input_argument_type(self.context, &v.info.v_type, v.info.state_space)),
+        )?;
+        let fn_ = unsafe { LLVMAddFunction(self.module, c_name.as_ptr(), fn_type) };
+        self.resolver.register(method.name, fn_);
+        Ok(())
     }
 
     fn emit_method(
@@ -138,15 +213,32 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 }),
             )?;
             fn_ = unsafe { LLVMAddFunction(self.module, name.as_ptr(), fn_type) };
-            self.emit_fn_attribute_string(fn_, "amdgpu-unsafe-fp-atomics", "true");
-            self.emit_fn_attribute_string(fn_, "uniform-work-group-size", "true");
-            self.emit_fn_attribute_string(fn_, "no-trapping-math", "true");
-            if self.fp_mode == FloatingPointMode::Constrained {
-                self.emit_fn_attribute_enum(fn_, "strictfp");
-            }
+        }
+        self.emit_fn_attribute_string(fn_, "amdgpu-unsafe-fp-atomics", "true");
+        self.emit_fn_attribute_string(fn_, "uniform-work-group-size", "true");
+        self.emit_fn_attribute_string(fn_, "no-trapping-math", "true");
+        if self.fp_mode == FloatingPointMode::Constrained {
+            self.emit_fn_attribute_enum(fn_, "strictfp");
         }
         self.emit_target_features(fn_);
         self.emit_tuning(fn_, &method.tuning);
+        // Kernels without .maxntid/.reqntid get no amdgpu-flat-work-group-size,
+        // causing LLVM to assume a small default. Default to 1024 (CUDA max) so
+        // that any legal CUDA launch succeeds — LLVM will spill to scratch if
+        // VGPR pressure is too high, which is slower but correct. This matches
+        // NVIDIA behavior where .maxntid is a hint, not an enforced limit.
+        if method.is_kernel() {
+            let has_workgroup_size = method.tuning.iter().any(|t| {
+                matches!(
+                    t,
+                    ptx_parser::TuningDirective::MaxNtid(..)
+                        | ptx_parser::TuningDirective::ReqNtid(..)
+                )
+            });
+            if !has_workgroup_size {
+                self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", "1,1024");
+            }
+        }
         if let Some(kernel_attrs) = &method.kernel_attributes {
             self.emit_fn_attribute_string(
                 fn_,
@@ -273,12 +365,6 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 get_state_space(var.info.state_space)?,
             )
         };
-        if matches!(var.info.v_type, ast::Type::Texref) {
-            unsafe { LLVMSetInitializer(global, LLVMGetUndef(llvm_type)) };
-            unsafe {
-                LLVMSetAlignment(global, 8);
-            }
-        }
         self.emit_linkage(global, &var.info)?;
         self.resolver.register(var.name, global);
         if let Some(align) = var.info.align {
@@ -287,6 +373,51 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         if !var.info.array_init.is_empty() {
             let initializer = self.get_array_init(&var.info.v_type, &*var.info.array_init)?;
             unsafe { LLVMSetInitializer(global, initializer) };
+        } else if var.info.state_space == ast::StateSpace::Global
+            && matches!(var.info.v_type, ast::Type::Texref | ast::Type::Surfref)
+        {
+            // .texref/.surfref globals: define with zero initializer so the symbol
+            // is exported (not undefined). The HIP runtime writes the actual texture
+            // handle via hipModuleGetTexRef at runtime.
+            let ty = get_type(self.context, &var.info.v_type)?;
+            unsafe { LLVMSetInitializer(global, LLVMConstNull(ty)) };
+            unsafe { LLVMSetExternallyInitialized(global, 1) };
+            unsafe { LLVMSetAlignment(global, std::mem::size_of::<usize>() as u32) };
+            self.preserved_globals.push(global);
+        } else if matches!(
+            var.info.state_space,
+            ast::StateSpace::Shared | ast::StateSpace::SharedCluster | ast::StateSpace::SharedCta
+        ) {
+            // Internal-linkage shared globals need an initializer per LLVM's
+            // verifier. LDS storage is undefined at workgroup start on AMDGPU,
+            // so `undef` is the correct semantic — it lets the backend allocate
+            // the slot without pretending we know its contents. Dynamic
+            // shared memory (zero-length array, kept External) doesn't get
+            // an initializer.
+            let is_dynamic_shared = matches!(
+                &var.info.v_type,
+                ast::Type::Array(_, _, dims) if dims.iter().any(|&d| d == 0)
+            );
+            if !is_dynamic_shared {
+                let ty = get_type(self.context, &var.info.v_type)?;
+                unsafe { LLVMSetInitializer(global, LLVMGetUndef(ty)) };
+            }
+        } else if var.info.state_space == ast::StateSpace::Global {
+            // Other global variables without explicit initializers need a zero initializer
+            let ty = get_type(self.context, &var.info.v_type)?;
+            unsafe { LLVMSetInitializer(global, LLVMConstNull(ty)) };
+        } else if var.info.state_space == ast::StateSpace::Const {
+            // .const globals without explicit initializers: add explicit zero initializer
+            // so they go in .data instead of .bss in the ELF. This ensures HSA allocates
+            // them in device memory rather than host-mapped code object memory.
+            let ty = get_type(self.context, &var.info.v_type)?;
+            unsafe { LLVMSetInitializer(global, LLVMConstNull(ty)) };
+        }
+        // Preserve .const globals in @llvm.used so -amdgpu-internalize-symbols
+        // (set in init_globals()) doesn't internalize them during per-kernel
+        // object emission, which would cause hipModuleGetGlobal to fail.
+        if var.info.state_space == ast::StateSpace::Const {
+            self.preserved_globals.push(global);
         }
         Ok(())
     }
@@ -361,7 +492,14 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 // Not really applicable
                 ptx_parser::TuningDirective::MaxNReg(_) => {}
                 ptx_parser::TuningDirective::MaxNtid(x, y, z) => {
-                    let size = x * y * z;
+                    // On NVIDIA, .maxntid is a register-allocation hint, NOT an
+                    // enforced launch limit — the driver never rejects a launch
+                    // that exceeds it. Always use 1024 as the upper bound so
+                    // any legal CUDA launch succeeds (e.g. CUB RadixSort
+                    // declares .maxntid 512 but launches with 1024 threads).
+                    // LLVM will allocate VGPRs for 1024 threads and spill to
+                    // scratch if pressure is too high.
+                    let size = (x * y * z).max(1024);
                     let value = format!("1,{size}");
                     self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
                 }
@@ -370,24 +508,29 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     let value = format!("{size},{size}");
                     self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
                 }
-                ptx_parser::TuningDirective::MinNCtaPerSm(ctas) => {
-                    let value = format!("{ctas},1024");
-                    self.emit_fn_attribute_string(fn_, "amdgpu-waves-per-eu", &value);
+                ptx_parser::TuningDirective::MinNCtaPerSm(_) => {
+                    // .minnctapersm maps to CUDA occupancy hints, not directly
+                    // to AMDGPU waves-per-eu. Setting waves-per-eu can conflict
+                    // with flat-work-group-size: e.g. waves-per-eu=1 allows up
+                    // to 256 VGPRs/wave, but a 512-thread workgroup needs 16
+                    // waves → max 64 VGPRs. The conflict causes LLVM to
+                    // over-allocate VGPRs, making the launch infeasible (719).
+                    // Let LLVM derive occupancy from flat-work-group-size alone.
                 }
             }
         }
     }
 
     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
-        let value = format!(
-            "+wavefrontsize32,-wavefrontsize64,+cumode{}",
-            if cfg!(debug_assertions) {
-                ",+precise-memory"
-            } else {
-                ""
-            }
-        );
-        self.emit_fn_attribute_string(fn_, "target-features", &*value)
+        // Always enable +precise-memory. Without it, the AMDGPU backend's machine
+        // scheduler and register allocator can reorder/drop instructions across
+        // memory operations. This causes CUB RadixSort's Downsweep kernel to lose
+        // the XOR 0x80000000 flip-back on tail tile stores, producing corrupt sort
+        // output (bit 31 stuck) that crashes PhysX via signed index sign-extension.
+        // See: LLVM #131386, Codeplay's GROMACS regalloc analysis.
+        // Performance impact: adds s_waitcnt after every memory op (~5-10% slower).
+        let value = "+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory";
+        self.emit_fn_attribute_string(fn_, "target-features", value)
     }
 
     fn emit_linkage(
@@ -403,22 +546,38 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             ),
             ast::StateSpace::Shared
             | ast::StateSpace::SharedCluster
-            | ast::StateSpace::SharedCta
-                if var_info.array_init.is_empty() =>
-            {
-                (
-                    LLVMLinkage::LLVMExternalLinkage,
-                    LLVMVisibility::LLVMDefaultVisibility,
-                    false,
-                )
+            | ast::StateSpace::SharedCta => {
+                // Dynamic shared memory (`.extern .shared .b8 sdata[];`,
+                // zero-length array) keeps External linkage because its size
+                // is fixed at launch time by hipModuleLaunchKernel's
+                // shared_mem_bytes; the AMDGPU backend treats any
+                // external addrspace(3) global as the dynamic-shared base.
+                //
+                // STATIC `.shared` arrays with a declared size get Internal
+                // linkage so the AMDGPU LDS allocator places each at its
+                // own non-overlapping offset. Observed bug on IOFX_bboxKernel:
+                // with External linkage for everything, sWarpLastActorID (132B)
+                // was at LDS offset 0 and sWarpLastBounds (792B) at LDS
+                // offset 24, so sWarpLastBounds writes clobbered
+                // sWarpLastActorID[6..32].
+                let is_dynamic_shared = matches!(
+                    &var_info.v_type,
+                    ast::Type::Array(_, _, dims) if dims.iter().any(|&d| d == 0)
+                );
+                if is_dynamic_shared {
+                    (
+                        LLVMLinkage::LLVMExternalLinkage,
+                        LLVMVisibility::LLVMDefaultVisibility,
+                        false,
+                    )
+                } else {
+                    (
+                        LLVMLinkage::LLVMInternalLinkage,
+                        LLVMVisibility::LLVMDefaultVisibility,
+                        false,
+                    )
+                }
             }
-            ast::StateSpace::Shared
-            | ast::StateSpace::SharedCluster
-            | ast::StateSpace::SharedCta => (
-                LLVMLinkage::LLVMPrivateLinkage,
-                LLVMVisibility::LLVMHiddenVisibility,
-                false,
-            ),
             _ => return Err(error_unreachable()),
         };
         unsafe {
@@ -526,7 +685,20 @@ impl<'a> MethodEmitContext<'a> {
             Statement::RetValue(_, values) => self.emit_ret_value(values)?,
             Statement::PtrAccess(ptr_access) => self.emit_ptr_access(ptr_access)?,
             Statement::RepackVector(repack) => self.emit_vector_repack(repack)?,
-            Statement::FunctionPointer(_) => todo!(),
+            Statement::FunctionPointer(FunctionPointerDetails { dst, src }) => {
+                let i64_type = get_scalar_type(self.context, ast::ScalarType::U64);
+                let ptr_as_int = if let Some(&func_value) = self.resolver.values.get(&src) {
+                    unsafe {
+                        LLVMBuildPtrToInt(self.builder, func_value, i64_type, LLVM_UNNAMED.as_ptr())
+                    }
+                } else {
+                    // Function pointer target not in resolver (declared externally or
+                    // forward reference not yet resolved). Use null constant so the
+                    // kernel compiles — the indirect call won't work at runtime.
+                    unsafe { LLVMConstInt(i64_type, 0, 0) }
+                };
+                self.resolver.register(dst, ptr_as_int);
+            }
             Statement::VectorRead(vector_read) => self.emit_vector_read(vector_read)?,
             Statement::VectorWrite(vector_write) => self.emit_vector_write(vector_write)?,
             Statement::SetMode(mode_reg) => self.emit_set_mode(mode_reg)?,
@@ -555,6 +727,73 @@ impl<'a> MethodEmitContext<'a> {
             ..
         }) = kernel_attrs
         {
+            // Insert a system-scope acquire fence at the start of every
+            // kernel. This pairs with the release fence in `emit_ret` to
+            // give proper cross-kernel release-acquire ordering on AMDGPU.
+            //
+            // On gfx10, AMDGPU's `SIGfx10CacheControl::insertAcquire`
+            // (in SIMemoryLegalizer.cpp) lowers system-scope acquire to
+            // `BUFFER_GL1_INV; BUFFER_GL0_INV` — invalidating the new
+            // wavefront's L0/L1 caches BEFORE the first read. Without
+            // this, a wavefront landing on a WGP that previously ran a
+            // different kernel can read stale L0/L1 cache lines from
+            // before the previous kernel's writes hit L2.
+            //
+            // This is the missing half of the Bug A fix. The exit fence
+            // alone (release + writer-side acquire) only invalidates the
+            // WRITER's L0/L1; it doesn't help the READER on a different
+            // wavefront. Bug A came back in runs 39/40 after the F.6
+            // tracker was disabled, because F.6's `hipMemcpyDtoD` after
+            // every kernel was inadvertently providing the queue-level
+            // acquire/release that's needed. See plan
+            // ~/.claude/plans/eventual-rolling-thunder.md (Phase 6) and
+            // memory project_complete_run_catalog.md.
+            //
+            // Only fires for kernel entries (`kernel_attrs.is_some()`),
+            // not for device function entries — those are called from
+            // within a kernel and inherit its cache state.
+            //
+            // Empty scope string is what AMDGPU LLVM expects for system
+            // scope (matches `get_scope_membar` for `ast::MemScope::Sys`
+            // and matches the `emit_ret` exit fence).
+            if llvm_zluda::legacy_workaround_enabled("ZLUDA_KERNEL_FENCES") {
+                unsafe {
+                    LLVMZludaBuildFence(
+                        self.builder,
+                        LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                        c"".as_ptr(),
+                        LLVM_UNNAMED.as_ptr(),
+                    );
+                }
+            }
+            // 2026-06-08 SRD cache hypothesis (env-gated, default OFF):
+            // LLVM's SIMemoryLegalizer does NOT emit scalar cache
+            // invalidation for system-scope SeqCst fences on gfx10
+            // (verified via LLVM source). The SeqCst fence above lowers
+            // to BUFFER_GL1_INV + BUFFER_GL0_INV — VECTOR caches only.
+            // The scalar L0/L1 (sK$, used for buffer-descriptor loads
+            // via s_load_dwordx4) is invalidated only of VOLATILE lines
+            // between dispatches per AMDGPU docs. Non-volatile scalar
+            // lines persist, which can serve a STALE buffer descriptor
+            // (V#/T#) if the host freed+realloced the underlying buffer.
+            //
+            // ZLUDA_SCALAR_CACHE_INV=1 emits explicit s_dcache_inv at
+            // kernel entry to force scalar cache invalidation. Heavy on
+            // instruction count (one extra instruction per kernel
+            // start). Diagnostic for the Class A GPU-internal cache
+            // hypothesis (see project_launch_hdp_flush_diagnostic_2026_06_08.md).
+            // Read at compile time of the PTX module; cache key must
+            // include this env var.
+            let scalar_cache_inv = std::env::var("ZLUDA_SCALAR_CACHE_INV")
+                .map_or(false, |v| v == "1");
+            if scalar_cache_inv {
+                self.emit_intrinsic(
+                    c"llvm.amdgcn.s.dcache.inv",
+                    None,
+                    vec![],
+                    vec![],
+                )?;
+            }
             if rounding_mode_f32 != ast::RoundingMode::NearestEven
                 || rounding_mode_f16f64 != ast::RoundingMode::NearestEven
             {
@@ -568,10 +807,11 @@ impl<'a> MethodEmitContext<'a> {
     }
 
     fn emit_variable(&mut self, var: ast::Variable<SpirvWord>) -> Result<(), TranslateError> {
+        let llvm_type = get_type(self.context, &var.info.v_type)?;
         let alloca = unsafe {
             LLVMZludaBuildAlloca(
                 self.variables_builder.get(),
-                get_type(self.context, &var.info.v_type)?,
+                llvm_type,
                 get_state_space(var.info.state_space)?,
                 self.resolver.get_or_add_raw(var.name),
             )
@@ -659,6 +899,7 @@ impl<'a> MethodEmitContext<'a> {
             ast::Instruction::Selp { data, arguments } => self.emit_selp(data, arguments),
             ast::Instruction::Atom { data, arguments } => self.emit_atom(data, arguments),
             ast::Instruction::AtomCas { data, arguments } => self.emit_atom_cas(data, arguments),
+            ast::Instruction::Red { data, arguments } => self.emit_red(data, arguments),
             ast::Instruction::Div { data, arguments } => self.emit_div(data, arguments),
             ast::Instruction::Neg { data, arguments } => self.emit_neg(data, arguments),
             ast::Instruction::Sin { data, arguments } => self.emit_sin(data, arguments),
@@ -666,8 +907,8 @@ impl<'a> MethodEmitContext<'a> {
             ast::Instruction::Lg2 { data, arguments } => self.emit_lg2(data, arguments),
             ast::Instruction::Ex2 { data, arguments } => self.emit_ex2(data, arguments),
             ast::Instruction::Clz { data, arguments } => self.emit_clz(data, arguments),
-            ast::Instruction::Bfind { data, arguments } => self.emit_bfind(data, arguments),
             ast::Instruction::Brev { data, arguments } => self.emit_brev(data, arguments),
+            ast::Instruction::Bfind { data, arguments } => self.emit_bfind(data, arguments),
             ast::Instruction::Popc { data, arguments } => self.emit_popc(data, arguments),
             ast::Instruction::Xor { data, arguments } => self.emit_xor(data, arguments),
             ast::Instruction::Rem { data, arguments } => self.emit_rem(data, arguments),
@@ -696,6 +937,7 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::Shfl { .. }
             | ast::Instruction::MatchSync { .. }
             | ast::Instruction::Vote { .. }
+            | ast::Instruction::VotePreSync { .. }
             | ast::Instruction::Nanosleep { .. }
             | ast::Instruction::ReduxSync { .. }
             | ast::Instruction::LdMatrix { .. }
@@ -703,7 +945,9 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::Mma { .. }
             | ast::Instruction::Dp2a { .. }
             | ast::Instruction::Tanh { .. }
-            | ast::Instruction::Tex { .. } => return Err(error_unreachable()),
+            | ast::Instruction::Tex { .. }
+            | ast::Instruction::Sust { .. }
+            | ast::Instruction::Suld { .. } => return Err(error_unreachable()),
         }
     }
 
@@ -728,6 +972,17 @@ impl<'a> MethodEmitContext<'a> {
         let src = self.resolver.value(arguments.src)?;
         let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
         apply_qualifier(load, data.qualifier)?;
+        // Phase 2.1 (2026-05-06): force LLVM `load volatile` for ld.shared.
+        // Prevents CSE/MachineLICM from coalescing or hoisting LDS reads
+        // across barriers. Verified not the smoke regression cause —
+        // smoke regression is the D3D11 SubResource hipArray path
+        // (commit 70683673), gated off by default via
+        // ZLUDA_D3D11_SUBRESOURCE=0.
+        if data.state_space == ast::StateSpace::Shared
+            && llvm_zluda::legacy_workaround_enabled("ZLUDA_VOLATILE_SHARED")
+        {
+            unsafe { LLVMSetVolatile(load, 1) };
+        }
         unsafe {
             LLVMSetAlignment(
                 load,
@@ -789,11 +1044,36 @@ impl<'a> MethodEmitContext<'a> {
                             dst,
                         )
                     });
+                    return Ok(());
+                }
+                let from_size = conversion
+                    .from_type
+                    .layout()
+                    .ok_or_else(error_unreachable)?
+                    .size();
+                // On AMDGPU, shared (addrspace 3) and local (addrspace 5)
+                // pointers are 32-bit. PTX uses 64-bit integers for addresses
+                // (`mov.u64 reg, shared_var`), so the round-trip through i64
+                // produces `inttoptr i64 → ptr addrspace(3)` which LLVM's
+                // AMDGPU backend mishandles — the IR type-checks but generates
+                // incorrect machine code. Direct shared access works fine;
+                // only the indirect address pattern fails on GPU.
+                // Truncate to native i32 width before inttoptr to fix this.
+                let src = if is_32bit_ptr_space(conversion.to_space) && from_size > 4 {
+                    unsafe {
+                        LLVMBuildTrunc(
+                            builder,
+                            src,
+                            LLVMInt32TypeInContext(self.context),
+                            LLVM_UNNAMED.as_ptr(),
+                        )
+                    }
                 } else {
-                    self.resolver.with_result(conversion.dst, |dst| unsafe {
-                        LLVMBuildIntToPtr(builder, src, ptr_type, dst)
-                    });
+                    src
                 };
+                self.resolver.with_result(conversion.dst, |dst| unsafe {
+                    LLVMBuildIntToPtr(builder, src, ptr_type, dst)
+                });
                 Ok(())
             }
             ConversionKind::PtrToPtr => {
@@ -821,9 +1101,31 @@ impl<'a> MethodEmitContext<'a> {
                 {
                     // Should never happen because globals are removed
                     return Err(error_unreachable());
+                }
+                let to_size = conversion
+                    .to_type
+                    .layout()
+                    .ok_or_else(error_unreachable)?
+                    .size();
+                // On AMDGPU, shared (addrspace 3) and local (addrspace 5)
+                // pointers are 32-bit. PTX takes addresses into 64-bit regs
+                // (`mov.u64 reg, shared_var`), producing `ptrtoint ptr
+                // addrspace(3) → i64`. This IR type-checks but LLVM's AMDGPU
+                // backend generates incorrect relocations/constant expressions
+                // for the 64←32 bit mismatch. Direct shared access is fine;
+                // only this address-taking round-trip fails on GPU.
+                // Convert to native i32 first, then zero-extend to i64.
+                if is_32bit_ptr_space(conversion.from_space) && to_size > 4 {
+                    let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+                    let narrow = unsafe {
+                        LLVMBuildPtrToInt(self.builder, src, i32_type, LLVM_UNNAMED.as_ptr())
+                    };
+                    self.resolver.with_result(conversion.dst, |dst| unsafe {
+                        LLVMBuildZExt(self.builder, narrow, dst_type, dst)
+                    });
                 } else {
                     self.resolver.with_result(conversion.dst, |dst| unsafe {
-                        LLVMBuildPtrToInt(builder, src, dst_type, dst)
+                        LLVMBuildPtrToInt(self.builder, src, dst_type, dst)
                     });
                 }
                 Ok(())
@@ -1177,7 +1479,7 @@ impl<'a> MethodEmitContext<'a> {
         data: ast::StData,
         arguments: ast::StArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        let ptr = self.resolver.value(arguments.src1)?;
+        let mut ptr = self.resolver.value(arguments.src1)?;
         let underlying_type = get_type(self.context, &data.typ)?;
         let needs_cast = not_supported_by_atomics(data.qualifier, underlying_type);
         let mut value = self.resolver.value(arguments.src2)?;
@@ -1194,8 +1496,21 @@ impl<'a> MethodEmitContext<'a> {
                 )
             };
         }
+        // NOTE: Bounds-check pass for st.global was attempted but disabled.
+        // inttoptr is too common (every cvta.to.global), catching ALL global stores
+        // not just scatter-writes. This breaks physics effects and hurts performance.
+        // Per-kernel workarounds in function.rs (SHAPES4_FIX, CREATEGRID_FIX) are
+        // more targeted and correct. The bounds-check infrastructure remains for
+        // future use if we find a way to identify scatter-write patterns specifically.
         let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
         apply_qualifier(store, data.qualifier)?;
+        // Phase 2.1b (volatile on st.shared) was REVERTED 2026-05-06:
+        // user reported particle/smoke effects disappeared from Batman
+        // benchmark. Volatile stores at codegen level cause TFS (smoke
+        // simulation) to compute wrong output. Same regression class
+        // as the prior PTX-level st.volatile.shared attempt (commit
+        // 56ffc0fd which regressed IOFX_actorRange to SIGABRT). Keep
+        // volatile=true ONLY on loads (Phase 2.1, in emit_ld).
         unsafe {
             LLVMSetAlignment(
                 store,
@@ -1206,7 +1521,31 @@ impl<'a> MethodEmitContext<'a> {
     }
 
     fn emit_ret(&self, _data: ast::RetData) {
-        unsafe { LLVMBuildRetVoid(self.builder) };
+        // Insert a system-scope fence before the kernel exit to ensure
+        // all pending stores are globally visible before the next kernel
+        // launches. This compensates for PhysX MemCopyBatchedAsync (and
+        // other PTX kernels) whose zero-fill `bra.uni` exit path is
+        // missing the `membar.sys` that the memcpy exit path emits.
+        // NVIDIA forgives the missing fence (write-through L1 / stronger
+        // implicit kernel-end barrier); AMDGPU exposes it as a stale L1
+        // cache line that occasionally causes the next kernel to read the
+        // pre-store value (Batman: Arkham Knight Bug A — see
+        // project_batman_30_run_dataset.md). Empty scope string is what
+        // AMDGPU LLVM expects for system-scope fence (matches the trick
+        // in get_scope_membar for ast::MemScope::Sys).
+        if llvm_zluda::legacy_workaround_enabled("ZLUDA_KERNEL_FENCES") {
+            unsafe {
+                LLVMZludaBuildFence(
+                    self.builder,
+                    LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                    c"".as_ptr(),
+                    LLVM_UNNAMED.as_ptr(),
+                );
+            }
+        }
+        unsafe {
+            LLVMBuildRetVoid(self.builder);
+        };
     }
 
     fn emit_call(
@@ -1270,6 +1609,25 @@ impl<'a> MethodEmitContext<'a> {
     fn emit_ptr_access(&mut self, ptr_access: PtrAccess<SpirvWord>) -> Result<(), TranslateError> {
         let ptr_src = self.resolver.value(ptr_access.ptr_src)?;
         let mut offset_src = self.resolver.value(ptr_access.offset_src)?;
+        let ptr_type = unsafe { LLVMTypeOf(ptr_src) };
+        let offset_type = unsafe { LLVMTypeOf(offset_src) };
+        if unsafe { LLVMGetTypeKind(ptr_type) } == LLVMTypeKind::LLVMPointerTypeKind
+            && matches!(
+                unsafe { LLVMGetPointerAddressSpace(ptr_type) },
+                SHARED_ADDRESS_SPACE | PRIVATE_ADDRESS_SPACE
+            )
+            && unsafe { LLVMGetTypeKind(offset_type) } == LLVMTypeKind::LLVMIntegerTypeKind
+            && unsafe { LLVMGetIntTypeWidth(offset_type) } > 32
+        {
+            offset_src = unsafe {
+                LLVMBuildTrunc(
+                    self.builder,
+                    offset_src,
+                    LLVMInt32TypeInContext(self.context),
+                    LLVM_UNNAMED.as_ptr(),
+                )
+            };
+        }
         let pointee_type = get_scalar_type(self.context, ast::ScalarType::B8);
         self.resolver.with_result(ptr_access.dst, |dst| unsafe {
             LLVMBuildInBoundsGEP2(self.builder, pointee_type, ptr_src, &mut offset_src, 1, dst)
@@ -1293,7 +1651,8 @@ impl<'a> MethodEmitContext<'a> {
         arguments: ast::AtomArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
         let builder = self.builder;
-        let src1 = self.resolver.value(arguments.src1)?;
+        let mut src1 = self.resolver.value(arguments.src1)?;
+        // NOTE: Bounds-check for atom.global disabled — see comment in emit_st.
         let src2 = self.resolver.value(arguments.src2)?;
         let op = match data.op {
             ast::AtomicOp::And => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpAnd,
@@ -1355,6 +1714,46 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    fn emit_red(
+        &mut self,
+        data: ast::AtomDetails,
+        arguments: ast::RedArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let src1 = self.resolver.value(arguments.src1)?;
+        let src2 = self.resolver.value(arguments.src2)?;
+        let op = match data.op {
+            ast::AtomicOp::And => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpAnd,
+            ast::AtomicOp::Or => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpOr,
+            ast::AtomicOp::Xor => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpXor,
+            ast::AtomicOp::Exchange => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpXchg,
+            ast::AtomicOp::Add => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpAdd,
+            ast::AtomicOp::IncrementWrap => {
+                LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpUIncWrap
+            }
+            ast::AtomicOp::DecrementWrap => {
+                LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpUDecWrap
+            }
+            ast::AtomicOp::SignedMin => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpMin,
+            ast::AtomicOp::UnsignedMin => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpUMin,
+            ast::AtomicOp::SignedMax => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpMax,
+            ast::AtomicOp::UnsignedMax => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpUMax,
+            ast::AtomicOp::FloatAdd => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFAdd,
+            ast::AtomicOp::FloatMin => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMin,
+            ast::AtomicOp::FloatMax => LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFMax,
+        };
+        unsafe {
+            LLVMZludaBuildAtomicRMW(
+                self.builder,
+                op,
+                src1,
+                src2,
+                get_scope(data.scope)?,
+                get_ordering(data.semantics),
+            )
+        };
+        Ok(())
+    }
+
     fn emit_bra(&self, arguments: ast::BraArgs<SpirvWord>) -> Result<(), TranslateError> {
         let src = self.resolver.value(arguments.src)?;
         let src = unsafe { LLVMValueAsBasicBlock(src) };
@@ -1410,7 +1809,12 @@ impl<'a> MethodEmitContext<'a> {
             loads => {
                 let struct_type =
                     get_or_create_struct_type(self.context, loads.iter().map(|(_, type_)| *type_))?;
-                let mut value = unsafe { LLVMGetUndef(struct_type) };
+                // Use zeroinitializer instead of undef to prevent LLVM's
+                // optimizer from propagating undef through phi nodes. See
+                // the IOFX sort undef-amplification analysis (2026-04-13):
+                // 3 insertelement-undef seeds → 63 post-opt undefs that
+                // corrupt radix sort output → OOB scatter → GPU page fault.
+                let mut value = unsafe { LLVMConstNull(struct_type) };
                 for (i, (load, _)) in loads.iter().enumerate() {
                     value = unsafe {
                         LLVMBuildInsertValue(
@@ -1462,6 +1866,77 @@ impl<'a> MethodEmitContext<'a> {
         Ok(unsafe {
             LLVMBuildTruncOrBitCast(self.builder, result, i32_llvm, LLVM_UNNAMED.as_ptr())
         })
+    }
+
+    fn emit_bfind(
+        &mut self,
+        data: ptx_parser::BfindDetails,
+        arguments: ptx_parser::BfindArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let bitwidth = data.type_.size_of() as u64 * 8;
+        let llvm_fn = match data.type_.size_of() {
+            4 => c"llvm.ctlz.i32",
+            8 => c"llvm.ctlz.i64",
+            _ => return Err(error_unreachable()),
+        };
+        let src_type = get_scalar_type(self.context, data.type_.into());
+        let pred = get_scalar_type(self.context, ast::ScalarType::Pred);
+        let i32_type = get_scalar_type(self.context, ast::ScalarType::U32);
+        let src = self.resolver.value(arguments.src)?;
+        let false_ = unsafe { LLVMConstInt(pred, 0, 0) };
+        // ctlz(src, false) — returns bitwidth when src == 0
+        let ctlz = self.emit_intrinsic(
+            llvm_fn,
+            None,
+            vec![&data.type_.into()],
+            vec![(src, src_type), (false_, pred)],
+        )?;
+        // Truncate ctlz to i32 if input was i64
+        let ctlz_i32 = if bitwidth == 64 {
+            unsafe { LLVMBuildTrunc(self.builder, ctlz, i32_type, LLVM_UNNAMED.as_ptr()) }
+        } else {
+            ctlz
+        };
+        // Check if src == 0
+        let zero = unsafe { LLVMConstInt(src_type, 0, 0) };
+        let is_zero = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntEQ,
+                src,
+                zero,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let minus_one = unsafe { LLVMConstInt(i32_type, 0xFFFFFFFF, 0) };
+        let result = if data.shift {
+            // bfind.shiftamt: return ctlz directly, or 0xFFFFFFFF if zero
+            unsafe {
+                LLVMBuildSelect(
+                    self.builder,
+                    is_zero,
+                    minus_one,
+                    ctlz_i32,
+                    LLVM_UNNAMED.as_ptr(),
+                )
+            }
+        } else {
+            // bfind: return (bitwidth - 1) - ctlz, or 0xFFFFFFFF if zero
+            let bw_minus_1 = unsafe { LLVMConstInt(i32_type, bitwidth - 1, 0) };
+            let position =
+                unsafe { LLVMBuildSub(self.builder, bw_minus_1, ctlz_i32, LLVM_UNNAMED.as_ptr()) };
+            unsafe {
+                LLVMBuildSelect(
+                    self.builder,
+                    is_zero,
+                    minus_one,
+                    position,
+                    LLVM_UNNAMED.as_ptr(),
+                )
+            }
+        };
+        self.resolver.register(arguments.dst, result);
+        Ok(())
     }
 
     fn emit_mul(
@@ -1578,6 +2053,13 @@ impl<'a> MethodEmitContext<'a> {
         _data: ptx_parser::ScalarType,
         arguments: ptx_parser::XorArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
+        // Plain XOR — no asm barrier needed. The inline-asm `=v,0` barrier
+        // that was here previously caused extreme VGPR pressure on large
+        // kernels (e.g. BasicIOS_simulateKernel_templ with 275+ stack slots)
+        // making LLVM crash with `loadRegFromStackSlot called with impossible value`.
+        // The CUB sort test at game params (500 iters, signed keys) passes with
+        // 0 violations without the barrier — the XOR-elimination concern was a
+        // test-parameter artifact, not a real LLVM optimization issue.
         let src1 = self.resolver.value(arguments.src1)?;
         let src2 = self.resolver.value(arguments.src2)?;
         self.resolver.with_result(arguments.dst, |dst| unsafe {
@@ -1635,7 +2117,12 @@ impl<'a> MethodEmitContext<'a> {
                 self.context,
                 &ast::Type::Vector(repack.unpacked.len() as u8, repack.typ),
             )?;
-            let mut temp_vec = unsafe { LLVMGetUndef(vector_type) };
+            // Use zeroinitializer instead of undef — same rationale as
+            // the struct case above. The vector lanes that get overwritten
+            // by subsequent insertelement are fine either way, but the
+            // undef in the NOT-yet-overwritten lanes lets LLVM introduce
+            // undefs at phi nodes downstream, corrupting sort kernels.
+            let mut temp_vec = unsafe { LLVMConstNull(vector_type) };
             for (index, src_id) in repack.unpacked.iter().enumerate() {
                 let dst = if index == repack.unpacked.len() - 1 {
                     Some(repack.packed)
@@ -1726,6 +2213,31 @@ impl<'a> MethodEmitContext<'a> {
         let from_type = get_pointer_type(self.context, from_space)?;
         let dest_type = get_pointer_type(self.context, to_space)?;
         let src = self.resolver.value(arguments.src)?;
+        let src = if is_32bit_ptr_space(from_space)
+            && unsafe { LLVMGetTypeKind(LLVMTypeOf(src)) } == LLVMTypeKind::LLVMIntegerTypeKind
+        {
+            match unsafe { LLVMGetIntTypeWidth(LLVMTypeOf(src)) } {
+                0..=31 => unsafe {
+                    LLVMBuildZExt(
+                        self.builder,
+                        src,
+                        LLVMInt32TypeInContext(self.context),
+                        LLVM_UNNAMED.as_ptr(),
+                    )
+                },
+                32 => src,
+                _ => unsafe {
+                    LLVMBuildTrunc(
+                        self.builder,
+                        src,
+                        LLVMInt32TypeInContext(self.context),
+                        LLVM_UNNAMED.as_ptr(),
+                    )
+                },
+            }
+        } else {
+            src
+        };
         let temp_ptr =
             unsafe { LLVMBuildIntToPtr(self.builder, src, from_type, LLVM_UNNAMED.as_ptr()) };
         let temp_converted = unsafe {
@@ -3622,38 +4134,12 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
-    fn emit_bfind(
-        &mut self,
-        _data: (),
-        arguments: ast::BfindArgs<SpirvWord>,
-    ) -> Result<(), TranslateError> {
-        let src = self.resolver.value(arguments.src)?;
-        let llvm_i32 = get_scalar_type(self.context, ast::ScalarType::B32);
-        let const_0 = unsafe { LLVMConstInt(llvm_i32, 0, 0) };
-        let const_max = unsafe { LLVMConstInt(llvm_i32, u64::MAX, 0) };
-        let src_is_zero = unsafe {
-            LLVMBuildICmp(
-                self.builder,
-                LLVMIntPredicate::LLVMIntEQ,
-                src,
-                const_0,
-                LLVM_UNNAMED.as_ptr(),
-            )
-        };
-        let clz_result = self.emit_clz_impl(ast::ScalarType::B32, arguments.src)?;
-        self.resolver.with_result(arguments.dst, |dst_name| unsafe {
-            LLVMBuildSelect(self.builder, src_is_zero, const_max, clz_result, dst_name)
-        });
-        Ok(())
-    }
-
     fn emit_exit(&mut self) -> Result<(), TranslateError> {
         if !self.is_kernel {
             return Err(error_todo());
         }
-        unsafe {
-            LLVMBuildRetVoid(self.builder);
-        }
+        // Same kernel exit as `ret`, including its system-scope fence.
+        self.emit_ret(ast::RetData { uniform: false });
         Ok(())
     }
 
@@ -3787,10 +4273,34 @@ fn get_pointer_type<'ctx>(
 }
 
 // https://llvm.org/docs/AMDGPUUsage.html#memory-scopes
+//
+// 2026-06-05 Class B fix: PTX `atom.global` without explicit scope defaults
+// to MemScope::Gpu in the parser. On NVIDIA, "device" / "gpu" scope atomics
+// are L2-coherent and effectively host-visible because NVIDIA's L2 is
+// unified with host coherency. On AMD gfx10 RDNA, the "agent" scope is
+// GPU-only: writes from the GPU are visible to other GPU work-items but
+// can sit in the HDP write-combining buffer indefinitely from the host's
+// perspective. PhysX 3.3's CreateParticleShapesIncremental_MultiStage_3
+// (see project_multistage_3_producer_race_2026_06_05.md) exploits the
+// NVIDIA L2 coherency by atomically incrementing a counter in
+// mapped-host memory, then writing 4 u16 entry fields that the host
+// reads through the actor-shape iterator. On AMD with agent-scope, the
+// host sees the count update before the 4 entry stores drain → slot[0]
+// is NULL → the Class B NULL-deref at PhysX3_x64.dll+0x20ced9.
+//
+// Mapping `Gpu` to `"one-as"` (system scope, no scope qualifier on AMDGPU
+// LLVM) makes ZLUDA emit full HDP-flushing atomics. Cost is a heavier
+// AQL atomic for every device-scope PTX atom; correctness is the win.
 fn get_scope(scope: ast::MemScope) -> Result<*const i8, TranslateError> {
     Ok(match scope {
         ast::MemScope::Cta => c"workgroup-one-as",
-        ast::MemScope::Gpu => c"agent-one-as",
+        ast::MemScope::Gpu => {
+            if llvm_zluda::legacy_workaround_enabled("ZLUDA_STRONG_ATOMICS") {
+                c"one-as"
+            } else {
+                c"agent-one-as"
+            }
+        }
         ast::MemScope::Sys => c"one-as",
         ast::MemScope::Cluster => return Err(error_todo()),
     }
@@ -3810,7 +4320,21 @@ fn get_scope_membar(scope: ast::MemScope) -> Result<*const i8, TranslateError> {
 
 fn get_ordering(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
     match semantics {
-        ast::AtomSemantics::Relaxed => LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic,
+        // NVIDIA hardware provides de facto release/acquire for unqualified
+        // (relaxed) device-scope atomics via L2 serialization. AMDGPU's
+        // Monotonic ordering emits NO cache fencing (no s_waitcnt, no
+        // buffer_gl1_inv), breaking inter-block synchronization patterns
+        // that PhysX and other CUDA code rely on. Upgrade to AcqRel so
+        // the AMDGPU backend emits s_waitcnt (drain stores before atomic)
+        // and cache invalidation (fresh reads after atomic).
+        // See: NVIDIA/cccl#3827, LLVM SIMemoryLegalizer, GPUHarbor ISSTA'23.
+        ast::AtomSemantics::Relaxed => {
+            if llvm_zluda::legacy_workaround_enabled("ZLUDA_STRONG_ATOMICS") {
+                LLVMAtomicOrdering::LLVMAtomicOrderingAcquireRelease
+            } else {
+                LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic
+            }
+        }
         ast::AtomSemantics::Acquire => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::Release => LLVMAtomicOrdering::LLVMAtomicOrderingRelease,
         ast::AtomSemantics::AcqRel => LLVMAtomicOrdering::LLVMAtomicOrderingAcquireRelease,
@@ -3819,12 +4343,21 @@ fn get_ordering(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
 
 fn get_ordering_failure(semantics: ast::AtomSemantics) -> LLVMAtomicOrdering {
     match semantics {
-        ast::AtomSemantics::Relaxed => LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic,
+        // CAS failure ordering must be Acquire (not Release/AcqRel per LLVM rules)
+        ast::AtomSemantics::Relaxed => {
+            if llvm_zluda::legacy_workaround_enabled("ZLUDA_STRONG_ATOMICS") {
+                LLVMAtomicOrdering::LLVMAtomicOrderingAcquire
+            } else {
+                LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic
+            }
+        }
         ast::AtomSemantics::Acquire => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::Release => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
         ast::AtomSemantics::AcqRel => LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
     }
 }
+
+const TEXREF_UNDERLYING: &[u8] = b"struct.textureReference\0";
 
 fn get_type(context: LLVMContextRef, type_: &ast::Type) -> Result<LLVMTypeRef, TranslateError> {
     Ok(match type_ {
@@ -3847,60 +4380,23 @@ fn get_type(context: LLVMContextRef, type_: &ast::Type) -> Result<LLVMTypeRef, T
                     LLVMArrayType2(result, *dimension as u64)
                 })
         }
-        ast::Type::Texref => {
-            // Definitions taken from ROCm LLVM output
-            let format_desc =
-                unsafe { LLVMStructCreateNamed(context, c"struct.hipChannelFormatDesc".as_ptr()) };
-            let llvm_i32 = get_scalar_type(context, ast::ScalarType::B32);
-            let mut format_desc_fields = [llvm_i32, llvm_i32, llvm_i32, llvm_i32, llvm_i32];
+        ast::Type::Texref | ast::Type::Surfref => {
+            // Texture/surface references must be sizeof(textureReference) = 88 bytes
+            // to match HIP's expectation for hipModuleGetTexRef to find them.
+            // Use a named struct type so LLD/HIP recognizes it.
             unsafe {
-                LLVMStructSetBody(
-                    format_desc,
-                    format_desc_fields.as_mut_ptr(),
-                    format_desc_fields.len() as u32,
-                    0,
-                )
-            };
-            let texture_reference =
-                unsafe { LLVMStructCreateNamed(context, c"struct.textureReference".as_ptr()) };
-            let llvm_a3i32 = unsafe { LLVMArrayType2(llvm_i32, 3) };
-            let llvm_float = get_scalar_type(context, ast::ScalarType::F32);
-            let llvm_ptr = get_pointer_type(context, ast::StateSpace::Generic)?;
-            let mut texture_reference_fields = [
-                llvm_i32,
-                llvm_i32,
-                llvm_i32,
-                llvm_a3i32,
-                format_desc,
-                llvm_i32,
-                llvm_i32,
-                llvm_i32,
-                llvm_float,
-                llvm_float,
-                llvm_float,
-                llvm_ptr,
-                llvm_i32,
-                llvm_i32,
-            ];
-            unsafe {
-                LLVMStructSetBody(
-                    texture_reference,
-                    texture_reference_fields.as_mut_ptr(),
-                    texture_reference_fields.len() as u32,
-                    0,
-                )
-            };
-            let texture = unsafe { LLVMStructCreateNamed(context, c"struct.texture".as_ptr()) };
-            let mut texture_fields = [texture_reference];
-            unsafe {
-                LLVMStructSetBody(
-                    texture,
-                    texture_fields.as_mut_ptr(),
-                    texture_fields.len() as u32,
-                    0,
-                )
-            };
-            texture
+                let existing = LLVMGetTypeByName2(context, TEXREF_UNDERLYING.as_ptr() as *const _);
+                if !existing.is_null() {
+                    existing
+                } else {
+                    let s = LLVMStructCreateNamed(context, TEXREF_UNDERLYING.as_ptr() as *const _);
+                    // 11 x i64 = 88 bytes = sizeof(textureReference)
+                    let i64_ty = LLVMInt64TypeInContext(context);
+                    let mut fields = [i64_ty; 11];
+                    LLVMStructSetBody(s, fields.as_mut_ptr(), 11, 0);
+                    s
+                }
+            }
         }
     })
 }

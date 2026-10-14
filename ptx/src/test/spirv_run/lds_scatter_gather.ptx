@@ -1,0 +1,64 @@
+.version 3.2
+.target sm_30
+.address_size 64
+
+// LDS scatter-gather test mimicking CUB's BlockExchange.
+// 128 threads, each has 2 items. Thread tid has items input[tid] and input[tid+128].
+//
+// Phase 1: scatter to LDS by rank
+//   smem[rank0] = item0, smem[rank1] = item1
+//   where rank0 = tid*2, rank1 = tid*2+1 (simple interleave-to-blocked)
+// Phase 2: read back in blocked order
+//   out[tid] = smem[tid], out[tid+128] = smem[tid+128]
+//
+// Expected: output[i] = input[reverse_map[i]]
+// With rank0=tid*2, rank1=tid*2+1:
+//   smem[0]=input[0], smem[1]=input[128], smem[2]=input[1], smem[3]=input[129], ...
+//   Then blocked read: out[0]=smem[0]=input[0], out[1]=smem[1]=input[128],
+//   out[128]=smem[128]=input[64], out[129]=smem[129]=input[192]
+// Actually this is just a transpose test.
+//
+// Simpler: just scatter input[tid] to smem[tid XOR 1], barrier, read smem[tid]
+// Expected: output[i] = input[i XOR 1] (swap adjacent pairs)
+.visible .entry lds_scatter_gather_test(
+    .param .u64 lds_scatter_gather_test_param_0,
+    .param .u64 lds_scatter_gather_test_param_1
+)
+.maxntid 128, 1, 1
+{
+    .reg .u32 %r<10>;
+    .reg .u64 %rd<10>;
+    .shared .align 4 .u32 smem[256];
+
+    ld.param.u64 %rd0, [lds_scatter_gather_test_param_0];
+    ld.param.u64 %rd1, [lds_scatter_gather_test_param_1];
+    cvta.to.global.u64 %rd2, %rd0;
+    cvta.to.global.u64 %rd3, %rd1;
+
+    mov.u32 %r0, %tid.x;  // tid
+
+    // Load input[tid]
+    mul.wide.u32 %rd4, %r0, 4;
+    add.u64 %rd5, %rd2, %rd4;
+    ld.global.u32 %r1, [%rd5];
+
+    // Scatter: smem[tid XOR 1] = input[tid]
+    xor.b32 %r2, %r0, 1;           // dest = tid ^ 1
+    mul.lo.u32 %r3, %r2, 4;
+    mov.u32 %r4, smem;
+    add.u32 %r5, %r4, %r3;
+    st.shared.u32 [%r5], %r1;
+
+    bar.sync 0;
+
+    // Gather: output[tid] = smem[tid]
+    mul.lo.u32 %r6, %r0, 4;
+    add.u32 %r7, %r4, %r6;
+    ld.shared.u32 %r8, [%r7];
+
+    // Store output[tid]
+    add.u64 %rd6, %rd3, %rd4;
+    st.global.u32 [%rd6], %r8;
+
+    ret;
+}

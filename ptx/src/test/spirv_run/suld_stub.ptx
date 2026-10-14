@@ -1,0 +1,35 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Test: suld.b.3d instruction compiles with stub generation.
+// Verifies suld_b_3d implementation (89d8a297).
+
+.visible .entry suld_stub(
+	.param .u64 output
+)
+{
+	.reg .u64	out_addr;
+	.reg .u64	surf_handle;
+	.reg .s32	coord1;
+	.reg .s32	coord2;
+	.reg .s32	coord3;
+	.reg .s32	coord4;
+	.reg .b32	val;
+
+	ld.param.u64	out_addr, [output];
+
+	// Set up dummy values
+	mov.u64		surf_handle, 0;
+	mov.s32		coord1, 0;
+	mov.s32		coord2, 0;
+	mov.s32		coord3, 0;
+	mov.s32		coord4, 0;
+
+	// Surface load 3D — will become __zluda_ptx_impl_suld_b_3d_b32_zero
+	suld.b.3d.b32.zero	{val}, [surf_handle, {coord1, coord2, coord3, coord4}];
+
+	// Store loaded value to output
+	st.global.b32	[out_addr], val;
+	ret;
+}
