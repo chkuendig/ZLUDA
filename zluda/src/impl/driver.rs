@@ -1320,13 +1320,15 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
         crate::is_log_all_enabled()
     ));
     configure_hip_fence_scope()?;
-    // Disable SDMA before HIP init. On Steam Deck / gfx10.3 we now see SDMA
-    // queue exhaustion ("No more SDMA queue to allocate") and follow-on copy
-    // hangs in module/copy probes; Wine's SIGUSR1 APC delivery can also
-    // interrupt the KFD ioctl that waits for SDMA completion. On APUs (unified
-    // memory), blit kernels are the safer path anyway.
-    // Uses setenv with overwrite=0 so user can still override with HSA_ENABLE_SDMA=1.
-    unsafe { libc::setenv(c"HSA_ENABLE_SDMA".as_ptr(), c"0".as_ptr(), 0) };
+    // Deck copy/queue policy belongs at the HIP initialization boundary, not
+    // in every Proton launch. Do not constrain other GPUs (including attached
+    // GPUs on a Deck), and preserve explicit user overrides.
+    if super::hardware::is_deck_apu() {
+        unsafe {
+            libc::setenv(c"HSA_ENABLE_SDMA".as_ptr(), c"0".as_ptr(), 0);
+            libc::setenv(c"GPU_MAX_HW_QUEUES".as_ptr(), c"2".as_ptr(), 0);
+        }
+    }
     // Enable HSA VM fault messages for GPU page fault diagnostics.
     // Prints "Memory access fault by GPU node on address %p. Reason: %s" to stderr.
     unsafe { libc::setenv(c"HSA_ENABLE_VM_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
