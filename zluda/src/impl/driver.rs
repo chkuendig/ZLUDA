@@ -117,9 +117,1320 @@ pub(crate) fn global_state() -> Result<&'static GlobalState, CUerror> {
         .map_err(|e| *e)
 }
 
+// Global log file handles, opened once on first write and protected by a mutex so
+// concurrent writers don't interleave at the byte level. Previously each call opened
+// the file fresh and used `writeln!`, which issues multiple write() syscalls per
+// format argument — concurrent threads produced output like
+// `[[10721821072182ms #ms #531716531717] OK ] OK cuLaunchKernelcuLaunchKernel`,
+// corrupting diagnostics during exactly the races we need to investigate.
+//
+// The SIGABRT handler in `install_fault_signal_handler` deliberately does NOT use
+// these — Mutex is not async-signal-safe, so the crash path keeps its own per-call
+// open-append pattern and accepts a small risk of one corrupted crash line.
+static LOG_FILE: std::sync::LazyLock<Mutex<Option<std::fs::File>>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/zluda_tex.log")
+                .ok(),
+        )
+    });
+
+static DEBUG_LOG_FILE: std::sync::LazyLock<Mutex<Option<std::fs::File>>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/zluda_debug.log")
+                .ok(),
+        )
+    });
+
+pub(crate) fn zluda_log(msg: &str) {
+    use std::io::Write;
+    // Check ZLUDA_DEBUG env var (cached after first check)
+    static ENABLED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let enabled = match ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let e = std::env::var("ZLUDA_DEBUG").map_or(false, |v| v == "1");
+            ENABLED.store(if e { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+            e
+        }
+        2 => true,
+        _ => false,
+    };
+    if !enabled {
+        return;
+    }
+    // Pre-format into a String so the whole line goes out in one write_all.
+    let line = format!("{}\n", msg);
+    if let Ok(mut guard) = DEBUG_LOG_FILE.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+pub(crate) fn zluda_log_err(msg: &str) {
+    use std::io::Write;
+    let ms = crate::elapsed_ms();
+    // Pre-format into a String so the whole line goes out in a single write_all —
+    // avoids inter-thread interleaving of the timestamp prefix and message body.
+    let line = format!("[{}ms] {}\n", ms, msg);
+    if let Ok(mut guard) = LOG_FILE.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// 2026-06-04 Class B null-deref investigation: per-call timeline of
+/// cu{Stream,Event,Ctx}Synchronize calls written to /tmp/zluda_sync_timeline.log.
+/// Goal: correlate sync cadence with the deterministic PhysX3_x64.dll+0x20ced9
+/// SIGSEGV (RCX=0 first-iteration NULL deref). Off by default; enable with
+/// `ZLUDA_SYNC_TIMELINE=1`.
+static SYNC_TIMELINE_FILE: std::sync::LazyLock<Mutex<Option<std::fs::File>>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/zluda_sync_timeline.log")
+                .ok(),
+        )
+    });
+
+static SYNC_CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn sync_timeline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("ZLUDA_SYNC_TIMELINE").map_or(false, |v| v == "1"))
+}
+
+/// Log a single sync-call event. `kind` is the API name ("stream", "event",
+/// "ctx"), `handle` is the user-facing handle value (NULL stream = 0). Cheap
+/// when the gate is off (one OnceLock read + atomic load).
+pub(crate) fn sync_timeline_log(kind: &str, handle: usize) {
+    if !sync_timeline_enabled() {
+        return;
+    }
+    use std::io::Write;
+    let seq = SYNC_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ms = crate::elapsed_ms();
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    let line = format!(
+        "[{}ms] seq={} kind={} handle=0x{:x} tid={}\n",
+        ms, seq, kind, handle, tid
+    );
+    if let Ok(mut guard) = SYNC_TIMELINE_FILE.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// Ring buffer of last N kernel launches — the SIGABRT handler dumps all of them
+/// so we see the crash context, not just the racy "last" slot. The fault is
+/// asynchronous on Van Gogh APU, so the actually-faulting kernel is usually
+/// NOT the single most recent one.
+///
+/// Each entry records (launch_n, ts_ns, kernel_name, up to 8 ptr ranges) so the
+/// signal handler + post-mortem tooling can correlate a journalctl fault VA
+/// against the buffers any recent kernel might have written. ptr_count==0
+/// means the launch path didn't supply structured args (callers can still pass
+/// the legacy `info: String` summary).
+const KERNEL_RING_SIZE: usize = 32;
+const KERNEL_RING_NAME_BYTES: usize = 96;
+const KERNEL_RING_PTRS: usize = 8;
+
+#[derive(Clone)]
+pub(crate) struct KernelRingEntry {
+    pub launch_n: u64,
+    pub ts_ns: u64,
+    pub name: [u8; KERNEL_RING_NAME_BYTES],
+    pub info: Option<String>,
+    pub ptr_count: u8,
+    pub ptr_ranges: [(u64, u64); KERNEL_RING_PTRS],
+}
+
+impl KernelRingEntry {
+    const fn empty() -> Self {
+        Self {
+            launch_n: 0,
+            ts_ns: 0,
+            name: [0u8; KERNEL_RING_NAME_BYTES],
+            info: None,
+            ptr_count: 0,
+            ptr_ranges: [(0, 0); KERNEL_RING_PTRS],
+        }
+    }
+
+    pub fn name_str(&self) -> &str {
+        let end = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(KERNEL_RING_NAME_BYTES);
+        std::str::from_utf8(&self.name[..end]).unwrap_or("<utf8 err>")
+    }
+}
+
+static KERNEL_RING: std::sync::Mutex<(
+    [KernelRingEntry; KERNEL_RING_SIZE],
+    usize, // write index
+    u64,   // total push count
+)> = std::sync::Mutex::new((
+    [const { KernelRingEntry::empty() }; KERNEL_RING_SIZE],
+    0,
+    0,
+));
+
+fn copy_name_into(dst: &mut [u8; KERNEL_RING_NAME_BYTES], src: &str) {
+    let bytes = src.as_bytes();
+    let n = bytes.len().min(KERNEL_RING_NAME_BYTES);
+    dst[..n].copy_from_slice(&bytes[..n]);
+    for b in &mut dst[n..] {
+        *b = 0;
+    }
+}
+
+pub(crate) fn set_last_kernel(info: String) {
+    if let Ok(mut guard) = KERNEL_RING.lock() {
+        let (ref mut buf, ref mut idx, ref mut total) = *guard;
+        let entry = &mut buf[*idx];
+        // Reset the structured fields; only the free-form `info` is meaningful
+        // when called via this legacy entry point.
+        *entry = KernelRingEntry::empty();
+        entry.ts_ns = elapsed_ns();
+        entry.info = Some(info);
+        *idx = (*idx + 1) % KERNEL_RING_SIZE;
+        *total += 1;
+    }
+}
+
+/// Structured launch recorder — preferred over `set_last_kernel`. Records the
+/// kernel name, timestamp, and any pointer-arg ranges the caller could extract.
+/// Pass an empty `ranges` slice for callers that can't or won't decode args.
+pub(crate) fn record_kernel_launch(
+    launch_n: u64,
+    name: &str,
+    ranges: &[(u64, u64)],
+    extra_info: Option<String>,
+) {
+    if let Ok(mut guard) = KERNEL_RING.lock() {
+        let (ref mut buf, ref mut idx, ref mut total) = *guard;
+        let entry = &mut buf[*idx];
+        *entry = KernelRingEntry::empty();
+        entry.launch_n = launch_n;
+        entry.ts_ns = elapsed_ns();
+        copy_name_into(&mut entry.name, name);
+        let n = ranges.len().min(KERNEL_RING_PTRS);
+        entry.ptr_count = n as u8;
+        for (i, range) in ranges.iter().take(n).enumerate() {
+            entry.ptr_ranges[i] = *range;
+        }
+        entry.info = extra_info;
+        *idx = (*idx + 1) % KERNEL_RING_SIZE;
+        *total += 1;
+    }
+}
+
+/// 2026-06-08 Class A use-after-free instrumentation: scan the kernel
+/// launch ring for entries whose recorded ptr_ranges contain `addr`.
+/// Returns the matching (launch_n, kernel_name) tuples — those kernels
+/// were recently queued with a pointer arg into the buffer being freed
+/// and may still be in-flight at free time. Called from
+/// `memory.rs::free_v2` when ZLUDA_FREE_AFTER_LAUNCH_SCAN=1.
+pub(crate) fn scan_kernel_ring_for_ptr(addr: u64) -> Vec<(u64, String)> {
+    let mut hits = Vec::new();
+    if let Ok(guard) = KERNEL_RING.lock() {
+        let (ref buf, _idx, _total) = *guard;
+        for entry in buf.iter() {
+            if entry.ptr_count == 0 {
+                continue;
+            }
+            for r in 0..entry.ptr_count.min(KERNEL_RING_PTRS as u8) as usize {
+                let (base, size) = entry.ptr_ranges[r];
+                if size == 0 {
+                    continue;
+                }
+                if addr >= base && addr < base + size {
+                    hits.push((entry.launch_n, entry.name_str().to_string()));
+                    break;
+                }
+            }
+        }
+    }
+    hits
+}
+
+fn elapsed_ns() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = ORIGIN.get_or_init(Instant::now);
+    Instant::now().saturating_duration_since(*origin).as_nanos() as u64
+}
+
+/// SIGABRT/SIGSEGV handler — fires when HSA runtime kills the process on GPU fault.
+/// Dumps the last N kernel launches to the log so we can see the crash context.
+///
+/// 2026-06-04: Switched from `libc::signal()` to `libc::sigaction(SA_SIGINFO)`
+/// so the handler receives `ucontext_t` and can probe register state at the
+/// fault site. For canonical Class B SIGSEGV at PhysX3_x64.dll+0x20ced9 we
+/// dump the NULL-deref iterator state (R14, OUT struct, inner_array contents)
+/// directly from the live process — these regions live in Wine PE-private
+/// file-backed mappings that systemd-coredump can't recover post-process-exit.
+#[cfg(not(windows))]
+fn install_fault_signal_handler() {
+    unsafe extern "C" fn sigabrt_handler(
+        sig: i32,
+        _info: *mut libc::siginfo_t,
+        ctx: *mut libc::c_void,
+    ) {
+        // Minimal async-signal-safe operations only.
+        // Write directly to the log file.
+        use std::io::Write;
+        let sig_name = match sig {
+            6 => "SIGABRT",
+            11 => "SIGSEGV",
+            _ => "signal",
+        };
+
+        // 2026-06-04 Class B live probe: when SIGSEGV fires at the canonical
+        // PhysX3_x64.dll+0x20ced9 NULL deref, dump the iterator state.
+        // Wine PE heap regions disappear from coredumps so this is the only
+        // way to see what `inner_array[0]` actually contained.
+        let mut class_b_rip = 0u64;
+        let mut class_b_r14 = 0u64;
+        let mut class_b_rsp = 0u64;
+        let mut class_b_r8 = 0u64;
+        if sig == 11 && !ctx.is_null() {
+            let uctx = ctx as *const libc::ucontext_t;
+            let gregs = &(*uctx).uc_mcontext.gregs;
+            // Linux x86_64 register indices (from libc::REG_*)
+            class_b_rip = gregs[libc::REG_RIP as usize] as u64;
+            class_b_r14 = gregs[libc::REG_R14 as usize] as u64;
+            class_b_rsp = gregs[libc::REG_RSP as usize] as u64;
+            class_b_r8 = gregs[libc::REG_R8 as usize] as u64;
+        }
+        // Match by Wine-PE-region + low-16-bit function-offset + RCX=NULL.
+        // PhysX3_x64.dll is ASLR-relocated by Wine — observed bases include
+        // 0x6ffffc6f0000 and 0x6ffffc5e0000 in different sessions. The RVA
+        // 0x20ced9 is the same across bases, but its LOW 24 BITS in absolute
+        // VA shift with the base (0x8fced9 vs 0x7eced9). Only the low 16 bits
+        // (0xced9 — the function-internal offset) are guaranteed stable across
+        // 4KB-aligned reloc. We tighten the check by also requiring RCX=NULL
+        // (the canonical Class B has RCX=0 in 4 of 4 captured coredumps).
+        let class_b_rcx = if !ctx.is_null() {
+            let uctx = ctx as *const libc::ucontext_t;
+            (*uctx).uc_mcontext.gregs[libc::REG_RCX as usize] as u64
+        } else {
+            !0u64
+        };
+        // Wine-PE high addresses live in the 0x6XXX_XXXX_XXXX range
+        // (12-digit hex). Shifting RIP right by 44 yields the top nibble: 0x6.
+        let is_canonical_class_b =
+            (class_b_rip & 0xFFFF) == 0xced9
+                && (class_b_rip >> 44) == 0x6
+                && class_b_rcx == 0;
+
+        // Dump the MS_4 and MS_2_Batched capture ring buffers to
+        // /tmp/ms4_captures.bin and /tmp/ms2b_captures.bin if capture was
+        // enabled. Uses raw open/write/close syscalls via libc since they're
+        // async-signal-safe (unlike std::fs::File which uses the allocator
+        // and mutexes indirectly).
+        unsafe fn dump_ring(host_ptr: usize, total_bytes: usize, path_cstr: *const libc::c_char) {
+            if host_ptr == 0 || total_bytes == 0 {
+                return;
+            }
+            let fd = libc::open(
+                path_cstr,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            );
+            if fd < 0 {
+                return;
+            }
+            let mut written = 0usize;
+            while written < total_bytes {
+                let n = libc::write(
+                    fd,
+                    (host_ptr + written) as *const libc::c_void,
+                    total_bytes - written,
+                );
+                if n <= 0 {
+                    break;
+                }
+                written += n as usize;
+            }
+            libc::close(fd);
+        }
+        let ms4_host_ptr =
+            super::function::MS4_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let ms4_total_bytes =
+            super::function::MS4_CAPTURE_TOTAL_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            ms4_host_ptr,
+            ms4_total_bytes,
+            c"/tmp/ms4_captures.bin".as_ptr(),
+        );
+
+        let ms2b_host_ptr =
+            super::function::MS2B_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let ms2b_total_bytes =
+            super::function::MS2B_CAPTURE_TOTAL_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            ms2b_host_ptr,
+            ms2b_total_bytes,
+            c"/tmp/ms2b_captures.bin".as_ptr(),
+        );
+
+        let ms3_host_ptr =
+            super::function::MS3_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let ms3_total_bytes =
+            super::function::MS3_CAPTURE_TOTAL_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            ms3_host_ptr,
+            ms3_total_bytes,
+            c"/tmp/ms3_captures.bin".as_ptr(),
+        );
+
+        let tfs_host_ptr =
+            super::function::TFS_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let tfs_total_bytes =
+            super::function::TFS_CAPTURE_TOTAL_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            tfs_host_ptr,
+            tfs_total_bytes,
+            c"/tmp/tfs_captures.bin".as_ptr(),
+        );
+
+        let iofx_host_ptr = super::function::IOFX_ACTOR_RANGE_CAPTURE_HOST_PTR
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let iofx_total_bytes = super::function::IOFX_ACTOR_RANGE_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            iofx_host_ptr,
+            iofx_total_bytes,
+            c"/tmp/iofx_actor_range_captures.bin".as_ptr(),
+        );
+
+        let iofx_bbox_host_ptr =
+            super::function::IOFX_BBOX_CAPTURE_HOST_PTR.load(std::sync::atomic::Ordering::SeqCst);
+        let iofx_bbox_total_bytes = super::function::IOFX_BBOX_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            iofx_bbox_host_ptr,
+            iofx_bbox_total_bytes,
+            c"/tmp/iofx_bbox_captures.bin".as_ptr(),
+        );
+
+        let cub_downsweep_host_ptr = super::function::CUB_DOWNSWEEP_CAPTURE_HOST_PTR
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let cub_downsweep_total_bytes = super::function::CUB_DOWNSWEEP_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            cub_downsweep_host_ptr,
+            cub_downsweep_total_bytes,
+            c"/tmp/cub_downsweep_captures.bin".as_ptr(),
+        );
+
+        let iofx_chain_host_ptr = super::function::IOFX_CHAIN_CAPTURE_HOST_PTR
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let iofx_chain_total_bytes = super::function::IOFX_CHAIN_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            iofx_chain_host_ptr,
+            iofx_chain_total_bytes,
+            c"/tmp/iofx_chain_captures.bin".as_ptr(),
+        );
+
+        let cub_scan_host_ptr = super::function::CUB_SCAN_CAPTURE_HOST_PTR
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let cub_scan_total_bytes = super::function::CUB_SCAN_CAPTURE_TOTAL_BYTES
+            .load(std::sync::atomic::Ordering::SeqCst);
+        dump_ring(
+            cub_scan_host_ptr,
+            cub_scan_total_bytes,
+            c"/tmp/cub_scan_captures.bin".as_ptr(),
+        );
+
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/zluda_tex.log")
+        {
+            let _ = write!(
+                f,
+                "\n*** {} (signal {}) — GPU fault likely ***\n",
+                sig_name, sig
+            );
+            // 2026-06-04 Class B live probe — fires only on canonical NULL
+            // deref at PhysX3_x64.dll+0x20ced9. Reads register state from the
+            // signal-time ucontext_t and dereferences pointers that are alive
+            // RIGHT NOW (Wine PE heap is mapped). Each deref is wrapped in a
+            // "safe" range check (only addresses in the Wine PE arena 0x00000000_40000000
+            // .. 0x00000001_00000000 are read).
+            if is_canonical_class_b {
+                let _ = write!(
+                    f,
+                    "*** Class B canonical NULL deref at RIP=0x{:x} R14=0x{:x} RSP=0x{:x} R8=0x{:x}\n",
+                    class_b_rip, class_b_r14, class_b_rsp, class_b_r8
+                );
+                // Safe-deref helper: read if addr is in any of the known
+                // Wine-managed ranges. After the 2026-06-04 first capture we
+                // widened this from [0x4000_0000, 0x1_0000_0000] to include
+                // (a) Wine PE-private stack at ~0x3f00_0000 (RSP=0x3f56fdf0)
+                // and (b) Wine PE-loaded DLL text/data at ~0x6ffff_8000_0000
+                // (sub-object vtable was 0x6ffff8a75760).
+                let safe_read_q = |addr: u64| -> Option<u64> {
+                    let in_wine_pe_arena = addr >= 0x1000_0000 && addr <= 0x1_0000_0000;
+                    let in_wine_pe_dlls = addr >= 0x6_0000_0000_0000 && addr <= 0x8_0000_0000_0000;
+                    if !(in_wine_pe_arena || in_wine_pe_dlls) {
+                        return None;
+                    }
+                    // SAFETY: we restrict to known-mapped ranges and accept a
+                    // tail-of-handler nested SEGV if we're wrong. The original
+                    // SEGV is already fatal; losing the rest of the dump in the
+                    // worst case is acceptable.
+                    Some(unsafe { std::ptr::read_volatile(addr as *const u64) })
+                };
+                // OUT struct lives at RSP+0x38 .. RSP+0x58 (4 qwords).
+                // Layout: [ptr1, count1, ptr2, count2]
+                let ptr1 = safe_read_q(class_b_rsp.wrapping_add(0x38));
+                let count1 = safe_read_q(class_b_rsp.wrapping_add(0x40));
+                let ptr2 = safe_read_q(class_b_rsp.wrapping_add(0x48));
+                let count2 = safe_read_q(class_b_rsp.wrapping_add(0x50));
+                let _ = write!(
+                    f,
+                    "*** Class B OUT struct: ptr1=0x{:x?} count1=0x{:x?} ptr2=0x{:x?} count2=0x{:x?}\n",
+                    ptr1, count1, ptr2, count2
+                );
+                // Read 8 qwords starting at OUT.ptr2 — the failing inner_array.
+                if let Some(p) = ptr2 {
+                    let _ = write!(f, "*** Class B inner_array @ 0x{:x}:\n", p);
+                    for i in 0..8 {
+                        let v = safe_read_q(p.wrapping_add(i * 8));
+                        let _ = write!(f, "***   [{}]=0x{:x?}\n", i, v);
+                    }
+                }
+                // Read 8 qwords starting at OUT.ptr1 (the other paired array).
+                if let Some(p) = ptr1 {
+                    let _ = write!(f, "*** Class B paired_array @ 0x{:x}:\n", p);
+                    for i in 0..8 {
+                        let v = safe_read_q(p.wrapping_add(i * 8));
+                        let _ = write!(f, "***   [{}]=0x{:x?}\n", i, v);
+                    }
+                }
+                // R14 = iterator `this`. Dump first 8 qwords + the sub-vtable
+                // pointer at +0x60 (which populated the inner_array).
+                if class_b_r14 != 0 {
+                    let _ = write!(f, "*** Class B R14 (iterator this) @ 0x{:x}:\n", class_b_r14);
+                    for i in 0..8 {
+                        let v = safe_read_q(class_b_r14.wrapping_add(i * 8));
+                        let _ = write!(f, "***   [+0x{:x}]=0x{:x?}\n", i * 8, v);
+                    }
+                    let sub_obj = safe_read_q(class_b_r14.wrapping_add(0x60));
+                    let _ = write!(
+                        f,
+                        "*** Class B R14+0x60 sub-object pointer = 0x{:x?}\n",
+                        sub_obj
+                    );
+                    if let Some(s) = sub_obj {
+                        let sub_vtable = safe_read_q(s);
+                        let _ = write!(
+                            f,
+                            "*** Class B sub-object vtable = 0x{:x?}\n",
+                            sub_vtable
+                        );
+                    }
+                }
+            }
+            if ms4_host_ptr != 0 && ms4_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** MS4 capture dumped to /tmp/ms4_captures.bin ({} bytes)\n",
+                    ms4_total_bytes
+                );
+            }
+            if ms2b_host_ptr != 0 && ms2b_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** MS2B capture dumped to /tmp/ms2b_captures.bin ({} bytes)\n",
+                    ms2b_total_bytes
+                );
+            }
+            if ms3_host_ptr != 0 && ms3_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** MS3 capture dumped to /tmp/ms3_captures.bin ({} bytes)\n",
+                    ms3_total_bytes
+                );
+            }
+            if tfs_host_ptr != 0 && tfs_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** TFS capture dumped to /tmp/tfs_captures.bin ({} bytes)\n",
+                    tfs_total_bytes
+                );
+            }
+            if iofx_host_ptr != 0 && iofx_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** IOFX actorRange capture dumped to /tmp/iofx_actor_range_captures.bin ({} bytes)\n",
+                    iofx_total_bytes
+                );
+            }
+            if iofx_bbox_host_ptr != 0 && iofx_bbox_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** IOFX bbox capture dumped to /tmp/iofx_bbox_captures.bin ({} bytes)\n",
+                    iofx_bbox_total_bytes
+                );
+            }
+            if cub_downsweep_host_ptr != 0 && cub_downsweep_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** CUB downsweep capture dumped to /tmp/cub_downsweep_captures.bin ({} bytes)\n",
+                    cub_downsweep_total_bytes
+                );
+            }
+            if iofx_chain_host_ptr != 0 && iofx_chain_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** IOFX chain capture dumped to /tmp/iofx_chain_captures.bin ({} bytes)\n",
+                    iofx_chain_total_bytes
+                );
+            }
+            if cub_scan_host_ptr != 0 && cub_scan_total_bytes != 0 {
+                let _ = write!(
+                    f,
+                    "*** CUB scan capture dumped to /tmp/cub_scan_captures.bin ({} bytes)\n",
+                    cub_scan_total_bytes
+                );
+            }
+            if let Ok(guard) = KERNEL_RING.lock() {
+                let (ref buf, idx, total) = *guard;
+                let _ = write!(
+                    f,
+                    "*** Kernel launch history (total={}, newest last):\n",
+                    total
+                );
+                // Iterate from oldest to newest entry in the ring.
+                let start = if total >= KERNEL_RING_SIZE as u64 {
+                    idx
+                } else {
+                    0
+                };
+                let count = if total >= KERNEL_RING_SIZE as u64 {
+                    KERNEL_RING_SIZE
+                } else {
+                    total as usize
+                };
+                for i in 0..count {
+                    let slot = (start + i) % KERNEL_RING_SIZE;
+                    let entry = &buf[slot];
+                    let ring_n = total.saturating_sub((count - i) as u64);
+                    let name = entry.name_str();
+                    if entry.ptr_count == 0 && name.is_empty() {
+                        if let Some(ref info) = entry.info {
+                            let _ = write!(f, "***   #{} {}\n", ring_n, info);
+                        }
+                        continue;
+                    }
+                    let _ = write!(
+                        f,
+                        "***   #{} launch_n={} ts_ns={} {}",
+                        ring_n, entry.launch_n, entry.ts_ns, name
+                    );
+                    if entry.ptr_count > 0 {
+                        let _ = write!(f, " ptrs=[");
+                        for k in 0..(entry.ptr_count as usize) {
+                            let (lo, hi) = entry.ptr_ranges[k];
+                            if k > 0 {
+                                let _ = write!(f, " ");
+                            }
+                            let _ = write!(f, "0x{:x}..0x{:x}", lo, hi);
+                        }
+                        let _ = write!(f, "]");
+                    }
+                    if let Some(ref info) = entry.info {
+                        let _ = write!(f, " {}", info);
+                    }
+                    let _ = write!(f, "\n");
+                }
+            }
+            // Read /proc/self/maps to find what's at common fault regions
+            if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+                let _ = write!(f, "*** Process memory maps (0x7f region):\n");
+                for line in maps.lines() {
+                    if line.starts_with("7f") {
+                        let _ = writeln!(f, "***   {}", line);
+                    }
+                }
+                // 2026-06-04 also dump 0x6f region (Wine PE-loaded DLLs).
+                // PhysX3_x64.dll / PhysX3Gpu_x64.dll / PhysX3Common live here.
+                let _ = write!(f, "*** Process memory maps (0x6 region — Wine PE DLLs):\n");
+                for line in maps.lines() {
+                    if line.starts_with("6f") || line.starts_with("60") || line.starts_with("70") {
+                        let _ = writeln!(f, "***   {}", line);
+                    }
+                }
+            }
+        }
+        // Re-raise with default handler to actually die.
+        // (signal() works fine for setting SIG_DFL even when the original
+        // install was via sigaction — they share the same kernel disposition.)
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+    unsafe {
+        // Switched from libc::signal to libc::sigaction with SA_SIGINFO so
+        // the handler receives ucontext_t and can probe registers at the
+        // fault site (needed for the Class B live-probe at PhysX3_x64.dll+0x20ced9).
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigabrt_handler as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGABRT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        // Also dump capture rings on normal (non-crash) process exit so
+        // clean-bench runs still produce harvestable data.
+        extern "C" fn dump_rings_atexit() {
+            unsafe {
+                unsafe fn dump_ring_safe(ptr_atomic: usize, len_atomic: usize, path: &str) {
+                    if ptr_atomic == 0 || len_atomic == 0 {
+                        return;
+                    }
+                    let slice = std::slice::from_raw_parts(ptr_atomic as *const u8, len_atomic);
+                    let _ = std::fs::write(path, slice);
+                }
+                dump_ring_safe(
+                    super::function::MS4_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::MS4_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/ms4_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::MS2B_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::MS2B_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/ms2b_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::MS3_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::MS3_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/ms3_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::TFS_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::TFS_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/tfs_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::IOFX_ACTOR_RANGE_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::IOFX_ACTOR_RANGE_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/iofx_actor_range_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::IOFX_BBOX_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::IOFX_BBOX_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/iofx_bbox_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::CUB_DOWNSWEEP_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::CUB_DOWNSWEEP_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/cub_downsweep_captures.bin",
+                );
+                dump_ring_safe(
+                    super::function::IOFX_CHAIN_CAPTURE_HOST_PTR
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    super::function::IOFX_CHAIN_CAPTURE_TOTAL_BYTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "/tmp/iofx_chain_captures.bin",
+                );
+            }
+        }
+        libc::atexit(dump_rings_atexit);
+    }
+    zluda_log_err("[ZLUDA] Signal handlers installed (SIGABRT+SIGSEGV) for fault capture");
+}
+
+/// Load the ROCm debug agent library and call its OnLoad entry point.
+///
+/// The debug agent catches GPU faults (memory violations, illegal instructions,
+/// assert traps) and dumps wavefront register state to stderr or a file
+/// (configurable via ROCM_DEBUG_AGENT_OPTIONS env var). It uses amd_dbgapi to
+/// attach to the process as a GPU debugger and receive hardware exceptions.
+///
+/// This bypasses HSA_TOOLS_LIB, which fails inside pressure-vessel Steam
+/// Runtime containers because dlopen can't resolve transitive dependencies.
+/// After hipInit(), the core ROCm libraries (libhsa-runtime64, libamd_comgr,
+/// librocprofiler-register) are already loaded, so the debug agent's
+/// dependencies resolve from the process and its co-located RUNPATH=$ORIGIN dir.
+///
+/// The agent also hooks hsa_executable_freeze and hsa_executable_destroy in the
+/// API table to track loaded code objects for disassembly context. Since we pass
+/// our own copy of the table (not the runtime's internal one), these hooks won't
+/// intercept actual HSA calls -- code object tracking will be incomplete. The
+/// core fault-catching and wavefront-dumping via amd_dbgapi works regardless.
+///
+/// Controlled by ZLUDA_DEBUG_AGENT=1. Options via ROCM_DEBUG_AGENT_OPTIONS
+/// (e.g. "--all --save-code-objects --output=/tmp/rocm_fault.log").
+#[cfg(not(windows))]
+fn load_rocm_debug_agent() {
+    // Path to the debug agent library. RUNPATH=$ORIGIN means its deps
+    // (librocm-dbgapi.so.0, libamd_comgr.so.3) are found in the same dir.
+    // Default path in the self-contained agent dir (all deps co-located).
+    // Override with ZLUDA_DEBUG_AGENT_PATH env var if needed.
+    let default_path = "/home/deck/.local/share/Steam/compatibilitytools.d/proton-cuda/files/lib64/rocm_debug_agent/librocm-debug-agent.so.2";
+    let agent_path =
+        std::env::var("ZLUDA_DEBUG_AGENT_PATH").unwrap_or_else(|_| default_path.to_string());
+
+    zluda_log_err(&format!(
+        "[ZLUDA] Loading ROCm debug agent from: {}",
+        agent_path
+    ));
+
+    let c_path = match CString::new(agent_path.as_bytes()) {
+        Ok(p) => p,
+        Err(e) => {
+            zluda_log_err(&format!(
+                "[ZLUDA] Debug agent path contains null byte: {}",
+                e
+            ));
+            return;
+        }
+    };
+
+    // RTLD_NOW: resolve all symbols immediately (fail fast if deps missing).
+    // RTLD_LOCAL: keep the agent's symbols (and its transitive deps like
+    //             libamd_comgr.so.2) hidden from the main process, so HIP's
+    //             own comgr.so.3 calls don't collide with the agent's comgr.so.2.
+    // RTLD_DEEPBIND: force the agent and its deps to resolve symbols from their
+    //                own namespace first, not from the global scope. This is the
+    //                key bit: without DEEPBIND, librocm-dbgapi.so.0's comgr calls
+    //                may still get routed to HIP's already-loaded comgr.so.3,
+    //                which doesn't export the v2.0 symbols it needs → SIGSEGV.
+    let handle = unsafe {
+        libc::dlopen(
+            c_path.as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_DEEPBIND,
+        )
+    };
+    if handle.is_null() {
+        let err = unsafe { CStr::from_ptr(libc::dlerror()) };
+        zluda_log_err(&format!(
+            "[ZLUDA] Failed to dlopen debug agent: {}",
+            err.to_string_lossy()
+        ));
+        return;
+    }
+    zluda_log_err("[ZLUDA] Debug agent library loaded");
+
+    // Look up OnLoad. Signature from ROCr tool ABI (hsa_api_trace.h):
+    //   bool OnLoad(void* api_table, uint64_t runtime_version,
+    //               uint64_t failed_tool_count, const char* const* failed_tool_names)
+    let onload_sym = unsafe { libc::dlsym(handle, c"OnLoad".as_ptr()) };
+    if onload_sym.is_null() {
+        zluda_log_err("[ZLUDA] Debug agent has no OnLoad symbol, skipping");
+        return;
+    }
+    type OnLoadFn = unsafe extern "C" fn(*mut c_void, u64, u64, *const *const i8) -> bool;
+    let onload: OnLoadFn = unsafe { mem::transmute(onload_sym) };
+
+    // Build an HsaApiTable populated with real function pointers resolved from
+    // the already-loaded libhsa-runtime64.so.1 via dlsym(RTLD_DEFAULT, ...).
+    //
+    // The agent modifies the table in-place (installs hooks) and keeps the
+    // pointer for the process lifetime, so these must be static and mutable.
+    //
+    // Layout from ext/rocm/include/hsa/hsa_api_trace.h:
+    //   Each table starts with ApiTableVersion { major_id, minor_id, step_id, reserved }
+    //   (4 x u32 = 16 bytes = 2 usize slots), followed by function pointers.
+    //
+    //   HsaApiTable (root):
+    //     [0..1] ApiTableVersion  (major=3, minor=sizeof, step=1)
+    //     [2]    core_: *mut CoreApiTable       (offset 0x10)
+    //     [3]    amd_ext_: *mut AmdExtTable     (offset 0x18)
+    //     [4]    finalizer_ext_                 (offset 0x20)
+    //     [5]    image_ext_                     (offset 0x28)
+    //     [6]    tools_                         (offset 0x30)
+    //     [7]    pc_sampling_ext_               (offset 0x38)
+
+    // CoreApiTable: 127 entries (version + 125 function pointers) = ~1016 bytes.
+    // Use 128 slots for safety against minor version differences.
+    static mut CORE_TABLE: [usize; 128] = [0; 128];
+    // AmdExtTable: ~74 entries in ROCm 6.4. Use 128 slots.
+    static mut AMD_EXT_TABLE: [usize; 128] = [0; 128];
+    // Root HsaApiTable: 8 entries.
+    static mut HSA_TABLE: [usize; 8] = [0; 8];
+
+    // Resolve an HSA function from the already-loaded runtime.
+    // RTLD_DEFAULT searches all loaded shared objects.
+    macro_rules! resolve {
+        ($name:literal, $table:ident, $idx:expr) => {
+            let ptr = libc::dlsym(
+                libc::RTLD_DEFAULT,
+                concat!($name, "\0").as_ptr() as *const _,
+            );
+            if !ptr.is_null() {
+                *$table.add($idx) = ptr as usize;
+            }
+        };
+    }
+
+    unsafe {
+        // Raw pointers to the static tables, avoiding mutable references to
+        // mutable statics (which trigger static_mut_refs warnings in Rust 2024).
+        let hsa_tbl = ptr::addr_of_mut!(HSA_TABLE) as *mut usize;
+        let core_tbl = ptr::addr_of_mut!(CORE_TABLE) as *mut usize;
+        let amd_tbl = ptr::addr_of_mut!(AMD_EXT_TABLE) as *mut usize;
+        // --- Root table version ---
+        let ver = hsa_tbl as *mut u32;
+        *ver.add(0) = 0x03; // HSA_API_TABLE_MAJOR_VERSION
+        *ver.add(1) = mem::size_of::<[usize; 8]>() as u32;
+        *ver.add(2) = 0x01; // HSA_API_TABLE_STEP_VERSION
+        *ver.add(3) = 0;
+        *hsa_tbl.add(2) = core_tbl as usize; // core_
+        *hsa_tbl.add(3) = amd_tbl as usize; // amd_ext_
+                                            // finalizer_ext_, image_ext_, tools_, pc_sampling_ext_ left as null --
+                                            // the agent doesn't access them.
+
+        // --- CoreApiTable version ---
+        let ver = core_tbl as *mut u32;
+        *ver.add(0) = 0x02; // HSA_CORE_API_TABLE_MAJOR_VERSION
+        *ver.add(1) = mem::size_of::<[usize; 128]>() as u32;
+        *ver.add(2) = 0x00; // HSA_CORE_API_TABLE_STEP_VERSION
+        *ver.add(3) = 0;
+
+        // CoreApiTable function pointers (index = byte_offset / 8).
+        // The agent hooks [86] hsa_executable_destroy and [88] hsa_executable_freeze.
+        // We populate all entries so the hooks have valid originals to call through.
+        resolve!("hsa_init", core_tbl, 2);
+        resolve!("hsa_shut_down", core_tbl, 3);
+        resolve!("hsa_system_get_info", core_tbl, 4);
+        resolve!("hsa_system_extension_supported", core_tbl, 5);
+        resolve!("hsa_system_get_extension_table", core_tbl, 6);
+        resolve!("hsa_iterate_agents", core_tbl, 7);
+        resolve!("hsa_agent_get_info", core_tbl, 8);
+        resolve!("hsa_queue_create", core_tbl, 9);
+        resolve!("hsa_soft_queue_create", core_tbl, 10);
+        resolve!("hsa_queue_destroy", core_tbl, 11);
+        resolve!("hsa_queue_inactivate", core_tbl, 12);
+        resolve!("hsa_queue_load_read_index_scacquire", core_tbl, 13);
+        resolve!("hsa_queue_load_read_index_relaxed", core_tbl, 14);
+        resolve!("hsa_queue_load_write_index_scacquire", core_tbl, 15);
+        resolve!("hsa_queue_load_write_index_relaxed", core_tbl, 16);
+        resolve!("hsa_queue_store_write_index_relaxed", core_tbl, 17);
+        resolve!("hsa_queue_store_write_index_screlease", core_tbl, 18);
+        resolve!("hsa_queue_cas_write_index_scacq_screl", core_tbl, 19);
+        resolve!("hsa_queue_cas_write_index_scacquire", core_tbl, 20);
+        resolve!("hsa_queue_cas_write_index_relaxed", core_tbl, 21);
+        resolve!("hsa_queue_cas_write_index_screlease", core_tbl, 22);
+        resolve!("hsa_queue_add_write_index_scacq_screl", core_tbl, 23);
+        resolve!("hsa_queue_add_write_index_scacquire", core_tbl, 24);
+        resolve!("hsa_queue_add_write_index_relaxed", core_tbl, 25);
+        resolve!("hsa_queue_add_write_index_screlease", core_tbl, 26);
+        resolve!("hsa_queue_store_read_index_relaxed", core_tbl, 27);
+        resolve!("hsa_queue_store_read_index_screlease", core_tbl, 28);
+        resolve!("hsa_agent_iterate_regions", core_tbl, 29);
+        resolve!("hsa_region_get_info", core_tbl, 30);
+        resolve!("hsa_agent_get_exception_policies", core_tbl, 31);
+        resolve!("hsa_agent_extension_supported", core_tbl, 32);
+        resolve!("hsa_memory_register", core_tbl, 33);
+        resolve!("hsa_memory_deregister", core_tbl, 34);
+        resolve!("hsa_memory_allocate", core_tbl, 35);
+        resolve!("hsa_memory_free", core_tbl, 36);
+        resolve!("hsa_memory_copy", core_tbl, 37);
+        resolve!("hsa_memory_assign_agent", core_tbl, 38);
+        resolve!("hsa_signal_create", core_tbl, 39);
+        resolve!("hsa_signal_destroy", core_tbl, 40);
+        resolve!("hsa_signal_load_relaxed", core_tbl, 41);
+        resolve!("hsa_signal_load_scacquire", core_tbl, 42);
+        resolve!("hsa_signal_store_relaxed", core_tbl, 43);
+        resolve!("hsa_signal_store_screlease", core_tbl, 44);
+        resolve!("hsa_signal_wait_relaxed", core_tbl, 45);
+        resolve!("hsa_signal_wait_scacquire", core_tbl, 46);
+        resolve!("hsa_signal_and_relaxed", core_tbl, 47);
+        resolve!("hsa_signal_and_scacquire", core_tbl, 48);
+        resolve!("hsa_signal_and_screlease", core_tbl, 49);
+        resolve!("hsa_signal_and_scacq_screl", core_tbl, 50);
+        resolve!("hsa_signal_or_relaxed", core_tbl, 51);
+        resolve!("hsa_signal_or_scacquire", core_tbl, 52);
+        resolve!("hsa_signal_or_screlease", core_tbl, 53);
+        resolve!("hsa_signal_or_scacq_screl", core_tbl, 54);
+        resolve!("hsa_signal_xor_relaxed", core_tbl, 55);
+        resolve!("hsa_signal_xor_scacquire", core_tbl, 56);
+        resolve!("hsa_signal_xor_screlease", core_tbl, 57);
+        resolve!("hsa_signal_xor_scacq_screl", core_tbl, 58);
+        resolve!("hsa_signal_exchange_relaxed", core_tbl, 59);
+        resolve!("hsa_signal_exchange_scacquire", core_tbl, 60);
+        resolve!("hsa_signal_exchange_screlease", core_tbl, 61);
+        resolve!("hsa_signal_exchange_scacq_screl", core_tbl, 62);
+        resolve!("hsa_signal_add_relaxed", core_tbl, 63);
+        resolve!("hsa_signal_add_scacquire", core_tbl, 64);
+        resolve!("hsa_signal_add_screlease", core_tbl, 65);
+        resolve!("hsa_signal_add_scacq_screl", core_tbl, 66);
+        resolve!("hsa_signal_subtract_relaxed", core_tbl, 67);
+        resolve!("hsa_signal_subtract_scacquire", core_tbl, 68);
+        resolve!("hsa_signal_subtract_screlease", core_tbl, 69);
+        resolve!("hsa_signal_subtract_scacq_screl", core_tbl, 70);
+        resolve!("hsa_signal_cas_relaxed", core_tbl, 71);
+        resolve!("hsa_signal_cas_scacquire", core_tbl, 72);
+        resolve!("hsa_signal_cas_screlease", core_tbl, 73);
+        resolve!("hsa_signal_cas_scacq_screl", core_tbl, 74);
+        resolve!("hsa_isa_from_name", core_tbl, 75);
+        resolve!("hsa_isa_get_info", core_tbl, 76);
+        resolve!("hsa_isa_compatible", core_tbl, 77);
+        resolve!("hsa_code_object_serialize", core_tbl, 78);
+        resolve!("hsa_code_object_deserialize", core_tbl, 79);
+        resolve!("hsa_code_object_destroy", core_tbl, 80);
+        resolve!("hsa_code_object_get_info", core_tbl, 81);
+        resolve!("hsa_code_object_get_symbol", core_tbl, 82);
+        resolve!("hsa_code_symbol_get_info", core_tbl, 83);
+        resolve!("hsa_code_object_iterate_symbols", core_tbl, 84);
+        resolve!("hsa_executable_create", core_tbl, 85);
+        resolve!("hsa_executable_destroy", core_tbl, 86); // agent hooks this
+        resolve!("hsa_executable_load_code_object", core_tbl, 87);
+        resolve!("hsa_executable_freeze", core_tbl, 88); // agent hooks this
+        resolve!("hsa_executable_get_info", core_tbl, 89);
+        resolve!("hsa_executable_global_variable_define", core_tbl, 90);
+        resolve!("hsa_executable_agent_global_variable_define", core_tbl, 91);
+        resolve!("hsa_executable_readonly_variable_define", core_tbl, 92);
+        resolve!("hsa_executable_validate", core_tbl, 93);
+        resolve!("hsa_executable_get_symbol", core_tbl, 94);
+        resolve!("hsa_executable_symbol_get_info", core_tbl, 95);
+        resolve!("hsa_executable_iterate_symbols", core_tbl, 96);
+        resolve!("hsa_status_string", core_tbl, 97);
+        // v1.1 additions
+        resolve!("hsa_extension_get_name", core_tbl, 98);
+        resolve!("hsa_system_major_extension_supported", core_tbl, 99);
+        resolve!("hsa_system_get_major_extension_table", core_tbl, 100);
+        resolve!("hsa_agent_major_extension_supported", core_tbl, 101);
+        resolve!("hsa_cache_get_info", core_tbl, 102);
+        resolve!("hsa_agent_iterate_caches", core_tbl, 103);
+        resolve!("hsa_signal_silent_store_relaxed", core_tbl, 104);
+        resolve!("hsa_signal_silent_store_screlease", core_tbl, 105);
+        resolve!("hsa_signal_group_create", core_tbl, 106);
+        resolve!("hsa_signal_group_destroy", core_tbl, 107);
+        resolve!("hsa_signal_group_wait_any_scacquire", core_tbl, 108);
+        resolve!("hsa_signal_group_wait_any_relaxed", core_tbl, 109);
+        resolve!("hsa_agent_iterate_isas", core_tbl, 110);
+        resolve!("hsa_isa_get_info_alt", core_tbl, 111);
+        resolve!("hsa_isa_get_exception_policies", core_tbl, 112);
+        resolve!("hsa_isa_get_round_method", core_tbl, 113);
+        resolve!("hsa_wavefront_get_info", core_tbl, 114);
+        resolve!("hsa_isa_iterate_wavefronts", core_tbl, 115);
+        resolve!("hsa_code_object_get_symbol_from_name", core_tbl, 116);
+        resolve!("hsa_code_object_reader_create_from_file", core_tbl, 117);
+        resolve!("hsa_code_object_reader_create_from_memory", core_tbl, 118);
+        resolve!("hsa_code_object_reader_destroy", core_tbl, 119);
+        resolve!("hsa_executable_create_alt", core_tbl, 120);
+        resolve!("hsa_executable_load_program_code_object", core_tbl, 121);
+        resolve!("hsa_executable_load_agent_code_object", core_tbl, 122);
+        resolve!("hsa_executable_validate_alt", core_tbl, 123);
+        resolve!("hsa_executable_get_symbol_by_name", core_tbl, 124);
+        resolve!("hsa_executable_iterate_agent_symbols", core_tbl, 125);
+        resolve!("hsa_executable_iterate_program_symbols", core_tbl, 126);
+
+        // --- AmdExtTable version ---
+        let ver = amd_tbl as *mut u32;
+        *ver.add(0) = 0x02; // HSA_AMD_EXT_API_TABLE_MAJOR_VERSION
+        *ver.add(1) = mem::size_of::<[usize; 128]>() as u32;
+        *ver.add(2) = 0x05; // HSA_AMD_EXT_API_TABLE_STEP_VERSION
+        *ver.add(3) = 0;
+
+        // AmdExtTable function pointers. Populate the critical ones the agent
+        // may use during fault handling (e.g. hsa_amd_register_system_event_handler).
+        resolve!("hsa_amd_coherency_get_type", amd_tbl, 2);
+        resolve!("hsa_amd_coherency_set_type", amd_tbl, 3);
+        resolve!("hsa_amd_profiling_set_profiler_enabled", amd_tbl, 4);
+        resolve!("hsa_amd_profiling_async_copy_enable", amd_tbl, 5);
+        resolve!("hsa_amd_profiling_get_dispatch_time", amd_tbl, 6);
+        resolve!("hsa_amd_profiling_get_async_copy_time", amd_tbl, 7);
+        resolve!(
+            "hsa_amd_profiling_convert_tick_to_system_domain",
+            amd_tbl,
+            8
+        );
+        resolve!("hsa_amd_signal_async_handler", amd_tbl, 9);
+        resolve!("hsa_amd_async_function", amd_tbl, 10);
+        resolve!("hsa_amd_signal_wait_any", amd_tbl, 11);
+        resolve!("hsa_amd_queue_cu_set_mask", amd_tbl, 12);
+        resolve!("hsa_amd_memory_pool_get_info", amd_tbl, 13);
+        resolve!("hsa_amd_agent_iterate_memory_pools", amd_tbl, 14);
+        resolve!("hsa_amd_memory_pool_allocate", amd_tbl, 15);
+        resolve!("hsa_amd_memory_pool_free", amd_tbl, 16);
+        resolve!("hsa_amd_memory_async_copy", amd_tbl, 17);
+        resolve!("hsa_amd_memory_async_copy_on_engine", amd_tbl, 18);
+        resolve!("hsa_amd_memory_copy_engine_status", amd_tbl, 19);
+        resolve!("hsa_amd_agent_memory_pool_get_info", amd_tbl, 20);
+        resolve!("hsa_amd_agents_allow_access", amd_tbl, 21);
+        resolve!("hsa_amd_memory_pool_can_migrate", amd_tbl, 22);
+        resolve!("hsa_amd_memory_migrate", amd_tbl, 23);
+        resolve!("hsa_amd_memory_lock", amd_tbl, 24);
+        resolve!("hsa_amd_memory_unlock", amd_tbl, 25);
+        resolve!("hsa_amd_memory_fill", amd_tbl, 26);
+        resolve!("hsa_amd_interop_map_buffer", amd_tbl, 27);
+        resolve!("hsa_amd_interop_unmap_buffer", amd_tbl, 28);
+        resolve!("hsa_amd_image_create", amd_tbl, 29);
+        resolve!("hsa_amd_pointer_info", amd_tbl, 30);
+        resolve!("hsa_amd_pointer_info_set_userdata", amd_tbl, 31);
+        resolve!("hsa_amd_ipc_memory_create", amd_tbl, 32);
+        resolve!("hsa_amd_ipc_memory_attach", amd_tbl, 33);
+        resolve!("hsa_amd_ipc_memory_detach", amd_tbl, 34);
+        resolve!("hsa_amd_signal_create", amd_tbl, 35);
+        resolve!("hsa_amd_ipc_signal_create", amd_tbl, 36);
+        resolve!("hsa_amd_ipc_signal_attach", amd_tbl, 37);
+        resolve!("hsa_amd_register_system_event_handler", amd_tbl, 38);
+        resolve!("hsa_amd_queue_intercept_create", amd_tbl, 39);
+        resolve!("hsa_amd_queue_intercept_register", amd_tbl, 40);
+        resolve!("hsa_amd_queue_set_priority", amd_tbl, 41);
+        resolve!("hsa_amd_memory_async_copy_rect", amd_tbl, 42);
+        resolve!("hsa_amd_runtime_queue_create_register", amd_tbl, 43);
+        resolve!("hsa_amd_memory_lock_to_pool", amd_tbl, 44);
+        resolve!("hsa_amd_register_deallocation_callback", amd_tbl, 45);
+        resolve!("hsa_amd_deregister_deallocation_callback", amd_tbl, 46);
+        resolve!("hsa_amd_signal_value_pointer", amd_tbl, 47);
+
+        // Log how many functions we resolved
+        let mut core_count = 0usize;
+        for i in 2..128 {
+            if *core_tbl.add(i) != 0 {
+                core_count += 1;
+            }
+        }
+        let mut amd_count = 0usize;
+        for i in 2..128 {
+            if *amd_tbl.add(i) != 0 {
+                amd_count += 1;
+            }
+        }
+        zluda_log_err(&format!(
+            "[ZLUDA] HSA API table: {} core + {} amd_ext functions resolved",
+            core_count, amd_count
+        ));
+
+        // Call OnLoad(table, runtime_version=0, failed_count=0, failed_names=null)
+        let table_ptr = hsa_tbl as *mut c_void;
+        zluda_log_err("[ZLUDA] Calling debug agent OnLoad...");
+        let result = onload(table_ptr, 0, 0, ptr::null());
+        if result {
+            zluda_log_err("[ZLUDA] Debug agent OnLoad succeeded - GPU fault handler active");
+            zluda_log_err("[ZLUDA] Send SIGQUIT (kill -3 <pid>) to dump all wavefront state");
+        } else {
+            zluda_log_err("[ZLUDA] Debug agent OnLoad returned false (init failed)");
+        }
+    }
+
+    // Intentionally leak the dlopen handle: the debug agent registers signal
+    // handlers and amd_dbgapi callbacks that must persist for the process lifetime.
+    // The static tables above must also remain valid.
+}
+
+fn init_hip_and_state(flags: ::core::ffi::c_uint) -> CUresult {
+    super::signal::with_preserved_state(|| {
+        unsafe { hipInit(flags) }.map_err(|e| {
+            zluda_log(&format!("[ZLUDA] hipInit failed: {:?}", e));
+            CUerror::UNKNOWN
+        })
+    })?;
+    // Primary-context stream creation compiles HIP's internal blit kernels via
+    // comgr. Do this on the same native thread, not the original Wine caller.
+    // Context::new selects each device and preserves signal state separately.
+    global_state().map(|_| ())
+}
+
+/// Initialize HIP and all primary contexts on a native pthread. Besides ROCm's
+/// stack-address assumptions, comgr may replace this thread's alternate stack.
+#[cfg(not(windows))]
+fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> Result<(), cuda_types::cuda::CUerror> {
+    let builder = std::thread::Builder::new().name("zluda-hip-init".into());
+    let handle = builder
+        .spawn(move || init_hip_and_state(flags))
+        .map_err(|e| {
+            zluda_log(&format!("[ZLUDA] Failed to spawn hipInit thread: {}", e));
+            cuda_types::cuda::CUerror::UNKNOWN
+        })?;
+    handle.join().map_err(|_| {
+        zluda_log("[ZLUDA] hipInit thread panicked");
+        cuda_types::cuda::CUerror::UNKNOWN
+    })?
+}
+
+#[cfg(windows)]
+fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> Result<(), cuda_types::cuda::CUerror> {
+    init_hip_and_state(flags)
+}
+
+fn configure_hip_fence_scope() -> CUresult {
+    static CONFIGURED: std::sync::OnceLock<CUresult> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        let inherited = std::env::var_os("AMD_OPT_FLUSH");
+        // ROCclr reads this at runtime initialization and retains it in device
+        // settings/queues. With 7.2.4 on gfx1030, concurrent same-stream chains
+        // reproduced stale values with agent scopes and passed with SYSTEM
+        // acquire/release. Stronger packet fences do not drain the device.
+        // Configure before our first HIP initialization; an unrelated HIP user
+        // may already have initialized the runtime. Preserve explicit overrides.
+        if unsafe { libc::setenv(c"AMD_OPT_FLUSH".as_ptr(), c"0".as_ptr(), 0) } != 0 {
+            eprintln!(
+                "ZLUDA: setting AMD_OPT_FLUSH failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return Err(CUerror::UNKNOWN);
+        }
+        let value = std::env::var_os("AMD_OPT_FLUSH").unwrap_or_default();
+        eprintln!(
+            "ZLUDA: HIP AMD_OPT_FLUSH={} ({})",
+            value.to_string_lossy(),
+            if inherited.is_some() {
+                "inherited"
+            } else {
+                "ZLUDA default"
+            }
+        );
+        Ok(())
+    })
+}
+
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
-    unsafe { hipInit(flags) }?;
-    global_state()?;
+    zluda_log(&format!("[ZLUDA] cuInit({})", flags));
+    zluda_log_err(&format!(
+        "=== ZLUDA init (flags={}) LOG_ALL={} ===",
+        flags,
+        crate::is_log_all_enabled()
+    ));
+    configure_hip_fence_scope()?;
+    // Disable SDMA before HIP init. On Steam Deck / gfx10.3 we now see SDMA
+    // queue exhaustion ("No more SDMA queue to allocate") and follow-on copy
+    // hangs in module/copy probes; Wine's SIGUSR1 APC delivery can also
+    // interrupt the KFD ioctl that waits for SDMA completion. On APUs (unified
+    // memory), blit kernels are the safer path anyway.
+    // Uses setenv with overwrite=0 so user can still override with HSA_ENABLE_SDMA=1.
+    unsafe { libc::setenv(c"HSA_ENABLE_SDMA".as_ptr(), c"0".as_ptr(), 0) };
+    // Enable HSA VM fault messages for GPU page fault diagnostics.
+    // Prints "Memory access fault by GPU node on address %p. Reason: %s" to stderr.
+    unsafe { libc::setenv(c"HSA_ENABLE_VM_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
+    unsafe { libc::setenv(c"HSA_ENABLE_QUEUE_FAULT_MESSAGE".as_ptr(), c"1".as_ptr(), 0) };
+    // Run hipInit on a native pthread to avoid Wine thread incompatibility.
+    // ROCm 6.4+ does stack validation and internal allocations during hipInit()
+    // that crash with free(): invalid pointer on Wine threads (low NT stack
+    // addresses confuse ROCm's thread initialization). A native pthread has a
+    // normal 8MB stack at a high address, so ROCm's logic works correctly.
+    // Initialize primary contexts here too: their first streams compile HIP's
+    // blit program, and comgr otherwise replaces the Wine caller's sigaltstack.
+    // HIP initialization and the stored primary contexts are process-global.
+    hip_init_on_native_thread(flags)?;
+    // Install SIGABRT handler to dump last kernel info before dying.
+    // The HSA runtime sends SIGABRT on GPU page faults — our normal
+    // hipDeviceSynchronize error check doesn't run in time.
+    #[cfg(not(windows))]
+    if std::env::var("ZLUDA_FAULT_CAPTURE").map_or(false, |value| value == "1") {
+        install_fault_signal_handler();
+    }
+    // 2026-06-04 Class B coredump enrichment: by default the kernel's
+    // /proc/self/coredump_filter is 0x33 which omits file-backed mappings
+    // (private+shared). Wine PE-loaded heap and PE-mapped DLL data live
+    // there, so the canonical Class B SIGSEGV (PhysX3_x64.dll+0x20ced9)
+    // produces a coredump where gdb returns "Cannot access memory" at the
+    // failing iterator's inner_array pointer. Set filter to 0xff to also
+    // capture file-backed (private+shared), DAX, and the rest — at the
+    // cost of a larger dump file. Gated on ZLUDA_FULL_COREDUMP=1.
+    #[cfg(not(windows))]
+    if std::env::var("ZLUDA_FULL_COREDUMP").map_or(false, |v| v == "1") {
+        if let Ok(()) = std::fs::write("/proc/self/coredump_filter", "0xff") {
+            zluda_log_err("[ZLUDA] coredump_filter set to 0xff (full process memory in next core)");
+        }
+    }
+    // Load ROCm debug agent if requested. Must happen after hipInit() so that
+    // libhsa-runtime64.so.1 and other ROCm deps are already in the process,
+    // allowing dlopen to resolve the agent's transitive dependencies.
+    #[cfg(not(windows))]
+    if std::env::var("ZLUDA_DEBUG_AGENT").map_or(false, |v| v == "1") {
+        load_rocm_debug_agent();
+    }
+    // Verify HIP runtime version matches what ZLUDA was compiled against.
+    // Mismatched versions cause silent GPU failures: hipModuleGetGlobal returns
+    // success but doesn't write output parameters, leading to HOST addresses
+    // and bytes=0 for .const globals (e.g. gParams/gBounds in PhysX FleX).
+    {
+        // ROCm version ZLUDA was compiled with (from hip_version.h via hip_runtime-sys build.rs)
+        let compiled_major: i32 = env!("HIP_VERSION_MAJOR").parse().unwrap_or(0);
+        let compiled_minor: i32 = env!("HIP_VERSION_MINOR").parse().unwrap_or(0);
+
+        let mut runtime_ver = 0i32;
+        if unsafe { hip_runtime_sys::hipRuntimeGetVersion(&mut runtime_ver) }.is_ok() {
+            let rt_major = runtime_ver / 10_000_000;
+            let rt_minor = (runtime_ver / 100_000) % 100;
+            let rt_patch = runtime_ver % 100_000;
+            zluda_log(&format!(
+                "[ZLUDA] HIP runtime version: {}.{}.{} (compiled with {}.{})",
+                rt_major, rt_minor, rt_patch, compiled_major, compiled_minor
+            ));
+            if rt_major != compiled_major {
+                let msg = format!(
+                    "[ZLUDA] FATAL: ROCm version mismatch! Compiled with {}.{}, runtime is {}.{}. \
+                     GPU code compiled with one version cannot be loaded by another. \
+                     Update Proton ROCm libs: cd proton-ge-custom && ./scripts/fetch-rocm.sh",
+                    compiled_major, compiled_minor, rt_major, rt_minor
+                );
+                zluda_log(&msg);
+                zluda_log_err(&msg);
+                return Err(cuda_types::cuda::CUerror::UNKNOWN);
+            }
+        }
+    }
+    static STARTUP_LOG: std::sync::Once = std::sync::Once::new();
+    STARTUP_LOG.call_once(|| {
+        let mut props = unsafe { mem::zeroed() };
+        let device_name = if unsafe { hipGetDevicePropertiesR0600(&mut props, 0) }.is_ok() {
+            unsafe { CStr::from_ptr(props.name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            "unknown".to_owned()
+        };
+        let mut runtime_ver = 0i32;
+        let hip_version =
+            if unsafe { hip_runtime_sys::hipRuntimeGetVersion(&mut runtime_ver) }.is_ok() {
+                format!(
+                    "{}.{}.{}",
+                    runtime_ver / 10_000_000,
+                    (runtime_ver / 100_000) % 100,
+                    runtime_ver % 100_000
+                )
+            } else {
+                "unknown".to_owned()
+            };
+        eprintln!(
+            "ZLUDA: cuInit ok ({}, HIP {}, ZLUDA {})",
+            device_name,
+            hip_version,
+            env!("VERGEN_GIT_SHA")
+        );
+    });
+    zluda_log("[ZLUDA] cuInit -> SUCCESS");
+    zluda_log_err("=== ZLUDA cuInit -> SUCCESS ===");
+    crate::r#impl::recording::initialize();
     Ok(())
 }
 
@@ -150,6 +1461,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         result: *mut cuda_types::cuda::CUmodule,
         fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!(
+            "dark_api::get_module_from_cubin(fatbinc={:p})",
+            fatbinc_wrapper
+        ));
         let result = match result.as_mut() {
             Some(p) => p,
             None => return CUresult::ERROR_INVALID_VALUE,
@@ -158,13 +1473,16 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             .cast::<c_void>()
             .as_ref()
             .ok_or(CUerror::INVALID_VALUE)?;
-        module::load_data(result, data)
+        let r = module::load_data(result, data);
+        zluda_log_err(&format!("dark_api::get_module_from_cubin -> {:?}", r));
+        r
     }
 
     unsafe extern "system" fn cudart_interface_fn2(
         pctx: *mut cuda_types::cuda::CUcontext,
         hip_dev: hipDevice_t,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::cudart_interface_fn2(dev={})", hip_dev));
         let pctx = match pctx.as_mut() {
             Some(p) => p,
             None => return CUresult::ERROR_INVALID_VALUE,
@@ -172,6 +1490,40 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
 
         let (_, cu_ctx) = device::get_primary_context(hip_dev)?;
         *pctx = cu_ctx;
+        zluda_log_err(&format!(
+            "dark_api::cudart_interface_fn2 -> OK (ctx={:p})",
+            cu_ctx.0
+        ));
+        Ok(())
+    }
+
+    // PhysX uses these dark API functions - indices 4 and 5 in CUDART_INTERFACE
+    // set_device_flags: configures scheduling behavior for CUDA on the specified device
+    // set_device: makes the specified device active (like cudaSetDevice)
+    unsafe extern "system" fn set_device_flags(
+        dev: hipDevice_t,
+        flags: std::ffi::c_uint,
+    ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!(
+            "dark_api::set_device_flags(dev={}, flags={})",
+            dev, flags
+        ));
+        let mut active_dev = 0i32;
+        hipGetDevice(&mut active_dev)?;
+        if dev != active_dev {
+            hipSetDevice(dev)?;
+        }
+        let result = hipSetDeviceFlags(flags);
+        if dev != active_dev {
+            let _ = hipSetDevice(active_dev);
+        }
+        result?;
+        Ok(())
+    }
+
+    unsafe extern "system" fn set_device(dev: hipDevice_t) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::set_device(dev={})", dev));
+        hipSetDevice(dev)?;
         Ok(())
     }
 
@@ -182,7 +1534,16 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         arg4: *mut std::ffi::c_void,
         arg5: u32,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log("[ZLUDA] dark_api::get_module_from_cubin_ext1");
+        zluda_log_err(&format!(
+            "dark_api::get_module_from_cubin_ext1(fatbinc={:p})",
+            fatbinc_wrapper
+        ));
         if arg3 != ptr::null_mut() || arg4 != ptr::null_mut() || arg5 != 0 {
+            zluda_log(
+                "[ZLUDA] dark_api::get_module_from_cubin_ext1 -> NOT_SUPPORTED (non-null args)",
+            );
+            zluda_log_err("dark_api::get_module_from_cubin_ext1 -> NOT_SUPPORTED (non-null args)");
             return CUresult::ERROR_NOT_SUPPORTED;
         }
         let result = match result.as_mut() {
@@ -193,11 +1554,20 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             .cast::<c_void>()
             .as_ref()
             .ok_or(CUerror::INVALID_VALUE)?;
-        module::load_data(result, data)
+        let r = module::load_data(result, data);
+        zluda_log(&format!(
+            "[ZLUDA] dark_api::get_module_from_cubin_ext1 -> {:?}",
+            r
+        ));
+        zluda_log_err(&format!("dark_api::get_module_from_cubin_ext1 -> {:?}", r));
+        r
     }
 
     unsafe extern "system" fn cudart_interface_fn7(_arg1: usize) -> () {
-        ()
+        zluda_log_err(&format!(
+            "dark_api::cudart_interface_fn7(arg1=0x{:x})",
+            _arg1
+        ));
     }
 
     unsafe extern "system" fn get_module_from_cubin_ext2(
@@ -207,7 +1577,12 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         arg4: *mut std::ffi::c_void,
         arg5: u32,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!(
+            "dark_api::get_module_from_cubin_ext2(fatbin={:p})",
+            fatbin_header
+        ));
         if arg3 != ptr::null_mut() || arg4 != ptr::null_mut() || arg5 != 0 {
+            zluda_log_err("dark_api::get_module_from_cubin_ext2 -> NOT_SUPPORTED (non-null args)");
             return CUresult::ERROR_NOT_SUPPORTED;
         }
         let result = match result.as_mut() {
@@ -218,7 +1593,9 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             .cast::<c_void>()
             .as_ref()
             .ok_or(CUerror::INVALID_VALUE)?;
-        module::load_data(result, data)
+        let r = module::load_data(result, data);
+        zluda_log_err(&format!("dark_api::get_module_from_cubin_ext2 -> {:?}", r));
+        r
     }
 
     unsafe extern "system" fn get_unknown_buffer1(
@@ -227,6 +1604,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     ) -> () {
         *ptr = UNKNOWN_BUFFER1.buffer.get() as *mut std::ffi::c_void;
         *size = UNKNOWN_BUFFER1.len();
+        zluda_log_err(&format!(
+            "dark_api::get_unknown_buffer1 -> ptr={:p}, size={}",
+            *ptr, *size
+        ));
     }
 
     unsafe extern "system" fn get_unknown_buffer2(
@@ -235,6 +1616,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     ) -> () {
         *ptr = UNKNOWN_BUFFER2.buffer.get() as *mut std::ffi::c_void;
         *size = UNKNOWN_BUFFER2.len();
+        zluda_log_err(&format!(
+            "dark_api::get_unknown_buffer2 -> ptr={:p}, size={}",
+            *ptr, *size
+        ));
     }
 
     unsafe extern "system" fn context_local_storage_put(
@@ -243,6 +1628,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         value: *mut c_void,
         dtor_cb: Option<extern "system" fn(CUcontext, *mut c_void, *mut c_void)>,
     ) -> CUresult {
+        zluda_log_err(&format!(
+            "dark_api::context_local_storage_put(ctx={:p}, key={:p}, val={:p})",
+            cu_ctx.0, key, value
+        ));
         let ctx = if cu_ctx.0 != ptr::null_mut() {
             cu_ctx
         } else {
@@ -269,6 +1658,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         cu_ctx: CUcontext,
         key: *mut c_void,
     ) -> CUresult {
+        zluda_log_err(&format!(
+            "dark_api::context_local_storage_delete(ctx={:p}, key={:p})",
+            cu_ctx.0, key
+        ));
         let ctx = if cu_ctx.0 != ptr::null_mut() {
             cu_ctx
         } else {
@@ -289,9 +1682,28 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         cu_ctx: CUcontext,
         key: *mut c_void,
     ) -> CUresult {
+        zluda_log_err(&format!(
+            "dark_api::context_local_storage_get(ctx={:p}, key={:p})",
+            cu_ctx.0, key
+        ));
         let mut _ctx: CUcontext;
         if cu_ctx.0 == ptr::null_mut() {
             _ctx = context::get_current_context()?;
+            // 2026-06-03: surface the NULL-ctx fallback once per process.
+            // PhysX calls this 256+ times per run with ctx=0x0. If
+            // get_current_context() returns a stale CUcontext (e.g.
+            // a destroyed context still on the thread-local stack), the
+            // subsequent FromCuda::from_cuda dereferences it — possible
+            // host-side SIGSEGV source. One log line is enough to
+            // confirm/deny this is the bench-time path; suppress repeats.
+            static LOGGED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            LOGGED.get_or_init(|| {
+                zluda_log_err(&format!(
+                    "[ZLUDA] context_local_storage_get: NULL ctx fallback resolved to {:p} (subsequent NULL-ctx calls suppressed)",
+                    _ctx.0
+                ));
+                true
+            });
         } else {
             _ctx = cu_ctx
         };
@@ -307,11 +1719,30 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     }
 
     unsafe extern "system" fn ctx_create_v2_bypass(
-        _pctx: *mut cuda_types::cuda::CUcontext,
-        _flags: ::std::os::raw::c_uint,
-        _dev: cuda_types::cuda::CUdevice,
+        pctx: *mut cuda_types::cuda::CUcontext,
+        flags: ::std::os::raw::c_uint,
+        dev: cuda_types::cuda::CUdevice,
     ) -> cuda_types::cuda::CUresult {
-        Err(r#impl::unimplemented())
+        zluda_log(&format!(
+            "[ZLUDA] dark_api::ctx_create_v2_bypass(dev={}, flags={})",
+            dev, flags
+        ));
+        zluda_log_err(&format!(
+            "dark_api::ctx_create_v2_bypass(dev={}, flags={})",
+            dev, flags
+        ));
+        // PhysX uses this dark API to create a context without the normal
+        // overhead. Implement it the same as cuCtxCreate_v2.
+        let result = match pctx.as_mut() {
+            Some(pctx) => r#impl::context::create_v2(pctx, flags, dev),
+            None => Err(cuda_types::cuda::CUerror::INVALID_VALUE),
+        };
+        zluda_log(&format!(
+            "[ZLUDA] dark_api::ctx_create_v2_bypass -> {:?}",
+            result
+        ));
+        zluda_log_err(&format!("dark_api::ctx_create_v2_bypass -> {:?}", result));
+        result
     }
 
     unsafe extern "system" fn heap_alloc(
@@ -319,6 +1750,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _arg2: usize,
         _arg3: usize,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!(
+            "dark_api::heap_alloc(arg2=0x{:x}, arg3=0x{:x})",
+            _arg2, _arg3
+        ));
         Err(r#impl::unimplemented())
     }
 
@@ -326,6 +1761,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _heap_alloc_record_ptr: *const std::ffi::c_void,
         _arg2: *mut usize,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!(
+            "dark_api::heap_free(ptr={:p})",
+            _heap_alloc_record_ptr
+        ));
         Err(r#impl::unimplemented())
     }
 
@@ -335,6 +1774,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _unknown: std::ffi::c_int,
         _result: *mut [usize; 2],
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!(
+            "dark_api::device_get_attribute_ext(dev={}, attr={}, unknown={})",
+            _dev, _attribute, _unknown
+        ));
         Err(r#impl::unimplemented())
     }
 
@@ -342,6 +1785,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         _result: *mut std::ffi::c_uchar,
         _dev: cuda_types::cuda::CUdevice,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::device_get_something(dev={})", _dev));
         Err(r#impl::unimplemented())
     }
 
@@ -350,6 +1794,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         unix_seconds: u64,
         result: *mut [u64; 2],
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!(
+            "dark_api::integrity_check(version={}, unix_seconds={})",
+            version, unix_seconds
+        ));
         let current_process = std::process::id();
         let current_thread = os::current_thread();
 
@@ -382,11 +1830,13 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         result1: *mut u32,
         _result2: *mut *const std::ffi::c_void,
     ) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::context_check(ctx={:p})", _ctx_in.0));
         *result1 = 0;
         CUresult::SUCCESS
     }
 
     unsafe extern "system" fn check_fn3() -> u32 {
+        zluda_log_err("dark_api::check_fn3()");
         0
     }
 
@@ -398,6 +1848,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         let name = CStr::from_ptr(name)
             .to_str()
             .map_err(|_| CUerror::INVALID_VALUE)?;
+        zluda_log_err(&format!(
+            "dark_api::hybrid_runtime_load_get_proc_address(name='{}')",
+            name
+        ));
         if name != "nvcudart_hybrid64.dll" && name != "nvcudart_hybrid64a.dll" {
             return CUresult::ERROR_INVALID_VALUE;
         }
@@ -421,6 +1875,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     }
 
     unsafe extern "system" fn hybrid_runtime_free(token: usize) -> cuda_types::cuda::CUresult {
+        zluda_log_err(&format!("dark_api::hybrid_runtime_free(token={})", token));
         if token != 302100128 {
             return CUresult::ERROR_INVALID_HANDLE;
         }
@@ -428,6 +1883,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     }
 
     unsafe extern "system" fn load_compilers() -> cuda_types::cuda::CUresult {
+        zluda_log_err("dark_api::load_compilers()");
         CUresult::SUCCESS
     }
 }
@@ -566,19 +2022,52 @@ pub(crate) fn get_export_table(
     pp_export_table: &mut *const ::core::ffi::c_void,
     p_export_table_id: &CUuuid,
 ) -> CUresult {
+    let guid_str = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        p_export_table_id.bytes[0], p_export_table_id.bytes[1], p_export_table_id.bytes[2], p_export_table_id.bytes[3],
+        p_export_table_id.bytes[4], p_export_table_id.bytes[5],
+        p_export_table_id.bytes[6], p_export_table_id.bytes[7],
+        p_export_table_id.bytes[8], p_export_table_id.bytes[9],
+        p_export_table_id.bytes[10], p_export_table_id.bytes[11],
+        p_export_table_id.bytes[12], p_export_table_id.bytes[13],
+        p_export_table_id.bytes[14], p_export_table_id.bytes[15]);
     if let Some(table) = EXPORT_TABLE.get(p_export_table_id) {
         *pp_export_table = table.start();
+        zluda_log(&format!(
+            "[ZLUDA] cuGetExportTable({}) -> SUCCESS",
+            guid_str
+        ));
+        zluda_log_err(&format!("cuGetExportTable({}) -> SUCCESS", guid_str));
         cuda_types::cuda::CUresult::SUCCESS
     } else if let Some(table) = ZLUDA32_EXPORT_TABLE.get(p_export_table_id) {
         *pp_export_table = table.start();
         cuda_types::cuda::CUresult::SUCCESS
     } else {
+        zluda_log(&format!(
+            "[ZLUDA] cuGetExportTable({}) -> ERROR_INVALID_VALUE (unknown GUID!)",
+            guid_str
+        ));
+        zluda_log_err(&format!(
+            "cuGetExportTable({}) -> ERROR_INVALID_VALUE (unknown GUID!)",
+            guid_str
+        ));
         cuda_types::cuda::CUresult::ERROR_INVALID_VALUE
     }
 }
 
 pub(crate) fn get_version(version: &mut ::core::ffi::c_int) -> CUresult {
-    *version = cuda_types::cuda::CUDA_VERSION as i32;
+    // 2026-05-15 Plan v6 Step C-bis: env-override for CUDA version reporting.
+    // Default CUDA_VERSION=13000 is CUDA 13.0; PhysX-3.4 / APEX 1.4 (Batman: AK)
+    // was compiled against CUDA 8.0 era and may take wrong code paths when
+    // queried for a much-newer version. ZLUDA_CUDA_VERSION=8000 forces CUDA 8.0
+    // reporting for A/B testing.
+    static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let v = *OVERRIDE.get_or_init(|| {
+        std::env::var("ZLUDA_CUDA_VERSION")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+    });
+    *version = v.unwrap_or(cuda_types::cuda::CUDA_VERSION) as i32;
+    zluda_log(&format!("[ZLUDA] cuDriverGetVersion -> {}", *version));
     Ok(())
 }
 
@@ -604,6 +2093,27 @@ pub(crate) unsafe fn get_proc_address_v2(
         include!("../../../zluda_bindgen/src/process_table.rs")
     }
     let fn_ptr = raw_match(symbol.to_bytes(), flags, cuda_version);
+    let status_str = if fn_ptr as usize == 0 {
+        "NOT_FOUND"
+    } else if fn_ptr as usize == usize::MAX {
+        "VERSION_NOT_SUFFICIENT"
+    } else {
+        "FOUND"
+    };
+    zluda_log(&format!(
+        "[ZLUDA] cuGetProcAddress('{}', ver={}, flags={}) -> {:?}",
+        symbol.to_string_lossy(),
+        cuda_version,
+        flags,
+        status_str
+    ));
+    zluda_log_err(&format!(
+        "cuGetProcAddress('{}', ver={}, flags={}) -> {}",
+        symbol.to_string_lossy(),
+        cuda_version,
+        flags,
+        status_str
+    ));
     match fn_ptr as usize {
         0 => {
             if let Some(symbol_status) = symbol_status {
@@ -845,4 +2355,28 @@ mod tests {
         api.cuDevicePrimaryCtxRetain(&mut primary_ctx, 0);
         assert_eq!(dark_ctx.0, primary_ctx.0);
     }
+}
+
+// Forwarding functions for cuMipmappedArray* — the cuda_normalize_fn macro
+// routes these to driver:: because "mipmapped" is not in the MODULES list.
+pub(crate) unsafe fn mipmapped_array_create(
+    p_handle: &mut cuda_types::cuda::CUmipmappedArray,
+    p_mipmapped_array_desc: &cuda_types::cuda::CUDA_ARRAY3D_DESCRIPTOR,
+    num_mipmap_levels: u32,
+) -> cuda_types::cuda::CUresult {
+    super::array::mipmapped_create(p_handle, p_mipmapped_array_desc, num_mipmap_levels)
+}
+
+pub(crate) unsafe fn mipmapped_array_destroy(
+    h_mipmapped_array: cuda_types::cuda::CUmipmappedArray,
+) -> cuda_types::cuda::CUresult {
+    super::array::mipmapped_destroy(h_mipmapped_array)
+}
+
+pub(crate) unsafe fn mipmapped_array_get_level(
+    p_level_array: &mut cuda_types::cuda::CUarray,
+    h_mipmapped_array: cuda_types::cuda::CUmipmappedArray,
+    level: u32,
+) -> cuda_types::cuda::CUresult {
+    super::array::mipmapped_get_level(p_level_array, h_mipmapped_array, level)
 }
