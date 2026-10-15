@@ -2734,7 +2734,7 @@ fn get_cache_key<'a, 'b>(
     let serialized_attributes = serde_json::to_string(&(attributes, compiler_options)).ok()?;
     Some(zluda_cache::ModuleKey {
         hash: blake3::hash(text.as_bytes()).to_hex(),
-        compiler_version: "builtin",
+        compiler_version: "builtin-llvm-d61363c5",
         zluda_version: env!("VERGEN_GIT_SHA"),
         device: isa,
         backend_key: serialized_attributes,
