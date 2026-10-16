@@ -230,8 +230,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         // Kernels without .maxntid/.reqntid get no amdgpu-flat-work-group-size,
         // causing LLVM to assume a small default. Default to 1024 (CUDA max) so
         // that any legal CUDA launch succeeds — LLVM will spill to scratch if
-        // VGPR pressure is too high, which is slower but correct. This matches
-        // NVIDIA behavior where .maxntid is a hint, not an enforced limit.
+        // VGPR pressure is too high, which is slower but correct. Explicit
+        // .maxntid and .reqntid declarations are handled by emit_tuning.
         if method.is_kernel() {
             let has_workgroup_size = method.tuning.iter().any(|t| {
                 matches!(
@@ -534,14 +534,9 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 // Not really applicable
                 ptx_parser::TuningDirective::MaxNReg(_) => {}
                 ptx_parser::TuningDirective::MaxNtid(x, y, z) => {
-                    // On NVIDIA, .maxntid is a register-allocation hint, NOT an
-                    // enforced launch limit — the driver never rejects a launch
-                    // that exceeds it. Always use 1024 as the upper bound so
-                    // any legal CUDA launch succeeds (e.g. CUB RadixSort
-                    // declares .maxntid 512 but launches with 1024 threads).
-                    // LLVM will allocate VGPRs for 1024 threads and spill to
-                    // scratch if pressure is too high.
-                    let size = (x * y * z).max(1024);
+                    // Honor the PTX launch bound so LLVM can allocate registers
+                    // for the declared workgroup rather than an invented 1024.
+                    let size = x * y * z;
                     let value = format!("1,{size}");
                     self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
                 }
@@ -564,13 +559,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
     }
 
     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
-        // Always enable +precise-memory. Without it, the AMDGPU backend's machine
-        // scheduler and register allocator can reorder/drop instructions across
-        // memory operations. This causes CUB RadixSort's Downsweep kernel to lose
-        // the XOR 0x80000000 flip-back on tail tile stores, producing corrupt sort
-        // output (bit 31 stuck) that crashes PhysX via signed index sign-extension.
-        // See: LLVM #131386, Codeplay's GROMACS regalloc analysis.
-        // Performance impact: adds s_waitcnt after every memory op (~5-10% slower).
+        // FluidMark faults with this feature disabled on the reduced LLVM tree.
+        // Keep it unconditional; the diagnostic environment switch is retired.
         let value = "+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory";
         self.emit_fn_attribute_string(fn_, "target-features", value)
     }

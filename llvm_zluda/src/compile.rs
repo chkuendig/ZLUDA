@@ -368,9 +368,8 @@ fn init_globals() -> Result<(), String> {
                         &*Box::leak(cs.into_boxed_c_str())
                     })
                     .collect(),
-                // Default: the AMDGPU zero-VGPR prolog stays off, as in the
-                // configuration validated in games.
-                _ => vec![c"-amdgpu-zero-vgpr-prolog=false"],
+                // The minimal LLVM trial has no historical zero-VGPR pass.
+                _ => vec![],
             };
             let llvm_args_ptrs: Vec<*const i8> = common_options
                 //.chain(opt_options)

@@ -72,13 +72,6 @@ use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 /// (BB10_184, rd305 guard, target BB10_186) and IOFX_bboxSyncKernel
 /// (BB9_146, rd540 guard, target BB9_148).
 pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
-    // 2026-04-28: env-gated for retirement testing on zluda-physx-clean.
-    // Set ZLUDA_IOFX_BBOX_GUARD=0 to disable. If smoke + game stability
-    // unaffected, the patch can be deleted entirely.
-    let env_off = std::env::var("ZLUDA_IOFX_BBOX_GUARD").map_or(false, |v| v == "0");
-    if env_off {
-        return None;
-    }
     if !ptx.contains("IOFX_bbox") {
         return None;
     }
@@ -195,371 +188,6 @@ pub fn patch_iofx_bbox_tail_merge(ptx: &str) -> Option<String> {
         ));
         Some(out)
     }
-}
-
-/// 2026-06-15 Class-4 bit31 SAFETY GUARD on the IOFX_bbox wild store.
-///
-/// Measured root cause (fault-VA correlation): IOFX_bboxKernel does
-/// `mul.wide.u32 %rdX, %rY, 16; add.s64 %rdA,<out>,%rdX; st.global.v4.f32 [%rdA],…`
-/// where %rY (= sWarpLastActorID[tid], unguarded `setp.ne -1` site) holds a
-/// GARBAGE bit31-set value (a float bit-pattern ~0xC0000000 read as a u32 index)
-/// for some lane → index*16 ≈ 48GB → page-not-present wild store = the Class-4
-/// SIGABRT (last kernel IOFX_bboxKernel; fault VA ~48GB above every allocation).
-///
-/// A store index with bit31 set is UNAMBIGUOUSLY ILLEGAL (valid actor indices are
-/// small), so skipping that store is a SAFETY fix, not value-mutation (sanctioned
-/// by CLAUDE.md for the radix bit31 case). For each `mul.wide.u32 %rdX,%rY,16`
-/// that feeds a `st.global` (a WRITE), inject before it a bit31 check that, when
-/// set, branches PAST the store to the next basic-block boundary. The check lives
-/// in a nested `{ .reg … }` block so no function-scope register renumbering is
-/// needed. Gate: ZLUDA_BBOX_BIT31_GUARD=0.
-pub fn patch_iofx_bbox_bit31_guard(ptx: &str) -> Option<String> {
-    if std::env::var("ZLUDA_BBOX_BIT31_GUARD").map_or(false, |v| v == "0") {
-        return None;
-    }
-    if !ptx.contains("IOFX_bbox") {
-        return None;
-    }
-    let lines: Vec<&str> = ptx.lines().collect();
-    let mut out = String::with_capacity(ptx.len() + 2048);
-    let mut in_bbox = false;
-    let mut depth: i32 = 0;
-    let mut uid = 0usize;
-    let mut count = 0usize;
-    let mut i = 0usize;
-    while i < lines.len() {
-        let t = lines[i].trim_start();
-        if t.starts_with(".visible .entry IOFX_bbox") || t.starts_with(".entry IOFX_bbox") {
-            in_bbox = true;
-            depth = 0;
-        }
-        // Detect `mul.wide.u32 %rdX, %rY, 16;` that feeds a st.global within the BB.
-        let guard_target: Option<(String, String)> = if in_bbox && depth >= 1 {
-            parse_mul_wide_by_16(t).and_then(|(_rd, ry)| {
-                // Look ahead (until a label / unconditional bra) for a st.global
-                // (a WRITE), and capture the skip target (first label, or the
-                // target of the first unconditional bra).
-                let mut feeds_store = false;
-                let mut skip: Option<String> = None;
-                let mut k = i + 1;
-                while k < lines.len() && k <= i + 30 {
-                    let l = lines[k].trim_start();
-                    if let Some(lbl) = l.strip_suffix(':') {
-                        if !lbl.contains(char::is_whitespace) {
-                            skip = Some(lbl.to_string());
-                            break;
-                        }
-                    }
-                    if l.starts_with("st.global") {
-                        feeds_store = true;
-                    }
-                    if l.starts_with("bra.uni ") {
-                        skip = Some(l["bra.uni ".len()..].trim_end_matches(';').to_string());
-                        break;
-                    }
-                    k += 1;
-                }
-                if feeds_store {
-                    skip.map(|s| (ry, s))
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
-        if let Some((ry, skip)) = guard_target {
-            out.push_str(&format!(
-                "{{\n.reg .b32 %rbg{u};\n.reg .pred %pbg{u};\nand.b32 %rbg{u}, %{ry}, -2147483648;\nsetp.ne.s32 %pbg{u}, %rbg{u}, 0;\n@%pbg{u} bra {skip};\n}}\n",
-                u = uid, ry = ry, skip = skip
-            ));
-            uid += 1;
-            count += 1;
-        }
-        out.push_str(lines[i]);
-        out.push('\n');
-        if in_bbox {
-            for c in lines[i].chars() {
-                if c == '{' {
-                    depth += 1;
-                } else if c == '}' {
-                    depth -= 1;
-                    if depth <= 0 {
-                        in_bbox = false;
-                        break;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    if count == 0 {
-        return None;
-    }
-    super::driver::zluda_log_err(&format!(
-        "[ZLUDA] patch_iofx_bbox_bit31_guard: guarded {} bbox wild-store site(s)",
-        count
-    ));
-    Some(out)
-}
-
-/// Parse `mul.wide.u32 %rdX, %rY, 16;` → (rdX-without-%, rY-without-%).
-fn parse_mul_wide_by_16(t: &str) -> Option<(String, String)> {
-    let rest = t.strip_prefix("mul.wide.u32 ")?.trim_end_matches(';');
-    let mut p = rest.split(',').map(|s| s.trim());
-    let rd = p.next()?.strip_prefix('%')?;
-    let ry = p.next()?.strip_prefix('%')?;
-    if p.next()? != "16" || p.next().is_some() {
-        return None;
-    }
-    Some((rd.to_string(), ry.to_string()))
-}
-
-/// 2026-06-09 MS_4 underflow guard — surgical fix for the Class A wild-VA
-/// scatter Bug at the root.
-///
-/// Background (see `project_class_a_is_genuine_physx_bug_2026_06_09.md` and the
-/// large comment block at `function.rs:12780`): Batman: Arkham Knight's PhysX
-/// 3.3 (Rocksteady-customized) ships a `CreateParticleShapesIncremental_MultiStage_4`
-/// kernel with this scatter pattern:
-///
-/// ```ptx
-/// atom.global.add.u32 %r8, [%rd19], -1;   // decrement counter, r8 = OLD value
-/// add.s32 %r9, %r7, %r8;                  // r9 = first_slot + old_counter
-/// add.s32 %r10, %r9, -1;                  // r10 = first_slot + old_counter - 1
-/// mul.wide.u32 %rd20, %r10, 4;            // ZERO-EXTEND to 64-bit
-/// add.s64 %rd21, %rd10, %rd20;
-/// st.global.u32 [%rd21], %r1;             // OUTPUT[r10 * 4] = thread_id
-/// ```
-///
-/// When the host launches MS_4 with `n_threads` greater than the actual number of
-/// active particles (which Batman:AK does because APEX 1.4 bypasses PhysX's
-/// `RemoveParticleShapes` API → `removed_count` never decrements → PhysX C++
-/// computes `n_threads = active_count - removed_count = active_count` = full
-/// 65000-particle ceiling), the over-dispatched threads underflow the counter:
-///
-///   - First over-dispatch: atom returns 0, decrements counter to 0xFFFFFFFF.
-///     r10 = first_slot - 1. If first_slot=0, r10 = -1 = 0xFFFFFFFF as u32.
-///     mul.wide.u32 zero-extends to 0x3FFFFFFFC ≈ +16 GiB.
-///     OUTPUT + 16 GiB = wild scatter into unmapped pages → SIGABRT.
-///   - Subsequent over-dispatches: atom returns 0xFFFFFFFF and decrements
-///     further. r10 wraps further negative; same wild scatter.
-///
-/// The bug also fires on NVIDIA driver ≥ 461.09; pre-460 drivers placed the +16 GiB
-/// target in benign unmapped memory (graceful kernel-side fault). Steam Community
-/// Guide 2433732129 documents the NVIDIA workaround (downgrade to 456.55).
-///
-/// **Fix**: insert a `setp.lt.s32; @%p_new bra <ret_label>` immediately before the
-/// `mul.wide.u32` to short-circuit the wild store when r10 has gone negative.
-/// Cost: 1 setp + 1 conditional bra per MS_4 thread.
-///
-/// Pattern match:
-/// ```text
-///   add.s32 %r<X>, %r<Y>, -1;
-///   mul.wide.u32 %rd<Z>, %r<X>, 4;
-///   add.s64 %rd<W>, %rd<V>, %rd<Z>;
-///   st.global.u32 [%rd<W>], %r<U>;
-/// ```
-/// Where the same `%r<X>` is used in the add and mul. Followed by a `BB<n>_<m>:`
-/// label and `ret;` (the kernel's natural exit). The bra target is that ret label.
-///
-/// Env-gate: `ZLUDA_MS4_UNDERFLOW_GUARD=0` to disable.
-///
-/// Only matches inside `CreateParticleShapesIncremental_MultiStage_4` (or in tests,
-/// any kernel containing that name substring) to avoid touching unrelated kernels.
-pub fn patch_ms4_underflow_guard(ptx: &str) -> Option<String> {
-    let env_off = std::env::var("ZLUDA_MS4_UNDERFLOW_GUARD").map_or(false, |v| v == "0");
-    if env_off {
-        return None;
-    }
-    if !ptx.contains("CreateParticleShapesIncremental_MultiStage_4") {
-        return None;
-    }
-    let lines: Vec<&str> = ptx.lines().collect();
-    let mut out = String::with_capacity(ptx.len() + 1024);
-    let mut in_ms4_kernel = false;
-    let mut brace_depth: i32 = 0;
-    let mut patch_count = 0usize;
-    let mut guard_uid: usize = 0;
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim_start();
-        // Enter MS_4 kernel
-        if trimmed.starts_with(".visible .entry CreateParticleShapesIncremental_MultiStage_4")
-            || trimmed.starts_with(".entry CreateParticleShapesIncremental_MultiStage_4")
-        {
-            in_ms4_kernel = true;
-            brace_depth = 0;
-        }
-        if in_ms4_kernel {
-            for c in line.chars() {
-                if c == '{' {
-                    brace_depth += 1;
-                } else if c == '}' {
-                    brace_depth -= 1;
-                    if brace_depth <= 0 {
-                        in_ms4_kernel = false;
-                        break;
-                    }
-                }
-            }
-        }
-        // Match the 4-line scatter pattern. We're at the `add.s32 r<X>, r<Y>, -1` line.
-        if in_ms4_kernel && brace_depth >= 1 && i + 3 < lines.len() {
-            let l0 = lines[i].trim_start();
-            let l1 = lines[i + 1].trim_start();
-            let l2 = lines[i + 2].trim_start();
-            let l3 = lines[i + 3].trim_start();
-            if let Some(r_underflow) = match_ms4_scatter_pattern(l0, l1, l2, l3) {
-                // Find the bra target: the next `BB<n>_<m>:` label inside this
-                // kernel that is immediately followed by `ret;`. The canonical
-                // PTX from /tmp/zluda_ptx_dump/module_3.ptx places this right
-                // after the store.
-                let bra_target = find_kernel_ret_label(&lines, i + 4).unwrap_or_default();
-                if !bra_target.is_empty() {
-                    // Emit the original `add.s32` line as-is.
-                    out.push_str(lines[i]);
-                    out.push('\n');
-                    // Emit our guard BEFORE the mul.wide.u32.
-                    emit_ms4_underflow_guard(&mut out, &r_underflow, &bra_target, guard_uid);
-                    guard_uid += 1;
-                    // Emit the remaining 3 lines (mul, add, st) as-is.
-                    out.push_str(lines[i + 1]);
-                    out.push('\n');
-                    out.push_str(lines[i + 2]);
-                    out.push('\n');
-                    out.push_str(lines[i + 3]);
-                    out.push('\n');
-                    i += 4;
-                    patch_count += 1;
-                    continue;
-                }
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-        i += 1;
-    }
-    if patch_count == 0 {
-        None
-    } else {
-        super::driver::zluda_log_err(&format!(
-            "[ZLUDA] patch_ms4_underflow_guard: applied {} guard(s)",
-            patch_count
-        ));
-        Some(out)
-    }
-}
-
-/// Match the 4-line MS_4 wild-scatter pattern. Returns the underflow-prone
-/// register name (e.g. `%r10`) on match.
-///
-/// Lines must be:
-///   l0: `add.s32 %r<X>, %r<Y>, -1;`
-///   l1: `mul.wide.u32 %rd<Z>, %r<X>, 4;`
-///   l2: `add.s64 %rd<W>, %rd<V>, %rd<Z>;`
-///   l3: `st.global.u32 [%rd<W>], %r<U>;`
-///
-/// The same `%r<X>` must appear in l0 and l1. l3's `[%rd<W>]` must match l2's
-/// destination `%rd<W>`.
-fn match_ms4_scatter_pattern(l0: &str, l1: &str, l2: &str, l3: &str) -> Option<String> {
-    let l0 = l0.trim_end_matches(';').trim();
-    let l1 = l1.trim_end_matches(';').trim();
-    let l2 = l2.trim_end_matches(';').trim();
-    let l3 = l3.trim_end_matches(';').trim();
-    // l0: add.s32 %rX, %rY, -1
-    let l0_rest = l0.strip_prefix("add.s32")?.trim();
-    let mut parts = l0_rest.split(',').map(str::trim);
-    let r_x = parts.next()?;
-    let _r_y = parts.next()?;
-    let neg_one = parts.next()?;
-    if neg_one != "-1" {
-        return None;
-    }
-    if !r_x.starts_with('%') {
-        return None;
-    }
-    // l1: mul.wide.u32 %rdZ, %rX, 4  (must use same %rX as l0)
-    let l1_rest = l1.strip_prefix("mul.wide.u32")?.trim();
-    let mut parts = l1_rest.split(',').map(str::trim);
-    let rd_z = parts.next()?;
-    let r_x2 = parts.next()?;
-    let four = parts.next()?;
-    if r_x2 != r_x || four != "4" {
-        return None;
-    }
-    if !rd_z.starts_with('%') {
-        return None;
-    }
-    // l2: add.s64 %rdW, %rdV, %rdZ  (must use same %rdZ as l1)
-    let l2_rest = l2.strip_prefix("add.s64")?.trim();
-    let mut parts = l2_rest.split(',').map(str::trim);
-    let rd_w = parts.next()?;
-    let _rd_v = parts.next()?;
-    let rd_z2 = parts.next()?;
-    if rd_z2 != rd_z {
-        return None;
-    }
-    if !rd_w.starts_with('%') {
-        return None;
-    }
-    // l3: st.global.u32 [%rdW], %rU  (must reference %rdW from l2)
-    if !l3.starts_with("st.global.u32") {
-        return None;
-    }
-    let bracket_form = format!("[{}]", rd_w);
-    if !l3.contains(&bracket_form) {
-        return None;
-    }
-    Some(r_x.to_string())
-}
-
-/// Find the kernel's natural ret label by scanning forward from `start_idx`
-/// within the current kernel body. We're looking for:
-///   `BB<n>_<m>:` followed by `ret;` (possibly with `.loc` directives between).
-fn find_kernel_ret_label(lines: &[&str], start_idx: usize) -> Option<String> {
-    let mut i = start_idx;
-    while i < lines.len() {
-        let trimmed = lines[i].trim_start();
-        // Match BB<n>_<m>: label
-        if is_bb_label(trimmed) {
-            // Scan ahead a few lines to verify `ret;` is reachable
-            let label = trimmed.trim_end_matches(':').to_string();
-            for j in (i + 1)..(i + 6).min(lines.len()) {
-                let t = lines[j].trim();
-                if t == "ret;" {
-                    return Some(label);
-                }
-                // Skip .loc directives and empty lines
-                if t.is_empty() || t.starts_with(".loc") {
-                    continue;
-                }
-                break;
-            }
-        }
-        // Stop if we hit end-of-kernel
-        if trimmed.starts_with('}') {
-            return None;
-        }
-        i += 1;
-    }
-    None
-}
-
-fn emit_ms4_underflow_guard(out: &mut String, r_underflow: &str, ret_label: &str, uid: usize) {
-    out.push_str("// ZLUDA MS_4 underflow guard\n");
-    out.push_str("{\n");
-    out.push_str(&format!(".reg .pred %p_ms4_uf_{};\n", uid));
-    out.push_str(&format!(
-        "setp.lt.s32 %p_ms4_uf_{}, {}, 0;\n",
-        uid, r_underflow
-    ));
-    out.push_str(&format!(
-        "@%p_ms4_uf_{} bra {};\n",
-        uid, ret_label
-    ));
-    out.push_str("}\n");
 }
 
 fn emit_lane0_guard(out: &mut String, target_label: &str, uid: usize) {
@@ -2365,16 +1993,10 @@ fn get_best_ptx_and_compile(
                         Some(patched) => Cow::Owned(patched),
                         None => Cow::Borrowed(ptx),
                     };
-                    // 2026-06-15 Class-4 bit31 safety guard on the bbox wild store.
-                    let after_bbox_b31: Cow<str> =
-                        match patch_iofx_bbox_bit31_guard(after_bbox.as_ref()) {
+                    let after_volatile: Cow<str> =
+                        match patch_broad_volatile_lds(after_bbox.as_ref()) {
                             Some(p) => Cow::Owned(p),
                             None => after_bbox,
-                        };
-                    let after_volatile: Cow<str> =
-                        match patch_broad_volatile_lds(after_bbox_b31.as_ref()) {
-                            Some(p) => Cow::Owned(p),
-                            None => after_bbox_b31,
                         };
                     let after_membar: Cow<str> =
                         match patch_broad_membar_before_bar_sync(after_volatile.as_ref()) {
@@ -2407,18 +2029,12 @@ fn get_best_ptx_and_compile(
                             Some(p) => Cow::Owned(p),
                             None => after_scan_branchless,
                         };
-                    // 2026-06-09 MS_4 underflow guard (default ON, env-gated).
-                    let after_ms4: Cow<str> =
-                        match patch_ms4_underflow_guard(after_prod.as_ref()) {
-                            Some(p) => Cow::Owned(p),
-                            None => after_prod,
-                        };
                     // v11: MS_1 gate-trace instrumentation (env-gated).
                     let trace_dev_ptr = super::function::ms1_gate_trace_get_or_init_dev_ptr();
                     let final_ptx: Cow<str> =
-                        match patch_ms1_gate_trace(after_ms4.as_ref(), trace_dev_ptr) {
+                        match patch_ms1_gate_trace(after_prod.as_ref(), trace_dev_ptr) {
                             Some(p) => Cow::Owned(p),
-                            None => after_ms4,
+                            None => after_prod,
                         };
                     ptx_modules.push(final_ptx);
                 }
@@ -2462,16 +2078,10 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => text,
                                         };
-                                    // 2026-06-15 Class-4 bit31 safety guard.
-                                    let after_bbox_b31: Cow<str> =
-                                        match patch_iofx_bbox_bit31_guard(after_bbox.as_ref()) {
+                                    let after_volatile: Cow<str> =
+                                        match patch_broad_volatile_lds(after_bbox.as_ref()) {
                                             Some(p) => Cow::Owned(p),
                                             None => after_bbox,
-                                        };
-                                    let after_volatile: Cow<str> =
-                                        match patch_broad_volatile_lds(after_bbox_b31.as_ref()) {
-                                            Some(p) => Cow::Owned(p),
-                                            None => after_bbox_b31,
                                         };
                                     let after_membar: Cow<str> =
                                         match patch_broad_membar_before_bar_sync(
@@ -2507,21 +2117,15 @@ fn get_best_ptx_and_compile(
                                             Some(p) => Cow::Owned(p),
                                             None => after_scan_branchless,
                                         };
-                                    // 2026-06-09 MS_4 underflow guard.
-                                    let after_ms4: Cow<str> =
-                                        match patch_ms4_underflow_guard(after_prod.as_ref()) {
-                                            Some(p) => Cow::Owned(p),
-                                            None => after_prod,
-                                        };
                                     // v11: MS_1 gate-trace instrumentation.
                                     let trace_dev_ptr =
                                         super::function::ms1_gate_trace_get_or_init_dev_ptr();
                                     let final_ptx: Cow<str> = match patch_ms1_gate_trace(
-                                        after_ms4.as_ref(),
+                                        after_prod.as_ref(),
                                         trace_dev_ptr,
                                     ) {
                                         Some(p) => Cow::Owned(p),
-                                        None => after_ms4,
+                                        None => after_prod,
                                     };
                                     ptx_modules.push(final_ptx);
                                 }
@@ -2734,7 +2338,7 @@ fn get_cache_key<'a, 'b>(
     let serialized_attributes = serde_json::to_string(&(attributes, compiler_options)).ok()?;
     Some(zluda_cache::ModuleKey {
         hash: blake3::hash(text.as_bytes()).to_hex(),
-        compiler_version: "builtin-llvm-9d31add0",
+        compiler_version: "builtin-llvm-f17a36e4",
         zluda_version: env!("VERGEN_GIT_SHA"),
         device: isa,
         backend_key: serialized_attributes,
@@ -3302,49 +2906,7 @@ mod patch_tests {
         assert!(patch_iofx_bbox_tail_merge(ptx).is_none());
     }
 
-    #[test]
-    fn bbox_bit31_guard_injects_and_parses() {
-        std::env::remove_var("ZLUDA_BBOX_BIT31_GUARD");
-        let ptx = "\
-.version 7.0
-.target sm_50
-.address_size 64
-.visible .entry IOFX_bboxKernel()
-{
-.reg .b32 %r<8>;
-.reg .f32 %f<8>;
-.reg .b64 %rd<8>;
-mov.u32 %r1, %tid.x;
-BB_W:
-mul.wide.u32 %rd1, %r22, 16;
-add.s64 %rd2, %rd5, %rd1;
-st.global.v4.f32 [%rd2], {%f1, %f2, %f3, %f4};
-BB_NEXT:
-ret;
-}
-";
-        let out = patch_iofx_bbox_bit31_guard(ptx).expect("bbox write should be guarded");
-        assert!(out.contains("and.b32 %rbg0, %r22, -2147483648;"), "bit31 mask missing:\n{}", out);
-        assert!(out.contains("@%pbg0 bra BB_NEXT;"), "guard branch to next BB missing:\n{}", out);
-        // guard must be BEFORE the mul.wide store-index computation.
-        assert!(out.find("@%pbg0 bra BB_NEXT;").unwrap() < out.find("mul.wide.u32 %rd1, %r22, 16;").unwrap());
-        ptx_parser::parse_module_checked(&out).expect("guarded bbox PTX must parse");
-        std::env::set_var("ZLUDA_BBOX_BIT31_GUARD", "0");
-        assert!(patch_iofx_bbox_bit31_guard(ptx).is_none(), "gate ignored");
-        std::env::remove_var("ZLUDA_BBOX_BIT31_GUARD");
-    }
 
-    #[test]
-    #[ignore = "reads run_archives/classb_2026_06_14/bbox_module.ptx — verifies the real bbox kernel guards + parses"]
-    fn bbox_bit31_guard_on_real_module_parses() {
-        std::env::remove_var("ZLUDA_BBOX_BIT31_GUARD");
-        let src = std::fs::read_to_string("../../run_archives/classb_2026_06_14/bbox_module.ptx")
-            .expect("bbox_module.ptx present");
-        let out = patch_iofx_bbox_bit31_guard(&src).expect("real bbox module should be guarded");
-        ptx_parser::parse_module_checked(&out).expect("guarded real bbox module must parse");
-        let n = out.matches("and.b32 %rbg").count();
-        eprintln!("real bbox module guarded {} store sites + parsed OK", n);
-    }
 
 
     #[test]
@@ -3562,121 +3124,11 @@ ret;
     // 2026-06-09 MS_4 underflow guard tests
     // ----------------------------------------------------------------
 
-    #[test]
-    fn ms4_patch_skips_non_ms4_ptx() {
-        let ptx = "// not MS_4\n.visible .entry foo() { ret; }\n";
-        assert!(patch_ms4_underflow_guard(ptx).is_none());
-    }
 
-    #[test]
-    fn ms4_patch_skips_ms4_without_scatter_pattern() {
-        // Has the kernel name but lacks the 4-line scatter pattern.
-        let ptx = r#"
-.visible .entry CreateParticleShapesIncremental_MultiStage_4() {
-.reg .pred %p<3>;
-.reg .s32 %r<10>;
-BB13_3:
-ret;
-}
-"#;
-        assert!(patch_ms4_underflow_guard(ptx).is_none());
-    }
 
-    #[test]
-    fn ms4_patch_inserts_underflow_guard_canonical_pattern() {
-        // Verbatim shape of the PTX dump (BB13_3 = ret label).
-        let ptx = r#"
-.visible .entry CreateParticleShapesIncremental_MultiStage_4() {
-.reg .pred %p<3>;
-.reg .s32 %r<11>;
-.reg .s64 %rd<22>;
-atom.global.add.u32 %r8, [%rd19], -1;
-add.s32 %r9, %r7, %r8;
-add.s32 %r10, %r9, -1;
-mul.wide.u32 %rd20, %r10, 4;
-add.s64 %rd21, %rd10, %rd20;
-st.global.u32 [%rd21], %r1;
 
-BB13_3:
-.loc 4 1071 2
-ret;
-}
-"#;
-        let patched =
-            patch_ms4_underflow_guard(ptx).expect("MS_4 underflow guard should patch canonical");
-        // setp.lt.s32 should appear, guarding %r10 against negative
-        assert!(
-            patched.contains("setp.lt.s32 %p_ms4_uf_0, %r10, 0"),
-            "missing setp.lt:\n{}",
-            patched
-        );
-        // bra should target BB13_3 (the kernel's ret label)
-        assert!(
-            patched.contains("@%p_ms4_uf_0 bra BB13_3"),
-            "missing bra to BB13_3:\n{}",
-            patched
-        );
-        // Original mul.wide.u32 must still be present (not stripped)
-        assert!(
-            patched.contains("mul.wide.u32 %rd20, %r10, 4"),
-            "mul.wide.u32 was stripped:\n{}",
-            patched
-        );
-        // Guard must be BEFORE the mul.wide.u32 line
-        let guard_pos = patched.find("setp.lt.s32 %p_ms4_uf_0").unwrap();
-        let mul_pos = patched.find("mul.wide.u32 %rd20").unwrap();
-        assert!(guard_pos < mul_pos, "guard not before mul:\n{}", patched);
-    }
 
-    #[test]
-    fn ms4_patch_skips_when_register_mismatch() {
-        // %r10 in add, but mul.wide uses %r11 — must NOT patch.
-        let ptx = r#"
-.visible .entry CreateParticleShapesIncremental_MultiStage_4() {
-add.s32 %r10, %r9, -1;
-mul.wide.u32 %rd20, %r11, 4;
-add.s64 %rd21, %rd10, %rd20;
-st.global.u32 [%rd21], %r1;
-BB13_3:
-ret;
-}
-"#;
-        assert!(patch_ms4_underflow_guard(ptx).is_none());
-    }
 
-    #[test]
-    fn ms4_patch_skips_when_addend_not_minus_one() {
-        // add.s32 with +1 instead of -1 — not the underflow pattern.
-        let ptx = r#"
-.visible .entry CreateParticleShapesIncremental_MultiStage_4() {
-add.s32 %r10, %r9, 1;
-mul.wide.u32 %rd20, %r10, 4;
-add.s64 %rd21, %rd10, %rd20;
-st.global.u32 [%rd21], %r1;
-BB13_3:
-ret;
-}
-"#;
-        assert!(patch_ms4_underflow_guard(ptx).is_none());
-    }
-
-    #[test]
-    fn ms4_patch_respects_env_off_switch() {
-        std::env::set_var("ZLUDA_MS4_UNDERFLOW_GUARD", "0");
-        let ptx = r#"
-.visible .entry CreateParticleShapesIncremental_MultiStage_4() {
-add.s32 %r10, %r9, -1;
-mul.wide.u32 %rd20, %r10, 4;
-add.s64 %rd21, %rd10, %rd20;
-st.global.u32 [%rd21], %r1;
-BB13_3:
-ret;
-}
-"#;
-        let result = patch_ms4_underflow_guard(ptx);
-        std::env::remove_var("ZLUDA_MS4_UNDERFLOW_GUARD");
-        assert!(result.is_none(), "should skip when env=0");
-    }
 
     // ----------------------------------------------------------------
     // 2026-06-03 Step 2: SimpleMemset AST detector tests
@@ -3877,7 +3329,6 @@ ret;
         stage!("scan_kernel_reader_acquire", patch_scan_kernel_reader_acquire);
         stage!("divergent_lds_merge_sync", patch_divergent_lds_merge_sync);
         stage!("lds_producer_volatile_store", patch_lds_producer_volatile_store);
-        stage!("ms4_underflow_guard", patch_ms4_underflow_guard);
         std::fs::write("/tmp/iofx_radixsort_patched.ptx", text.as_ref()).unwrap();
         eprintln!(
             "wrote {} bytes (was {} bytes) to /tmp/iofx_radixsort_patched.ptx; stages fired: {:?}",

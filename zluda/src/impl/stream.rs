@@ -12,56 +12,6 @@ use std::sync::Mutex;
 // Distinct CUDA contexts on one HIP device already share that queue; context
 // isolation requires a separate context/stream mapping change.
 
-/// Historical cross-kernel visibility workaround ("Bug A") — default ON.
-///
-/// Historical cross-stream visibility workaround: inject a small async D2D copy
-/// at event handoffs. Earlier game runs improved with it, but it is not an
-/// unconditional SYSTEM fence. In pinned ROCclr 7.2.4, copyBuffer requests
-/// SYSTEM scope only for particular source-memory properties or synchronous
-/// copies; the selected copy path also matters (rocblit.cpp).
-///
-/// Concurrent native fixtures reproduced stale values even with this injection.
-/// driver::init now defaults AMD_OPT_FLUSH=0 before HIP initialization to request
-/// SYSTEM acquire/release dispatch headers directly. Explicit AMD_OPT_FLUSH=0
-/// runs passed on Deck/gfx1030; this does not identify a game's faulting operation.
-///
-/// Retain the existing injection separately from the runtime-default correction.
-/// Default ON; ZLUDA_XKERNEL_SYSTEM_SCOPE=0 disables it for diagnostics.
-fn xkernel_system_scope_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ZLUDA_XKERNEL_SYSTEM_SCOPE").map_or(true, |v| v != "0")
-    })
-}
-
-/// Lazily-allocated 8-byte device scratch for the historical handoff copy.
-/// Stored as usize so the OnceLock is Send+Sync.
-fn system_scope_scratch() -> Option<hipDeviceptr_t> {
-    static SCRATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let p = *SCRATCH.get_or_init(|| {
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        if unsafe { hipMalloc(&mut ptr, 8) }.is_ok() {
-            ptr as usize
-        } else {
-            0
-        }
-    });
-    (p != 0).then(|| hipDeviceptr_t(p as *mut std::ffi::c_void))
-}
-
-/// Inject the historical 4-byte D2D handoff copy. Its fence-scope effect depends
-/// on ROCclr's copy path and memory properties; it is not a guaranteed fence.
-/// Active by default; no-op if `ZLUDA_XKERNEL_SYSTEM_SCOPE=0`. See `xkernel_system_scope_enabled`.
-pub(crate) fn force_system_scope(stream: hipStream_t) {
-    if !xkernel_system_scope_enabled() {
-        return;
-    }
-    if let Some(scratch) = system_scope_scratch() {
-        let dst = hipDeviceptr_t((scratch.0 as usize + 4) as *mut std::ffi::c_void);
-        let _ = unsafe { hipMemcpyDtoDAsync(dst, scratch, 4, stream) };
-    }
-}
-
 /// Resolve stream zero for the implemented CUDA _ptsz entry points.
 /// Explicit legacy (1), per-thread (2) and user-created handles are preserved.
 /// HIP's headers define hipStreamPerThread as the same pointer sentinel (2).
@@ -366,9 +316,6 @@ pub(crate) fn wait_event(
         "cuStreamWaitEvent(stream={:?}, event={:?}, flags={:#x}) -> {:?}",
         stream, event, flags, result
     ));
-    // Preserve the historical consumer-side handoff injection. Its scope
-    // effect is conditional; see xkernel_system_scope_enabled above.
-    force_system_scope(stream);
     result
 }
 

@@ -142,61 +142,8 @@ fn texref_log_enabled() -> bool {
 /// a texref binding (hipTexRefSetAddress / hipTexRefSetArray /
 /// hipTexRefSetAddress2D / hipTexRefSetMipmappedArray).
 ///
-/// CUDA snapshots texref bindings at kernel-launch time, so an in-flight
-/// kernel on stream B reading `texref_T` is guaranteed to read the bytes
-/// at the address `T` held when B's launch happened — even if the host
-/// calls cuTexRefSetAddress(T, new_addr) on stream A while B is running.
-///
-/// HIP doesn't make this guarantee: `hipTexRefSetAddress` flips global
-/// texref state immediately. In-flight kernels can therefore read mid-
-/// transition state (e.g. partial header with new ptr / old size), then
-/// `tex.1d.v4.u32.s32` returns a value computed from the wrong buffer.
-/// Downstream IOFX_actorRangeKernel scatters using that wild index →
-/// canonical CB/DB+TCP page fault (Class A).
-///
-/// `ZLUDA_TEXREF_SYNC=1` forces a `hipDeviceSynchronize` before the
-/// texref-changing call, matching the CUDA snapshot semantic. Cost: one
-/// device sync per binding change. Worth measuring; PhysX issues
-/// thousands per frame, so the cost ceiling is "one device sync per
-/// hipTexRefSet*" and not "free".
-/// ZLUDA_TEXREF_SYNC level:
-///   0 — OFF
-///   1 — drain in-flight kernels before SetAddress/SetArray binds (default;
-///       Arkham Asylum hangs without it).
-///   2 — ALSO drain before the non-address texref-state mutators (SetFlags /
-///       SetFormat / SetAddressMode / SetFilterMode). 2026-06-15 Class-4 fix:
-///       CUDA snapshots the WHOLE texref state at launch; a mid-flight
-///       SetFlags(READ_AS_INTEGER) / SetFormat race makes an in-flight
-///       IOFX_remapKernel `tex.1d.u32` fetch return a normalized FLOAT instead
-///       of the raw int actor-ID → float-pattern index → bbox/actorRange wild
-///       store. Gated separately because these mutators are on a hot path and
-///       an unconditional sync risks PhysX-init timing perturbation (cf. the
-///       rejected TEXREF_POST_SYNC=2); =2 lets us A/B it in-game.
-fn texref_sync_level() -> u32 {
-    static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        std::env::var("ZLUDA_TEXREF_SYNC")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(1)
-    })
-}
-
-fn texref_sync_enabled() -> bool {
-    texref_sync_level() >= 1
-}
-
-/// Pre-sync gate for the non-address texref-state mutators (level >= 2).
-unsafe fn texref_pre_sync_all_mutators_if_enabled() {
-    if texref_sync_level() >= 2 {
-        let _ = hipDeviceSynchronize();
-    }
-}
-
 /// 2026-06-09 Class A bf000 candidate fix: post-sync the texref binding.
 ///
-/// `ZLUDA_TEXREF_SYNC=1` drains in-flight kernels BEFORE changing a
-/// binding. That fixes CUDA's snapshot semantic for the bind transition.
 /// But the bf000 single-page Class A fault (FleX particle position
 /// buffer's slot[0] PERMISSION_FAULTS=0x5 RW=1 on direct st.global write)
 /// suggests that AFTER cuTexRefSetAddress_v2 completes, the AMDGPU TCP /
@@ -229,12 +176,6 @@ fn texref_post_sync_mode() -> u8 {
         ));
         mode
     })
-}
-
-unsafe fn texref_pre_sync_if_enabled() {
-    if texref_sync_enabled() {
-        let _ = hipDeviceSynchronize();
-    }
 }
 
 /// Post-sync after a cuTexRefSet*. `dptr` and `bytes` describe the bound
@@ -319,7 +260,6 @@ pub(crate) unsafe fn ref_set_address_v2(
         // sampler released, object freed) immediately. A kernel launched
         // before it may still be reading that object; CUDA snapshots the
         // binding at launch. Drain first, like every non-null bind below.
-        texref_pre_sync_if_enabled();
         hipUnbindTexture(tex_ref)?;
         return Ok(());
     }
@@ -335,7 +275,6 @@ pub(crate) unsafe fn ref_set_address_v2(
         }
         return Ok(());
     }
-    texref_pre_sync_if_enabled();
     let mut unused = 0;
     hipTexRefSetAddress(
         if byte_offset.is_null() {
@@ -362,7 +301,6 @@ pub(crate) unsafe fn ref_set_address_2d_v3(
     pitch: usize,
 ) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
-    texref_pre_sync_if_enabled();
     hipTexRefSetAddress2D(
         tex_ref,
         desc as *const CUDA_ARRAY_DESCRIPTOR as *const HIP_ARRAY_DESCRIPTOR,
@@ -484,7 +422,6 @@ pub(crate) unsafe fn ref_set_array(h_tex_ref: CUtexref, h_array: CUarray, flags:
             tex_ref, h_array, desc.Format.0, original_format.0, desc.NumChannels, flags, hack
         ));
     }
-    texref_pre_sync_if_enabled();
     let set_fmt_res = hipTexRefSetFormat(tex_ref, original_format, desc.NumChannels as i32);
     if set_fmt_res.is_err() && texref_log_enabled() {
         super::driver::zluda_log_err(&format!(
@@ -505,7 +442,6 @@ pub(crate) unsafe fn ref_set_mipmapped_array(
     flags: u32,
 ) -> CUresult {
     let tex_ref = as_tex_ref(h_tex_ref);
-    texref_pre_sync_if_enabled();
     hipTexRefSetMipmappedArray(tex_ref, h_mipmapped_array as hipMipmappedArray_t, flags)?;
     Ok(())
 }
@@ -519,7 +455,6 @@ pub(crate) unsafe fn ref_set_format(
     // 2026-06-15 Class-4: format (channel kind: int vs float) also decides how
     // tex.1d interprets the bytes; an immediate mid-flight flip is the same
     // float-vs-int race as SetFlags (see ref_set_flags). Drain first.
-    texref_pre_sync_all_mutators_if_enabled();
     let fmt_hip: hipArray_Format = mem::transmute(fmt);
     let res = hipTexRefSetFormat(tex_ref, fmt_hip, num_packed_components);
     if texref_log_enabled() {
@@ -545,7 +480,6 @@ pub(crate) unsafe fn ref_set_address_mode(
     let tex_ref = as_tex_ref(h_tex_ref);
     // 2026-06-15 Class-4: complete the CUDA texref-snapshot semantic — drain
     // in-flight kernels before flipping addressing mode too (see ref_set_flags).
-    texref_pre_sync_all_mutators_if_enabled();
     hipTexRefSetAddressMode(tex_ref, dim, mem::transmute(am))?;
     reset(tex_ref)
 }
@@ -554,7 +488,6 @@ pub(crate) unsafe fn ref_set_filter_mode(h_tex_ref: CUtexref, fm: CUfilter_mode)
     let tex_ref = as_tex_ref(h_tex_ref);
     // 2026-06-15 Class-4: complete the CUDA texref-snapshot semantic (see
     // ref_set_flags) — drain in-flight kernels before flipping filter mode.
-    texref_pre_sync_all_mutators_if_enabled();
     hipTexRefSetFilterMode(tex_ref, mem::transmute(fm))?;
     reset(tex_ref)
 }
@@ -613,7 +546,6 @@ pub(crate) unsafe fn ref_set_flags(h_tex_ref: CUtexref, flags: u32) -> CUresult 
     // existing pre-bind sync covered SetAddress/SetArray but NOT SetFlags, so
     // the race stayed open. Drain in-flight kernels first (gated, same as the
     // address path) to restore the CUDA snapshot semantic for flag changes too.
-    texref_pre_sync_all_mutators_if_enabled();
     hipTexRefSetFlags(tex_ref, flags)?;
     reset(tex_ref)
 }
