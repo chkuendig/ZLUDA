@@ -342,19 +342,7 @@ unsafe fn bind_legacy_array(
     // Match HIP's textureReference -> hipTextureDesc conversion. Border color
     // has no field in textureReference, so HIP also uses zero for it.
     let reference = &*tex_ref;
-    let sampler = hipTextureDesc {
-        addressMode: reference.addressMode,
-        filterMode: reference.filterMode,
-        readMode: reference.readMode,
-        sRGB: reference.sRGB,
-        borderColor: [0.0; 4],
-        normalizedCoords: reference.normalized,
-        maxAnisotropy: reference.maxAnisotropy,
-        mipmapFilterMode: reference.mipmapFilterMode,
-        mipmapLevelBias: reference.mipmapLevelBias,
-        minMipmapLevelClamp: reference.minMipmapLevelClamp,
-        maxMipmapLevelClamp: reference.maxMipmapLevelClamp,
-    };
+    let sampler = sampler_for_reference(reference);
     let runtime_view = hipResourceViewDesc {
         format: hipResourceViewFormat(view.format.0),
         width: view.width, height: view.height, depth: view.depth,
@@ -726,6 +714,52 @@ pub(crate) unsafe fn object_destroy(tex_object: CUtexObject) -> CUresult {
     Ok(())
 }
 
+// Match HIP's getTextureDesc(textureReference), including fields which do not
+// affect every resource type. Comparing the actual object rather than a cached
+// setter value also detects state left unapplied by an earlier failed rebuild.
+fn sampler_for_reference(reference: &textureReference) -> hipTextureDesc {
+    hipTextureDesc {
+        addressMode: reference.addressMode,
+        filterMode: reference.filterMode,
+        readMode: reference.readMode,
+        sRGB: reference.sRGB,
+        borderColor: [0.0; 4],
+        normalizedCoords: reference.normalized,
+        maxAnisotropy: reference.maxAnisotropy,
+        mipmapFilterMode: reference.mipmapFilterMode,
+        mipmapLevelBias: reference.mipmapLevelBias,
+        minMipmapLevelClamp: reference.minMipmapLevelClamp,
+        maxMipmapLevelClamp: reference.maxMipmapLevelClamp,
+    }
+}
+
+fn linear_format_matches(reference: &textureReference, desc: hipChannelFormatDesc) -> bool {
+    let kind = match reference.format {
+        hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT8
+        | hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT16
+        | hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32 => hipChannelFormatKind::hipChannelFormatKindUnsigned,
+        hipArray_Format::HIP_AD_FORMAT_SIGNED_INT8
+        | hipArray_Format::HIP_AD_FORMAT_SIGNED_INT16
+        | hipArray_Format::HIP_AD_FORMAT_SIGNED_INT32 => hipChannelFormatKind::hipChannelFormatKindSigned,
+        hipArray_Format::HIP_AD_FORMAT_HALF
+        | hipArray_Format::HIP_AD_FORMAT_FLOAT => hipChannelFormatKind::hipChannelFormatKindFloat,
+        _ => return false,
+    };
+    if !matches!(reference.numChannels, 1 | 2 | 4) {
+        return false;
+    }
+    let Ok(bytes) = super::surf::format_size(reference.format) else {
+        return false;
+    };
+    desc.f == kind
+        && [desc.x, desc.y, desc.z, desc.w]
+            .into_iter()
+            .enumerate()
+            .all(|(index, width)| {
+                width == if index < reference.numChannels as usize { (bytes * 8) as i32 } else { 0 }
+            })
+}
+
 unsafe fn reset(tex_ref: *mut textureReference) -> CUresult {
     if tex_ref.is_null() {
         return Err(CUerror::INVALID_VALUE);
@@ -747,6 +781,16 @@ unsafe fn reset(tex_ref: *mut textureReference) -> CUresult {
         hipResourceType::hipResourceTypeLinear => {
             let linear = res_desc.res.linear;
             if !linear.devPtr.is_null() && linear.sizeInBytes != 0 {
+                let mut sampler = mem::zeroed();
+                if linear_format_matches(&*tex_ref, linear.desc)
+                    && hipGetTextureObjectTextureDesc(&mut sampler, (*tex_ref).textureObject).is_ok()
+                    && sampler == sampler_for_reference(&*tex_ref)
+                {
+                    // The validated setter has left the bound object unchanged.
+                    // Reuse its already-published handle; HIP's rebind otherwise
+                    // destroys/recreates it and performs a synchronous upload.
+                    return Ok(());
+                }
                 let mut unused = 0usize;
                 hipTexRefSetAddress(
                     &mut unused,
@@ -988,6 +1032,68 @@ mod tests {
         api.cuMemFree_v2(output);
         api.cuModuleUnload(module);
         api.cuArrayDestroy(array);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // Validate device reads across repeated setters, a real format change,
+    // and a new resource. Descriptor equality alone cannot catch a stale
+    // device-global texture handle or a skipped format rebuild.
+    #[test_cuda]
+    unsafe fn legacy_linear_repeated_and_changed_state(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let ptx = concat!(include_str!("test_ptx/texref_linear_reconfigure.ptx"), "\0");
+        let mut module = mem::zeroed();
+        api.cuModuleLoadData(&mut module, ptx.as_ptr().cast());
+        let mut texref = mem::zeroed();
+        api.cuModuleGetTexRef(&mut texref, module, c"legacy_linear".as_ptr());
+        let mut function = mem::zeroed();
+        api.cuModuleGetFunction(&mut function, module, c"sample_linear".as_ptr());
+        let mut source = mem::zeroed();
+        let mut output = mem::zeroed();
+        let mut alternate = mem::zeroed();
+        api.cuMemAlloc_v2(&mut source, 16);
+        api.cuMemAlloc_v2(&mut output, 16);
+        api.cuMemAlloc_v2(&mut alternate, 16);
+        let first = [7u32, 11, 13, 17];
+        api.cuMemcpyHtoD_v2(source, first.as_ptr().cast(), 16);
+        api.cuTexRefSetFormat(texref, CUarray_format::CU_AD_FORMAT_UNSIGNED_INT32, 4);
+        api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
+        api.cuTexRefSetAddress_v2(&mut 0, texref, source, 16);
+        for state in 0..8 {
+            match state {
+                0 => {},
+                1 => api.cuTexRefSetFilterMode(texref, CUfilter_mode::CU_TR_FILTER_MODE_POINT),
+                2 => api.cuTexRefSetAddressMode(texref, 0, CUaddress_mode::CU_TR_ADDRESS_MODE_CLAMP),
+                3 => api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER),
+                4 => api.cuTexRefSetFormat(texref, CUarray_format::CU_AD_FORMAT_UNSIGNED_INT16, 4),
+                5 => api.cuTexRefSetFormat(texref, CUarray_format::CU_AD_FORMAT_UNSIGNED_INT32, 4),
+                6 => {
+                    let second = [19u32, 23, 29, 31];
+                    api.cuMemcpyHtoD_v2(alternate, second.as_ptr().cast(), 16);
+                    api.cuTexRefSetAddress_v2(&mut 0, texref, alternate, 16);
+                },
+                7 => api.cuTexRefSetFormat(texref, CUarray_format::CU_AD_FORMAT_UNSIGNED_INT32, 4),
+                _ => unreachable!(),
+            }
+            let mut params = [&mut output as *mut CUdeviceptr as *mut std::ffi::c_void];
+            api.cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0,
+                CUstream(std::ptr::null_mut()), params.as_mut_ptr(), std::ptr::null_mut());
+            api.cuCtxSynchronize();
+            let mut actual = [0u32; 4];
+            api.cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), output, 16);
+            let expected = match state {
+                4 => [7, 0, 11, 0],
+                6 | 7 => [19, 23, 29, 31],
+                _ => first,
+            };
+            assert_eq!(actual, expected, "linear texref state {state}");
+        }
+        api.cuModuleUnload(module);
+        api.cuMemFree_v2(source);
+        api.cuMemFree_v2(output);
+        api.cuMemFree_v2(alternate);
         api.cuCtxDestroy_v2(context);
     }
 
