@@ -118,9 +118,36 @@ pub(crate) fn global_state() -> Result<&'static GlobalState, CUerror> {
 }
 
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
-    unsafe { hipInit(flags) }?;
+    hip_init_on_native_thread(flags)
+}
+
+fn init_hip_and_state(flags: ::core::ffi::c_uint) -> CUresult {
+    super::signal::with_preserved_state(|| {
+        unsafe { hipInit(flags) }?;
+        Ok(())
+    })?;
+    // Primary contexts create streams, which compile HIP's blit kernels.
     global_state()?;
     Ok(())
+}
+
+/// Wine threads have low NT stack addresses that break ROCm's thread setup
+/// (`free(): invalid pointer` inside hipInit), and comgr replaces the calling
+/// thread's alternate stack. Initialize HIP and all primary contexts on a
+/// native pthread instead of the caller's thread.
+#[cfg(not(windows))]
+fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> CUresult {
+    std::thread::Builder::new()
+        .name("zluda-hip-init".into())
+        .spawn(move || init_hip_and_state(flags))
+        .map_err(|_| CUerror::UNKNOWN)?
+        .join()
+        .map_err(|_| CUerror::UNKNOWN)?
+}
+
+#[cfg(windows)]
+fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> CUresult {
+    init_hip_and_state(flags)
 }
 
 struct UnknownBuffer<const S: usize> {
