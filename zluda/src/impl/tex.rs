@@ -54,11 +54,11 @@ pub(crate) unsafe fn ref_set_flags(
     fn get_flags(texref: &textureReference) -> (u32, i32, i32) {
         (texref.readMode.0, texref.normalized, texref.sRGB)
     }
-    let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
-    let previous = *texref;
-    let pre_flags = get_flags(texref);
+    // End the shared borrow before HIP mutates this reference.
+    let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    let pre_flags = get_flags(&previous);
     hipTexRefSetFlags(raw_texref, flags)?;
-    let post_flags = get_flags(texref);
+    let post_flags = get_flags(raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?);
     if pre_flags != post_flags {
         hipfix::refresh_texref(raw_texref, previous)?;
     }
@@ -72,11 +72,10 @@ pub(crate) unsafe fn ref_set_filter_mode(
     fn get_flags(texref: &textureReference) -> u32 {
         texref.filterMode.0
     }
-    let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
-    let previous = *texref;
-    let pre_flags = get_flags(texref);
+    let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    let pre_flags = get_flags(&previous);
     hipTexRefSetFilterMode(raw_texref, filter_mode)?;
-    let post_flags = get_flags(texref);
+    let post_flags = get_flags(raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?);
     if pre_flags != post_flags {
         hipfix::refresh_texref(raw_texref, previous)?;
     }
@@ -94,11 +93,10 @@ pub(crate) unsafe fn ref_set_address_mode(
     if dim < 0 || dim > 2 {
         return Err(hipErrorCode_t::InvalidValue);
     }
-    let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
-    let previous = *texref;
-    let pre_flags = get_flags(texref, dim);
+    let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    let pre_flags = get_flags(&previous, dim);
     hipTexRefSetAddressMode(raw_texref, dim, address_mode)?;
-    let post_flags = get_flags(texref, dim);
+    let post_flags = get_flags(raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?, dim);
     if pre_flags != post_flags {
         hipfix::refresh_texref(raw_texref, previous)?;
     }
@@ -113,11 +111,10 @@ pub(crate) unsafe fn ref_set_format(
     fn get_flags(texref: &textureReference) -> (u32, u32) {
         (texref.format.0, texref.numChannels as u32)
     }
-    let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
-    let previous = *texref;
-    let pre_flags = get_flags(texref);
+    let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    let pre_flags = get_flags(&previous);
     hipTexRefSetFormat(raw_texref, format, num_components)?;
-    let post_flags = get_flags(texref);
+    let post_flags = get_flags(raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?);
     if pre_flags != post_flags {
         hipfix::refresh_texref(raw_texref, previous)?;
     }
