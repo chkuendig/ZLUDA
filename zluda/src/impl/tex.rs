@@ -2392,4 +2392,118 @@ mod tests {
         api.cuArrayDestroy(array);
         api.cuCtxDestroy_v2(ctx);
     }
+
+    unsafe fn read_linear_texel(api: &impl CudaApi, function: CUfunction, output: CUdeviceptr) -> [u32; 4] {
+        let mut output = output;
+        let mut params = [&mut output as *mut CUdeviceptr as *mut c_void];
+        api.cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0,
+            CUstream(std::ptr::null_mut()), params.as_mut_ptr(), std::ptr::null_mut());
+        api.cuCtxSynchronize();
+        let mut actual = [0u32; 4];
+        api.cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), output, 16);
+        actual
+    }
+
+    // Validate device reads across repeated setters, a real format change,
+    // and a new resource. Descriptor equality alone cannot catch a stale
+    // device-global texture handle or a skipped format rebuild.
+    #[test_cuda]
+    unsafe fn legacy_linear_repeated_and_changed_state(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let ptx = concat!(include_str!("test_ptx/texref_linear_reconfigure.ptx"), "\0");
+        let mut module = std::mem::zeroed();
+        api.cuModuleLoadData(&mut module, ptx.as_ptr().cast());
+        let mut texref = std::mem::zeroed();
+        api.cuModuleGetTexRef(&mut texref, module, c"legacy_linear".as_ptr());
+        let mut function = std::mem::zeroed();
+        api.cuModuleGetFunction(&mut function, module, c"sample_linear".as_ptr());
+        let mut source = std::mem::zeroed();
+        let mut output = std::mem::zeroed();
+        let mut alternate = std::mem::zeroed();
+        api.cuMemAlloc_v2(&mut source, 16);
+        api.cuMemAlloc_v2(&mut output, 16);
+        api.cuMemAlloc_v2(&mut alternate, 16);
+        let first = [7u32, 11, 13, 17];
+        api.cuMemcpyHtoD_v2(source, first.as_ptr().cast(), 16);
+        api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
+        api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
+        api.cuTexRefSetAddress_v2(&mut 0, texref, source, 16);
+        for state in 0..8 {
+            match state {
+                0 => {},
+                1 => api.cuTexRefSetFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_POINT),
+                2 => api.cuTexRefSetAddressMode(texref, 0, CUaddress_mode_enum::CU_TR_ADDRESS_MODE_CLAMP),
+                3 => api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER),
+                4 => api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT16, 4),
+                5 => api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4),
+                6 => {
+                    let second = [19u32, 23, 29, 31];
+                    api.cuMemcpyHtoD_v2(alternate, second.as_ptr().cast(), 16);
+                    api.cuTexRefSetAddress_v2(&mut 0, texref, alternate, 16);
+                },
+                7 => api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4),
+                _ => unreachable!(),
+            }
+            let actual = read_linear_texel(&api, function, output);
+            let expected = match state {
+                4 => [7, 0, 11, 0],
+                6 | 7 => [19, 23, 29, 31],
+                _ => first,
+            };
+            assert_eq!(actual, expected, "linear texref state {state}");
+        }
+        api.cuModuleUnload(module);
+        api.cuMemFree_v2(source);
+        api.cuMemFree_v2(output);
+        api.cuMemFree_v2(alternate);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // HIP destroys the bound object before rebuilding it, so a rebuild it
+    // rejects (three channels) leaves the texref without a valid object while
+    // its host fields already hold the new state. Restoring a valid format
+    // must rebuild from the binding rather than trust those host fields, and
+    // a repeat of the same setter must still read the bound buffer.
+    #[test_cuda]
+    unsafe fn legacy_linear_recovers_after_failed_rebuild(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let ptx = concat!(include_str!("test_ptx/texref_linear_reconfigure.ptx"), "\0");
+        let mut module = std::mem::zeroed();
+        api.cuModuleLoadData(&mut module, ptx.as_ptr().cast());
+        let mut texref = std::mem::zeroed();
+        api.cuModuleGetTexRef(&mut texref, module, c"legacy_linear".as_ptr());
+        let mut function = std::mem::zeroed();
+        api.cuModuleGetFunction(&mut function, module, c"sample_linear".as_ptr());
+        let mut source = std::mem::zeroed();
+        let mut output = std::mem::zeroed();
+        api.cuMemAlloc_v2(&mut source, 16);
+        api.cuMemAlloc_v2(&mut output, 16);
+        let texel = [7u32, 11, 13, 17];
+        api.cuMemcpyHtoD_v2(source, texel.as_ptr().cast(), 16);
+        api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
+        api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
+        api.cuTexRefSetAddress_v2(&mut 0, texref, source, 16);
+        assert_eq!(read_linear_texel(&api, function, output), texel, "before");
+        // CUDA may reject three channels; HIP accepts the setter but not the
+        // rebuild. Only the state after the next valid setter is compared.
+        let failed = api.cuTexRefSetFormat_unchecked(
+            texref,
+            CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32,
+            3,
+        );
+        // Logged so a run shows whether the failure was actually induced.
+        eprintln!("three-channel cuTexRefSetFormat: {failed:?}");
+        api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
+        assert_eq!(read_linear_texel(&api, function, output), texel, "restored format");
+        api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
+        assert_eq!(read_linear_texel(&api, function, output), texel, "repeated format");
+        api.cuModuleUnload(module);
+        api.cuMemFree_v2(source);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
 }
