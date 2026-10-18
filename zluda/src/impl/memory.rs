@@ -284,6 +284,11 @@ pub(crate) unsafe fn copy_2d_v2(memcpy: hip_Memcpy2D) -> CUresult {
     Ok(())
 }
 
+pub(crate) unsafe fn copy_2d_async_v2(memcpy: hip_Memcpy2D, stream: hipStream_t) -> CUresult {
+    hipMemcpyParam2DAsync(&memcpy, stream)?;
+    Ok(())
+}
+
 pub(crate) unsafe fn copy_2d_unaligned_v2(memcpy: hip_Memcpy2D) -> CUresult {
     hipDrvMemcpy2DUnaligned(&memcpy)?;
     Ok(())

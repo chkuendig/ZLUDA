@@ -439,6 +439,15 @@ pub(crate) fn get_name(
     Ok(())
 }
 
+/// The original API reports through a 32-bit unsigned int; the WoW64 relay
+/// passes a 4-byte buffer. Report at most 0xF0000000 rather than wrapping.
+pub(crate) fn total_memory(bytes: &mut ::core::ffi::c_uint, dev: hipDevice_t) -> hipError_t {
+    let mut total: usize = 0;
+    total_mem_v2(&mut total, dev)?;
+    *bytes = total.min(0xF000_0000) as ::core::ffi::c_uint;
+    Ok(())
+}
+
 pub(crate) fn total_mem_v2(bytes: *mut usize, dev: hipDevice_t) -> hipError_t {
     unsafe { hipDeviceTotalMem(bytes, dev) }
 }
