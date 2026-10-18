@@ -76,12 +76,39 @@ pub(crate) fn run<'input>(
             Directive2::Method(method) => emit_ctx.emit_method(method)?,
         }
     }
+    emit_llvm_used(&emit_ctx)?;
     if cfg!(debug_assertions) {
         if let Err(err) = module.verify() {
             panic!("{}\n{:?}", module.print_module_to_string(), err);
         }
     }
     Ok(module)
+}
+
+// -amdgpu-internalize-symbols drops .const globals that no kernel uses, but
+// the host can still look them up with cuModuleGetGlobal
+fn emit_llvm_used(emit_ctx: &ModuleEmitContext) -> Result<(), TranslateError> {
+    if emit_ctx.const_globals.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let ptr_type = LLVMPointerTypeInContext(emit_ctx.context, 0);
+        let mut values = emit_ctx
+            .const_globals
+            .iter()
+            .map(|&global| LLVMConstAddrSpaceCast(global, ptr_type))
+            .collect::<Vec<_>>();
+        let array = LLVMConstArray2(ptr_type, values.as_mut_ptr(), values.len() as u64);
+        let llvm_used = LLVMAddGlobal(
+            emit_ctx.module,
+            LLVMTypeOf(array),
+            c"llvm.used".as_ptr(),
+        );
+        LLVMSetInitializer(llvm_used, array);
+        LLVMSetLinkage(llvm_used, LLVMLinkage::LLVMAppendingLinkage);
+        LLVMSetSection(llvm_used, c"llvm.metadata".as_ptr());
+    }
+    Ok(())
 }
 
 struct ModuleEmitContext<'a, 'input> {
@@ -91,6 +118,7 @@ struct ModuleEmitContext<'a, 'input> {
     id_defs: &'a GlobalStringIdentResolver2<'input>,
     resolver: ResolveIdent,
     fp_mode: FloatingPointMode,
+    const_globals: Vec<LLVMValueRef>,
 }
 
 impl<'a, 'input> ModuleEmitContext<'a, 'input> {
@@ -107,6 +135,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             id_defs,
             resolver: ResolveIdent::new(&id_defs),
             fp_mode,
+            const_globals: Vec::new(),
         }
     }
 
@@ -287,6 +316,17 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         if !var.info.array_init.is_empty() {
             let initializer = self.get_array_init(&var.info.v_type, &*var.info.array_init)?;
             unsafe { LLVMSetInitializer(global, initializer) };
+        } else if matches!(
+            var.info.state_space,
+            ast::StateSpace::Global | ast::StateSpace::Const
+        ) && !matches!(var.info.v_type, ast::Type::Texref)
+        {
+            // Without an initializer this is a declaration of a symbol that no
+            // other code object defines, and the module fails to load
+            unsafe { LLVMSetInitializer(global, LLVMConstNull(llvm_type)) };
+        }
+        if var.info.state_space == ast::StateSpace::Const {
+            self.const_globals.push(global);
         }
         Ok(())
     }
