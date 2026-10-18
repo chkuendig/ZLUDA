@@ -4603,6 +4603,40 @@ mod tests {
     use winnow::prelude::*;
 
     #[test]
+    fn surface_load_and_store_modifiers_are_independent() {
+        use super::{ast, Instruction, ScalarType, TexDimensions};
+        for (dim, expected_dim, coords) in [
+            ("1d", TexDimensions::D1, "0"),
+            ("2d", TexDimensions::D2, "{0, 0}"),
+            ("3d", TexDimensions::D3, "{0, 0, 0, 0}"),
+        ] {
+            for (vector, values) in [("", "%v0"), (".v2", "{%v0, %v1}"), (".v4", "{%v0, %v1, %v2, %v3}")] {
+                for (ty, expected_ty) in [("b8", ScalarType::B8), ("b16", ScalarType::B16), ("b32", ScalarType::B32), ("b64", ScalarType::B64)] {
+                    for clamp in ["trap", "clamp", "zero"] {
+                        let text = format!(".version 6.5\n.target sm_30\n.address_size 64\n.visible .entry k() {{ suld.b.{dim}{vector}.{ty}.{clamp} {values}, [%s, {coords}]; sust.b.{dim}{vector}.{ty}.{clamp} [%s, {coords}], {values}; ret; }}");
+                        let module = parse_module_checked(&text).unwrap();
+                        let [ast::Directive::Method(_, method)] = &module.directives[..] else { panic!("missing kernel") };
+                        let body = method.body.as_ref().unwrap();
+                        let ast::Statement::Instruction(_, Instruction::Suld { data: load, .. }) = &body[0] else { panic!("missing surface load") };
+                        let ast::Statement::Instruction(_, Instruction::Sust { data: store, .. }) = &body[1] else { panic!("missing surface store") };
+                        for data in [load, store] {
+                            assert_eq!(data.dims, expected_dim);
+                            let expected_type = match vector {
+                                "" => ast::Type::Scalar(expected_ty),
+                                ".v2" => ast::Type::Vector(2, expected_ty),
+                                _ => ast::Type::Vector(4, expected_ty),
+                            };
+                            assert!(data.dst_type == expected_type);
+                            // Upstream accepts these modifiers but currently
+                            // does not retain their boundary behavior in the AST.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sink_is_not_an_identifier() {
         let tokens = Token::lexer("_ _reg __ %r1")
             .collect::<Result<Vec<_>, _>>()
