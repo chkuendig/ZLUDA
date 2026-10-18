@@ -2074,6 +2074,9 @@ derive_parser!(
     pub enum FunnelShiftMode { }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
+    pub enum SurfaceClamp { }
+
+    #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
     pub enum VoteMode {
         Ballot
     }
@@ -4450,6 +4453,50 @@ derive_parser!(
 
     .dtype: ScalarType = { .u32, .s32, .f32 };
     .ctype: ScalarType = { .s32, .f32 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-suld
+    suld.b.1d{.vec}.dtype.mode  d, [a, b] => {
+        Instruction::Suld {
+            data: SurfaceData { dims: TexDimensions::D1, vector: vec, type_: dtype, clamp: mode },
+            arguments: SuldArgs { dst: d, src_surface: a, src_coord: b }
+        }
+    }
+    suld.b.2d{.vec}.dtype.mode  d, [a, b] => {
+        Instruction::Suld {
+            data: SurfaceData { dims: TexDimensions::D2, vector: vec, type_: dtype, clamp: mode },
+            arguments: SuldArgs { dst: d, src_surface: a, src_coord: b }
+        }
+    }
+    suld.b.3d{.vec}.dtype.mode  d, [a, b] => {
+        Instruction::Suld {
+            data: SurfaceData { dims: TexDimensions::D3, vector: vec, type_: dtype, clamp: mode },
+            arguments: SuldArgs { dst: d, src_surface: a, src_coord: b }
+        }
+    }
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-sust
+    sust.b.1d{.vec}.dtype.mode  [a, b], c => {
+        Instruction::Sust {
+            data: SurfaceData { dims: TexDimensions::D1, vector: vec, type_: dtype, clamp: mode },
+            arguments: SustArgs { src_surface: a, src_coord: b, src_value: c }
+        }
+    }
+    sust.b.2d{.vec}.dtype.mode  [a, b], c => {
+        Instruction::Sust {
+            data: SurfaceData { dims: TexDimensions::D2, vector: vec, type_: dtype, clamp: mode },
+            arguments: SustArgs { src_surface: a, src_coord: b, src_value: c }
+        }
+    }
+    sust.b.3d{.vec}.dtype.mode  [a, b], c => {
+        Instruction::Sust {
+            data: SurfaceData { dims: TexDimensions::D3, vector: vec, type_: dtype, clamp: mode },
+            arguments: SustArgs { src_surface: a, src_coord: b, src_value: c }
+        }
+    }
+
+    .vec: VectorPrefix = { .v2, .v4 };
+    .dtype: ScalarType = { .b8, .b16, .b32, .b64 };
+    .mode: SurfaceClamp = { .trap, .clamp, .zero };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/
     match.any.sync.type  d, a, membermask => {

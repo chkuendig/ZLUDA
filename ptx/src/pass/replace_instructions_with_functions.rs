@@ -393,6 +393,14 @@ fn run_instruction<'input>(
             );
             to_call(resolver, fn_declarations, name.into(), i)?
         }
+        i @ ptx_parser::Instruction::Suld { data, .. } => {
+            let name = format!("suld_b_{}", surface_function_suffix(data));
+            to_call(resolver, fn_declarations, name.into(), i)?
+        }
+        i @ ptx_parser::Instruction::Sust { data, .. } => {
+            let name = format!("sust_b_{}", surface_function_suffix(data));
+            to_call(resolver, fn_declarations, name.into(), i)?
+        }
         i @ ptx_parser::Instruction::Sqrt {
             data:
                 ast::RcpData {
@@ -729,4 +737,24 @@ fn to_variables<'input>(
             name: resolver.register_unnamed(Some((type_.clone(), *space))),
         })
         .collect::<Vec<_>>()
+}
+
+fn surface_function_suffix(data: ast::SurfaceData) -> String {
+    let dims = match data.dims {
+        ast::TexDimensions::D1 => "1d",
+        ast::TexDimensions::D2 => "2d",
+        ast::TexDimensions::D3 => "3d",
+    };
+    let vector = match data.vector {
+        None => "",
+        Some(ast::VectorPrefix::V2) => "_v2",
+        Some(ast::VectorPrefix::V4) => "_v4",
+        Some(ast::VectorPrefix::V8) => "_v8",
+    };
+    let clamp = match data.clamp {
+        ptx_parser::SurfaceClamp::Trap => "trap",
+        ptx_parser::SurfaceClamp::Clamp => "clamp",
+        ptx_parser::SurfaceClamp::Zero => "zero",
+    };
+    format!("{dims}{vector}_{}_{clamp}", scalar_to_ptx_name(data.type_))
 }

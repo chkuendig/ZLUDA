@@ -5,7 +5,7 @@ use super::{
 use crate::{
     BmskMode, CacheLevel, EvictionPriority, FunnelShiftMode, MatrixLayout, MatrixNumber,
     MatrixShape, Mul24Control, PtxError, PtxParserState, Reduction, ShiftDirection, ShuffleMode,
-    VoteMode, VshOp,
+    SurfaceClamp, VoteMode, VshOp,
 };
 use bitflags::bitflags;
 use derive_more::Display;
@@ -942,6 +942,42 @@ ptx_parser_macros::generate_instruction_type!(
                     repr: T,
                     type: { data.coord_type() },
 
+                },
+            }
+        },
+        Suld {
+            type: !,
+            data: SurfaceData,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: { data.value_type() },
+                },
+                src_surface: {
+                    repr: T,
+                    type: { Type::Scalar(ScalarType::U64) },
+                },
+                src_coord: {
+                    repr: T,
+                    type: { data.coord_type() },
+                },
+            }
+        },
+        Sust {
+            type: !,
+            data: SurfaceData,
+            arguments<T>: {
+                src_surface: {
+                    repr: T,
+                    type: { Type::Scalar(ScalarType::U64) },
+                },
+                src_coord: {
+                    repr: T,
+                    type: { data.coord_type() },
+                },
+                src_value: {
+                    repr: T,
+                    type: { data.value_type() },
                 },
             }
         },
@@ -2901,6 +2937,32 @@ impl TexData {
             TexDimensions::D3 => 4,
         };
         Type::Vector(dims, self.ctype)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SurfaceData {
+    pub dims: TexDimensions,
+    pub vector: Option<VectorPrefix>,
+    pub type_: ScalarType,
+    pub clamp: SurfaceClamp,
+}
+
+impl SurfaceData {
+    pub fn coord_type(&self) -> Type {
+        let dims = match self.dims {
+            TexDimensions::D1 => 1,
+            TexDimensions::D2 => 2,
+            TexDimensions::D3 => 4,
+        };
+        Type::Vector(dims, ScalarType::S32)
+    }
+
+    pub fn value_type(&self) -> Type {
+        match self.vector {
+            Some(vector) => Type::Vector(vector.len().get(), self.type_),
+            None => Type::Scalar(self.type_),
+        }
     }
 }
 

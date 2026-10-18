@@ -4,8 +4,8 @@ use crate::{ffi::LLVMZludaLinkWithLLD, utils::Module};
 use llvm_sys::{
     core::*,
     target::{
-        LLVMInitializeAMDGPUAsmPrinter, LLVMInitializeAMDGPUTarget, LLVMInitializeAMDGPUTargetInfo,
-        LLVMInitializeAMDGPUTargetMC,
+        LLVMInitializeAMDGPUAsmParser, LLVMInitializeAMDGPUAsmPrinter, LLVMInitializeAMDGPUTarget,
+        LLVMInitializeAMDGPUTargetInfo, LLVMInitializeAMDGPUTargetMC,
     },
     target_machine::{
         LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMGetTargetFromTriple,
@@ -307,6 +307,8 @@ fn init_globals() -> Result<(), String> {
             unsafe { LLVMInitializeAMDGPUTarget() };
             unsafe { LLVMInitializeAMDGPUTargetMC() };
             unsafe { LLVMInitializeAMDGPUAsmPrinter() };
+            // The surface helpers in zluda_ptx_impl use inline assembly
+            unsafe { LLVMInitializeAMDGPUAsmParser() };
             Ok(())
         })
         .as_ref()

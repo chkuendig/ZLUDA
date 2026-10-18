@@ -896,6 +896,217 @@ extern "C"
     }
 }
 
+// sust.b and suld.b on surface objects, ported from lshqqytiger/ZLUDA v3. The
+// descriptor is used with the unformatted image_load_pck/image_store_pck
+// instructions, so texel bytes are read and written unconverted.
+typedef uint32_t zluda_uint3 __attribute__((ext_vector_type(3)));
+typedef uint32_t zluda_uint8 __attribute__((ext_vector_type(8)));
+// A descriptor in the constant address space makes the pinned LLVM hang on
+// large game modules
+typedef zluda_uint8 GLOBAL_SPACE *surface_ptr;
+
+// Surface and array texture object handles keep log2 of the texel size in their
+// top bits, because sust.b and suld.b take the x coordinate in bytes
+constexpr auto IMAGE_RESERVED_TOP_BITS = 3;
+
+template <typename To, typename From>
+static __device__ To transmute(From f)
+{
+    if constexpr (sizeof(To) == sizeof(From))
+    {
+        return std::bit_cast<To>(f);
+    }
+    else if constexpr (sizeof(To) > sizeof(From))
+    {
+        union
+        {
+            To t;
+            From f;
+        } u = {To{0}};
+        u.f = f;
+        return u.t;
+    }
+    else
+    {
+        union
+        {
+            From f;
+            To t;
+        } u = {From{f}};
+        return u.t;
+    }
+}
+
+enum class ImageGeometry
+{
+    _1D,
+    _2D,
+    _3D
+};
+
+// clang-format off
+template <ImageGeometry> struct Coordinates;
+template <> struct Coordinates<ImageGeometry::_1D> { using type = uint1::Native_vec_; };
+template <> struct Coordinates<ImageGeometry::_2D> { using type = uint2::Native_vec_; };
+template <> struct Coordinates<ImageGeometry::_3D> { using type = uint4::Native_vec_; };
+// clang-format on
+
+// The image instructions take the descriptor in SGPRs
+static __device__ zluda_uint8 surface_descriptor(surface_ptr surface)
+{
+    zluda_uint8 desc = *surface;
+    zluda_uint8 result;
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+        result[i] = __builtin_amdgcn_readfirstlane(desc[i]);
+    return result;
+}
+
+#define IMAGE_STORE_PCK(DMASK, VALUE)                                                                                                      \
+    if constexpr (geo == ImageGeometry::_1D)                                                                                               \
+        asm("image_store_pck %0, %1, %2 dmask:" DMASK " dim:1D unorm" : : "v"(VALUE), "v"(coord.x), "s"(desc) : "memory");                \
+    else if constexpr (geo == ImageGeometry::_2D)                                                                                          \
+        asm("image_store_pck %0, %1, %2 dmask:" DMASK " dim:2D unorm" : : "v"(VALUE), "v"(coord), "s"(desc) : "memory");                  \
+    else                                                                                                                                   \
+        asm("image_store_pck %0, %1, %2 dmask:" DMASK " dim:3D unorm" : : "v"(VALUE), "v"(transmute<zluda_uint3>(coord)), "s"(desc) : "memory");
+
+#define IMAGE_LOAD_PCK(DMASK, DATA)                                                                                                                         \
+    if constexpr (geo == ImageGeometry::_1D)                                                                                                                \
+        asm("image_load_pck %0, %1, %2 dmask:" DMASK " dim:1D unorm\ns_waitcnt vmcnt(0)" : "=v"(DATA) : "v"(coord.x), "s"(desc) : "memory");               \
+    else if constexpr (geo == ImageGeometry::_2D)                                                                                                           \
+        asm("image_load_pck %0, %1, %2 dmask:" DMASK " dim:2D unorm\ns_waitcnt vmcnt(0)" : "=v"(DATA) : "v"(coord), "s"(desc) : "memory");                 \
+    else                                                                                                                                                    \
+        asm("image_load_pck %0, %1, %2 dmask:" DMASK " dim:3D unorm\ns_waitcnt vmcnt(0)" : "=v"(DATA) : "v"(transmute<zluda_uint3>(coord)), "s"(desc) : "memory");
+
+template <typename T, ImageGeometry geo>
+static __device__ void image_store_pck(T value, typename Coordinates<geo>::type coord, surface_ptr surface)
+{
+    zluda_uint8 desc = surface_descriptor(surface);
+    if constexpr (sizeof(T) <= sizeof(uint32_t))
+    {
+        uint32_t data = transmute<uint32_t>(value);
+        IMAGE_STORE_PCK("0x1", data)
+    }
+    else if constexpr (sizeof(T) == sizeof(uint2::Native_vec_))
+    {
+        uint2::Native_vec_ data = transmute<uint2::Native_vec_>(value);
+        IMAGE_STORE_PCK("0x3", data)
+    }
+    else
+    {
+        static_assert(sizeof(T) == sizeof(uint4::Native_vec_), "Invalid vector size");
+        uint4::Native_vec_ data = transmute<uint4::Native_vec_>(value);
+        IMAGE_STORE_PCK("0xf", data)
+    }
+}
+
+template <typename T, ImageGeometry geo>
+static __device__ T image_load_pck(typename Coordinates<geo>::type coord, surface_ptr surface)
+{
+    zluda_uint8 desc = surface_descriptor(surface);
+    if constexpr (sizeof(T) <= sizeof(uint32_t))
+    {
+        uint32_t data;
+        IMAGE_LOAD_PCK("0x1", data)
+        return transmute<T>(data);
+    }
+    else if constexpr (sizeof(T) == sizeof(uint2::Native_vec_))
+    {
+        uint2::Native_vec_ data;
+        IMAGE_LOAD_PCK("0x3", data)
+        return transmute<T>(data);
+    }
+    else
+    {
+        static_assert(sizeof(T) == sizeof(uint4::Native_vec_), "Invalid vector size");
+        uint4::Native_vec_ data;
+        IMAGE_LOAD_PCK("0xf", data)
+        return transmute<T>(data);
+    }
+}
+
+#undef IMAGE_STORE_PCK
+#undef IMAGE_LOAD_PCK
+
+template <typename T, ImageGeometry geo>
+static __device__ T suld_b(uint64_t handle, typename Coordinates<geo>::type coord)
+{
+    surface_ptr surface = (surface_ptr)((handle << IMAGE_RESERVED_TOP_BITS) >> IMAGE_RESERVED_TOP_BITS);
+    coord.x = coord.x >> uint32_t(handle >> (64 - IMAGE_RESERVED_TOP_BITS));
+    return image_load_pck<T, geo>(coord, surface);
+}
+
+// Out-of-bounds stores are dropped by the hardware for every clamp mode
+template <typename T, ImageGeometry geo>
+static __device__ void sust_b(uint64_t handle, typename Coordinates<geo>::type coord, T value)
+{
+    surface_ptr surface = (surface_ptr)((handle << IMAGE_RESERVED_TOP_BITS) >> IMAGE_RESERVED_TOP_BITS);
+    uint32_t shift_x = uint32_t(handle >> (64 - IMAGE_RESERVED_TOP_BITS));
+    coord.x = coord.x >> shift_x;
+    if (shift_x <= __builtin_ctz(sizeof(T))) [[likely]]
+    {
+        image_store_pck<T, geo>(value, coord, surface);
+        return;
+    }
+    // The value is narrower than the texel: merge it into the texel's low bytes
+    uint4::Native_vec_ texel = image_load_pck<uint4::Native_vec_, geo>(coord, surface);
+    if constexpr (sizeof(T) == sizeof(uint8_t))
+    {
+        texel[0] = ((texel[0] >> 8) << 8) | uint32_t(std::bit_cast<uint8_t>(value));
+    }
+    else if constexpr (sizeof(T) == sizeof(uint16_t))
+    {
+        texel[0] = ((texel[0] >> 16) << 16) | uint32_t(std::bit_cast<uint16_t>(value));
+    }
+    else
+    {
+        union
+        {
+            uint4::Native_vec_ texel;
+            T value;
+        } u = {0};
+        u.texel = texel;
+        u.value = value;
+        texel = u.texel;
+    }
+    image_store_pck<uint4::Native_vec_, geo>(texel, coord, surface);
+}
+
+extern "C"
+{
+#define SURFACE_FUNCTIONS_MODE(TYPE, MODE, GEOMETRY, HIP_TYPE)                                                                      \
+    HIP_TYPE::Native_vec_ FUNC(suld_b_##TYPE##_##MODE)(uint64_t surface, typename Coordinates<GEOMETRY>::type coord)                \
+    {                                                                                                                               \
+        return suld_b<HIP_TYPE::Native_vec_, GEOMETRY>(surface, coord);                                                             \
+    }                                                                                                                               \
+    void FUNC(sust_b_##TYPE##_##MODE)(uint64_t surface, typename Coordinates<GEOMETRY>::type coord, HIP_TYPE::Native_vec_ value)  \
+    {                                                                                                                               \
+        sust_b<HIP_TYPE::Native_vec_, GEOMETRY>(surface, coord, value);                                                             \
+    }
+
+#define SURFACE_FUNCTIONS(TYPE, GEOMETRY, HIP_TYPE)          \
+    SURFACE_FUNCTIONS_MODE(TYPE, trap, GEOMETRY, HIP_TYPE)  \
+    SURFACE_FUNCTIONS_MODE(TYPE, clamp, GEOMETRY, HIP_TYPE) \
+    SURFACE_FUNCTIONS_MODE(TYPE, zero, GEOMETRY, HIP_TYPE)
+
+#define SURFACE_FUNCTIONS_ALL_TYPES(DIM, GEOMETRY)         \
+    SURFACE_FUNCTIONS(DIM##_b8, GEOMETRY, uchar1)          \
+    SURFACE_FUNCTIONS(DIM##_b16, GEOMETRY, ushort1)        \
+    SURFACE_FUNCTIONS(DIM##_b32, GEOMETRY, uint1)          \
+    SURFACE_FUNCTIONS(DIM##_b64, GEOMETRY, ulong1)         \
+    SURFACE_FUNCTIONS(DIM##_v2_b8, GEOMETRY, uchar2)       \
+    SURFACE_FUNCTIONS(DIM##_v2_b16, GEOMETRY, ushort2)     \
+    SURFACE_FUNCTIONS(DIM##_v2_b32, GEOMETRY, uint2)       \
+    SURFACE_FUNCTIONS(DIM##_v2_b64, GEOMETRY, ulong2)      \
+    SURFACE_FUNCTIONS(DIM##_v4_b8, GEOMETRY, uchar4)       \
+    SURFACE_FUNCTIONS(DIM##_v4_b16, GEOMETRY, ushort4)     \
+    SURFACE_FUNCTIONS(DIM##_v4_b32, GEOMETRY, uint4)
+
+    SURFACE_FUNCTIONS_ALL_TYPES(1d, ImageGeometry::_1D)
+    SURFACE_FUNCTIONS_ALL_TYPES(2d, ImageGeometry::_2D)
+    SURFACE_FUNCTIONS_ALL_TYPES(3d, ImageGeometry::_3D)
+}
+
 template <typename Acc, typename T>
 __device__ static Acc dot_product(Acc initial_value, T row[8], T column[8]);
 
@@ -1149,6 +1360,8 @@ extern "C"
 
     static std::pair<GLOBAL_SPACE void *, GLOBAL_SPACE void *> get_image_and_sampler(uint64_t texobj) __device__
     {
+        // Array texture objects carry the texel size in the top bits, like surfaces
+        texobj = (texobj << IMAGE_RESERVED_TOP_BITS) >> IMAGE_RESERVED_TOP_BITS;
         unsigned int GLOBAL_SPACE *image = (unsigned int GLOBAL_SPACE *)texobj;
         unsigned int GLOBAL_SPACE *sampler = image + HIP_SAMPLER_OBJECT_OFFSET_DWORD;
         return {image, sampler};

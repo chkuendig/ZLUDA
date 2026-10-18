@@ -741,7 +741,9 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::Mma { .. }
             | ast::Instruction::Dp2a { .. }
             | ast::Instruction::Tanh { .. }
-            | ast::Instruction::Tex { .. } => return Err(error_unreachable()),
+            | ast::Instruction::Tex { .. }
+            | ast::Instruction::Suld { .. }
+            | ast::Instruction::Sust { .. } => return Err(error_unreachable()),
         }
     }
 
