@@ -370,10 +370,10 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     let value = format!("{size},{size}");
                     self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
                 }
-                ptx_parser::TuningDirective::MinNCtaPerSm(ctas) => {
-                    let value = format!("{ctas},1024");
-                    self.emit_fn_attribute_string(fn_, "amdgpu-waves-per-eu", &value);
-                }
+                // amdgpu-waves-per-eu can contradict amdgpu-flat-work-group-size
+                // (one wave per EU leaves too few VGPRs for a 512-thread block),
+                // so the launch fails with CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES.
+                ptx_parser::TuningDirective::MinNCtaPerSm(_) => {}
             }
         }
     }
