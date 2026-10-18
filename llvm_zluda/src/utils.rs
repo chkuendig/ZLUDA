@@ -46,6 +46,12 @@ impl Drop for Context {
 pub struct Module(LLVMModuleRef);
 
 impl Module {
+    /// Test fixtures transfer ownership of a module parsed through the C API.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_raw(module: LLVMModuleRef) -> Self {
+        Self(module)
+    }
+
     pub fn new(ctx: &Context, name: &CStr) -> Self {
         Self(unsafe { LLVMModuleCreateWithNameInContext(name.as_ptr(), ctx.get()) })
     }
