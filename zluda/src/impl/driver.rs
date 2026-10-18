@@ -175,6 +175,30 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         Ok(())
     }
 
+    // CUDART_INTERFACE entries 4 and 5, used by the PhysX runtimes:
+    // cudaSetDeviceFlags and cudaSetDevice equivalents.
+    unsafe extern "system" fn set_device_flags(
+        dev: hipDevice_t,
+        flags: std::ffi::c_uint,
+    ) -> cuda_types::cuda::CUresult {
+        let mut active_dev = 0i32;
+        hipGetDevice(&mut active_dev)?;
+        if dev != active_dev {
+            hipSetDevice(dev)?;
+        }
+        let result = hipSetDeviceFlags(flags);
+        if dev != active_dev {
+            let _ = hipSetDevice(active_dev);
+        }
+        result?;
+        Ok(())
+    }
+
+    unsafe extern "system" fn set_device(dev: hipDevice_t) -> cuda_types::cuda::CUresult {
+        hipSetDevice(dev)?;
+        Ok(())
+    }
+
     unsafe extern "system" fn get_module_from_cubin_ext1(
         result: *mut cuda_types::cuda::CUmodule,
         fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper,
@@ -307,11 +331,15 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     }
 
     unsafe extern "system" fn ctx_create_v2_bypass(
-        _pctx: *mut cuda_types::cuda::CUcontext,
-        _flags: ::std::os::raw::c_uint,
-        _dev: cuda_types::cuda::CUdevice,
+        pctx: *mut cuda_types::cuda::CUcontext,
+        flags: ::std::os::raw::c_uint,
+        dev: cuda_types::cuda::CUdevice,
     ) -> cuda_types::cuda::CUresult {
-        Err(r#impl::unimplemented())
+        // PhysX creates its context through this entry; same as cuCtxCreate_v2.
+        match pctx.as_mut() {
+            Some(pctx) => r#impl::context::create_v2(pctx, flags, dev),
+            None => Err(cuda_types::cuda::CUerror::INVALID_VALUE),
+        }
     }
 
     unsafe extern "system" fn heap_alloc(
