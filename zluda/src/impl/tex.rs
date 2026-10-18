@@ -1726,11 +1726,9 @@ mod tests {
         api.cuCtxDestroy_v2(context);
     }
 
-    // HIP destroys the bound object before rebuilding it, so a rebuild it
-    // rejects (three channels) leaves the texref without a valid object while
-    // its host fields already hold the new state. Restoring a valid format
-    // must rebuild from the binding rather than trust those host fields, and
-    // a repeat of the same setter must still read the bound buffer.
+    // HIP destroys the bound object before rebuilding it and rejects the
+    // rebuild for three channels. The failed setter must leave the previous
+    // state bound, and later setters must still read the bound buffer.
     #[test_cuda]
     unsafe fn legacy_linear_recovers_after_failed_rebuild(api: impl CudaApi) {
         api.cuInit(0);
@@ -1753,15 +1751,16 @@ mod tests {
         api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
         api.cuTexRefSetAddress_v2(&mut 0, texref, source, 16);
         assert_eq!(read_linear_texel(&api, function, output), texel, "before");
-        // CUDA may reject three channels; HIP accepts the setter but not the
-        // rebuild. Only the state after the next valid setter is compared.
         let failed = api.cuTexRefSetFormat_unchecked(
             texref,
             CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32,
             3,
         );
-        // Logged so a run shows whether the failure was actually induced.
         eprintln!("three-channel cuTexRefSetFormat: {failed:?}");
+        // A rejected setter must leave the previous format and buffer bound.
+        if failed.is_err() {
+            assert_eq!(read_linear_texel(&api, function, output), texel, "after failed rebuild");
+        }
         api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
         assert_eq!(read_linear_texel(&api, function, output), texel, "restored format");
         api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
