@@ -15,13 +15,35 @@ pub(crate) fn get_attributes(
 
 pub(crate) const HIP_TRSA_OVERRIDE_FORMAT: u32 = 1;
 
-pub(crate) unsafe fn refresh_texref(raw_texref: *mut textureReference) -> hipError_t {
+// Rebinds the texref's resource so HIP rebuilds its texture object with the
+// texref's new state. `previous` is the texref as it was before the setter.
+pub(crate) unsafe fn refresh_texref(
+    raw_texref: *mut textureReference,
+    previous: textureReference,
+) -> hipError_t {
     let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
     let mut res_desc = std::mem::zeroed();
     if texref.textureObject.is_null() {
         return Ok(());
     }
     hipTexObjectGetResourceDesc(&mut res_desc, texref.textureObject)?;
+    rebind_texref(raw_texref, &res_desc).or_else(|error| {
+        // HIP destroys the bound object before creating the new one and keeps
+        // the freed handle when the creation fails. Restore the previous state
+        // and bind the same resource again, so the texref stays usable.
+        *raw_texref = textureReference {
+            textureObject: std::ptr::null_mut(),
+            ..previous
+        };
+        rebind_texref(raw_texref, &res_desc)?;
+        Err(error)
+    })
+}
+
+unsafe fn rebind_texref(
+    raw_texref: *mut textureReference,
+    res_desc: &HIP_RESOURCE_DESC,
+) -> hipError_t {
     match res_desc.resType {
         HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY => hipTexRefSetArray(
             raw_texref,
