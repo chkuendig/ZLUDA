@@ -86,10 +86,26 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
-    // TODO: fix constants in extra
-    if !extra.is_null() {
-        return hipError_t::ErrorNotSupported;
-    }
+    // CUDA terminates `extra` with CU_LAUNCH_PARAM_END (0), HIP with
+    // HIP_LAUNCH_PARAM_END (3); the buffer pointer (1) and size (2) markers
+    // match. Accept the packed-buffer form and translate its terminator.
+    let mut hip_extra;
+    let extra = if extra.is_null() {
+        extra
+    } else {
+        let cu_extra = unsafe { std::slice::from_raw_parts(extra, 5) };
+        if cu_extra[0] as usize != 1 || cu_extra[2] as usize != 2 || !cu_extra[4].is_null() {
+            return hipError_t::ErrorNotSupported;
+        }
+        hip_extra = [
+            cu_extra[0],
+            cu_extra[1],
+            cu_extra[2],
+            cu_extra[3],
+            3usize as *mut ::core::ffi::c_void,
+        ];
+        hip_extra.as_mut_ptr()
+    };
     unsafe {
         hipModuleLaunchKernel(
             f.base,
