@@ -118,6 +118,14 @@ pub(crate) fn global_state() -> Result<&'static GlobalState, CUerror> {
 }
 
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
+    // ROCclr reads AMD_OPT_FLUSH once, at runtime initialization. With the
+    // default agent-scope dispatch acquire/release, concurrent same-stream
+    // kernel chains read stale values on gfx1030; 0 selects SYSTEM scope.
+    // An explicit user setting is preserved.
+    #[cfg(not(windows))]
+    unsafe {
+        libc::setenv(c"AMD_OPT_FLUSH".as_ptr(), c"0".as_ptr(), 0)
+    };
     hip_init_on_native_thread(flags)
 }
 
