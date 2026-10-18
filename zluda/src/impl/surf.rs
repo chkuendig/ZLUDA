@@ -282,3 +282,13 @@ pub(crate) unsafe fn ref_set_array(
     }
     Ok(())
 }
+// PhysX also uses array texture-object handles with surface stores. Keep their
+// pixel-shift encoding identical to surfaces, and strip it for HIP and sampling.
+pub(crate) unsafe fn encode_pixel_shift(handle: usize, array: hipArray_t) -> Result<usize, CUerror> {
+    let (format, channels) = num_channels_for_array(array)?;
+    Ok(to_cuda(handle as _, pixel_size_from_format_channels(format, channels)?)? as usize)
+}
+
+pub(crate) fn strip_pixel_shift(handle: usize) -> usize {
+    to_hip(handle as _) as usize
+}

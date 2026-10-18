@@ -1169,6 +1169,9 @@ extern "C"
 
     static std::pair<GLOBAL_SPACE void *, GLOBAL_SPACE void *> get_image_and_sampler(uint64_t texobj) __device__
     {
+        // Array texture objects carry the pixel shift in their low 3 bits, like
+        // surface handles (see surf.rs)
+        texobj &= ~uint64_t(7);
         unsigned int GLOBAL_SPACE *image = (unsigned int GLOBAL_SPACE *)texobj;
         unsigned int GLOBAL_SPACE *sampler = image + HIP_SAMPLER_OBJECT_OFFSET_DWORD;
         return {image, sampler};
