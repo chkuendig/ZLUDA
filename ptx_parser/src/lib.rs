@@ -4474,6 +4474,10 @@ derive_parser!(
         }
     }
 
+    .vec: VectorPrefix = { .v2, .v4 };
+    .dtype: ScalarType = { .b8, .b16, .b32, .b64 };
+    .mode: SurfaceClamp = { .trap, .clamp, .zero };
+
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-sust
     sust.b.1d{.vec}.dtype.mode  [a, b], c => {
         Instruction::Sust {
@@ -4532,6 +4536,35 @@ mod tests {
     use logos::Logos;
     use logos::Span;
     use winnow::prelude::*;
+
+    #[test]
+    fn surface_load_and_store_modifiers_are_independent() {
+        use super::{ast, Instruction, ScalarType, SurfaceClamp, TexDimensions};
+        for (dim, expected_dim, coords) in [
+            ("1d", TexDimensions::D1, "0"),
+            ("2d", TexDimensions::D2, "{0, 0}"),
+            ("3d", TexDimensions::D3, "{0, 0, 0, 0}"),
+        ] {
+            for (vector, values) in [("", "%v0"), (".v2", "{%v0, %v1}"), (".v4", "{%v0, %v1, %v2, %v3}")] {
+                for (ty, expected_ty) in [("b8", ScalarType::B8), ("b16", ScalarType::B16), ("b32", ScalarType::B32), ("b64", ScalarType::B64)] {
+                    for (clamp, expected_clamp) in [("trap", SurfaceClamp::Trap), ("clamp", SurfaceClamp::Clamp), ("zero", SurfaceClamp::Zero)] {
+                        let text = format!(".version 6.5\n.target sm_30\n.address_size 64\n.visible .entry k() {{ suld.b.{dim}{vector}.{ty}.{clamp} {values}, [%s, {coords}]; sust.b.{dim}{vector}.{ty}.{clamp} [%s, {coords}], {values}; ret; }}");
+                        let module = parse_module_checked(&text).unwrap();
+                        let [ast::Directive::Method(_, method)] = &module.directives[..] else { panic!("missing kernel") };
+                        let body = method.body.as_ref().unwrap();
+                        let ast::Statement::Instruction(_, Instruction::Suld { data: load, .. }) = &body[0] else { panic!("missing surface load") };
+                        let ast::Statement::Instruction(_, Instruction::Sust { data: store, .. }) = &body[1] else { panic!("missing surface store") };
+                        for data in [load, store] {
+                            assert_eq!(data.dims, expected_dim);
+                            assert!(data.type_ == expected_ty);
+                            assert!(data.clamp == expected_clamp);
+                            assert_eq!(data.vector.is_some(), !vector.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn sink_is_not_an_identifier() {
