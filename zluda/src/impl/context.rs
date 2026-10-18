@@ -63,8 +63,18 @@ impl ContextState {
 
 impl Context {
     pub(crate) fn new(device: hipDevice_t) -> Result<Self, CUerror> {
-        let mut alloc_stream = unsafe { std::mem::zeroed() };
-        unsafe { hipStreamCreateWithFlags(&mut alloc_stream, hipStreamNonBlocking) }?;
+        // The first stream on a device builds HIP's blit kernels through comgr,
+        // which replaces the calling thread's alternate signal stack. Select
+        // the device so initialization warms every device's blit program.
+        let alloc_stream = super::signal::with_preserved_state(|| {
+            let mut previous_device = 0;
+            unsafe { hipGetDevice(&mut previous_device) }?;
+            unsafe { hipSetDevice(device) }?;
+            let _restore_device = SetDeviceOnDrop(previous_device);
+            let mut alloc_stream = unsafe { std::mem::zeroed() };
+            unsafe { hipStreamCreateWithFlags(&mut alloc_stream, hipStreamNonBlocking) }?;
+            Ok(alloc_stream)
+        })?;
         Ok(Self {
             device,
             alloc_stream,
