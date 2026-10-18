@@ -55,11 +55,12 @@ pub(crate) unsafe fn ref_set_flags(
         (texref.readMode.0, texref.normalized, texref.sRGB)
     }
     let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    let previous = *texref;
     let pre_flags = get_flags(texref);
     hipTexRefSetFlags(raw_texref, flags)?;
     let post_flags = get_flags(texref);
     if pre_flags != post_flags {
-        hipfix::refresh_texref(raw_texref)?;
+        hipfix::refresh_texref(raw_texref, previous)?;
     }
     Ok(())
 }
@@ -72,11 +73,12 @@ pub(crate) unsafe fn ref_set_filter_mode(
         texref.filterMode.0
     }
     let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    let previous = *texref;
     let pre_flags = get_flags(texref);
     hipTexRefSetFilterMode(raw_texref, filter_mode)?;
     let post_flags = get_flags(texref);
     if pre_flags != post_flags {
-        hipfix::refresh_texref(raw_texref)?;
+        hipfix::refresh_texref(raw_texref, previous)?;
     }
     Ok(())
 }
@@ -93,11 +95,12 @@ pub(crate) unsafe fn ref_set_address_mode(
         return Err(hipErrorCode_t::InvalidValue);
     }
     let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    let previous = *texref;
     let pre_flags = get_flags(texref, dim);
     hipTexRefSetAddressMode(raw_texref, dim, address_mode)?;
     let post_flags = get_flags(texref, dim);
     if pre_flags != post_flags {
-        hipfix::refresh_texref(raw_texref)?;
+        hipfix::refresh_texref(raw_texref, previous)?;
     }
     Ok(())
 }
@@ -111,11 +114,12 @@ pub(crate) unsafe fn ref_set_format(
         (texref.format.0, texref.numChannels as u32)
     }
     let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    let previous = *texref;
     let pre_flags = get_flags(texref);
     hipTexRefSetFormat(raw_texref, format, num_components)?;
     let post_flags = get_flags(texref);
     if pre_flags != post_flags {
-        hipfix::refresh_texref(raw_texref)?;
+        hipfix::refresh_texref(raw_texref, previous)?;
     }
     Ok(())
 }
