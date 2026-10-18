@@ -282,6 +282,13 @@ extern "C"
     int32_t __ockl_wgred_and_i32(int32_t) __device__;
     int32_t __ockl_wgred_or_i32(int32_t) __device__;
 
+    // ds_bpermute reads 0 from source lanes that are inactive in EXEC. Pre-Volta
+    // warp-synchronous code (CUB's radix-sort rank scan in PhysX) reads lanes that
+    // diverged away before the shuffle. Strict whole-wave mode enables every lane
+    // around the permute, so each source lane contributes its register value.
+    extern "C" __attribute__((device, convergent)) int32_t
+        __zluda_strict_wwm_i32(int32_t) __asm("llvm.amdgcn.strict.wwm.i32");
+
 #define BAR_RED_IMPL(reducer)                                                                                            \
     bool FUNC(bar_red_##reducer##_pred)(uint32_t barrier __attribute__((unused)), bool predicate, bool invert_predicate) \
     {                                                                                                                    \
@@ -321,7 +328,8 @@ extern "C"
         {                                                                                                                                       \
             idx = self;                                                                                                                         \
         }                                                                                                                                       \
-        int32_t output = __builtin_amdgcn_ds_bpermute(idx << 2, (int32_t)input);                                                                \
+        int32_t input_wwm = __zluda_strict_wwm_i32((int32_t)input);                                                                             \
+        int32_t output = __zluda_strict_wwm_i32(__builtin_amdgcn_ds_bpermute(idx << 2, input_wwm));                                             \
         return {(uint32_t)output, uint32_t(!out_of_bounds)};                                                                                    \
     }                                                                                                                                           \
                                                                                                                                                 \
