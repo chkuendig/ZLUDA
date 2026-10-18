@@ -1558,7 +1558,7 @@ pub enum RegOrImmediate<Ident> {
 #[derive(Clone)]
 pub enum ParsedOperand<Ident> {
     Reg(Ident),
-    RegOffset(Ident, i32),
+    RegOffset(Ident, i64),
     Imm(ImmediateValue),
     VecMember(Ident, u8),
     // None denotes a sink; retain its position in the vector.
