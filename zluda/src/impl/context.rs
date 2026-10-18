@@ -343,6 +343,16 @@ pub(crate) unsafe fn set_flags(flags: ::core::ffi::c_uint) -> CUresult {
     })
 }
 
+/// cudart 5.5 queries the bank size while setting up its context.
+pub(crate) unsafe fn get_shared_memory_config(p_config: *mut CUsharedconfig) -> hipError_t {
+    let p_config = p_config as *mut hipSharedMemConfig;
+    if hipCtxGetSharedMemConfig(p_config).is_err() && !p_config.is_null() {
+        // AMD LDS has fixed 4-byte banks.
+        *p_config = hipSharedMemConfig::hipSharedMemBankSizeFourByte;
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn get_api_version(
     _ctx: CUcontext,
     version: &mut ::core::ffi::c_uint,
