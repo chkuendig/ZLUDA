@@ -69,6 +69,7 @@ cuda_macros::cuda_function_declarations!(
     implemented
         <= [
             cuArray3DCreate_v2,
+            cuArray3DGetDescriptor_v2,
             cuArrayCreate_v2,
             cuArrayDestroy,
             cuCtxCreate_v2,
@@ -203,6 +204,8 @@ cuda_macros::cuda_function_declarations!(
             cuStreamQuery,
             cuStreamSynchronize,
             cuStreamWaitEvent,
+            cuSurfObjectCreate,
+            cuSurfObjectDestroy,
             cuTexObjectCreate,
             cuTexObjectDestroy,
             cuTexRefSetAddress_v2,

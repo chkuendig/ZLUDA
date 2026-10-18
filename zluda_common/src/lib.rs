@@ -231,6 +231,7 @@ from_cuda_nop!(
     CUdriverProcAddressQueryResult,
     CUjit_option,
     *mut CUsharedconfig,
+    cuda_types::cuda::CUDA_RESOURCE_DESC,
     CUlibraryOption,
     CUmoduleLoadingMode,
     CUuuid,

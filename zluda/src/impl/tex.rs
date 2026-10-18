@@ -1,4 +1,5 @@
-use crate::r#impl::hipfix;
+use crate::r#impl::{hipfix, surf};
+use cuda_types::cuda::CUresult;
 use hip_runtime_sys::*;
 
 pub(crate) unsafe fn object_create(
@@ -6,12 +7,31 @@ pub(crate) unsafe fn object_create(
     p_res_desc: *const HIP_RESOURCE_DESC,
     p_tex_desc: *const HIP_TEXTURE_DESC,
     p_res_view_desc: *const HIP_RESOURCE_VIEW_DESC,
-) -> hipError_t {
-    hipTexObjectCreate(p_tex_object, p_res_desc, p_tex_desc, p_res_view_desc)
+) -> CUresult {
+    // HIP's sampler cannot program anisotropy or a mipmap level bias and
+    // returns hipErrorNotSupported for either. Drop them; CUDA uses neither
+    // for the non-mipmapped resources HIP supports.
+    let mut tex_desc = *p_tex_desc.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    tex_desc.maxAnisotropy = 0;
+    tex_desc.mipmapLevelBias = 0.0;
+    hipTexObjectCreate(p_tex_object, p_res_desc, &tex_desc, p_res_view_desc)?;
+    // PhysX also writes through texture objects with sust, so array-backed
+    // ones carry the pixel shift of surface objects.
+    if (*p_res_desc).resType == HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY {
+        let array = (*p_res_desc).res.array.hArray;
+        match surf::encode_pixel_shift(*p_tex_object as usize, array) {
+            Ok(handle) => *p_tex_object = handle as hipTextureObject_t,
+            Err(error) => {
+                let _ = hipDestroyTextureObject(*p_tex_object);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) unsafe fn object_destroy(tex_object: hipTextureObject_t) -> hipError_t {
-    hipDestroyTextureObject(tex_object)
+    hipDestroyTextureObject(surf::strip_pixel_shift(tex_object as usize) as hipTextureObject_t)
 }
 
 pub(crate) unsafe fn ref_set_array(
@@ -19,7 +39,12 @@ pub(crate) unsafe fn ref_set_array(
     array: hipArray_t,
     flags: ::core::ffi::c_uint,
 ) -> hipError_t {
-    hipTexRefSetArray(texref, array, flags)
+    // CUDA also accepts flags=0, HIP only HIP_TRSA_OVERRIDE_FORMAT. HIP's
+    // texture references take the array's format either way.
+    if flags & !hipfix::HIP_TRSA_OVERRIDE_FORMAT != 0 {
+        return Err(hipErrorCode_t::InvalidValue);
+    }
+    hipTexRefSetArray(texref, array, hipfix::HIP_TRSA_OVERRIDE_FORMAT)
 }
 
 pub(crate) unsafe fn ref_set_flags(
@@ -103,6 +128,14 @@ pub(crate) unsafe fn ref_set_address_v2(
 ) -> hipError_t {
     if dev_ptr.0.is_null() {
         return hipUnbindTexture(texref);
+    }
+    // CUDA accepts an empty range, HIP rejects it. Nothing can be read
+    // through an empty range, so keep the current binding.
+    if bytes == 0 {
+        if let Some(byte_offset) = byte_offset.as_mut() {
+            *byte_offset = 0;
+        }
+        return Ok(());
     }
     hipTexRefSetAddress(byte_offset, texref, dev_ptr, bytes)
 }
@@ -1402,6 +1435,222 @@ mod tests {
             }
         }
 
+        api.cuCtxDestroy_v2(ctx);
+    }
+
+    #[test_cuda]
+    unsafe fn texref_set_address_accepts_zero_bytes(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut ctx = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut ctx, 0, 0);
+        let mut module = std::mem::zeroed();
+        api.cuModuleLoadData(
+            &mut module,
+            TEX_READ_1D_INT_S32COORD_PTX.as_ptr() as *const c_void,
+        );
+        let mut texref = std::mem::zeroed();
+        api.cuModuleGetTexRef(&mut texref, module, c"tex".as_ptr());
+        api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_SIGNED_INT32, 1);
+        let mut buffer = std::mem::zeroed();
+        api.cuMemAlloc_v2(&mut buffer, 16);
+        let mut offset = usize::MAX;
+        api.cuTexRefSetAddress_v2(&mut offset, texref, buffer, 0);
+        assert_eq!(offset, 0);
+        api.cuMemFree_v2(buffer);
+        api.cuModuleUnload(module);
+        api.cuCtxDestroy_v2(ctx);
+    }
+
+    #[test_cuda]
+    unsafe fn texref_set_array_accepts_zero_flags(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut ctx = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut ctx, 0, 0);
+        let desc = CUDA_ARRAY_DESCRIPTOR {
+            Width: 4,
+            Height: 0,
+            Format: CUarray_format_enum::CU_AD_FORMAT_SIGNED_INT32,
+            NumChannels: 1,
+        };
+        let mut array = std::mem::zeroed();
+        api.cuArrayCreate_v2(&mut array, &desc);
+        let texels = [3i32, 5, 7, 11];
+        api.cuMemcpyHtoA_v2(array, 0, texels.as_ptr() as *const c_void, 16);
+        let mut module = std::mem::zeroed();
+        api.cuModuleLoadData(&mut module, TEX_READ_1D_INT_PTX.as_ptr() as *const c_void);
+        let mut func = std::mem::zeroed();
+        api.cuModuleGetFunction(&mut func, module, c"tex_read_1d_int".as_ptr());
+        let mut texref = std::mem::zeroed();
+        api.cuModuleGetTexRef(&mut texref, module, c"tex".as_ptr());
+        api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_SIGNED_INT32, 1);
+        api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
+        api.cuTexRefSetArray(texref, array, 0);
+        let mut d_output = std::mem::zeroed();
+        api.cuMemAlloc_v2(&mut d_output, 16);
+        let coord_x = 2.5f32;
+        let mut params: [*mut c_void; 2] = [
+            &d_output as *const _ as *mut _,
+            &coord_x as *const _ as *mut _,
+        ];
+        api.cuLaunchKernel(
+            func,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            CUstream(std::ptr::null_mut()),
+            params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        api.cuStreamSynchronize(CUstream(std::ptr::null_mut()));
+        let mut result = [0i32; 4];
+        api.cuMemcpyDtoH_v2(result.as_mut_ptr() as *mut c_void, d_output, 16);
+        assert_eq!(result[0], 7);
+        api.cuMemFree_v2(d_output);
+        api.cuModuleUnload(module);
+        api.cuArrayDestroy(array);
+        api.cuCtxDestroy_v2(ctx);
+    }
+
+    #[test_cuda]
+    unsafe fn texobj_create_ignores_anisotropy_and_mip_bias(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut ctx = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut ctx, 0, 0);
+        let desc = CUDA_ARRAY_DESCRIPTOR {
+            Width: 4,
+            Height: 0,
+            Format: CUarray_format_enum::CU_AD_FORMAT_FLOAT,
+            NumChannels: 1,
+        };
+        let mut array = std::mem::zeroed();
+        api.cuArrayCreate_v2(&mut array, &desc);
+        let texels = [0.25f32, 0.5, 0.75, 1.0];
+        api.cuMemcpyHtoA_v2(array, 0, texels.as_ptr() as *const c_void, 16);
+        let mut res_desc: CUDA_RESOURCE_DESC = std::mem::zeroed();
+        res_desc.resType = CUresourcetype::CU_RESOURCE_TYPE_ARRAY;
+        res_desc.res.array.hArray = array;
+        let mut tex_desc: CUDA_TEXTURE_DESC = std::mem::zeroed();
+        tex_desc.maxAnisotropy = 4;
+        tex_desc.mipmapLevelBias = 0.5;
+        let mut texobj = std::mem::zeroed();
+        api.cuTexObjectCreate(&mut texobj, &res_desc, &tex_desc, std::ptr::null());
+        let mut module = std::mem::zeroed();
+        api.cuModuleLoadData(
+            &mut module,
+            TEX_READ_1D_FLOAT_TEXOBJ_PTX.as_ptr() as *const c_void,
+        );
+        let mut func = std::mem::zeroed();
+        api.cuModuleGetFunction(&mut func, module, c"tex_read_1d_float_texobj".as_ptr());
+        let mut d_output = std::mem::zeroed();
+        api.cuMemAlloc_v2(&mut d_output, 16);
+        let coord_x = 2.5f32;
+        let mut params: [*mut c_void; 3] = [
+            &d_output as *const _ as *mut _,
+            &texobj as *const _ as *mut _,
+            &coord_x as *const _ as *mut _,
+        ];
+        api.cuLaunchKernel(
+            func,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            CUstream(std::ptr::null_mut()),
+            params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        api.cuStreamSynchronize(CUstream(std::ptr::null_mut()));
+        let mut result = [0f32; 4];
+        api.cuMemcpyDtoH_v2(result.as_mut_ptr() as *mut c_void, d_output, 16);
+        assert_eq!(result[0], 0.75);
+        api.cuMemFree_v2(d_output);
+        api.cuModuleUnload(module);
+        api.cuTexObjectDestroy(texobj);
+        api.cuArrayDestroy(array);
+        api.cuCtxDestroy_v2(ctx);
+    }
+
+    // HALF arrays keep their format in HIP, so legacy binds and the rebuilds
+    // after each setter must keep reading signed half values.
+    #[test_cuda]
+    unsafe fn texref_half4_array_reads_across_rebinds(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut ctx = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut ctx, 0, 0);
+        let ptx = concat!(include_str!("test_ptx/texref_half4_rebind.ptx"), "\0");
+        let mut module = std::mem::zeroed();
+        api.cuModuleLoadData(&mut module, ptx.as_ptr() as *const c_void);
+        let mut texref = std::mem::zeroed();
+        api.cuModuleGetTexRef(&mut texref, module, c"legacy_half".as_ptr());
+        let mut func = std::mem::zeroed();
+        api.cuModuleGetFunction(&mut func, module, c"sample_half".as_ptr());
+        let desc = CUDA_ARRAY3D_DESCRIPTOR {
+            Width: 4,
+            Height: 4,
+            Depth: 2,
+            Format: CUarray_format_enum::CU_AD_FORMAT_HALF,
+            NumChannels: 4,
+            Flags: 0,
+        };
+        let mut array = std::mem::zeroed();
+        api.cuArray3DCreate_v2(&mut array, &desc);
+        // HALF encodings of 0.5, 1, 2 and -3 in every texel.
+        let pixels = [0x3800u16, 0x3c00, 0x4000, 0xc200].repeat(32);
+        let mut copy: CUDA_MEMCPY3D = std::mem::zeroed();
+        copy.srcMemoryType = CUmemorytype::CU_MEMORYTYPE_HOST;
+        copy.srcHost = pixels.as_ptr() as *const c_void;
+        copy.srcPitch = 32;
+        copy.srcHeight = 4;
+        copy.dstMemoryType = CUmemorytype::CU_MEMORYTYPE_ARRAY;
+        copy.dstArray = array;
+        copy.WidthInBytes = 32;
+        copy.Height = 4;
+        copy.Depth = 2;
+        api.cuMemcpy3D_v2(&copy);
+        api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_HALF, 4);
+        api.cuTexRefSetFlags(texref, 0);
+        api.cuTexRefSetArray(texref, array, CU_TRSA_OVERRIDE_FORMAT);
+        let mut d_output = std::mem::zeroed();
+        api.cuMemAlloc_v2(&mut d_output, 16);
+        for state in 0..6 {
+            match state {
+                0 => {}
+                1 => api.cuTexRefSetFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_LINEAR),
+                2 => api.cuTexRefSetAddressMode(texref, 0, CUaddress_mode_enum::CU_TR_ADDRESS_MODE_CLAMP),
+                3 => api.cuTexRefSetFlags(texref, CU_TRSF_NORMALIZED_COORDINATES),
+                4 => api.cuTexRefSetFlags(texref, 0),
+                5 => api.cuTexRefSetArray(texref, array, CU_TRSA_OVERRIDE_FORMAT),
+                _ => unreachable!(),
+            }
+            let mut params: [*mut c_void; 1] = [&d_output as *const _ as *mut _];
+            api.cuLaunchKernel(
+                func,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                CUstream(std::ptr::null_mut()),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+            api.cuStreamSynchronize(CUstream(std::ptr::null_mut()));
+            let mut result = [0f32; 4];
+            api.cuMemcpyDtoH_v2(result.as_mut_ptr() as *mut c_void, d_output, 16);
+            assert_eq!(result, [0.5, 1.0, 2.0, -3.0], "after setter state {state}");
+        }
+        api.cuMemFree_v2(d_output);
+        api.cuModuleUnload(module);
+        api.cuArrayDestroy(array);
         api.cuCtxDestroy_v2(ctx);
     }
 }
