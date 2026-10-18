@@ -119,6 +119,10 @@ pub fn to_llvm_module<'input>(
     let fp_mode = get_fp_mode(&directives[..]);
     on_pass_end("get_fp_mode");
     let context = llvm_zluda::utils::Context::new();
+    // Golden tests compare named IR in every Cargo profile. Keeping names here
+    // changes only test diagnostics; release libraries still discard them.
+    #[cfg(test)]
+    unsafe { llvm_zluda::core::LLVMContextSetDiscardValueNames(context.get(), 0) };
     let llvm_ir = llvm::emit::run(&context, flat_resolver, directives, fp_mode)?;
     let attributes_ir = llvm::attributes::run(&context, attributes)?;
     on_pass_end("emit_llvm");
