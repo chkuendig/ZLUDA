@@ -2053,6 +2053,9 @@ derive_parser!(
     pub enum ScalarType { }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
+    pub enum VectorPrefix { }
+
+    #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
     pub enum SetpBoolPostOp { }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
@@ -4558,7 +4561,7 @@ mod tests {
                             assert_eq!(data.dims, expected_dim);
                             assert!(data.type_ == expected_ty);
                             assert!(data.clamp == expected_clamp);
-                            assert_eq!(data.vector.is_some(), !vector.is_empty());
+                            assert_eq!(data.vector.map(|v| v.len().get()), match vector { "" => None, ".v2" => Some(2), _ => Some(4) });
                         }
                     }
                 }
