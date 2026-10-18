@@ -126,6 +126,12 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     unsafe {
         libc::setenv(c"AMD_OPT_FLUSH".as_ptr(), c"0".as_ptr(), 0)
     };
+    // SDMA engine copies on the Steam Deck APU intermittently lose their
+    // completion signal. Restrict this to the Deck; keep explicit settings.
+    #[cfg(not(windows))]
+    if super::hardware::is_deck_apu() {
+        unsafe { libc::setenv(c"HSA_ENABLE_SDMA".as_ptr(), c"0".as_ptr(), 0) };
+    }
     hip_init_on_native_thread(flags)
 }
 
