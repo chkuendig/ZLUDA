@@ -152,7 +152,14 @@ pub(crate) fn get_current_context() -> Result<CUcontext, CUerror> {
     if let Some(ctx) = STACK.with(|stack| stack.borrow().last().copied().map(|(ctx, _)| ctx)) {
         return Ok(ctx);
     }
-    Err(CUerror::INVALID_CONTEXT)
+    // PhysX/APEX query the current context on threads that never set one,
+    // after their probe contexts are gone, and pass the result to Wine's
+    // nvcuda ContextStorage, which dereferences NULL. Fall back to device 0's
+    // primary context.
+    match super::device::get_primary_context(0) {
+        Ok((_, cu_ctx)) => Ok(cu_ctx),
+        Err(_) => Err(CUerror::INVALID_CONTEXT),
+    }
 }
 
 pub(crate) unsafe fn get_limit(pvalue: *mut usize, limit: hipLimit_t) -> hipError_t {
@@ -310,8 +317,10 @@ pub(crate) unsafe fn create_v4(
     create_v2(ctx, flags, dev)
 }
 
-pub(crate) unsafe fn destroy_v2(ctx: CUcontext) -> CUresult {
-    zluda_common::drop_checked::<Context>(ctx)
+pub(crate) unsafe fn destroy_v2(_ctx: CUcontext) -> CUresult {
+    // Keep the context alive and current: Wine's nvcuda ContextStorage keeps
+    // using the context PhysX creates through the dark API and then destroys.
+    Ok(())
 }
 
 pub(crate) unsafe fn pop_current_v2(ctx: Option<&mut CUcontext>) -> CUresult {
