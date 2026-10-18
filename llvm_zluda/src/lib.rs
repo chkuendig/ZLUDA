@@ -10,6 +10,9 @@ pub use ffi::*;
 
 pub use compile::compile;
 
+#[cfg(test)]
+mod image_wrappers_test;
+
 /// Legacy fork mitigations are retained for comparison, not PTX requirements.
 /// They are retired by default (the configuration validated in games);
 /// `1` re-enables one. Compiler settings must enter the cache key.
