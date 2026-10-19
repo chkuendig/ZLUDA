@@ -218,6 +218,7 @@ cuda_macros::cuda_function_declarations!(
             cuTexRefSetFilterMode,
             cuTexRefSetFlags,
             cuTexRefSetFormat,
+            cuTexRefSetMipmapFilterMode,
             cuThreadExchangeStreamCaptureMode,
         ],
     implemented_in_function <= [cuLaunchKernel,]

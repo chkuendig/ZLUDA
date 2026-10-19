@@ -103,6 +103,19 @@ pub(crate) unsafe fn ref_set_address_mode(
     Ok(())
 }
 
+pub(crate) unsafe fn ref_set_mipmap_filter_mode(
+    raw_texref: *mut textureReference,
+    filter_mode: hipTextureFilterMode,
+) -> hipError_t {
+    let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    hipTexRefSetMipmapFilterMode(raw_texref, filter_mode)?;
+    let current = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?.mipmapFilterMode;
+    if previous.mipmapFilterMode != current {
+        hipfix::refresh_texref(raw_texref, previous)?;
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn ref_set_format(
     raw_texref: *mut textureReference,
     format: hipArray_Format,
@@ -2427,7 +2440,7 @@ mod tests {
         api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
         api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
         api.cuTexRefSetAddress_v2(&mut 0, texref, source, 16);
-        for state in 0..8 {
+        for state in 0..11 {
             match state {
                 0 => {},
                 1 => api.cuTexRefSetFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_POINT),
@@ -2441,12 +2454,14 @@ mod tests {
                     api.cuTexRefSetAddress_v2(&mut 0, texref, alternate, 16);
                 },
                 7 => api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4),
+                8 | 10 => api.cuTexRefSetMipmapFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_POINT),
+                9 => api.cuTexRefSetMipmapFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_LINEAR),
                 _ => unreachable!(),
             }
             let actual = read_linear_texel(&api, function, output);
             let expected = match state {
                 4 => [7, 0, 11, 0],
-                6 | 7 => [19, 23, 29, 31],
+                6..=10 => [19, 23, 29, 31],
                 _ => first,
             };
             assert_eq!(actual, expected, "linear texref state {state}");
