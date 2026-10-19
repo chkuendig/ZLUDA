@@ -1,12 +1,12 @@
-declare hidden i32 @__zluda_ptx_impl_suld_b_3d_b32_clamp(i64, <4 x i32>) #0
+declare hidden i32 @__zluda_ptx_impl_suldobj_b_3d_v1_b32(i64, <4 x i32>) #0
 
-declare hidden void @__zluda_ptx_impl_sust_b_2d_b32_zero(i64, <2 x i32>, i32) #0
+declare hidden void @__zluda_ptx_impl_sustobj_b_2d_v1_b32(i64, <2 x i32>, i32) #0
 
-declare hidden void @__zluda_ptx_impl_sust_b_3d_b32_zero(i64, <4 x i32>, i32) #0
+declare hidden void @__zluda_ptx_impl_sustobj_b_3d_v1_b32(i64, <4 x i32>, i32) #0
 
-declare hidden void @__zluda_ptx_impl_sust_b_3d_b64_zero(i64, <4 x i32>, i64) #0
+declare hidden void @__zluda_ptx_impl_sustobj_b_3d_v1_b64(i64, <4 x i32>, i64) #0
 
-declare hidden void @__zluda_ptx_impl_sust_b_3d_v4_b32_trap(i64, <4 x i32>, <4 x i32>) #0
+declare hidden void @__zluda_ptx_impl_sustobj_b_3d_v4_b32(i64, <4 x i32>, <4 x i32>) #0
 
 define amdgpu_kernel void @surface_3d(ptr addrspace(4) byref(i64) %"57", ptr addrspace(4) byref(i64) %"58") #1 {
   %"59" = alloca i64, align 8, addrspace(5)
@@ -38,7 +38,7 @@ define amdgpu_kernel void @surface_3d(ptr addrspace(4) byref(i64) %"57", ptr add
   %10 = insertelement <4 x i32> %9, i32 %6, i8 2
   %"46" = insertelement <4 x i32> %10, i32 %7, i8 3
   %11 = load i64, ptr addrspace(5) %"59", align 8
-  %"111" = call i32 @__zluda_ptx_impl_suld_b_3d_b32_clamp(i64 %11, <4 x i32> %"46")
+  %"111" = call i32 @__zluda_ptx_impl_suldobj_b_3d_v1_b32(i64 %11, <4 x i32> %"46")
   %"45" = bitcast i32 %"111" to <1 x i32>
   %"76" = extractelement <1 x i32> %"45", i8 0
   store i32 %"76", ptr addrspace(5) %"64", align 4
@@ -54,7 +54,7 @@ define amdgpu_kernel void @surface_3d(ptr addrspace(4) byref(i64) %"57", ptr add
   %"48" = insertelement <1 x i32> undef, i32 %19, i8 0
   %20 = load i64, ptr addrspace(5) %"59", align 8
   %"116" = bitcast <1 x i32> %"48" to i32
-  call void @__zluda_ptx_impl_sust_b_3d_b32_zero(i64 %20, <4 x i32> %"47", i32 %"116")
+  call void @__zluda_ptx_impl_sustobj_b_3d_v1_b32(i64 %20, <4 x i32> %"47", i32 %"116")
   %21 = load i32, ptr addrspace(5) %"61", align 4
   %22 = load i32, ptr addrspace(5) %"62", align 4
   %23 = load i32, ptr addrspace(5) %"63", align 4
@@ -72,7 +72,7 @@ define amdgpu_kernel void @surface_3d(ptr addrspace(4) byref(i64) %"57", ptr add
   %34 = insertelement <4 x i32> %33, i32 %30, i8 2
   %"50" = insertelement <4 x i32> %34, i32 %31, i8 3
   %35 = load i64, ptr addrspace(5) %"59", align 8
-  call void @__zluda_ptx_impl_sust_b_3d_v4_b32_trap(i64 %35, <4 x i32> %"49", <4 x i32> %"50")
+  call void @__zluda_ptx_impl_sustobj_b_3d_v4_b32(i64 %35, <4 x i32> %"49", <4 x i32> %"50")
   %36 = load i32, ptr addrspace(5) %"64", align 4
   %37 = load i32, ptr addrspace(5) %"64", align 4
   %38 = insertelement <2 x i32> undef, i32 %36, i8 0
@@ -91,7 +91,7 @@ define amdgpu_kernel void @surface_3d(ptr addrspace(4) byref(i64) %"57", ptr add
   %"53" = insertelement <1 x i64> undef, i64 %46, i8 0
   %47 = load i64, ptr addrspace(5) %"59", align 8
   %"126" = bitcast <1 x i64> %"53" to i64
-  call void @__zluda_ptx_impl_sust_b_3d_b64_zero(i64 %47, <4 x i32> %"52", i64 %"126")
+  call void @__zluda_ptx_impl_sustobj_b_3d_v1_b64(i64 %47, <4 x i32> %"52", i64 %"126")
   %48 = load i32, ptr addrspace(5) %"61", align 4
   %49 = load i32, ptr addrspace(5) %"62", align 4
   %50 = insertelement <2 x i32> undef, i32 %48, i8 0
@@ -100,7 +100,7 @@ define amdgpu_kernel void @surface_3d(ptr addrspace(4) byref(i64) %"57", ptr add
   %"55" = insertelement <1 x i32> undef, i32 %51, i8 0
   %52 = load i64, ptr addrspace(5) %"59", align 8
   %"129" = bitcast <1 x i32> %"55" to i32
-  call void @__zluda_ptx_impl_sust_b_2d_b32_zero(i64 %52, <2 x i32> %"54", i32 %"129")
+  call void @__zluda_ptx_impl_sustobj_b_2d_v1_b32(i64 %52, <2 x i32> %"54", i32 %"129")
   %53 = load i64, ptr addrspace(5) %"60", align 8
   %54 = load i32, ptr addrspace(5) %"64", align 4
   %"130" = inttoptr i64 %53 to ptr addrspace(1)
