@@ -419,12 +419,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
     }
 
     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
-        // precise-memory makes every memory access wait for completion. FluidMark
-        // hits GPU memory faults without it.
+        // Private diagnostic: isolate the historical FluidMark fault without
+        // forced precise-memory waits. Never promote this as a default.
         self.emit_fn_attribute_string(
             fn_,
             "target-features",
-            "+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory",
+            "+wavefrontsize32,-wavefrontsize64,+cumode",
         )
     }
 
