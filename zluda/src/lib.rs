@@ -218,7 +218,10 @@ cuda_macros::cuda_function_declarations!(
             cuTexRefSetFilterMode,
             cuTexRefSetFlags,
             cuTexRefSetFormat,
+            cuTexRefSetMaxAnisotropy,
             cuTexRefSetMipmapFilterMode,
+            cuTexRefSetMipmapLevelBias,
+            cuTexRefSetMipmapLevelClamp,
             cuThreadExchangeStreamCaptureMode,
         ],
     implemented_in_function <= [cuLaunchKernel,]
