@@ -44,7 +44,7 @@ define amdgpu_kernel void @subc_cc_s32(ptr addrspace(4) byref(i64) %"49", ptr ad
   store i32 %19, ptr addrspace(5) %"54", align 4
   %20 = load i32, ptr addrspace(5) %"53", align 4
   %21 = load i32, ptr addrspace(5) %"54", align 4
-  %22 = insertelement <2 x i32> zeroinitializer, i32 %20, i8 0
+  %22 = insertelement <2 x i32> undef, i32 %20, i8 0
   %"47" = insertelement <2 x i32> %22, i32 %21, i8 1
   %"80" = bitcast <2 x i32> %"47" to i64
   store i64 %"80", ptr addrspace(5) %"55", align 8
@@ -61,5 +61,5 @@ declare { i32, i1 } @llvm.uadd.with.overflow.i32(i32, i32) #1
 ; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
 declare { i32, i1 } @llvm.usub.with.overflow.i32(i32, i32) #1
 
-attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
 attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }

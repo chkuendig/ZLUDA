@@ -63,9 +63,10 @@ impl ContextState {
 
 impl Context {
     pub(crate) fn new(device: hipDevice_t) -> Result<Self, CUerror> {
+        // The first stream on a device builds HIP's blit kernels through comgr,
+        // which replaces the calling thread's alternate signal stack. Select
+        // the device so initialization warms every device's blit program.
         let alloc_stream = super::signal::with_preserved_state(|| {
-            // Warm the blit program on every device during native initialization,
-            // and protect later explicit context creation on Wine threads.
             let mut previous_device = 0;
             unsafe { hipGetDevice(&mut previous_device) }?;
             unsafe { hipSetDevice(device) }?;
@@ -151,10 +152,10 @@ pub(crate) fn get_current_context() -> Result<CUcontext, CUerror> {
     if let Some(ctx) = STACK.with(|stack| stack.borrow().last().copied().map(|(ctx, _)| ctx)) {
         return Ok(ctx);
     }
-    // Fall back to primary context for device 0 when stack is empty.
-    // Real CUDA makes the primary context implicitly available after cuInit.
-    // PhysX creates/destroys explicit contexts during probe, then expects
-    // the primary context to still be accessible.
+    // PhysX/APEX query the current context on threads that never set one,
+    // after their probe contexts are gone, and pass the result to Wine's
+    // nvcuda ContextStorage, which dereferences NULL. Fall back to device 0's
+    // primary context.
     match super::device::get_primary_context(0) {
         Ok((_, cu_ctx)) => Ok(cu_ctx),
         Err(_) => Err(CUerror::INVALID_CONTEXT),
@@ -181,12 +182,10 @@ pub(crate) fn set_cache_config(config: CUfunc_cache) -> CUresult {
 }
 
 pub(crate) fn synchronize() -> hipError_t {
-    super::driver::sync_timeline_log("ctx", 0);
     unsafe { hipDeviceSynchronize() }
 }
 
 pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {
-    super::driver::sync_timeline_log("ctx_v2", ctx.device as usize);
     let mut current_device = 0;
     unsafe { hipGetDevice(&mut current_device)? };
     let _dev_drop = if current_device != ctx.device {
@@ -242,65 +241,22 @@ pub(crate) fn set_current(raw_ctx: CUcontext) -> CUresult {
 pub(crate) fn get_current(pctx: &mut CUcontext) -> CUresult {
     match get_current_context() {
         Ok(ctx) => *pctx = ctx,
-        Err(_) => {
-            // Return primary context instead of NULL to prevent APEX from
-            // passing NULL to ContextStorage_Set (which causes NULL deref crash)
-            super::driver::zluda_log(
-                "[ZLUDA] cuCtxGetCurrent: stack empty, returning primary context",
-            );
-            super::driver::zluda_log_err("cuCtxGetCurrent: stack empty, returning primary context");
-            match super::device::get_primary_context(0) {
-                Ok((_, cu_ctx)) => *pctx = cu_ctx,
-                Err(_) => *pctx = CUcontext(ptr::null_mut()),
-            }
-        }
+        Err(_) => *pctx = CUcontext(ptr::null_mut()),
     }
     CUresult::SUCCESS
 }
 
 pub(crate) fn get_device(dev: &mut hipDevice_t) -> CUresult {
-    match get_device_v2(dev, MaybeContextRef::None) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // PhysX GPU dispatcher calls cuCtxGetDevice after destroying contexts.
-            // Return device 0 instead of error to keep the dispatcher running.
-            super::driver::zluda_log_err("cuCtxGetDevice failed, returning device 0");
-            *dev = 0;
-            Ok(())
-        }
-    }
+    get_device_v2(dev, MaybeContextRef::None)
 }
 
 pub(crate) fn get_device_v2(dev: &mut hipDevice_t, ctx: MaybeContextRef) -> CUresult {
     let device = match ctx {
         MaybeContextRef::Some(ctx) => ctx.device,
         MaybeContextRef::None => {
-            match get_current_context() {
-                Ok(cu_ctx) => {
-                    let ctx: Result<&Context, CUerror> = FromCuda::from_cuda(&cu_ctx);
-                    match ctx {
-                        Ok(ctx) => ctx.device,
-                        Err(_) => {
-                            // Primary context fallback: return device 0
-                            super::driver::zluda_log("[ZLUDA] cuCtxGetDevice: from_cuda failed, falling back to device 0");
-                            super::driver::zluda_log_err(
-                                "cuCtxGetDevice: from_cuda failed, falling back to device 0",
-                            );
-                            0
-                        }
-                    }
-                }
-                Err(_) => {
-                    // No context at all: return device 0 as PhysX expects
-                    super::driver::zluda_log(
-                        "[ZLUDA] cuCtxGetDevice: no context, falling back to device 0",
-                    );
-                    super::driver::zluda_log_err(
-                        "cuCtxGetDevice: no context, falling back to device 0",
-                    );
-                    0
-                }
-            }
+            let cu_ctx: CUcontext = get_current_context()?;
+            let ctx: &Context = FromCuda::<_, CUerror>::from_cuda(&cu_ctx)?;
+            ctx.device
         }
     };
     *dev = device;
@@ -345,14 +301,10 @@ pub(crate) unsafe fn create_v2(
     _flags: ::core::ffi::c_uint,
     dev: cuda_types::cuda::CUdevice,
 ) -> CUresult {
-    super::driver::zluda_log(&format!("[ZLUDA] cuCtxCreate_v2(dev={})", dev));
-    super::driver::zluda_log_err(&format!("cuCtxCreate_v2(dev={})", dev));
     let handle = Context::wrap(Context::new(dev)?);
     // TODO: optimize
     set_current(handle)?;
     *ctx = handle;
-    super::driver::zluda_log("[ZLUDA] cuCtxCreate_v2 -> SUCCESS");
-    super::driver::zluda_log_err(&format!("cuCtxCreate_v2 -> SUCCESS (ctx={:p})", handle.0));
     Ok(())
 }
 
@@ -366,19 +318,8 @@ pub(crate) unsafe fn create_v4(
 }
 
 pub(crate) unsafe fn destroy_v2(_ctx: CUcontext) -> CUresult {
-    // Complete no-op: don't pop from stack, don't free memory.
-    // Wine's nvcuda relay has a ContextStorage system that crashes (NULL deref)
-    // when cuCtxGetCurrent returns NULL (empty stack). PhysX creates contexts
-    // via dark API, "destroys" them, then later code (Relay1_func0) calls
-    // ContextStorage_Get with whatever cuCtxGetCurrent returns. If we popped
-    // the context, Wine gets NULL and crashes. By keeping the context on the
-    // stack, Wine always has a valid context pointer.
-    // On real NVIDIA, dark API contexts survive cuCtxDestroy anyway.
-    super::driver::zluda_log("[ZLUDA] cuCtxDestroy_v2: no-op (context kept on stack)");
-    super::driver::zluda_log_err(&format!(
-        "cuCtxDestroy_v2(ctx={:p}): no-op (context kept on stack)",
-        _ctx.0
-    ));
+    // Keep the context alive and current: Wine's nvcuda ContextStorage keeps
+    // using the context PhysX creates through the dark API and then destroys.
     Ok(())
 }
 
@@ -402,34 +343,13 @@ pub(crate) unsafe fn set_flags(flags: ::core::ffi::c_uint) -> CUresult {
     })
 }
 
-/// cuCtxGetSharedMemConfig implementation.
-/// cudart64_55.dll calls this during context init. Previously unimplemented,
-/// which returned NOT_SUPPORTED, potentially causing the runtime to skip
-/// texture object creation (gParams NULL texture bug).
+/// cudart 5.5 queries the bank size while setting up its context.
 pub(crate) unsafe fn get_shared_memory_config(p_config: *mut CUsharedconfig) -> hipError_t {
     let p_config = p_config as *mut hipSharedMemConfig;
-    let result = hipCtxGetSharedMemConfig(p_config);
-    super::driver::zluda_log_err(&format!("cuCtxGetSharedMemConfig -> result={:?}", result));
-    match result {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Return default (4-byte banks) so cudart doesn't skip init
-            if !p_config.is_null() {
-                *p_config = hipSharedMemConfig(1);
-            }
-            Ok(())
-        }
+    if hipCtxGetSharedMemConfig(p_config).is_err() && !p_config.is_null() {
+        // AMD LDS has fixed 4-byte banks.
+        *p_config = hipSharedMemConfig::hipSharedMemBankSizeFourByte;
     }
-}
-
-/// cuCtxSetSharedMemConfig — set shared memory bank size.
-/// No-op: hipCtxSetSharedMemConfig is unimplemented in ROCm (assertion failure).
-/// AMDGPU LDS always uses 32-bit bank mode, so this is safe to ignore.
-pub(crate) unsafe fn set_shared_memory_config(config: CUsharedconfig) -> hipError_t {
-    super::driver::zluda_log_err(&format!(
-        "cuCtxSetSharedMemConfig(config={}) -> no-op",
-        config.0
-    ));
     Ok(())
 }
 

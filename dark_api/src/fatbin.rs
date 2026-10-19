@@ -213,8 +213,8 @@ impl<'a> FatbinFile<'a> {
         {
             Cow::Owned(unsafe { decompress_zstd(self) }?)
         } else if self.header.flags.contains(FatbinFileHeaderFlags::Compress) {
-            // Old-style compression flag (0x1000): LZ4 compressed, but
-            // compressed size is in payload_size (not compressed_size)
+            // Old-style compression flag (0x1000): zlib-compressed, with the
+            // compressed size in payload_size (not compressed_size)
             Cow::Owned(unsafe { decompress_legacy(self) }?)
         } else {
             Cow::Borrowed(unsafe { self.get_non_compressed_payload() })

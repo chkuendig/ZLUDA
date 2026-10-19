@@ -1,0 +1,21 @@
+.version 6.5
+.target sm_50
+.address_size 64
+.visible .entry surf_store_3d_b64(
+    .param .u64 surface,
+    .param .s32 x_bytes,
+    .param .s32 y,
+    .param .s32 z,
+    .param .b64 value
+) {
+    .reg .u64 %s;
+    .reg .s32 %x, %y, %z;
+    .reg .b64 %v;
+    ld.param.u64 %s, [surface];
+    ld.param.s32 %x, [x_bytes];
+    ld.param.s32 %y, [y];
+    ld.param.s32 %z, [z];
+    ld.param.b64 %v, [value];
+    sust.b.3d.b64.zero [%s, {%x, %y, %z, %z}], {%v};
+    ret;
+}

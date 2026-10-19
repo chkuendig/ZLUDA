@@ -3,28 +3,23 @@ use zluda_common::from_cuda_object;
 
 pub(super) mod array;
 pub(super) mod context;
-pub(super) mod d3d11_interop;
 pub(super) mod device;
 pub(super) mod driver;
 pub(super) mod event;
 pub(super) mod function;
 pub(super) mod graph;
-pub(super) mod graphics;
 mod hardware;
 pub(super) mod hipfix;
+mod iofx_bbox;
 pub(super) mod kernel;
 pub(super) mod library;
 pub(super) mod memory;
 pub(super) mod module;
 pub(super) mod pointer;
 mod signal;
-pub(crate) mod recording;
 pub(super) mod stream;
 pub(super) mod surf;
 pub(super) mod tex;
-// Upstream #625 texture tests, run against this fork's texture implementation.
-#[cfg(test)]
-mod tex_upstream_tests;
 
 #[cfg(debug_assertions)]
 pub(crate) fn unimplemented() -> CUerror {

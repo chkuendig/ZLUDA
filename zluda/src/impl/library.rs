@@ -147,14 +147,7 @@ pub(crate) unsafe fn get_global(
     let module: &Module = zluda_common::as_ref(&module)
         .ok_or(CUerror::UNKNOWN)?
         .as_result()?;
-    // lsh hipfix item 7: hipModuleGetGlobal called with bytes==NULL leaves the
-    // global "unusable" — always pass a real local out-pointer and copy back
-    // only if the caller asked for it.
-    let mut local_bytes: usize = 0;
-    hipModuleGetGlobal(dptr, &mut local_bytes, module.base, name)?;
-    if !bytes.is_null() {
-        *bytes = local_bytes;
-    }
+    hipModuleGetGlobal(dptr, bytes, module.base, name)?;
     Ok(())
 }
 

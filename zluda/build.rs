@@ -1,7 +1,8 @@
 use vergen_gix::{Emitter, Gix};
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=ZLUDA_HIP_SDK_ROOT");
+    // SteamOS links an older glibc than the build box; an explicitly supplied
+    // object provides versioned math forwarders for the release binary.
     println!("cargo:rerun-if-env-changed=ZLUDA_MATHCOMPAT_OBJECT");
     if let Some(object) = std::env::var_os("ZLUDA_MATHCOMPAT_OBJECT") {
         let object = std::path::PathBuf::from(object);
@@ -22,46 +23,6 @@ fn main() {
         .unwrap()
         .emit()
         .unwrap();
-
-    // Forward HIP compile-time version to our crate for the runtime mismatch check.
-    // Try DEP_ metadata from hip_runtime-sys first, fall back to parsing the header directly.
-    let hip_major = std::env::var("DEP_AMDHIP_VERSION_MAJOR")
-        .or_else(|_| std::env::var("DEP_AMDHIP64_VERSION_MAJOR"))
-        .or_else(|_| std::env::var("DEP_HIP_RUNTIME_SYS_VERSION_MAJOR"))
-        .ok();
-    let hip_minor = std::env::var("DEP_AMDHIP_VERSION_MINOR")
-        .or_else(|_| std::env::var("DEP_AMDHIP64_VERSION_MINOR"))
-        .or_else(|_| std::env::var("DEP_HIP_RUNTIME_SYS_VERSION_MINOR"))
-        .ok();
-
-    // Fallback: parse hip_version.h directly
-    let (hip_major, hip_minor) = match (hip_major, hip_minor) {
-        (Some(maj), Some(min)) => (maj, min),
-        _ => {
-            let header = std::env::var_os("ZLUDA_HIP_SDK_ROOT")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../ext/rocm"))
-                .join("include/hip/hip_version.h");
-            println!("cargo:rerun-if-changed={}", header.display());
-            let mut maj = String::from("0");
-            let mut min = String::from("0");
-            if let Ok(contents) = std::fs::read_to_string(&header) {
-                for line in contents.lines() {
-                    let line = line.trim();
-                    if let Some(v) = line.strip_prefix("#define HIP_VERSION_MAJOR ") {
-                        maj = v.trim().to_string();
-                    }
-                    if let Some(v) = line.strip_prefix("#define HIP_VERSION_MINOR ") {
-                        min = v.trim().to_string();
-                    }
-                }
-            }
-            (maj, min)
-        }
-    };
-    println!("cargo:rustc-env=HIP_VERSION_MAJOR={}", hip_major);
-    println!("cargo:rustc-env=HIP_VERSION_MINOR={}", hip_minor);
 }
 
 fn check_lfs_file(bc_path: &str) {

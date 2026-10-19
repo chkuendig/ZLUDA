@@ -22,19 +22,19 @@ define amdgpu_kernel void @assertfail(ptr addrspace(4) byref(i64) %"95", ptr add
   %3 = load i64, ptr addrspace(4) %"96", align 8
   store i64 %3, ptr addrspace(5) %"98", align 8
   store i32 0, ptr addrspace(5) %"103", align 4
-  %"106" = getelementptr inbounds i8, ptr addrspace(5) %"105", i32 0
+  %"106" = getelementptr inbounds i8, ptr addrspace(5) %"105", i64 0
   %4 = load i64, ptr addrspace(5) %"97", align 8
   store i64 %4, ptr addrspace(5) %"106", align 8
-  %"109" = getelementptr inbounds i8, ptr addrspace(5) %"108", i32 0
+  %"109" = getelementptr inbounds i8, ptr addrspace(5) %"108", i64 0
   %5 = load i64, ptr addrspace(5) %"97", align 8
   store i64 %5, ptr addrspace(5) %"109", align 8
-  %"112" = getelementptr inbounds i8, ptr addrspace(5) %"111", i32 0
+  %"112" = getelementptr inbounds i8, ptr addrspace(5) %"111", i64 0
   %6 = load i32, ptr addrspace(5) %"103", align 4
   store i32 %6, ptr addrspace(5) %"112", align 4
-  %"115" = getelementptr inbounds i8, ptr addrspace(5) %"114", i32 0
+  %"115" = getelementptr inbounds i8, ptr addrspace(5) %"114", i64 0
   %7 = load i64, ptr addrspace(5) %"97", align 8
   store i64 %7, ptr addrspace(5) %"115", align 8
-  %"118" = getelementptr inbounds i8, ptr addrspace(5) %"117", i32 0
+  %"118" = getelementptr inbounds i8, ptr addrspace(5) %"117", i64 0
   %8 = load i64, ptr addrspace(5) %"97", align 8
   store i64 %8, ptr addrspace(5) %"118", align 8
   %9 = load i64, ptr addrspace(5) %"105", align 8
@@ -61,4 +61,4 @@ define amdgpu_kernel void @assertfail(ptr addrspace(4) byref(i64) %"95", ptr add
 }
 
 attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

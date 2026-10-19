@@ -37,8 +37,10 @@ pub(crate) fn run(
                         }) => {
                             cfg.add_branch(current_bb, *src);
                         }
-                        Statement::FunctionPointer(FunctionPointerDetails { .. }) => {
-                            // Indirect call target — can't statically trace reachability
+                        Statement::FunctionPointer(FunctionPointerDetails {
+                            src: _func, ..
+                        }) => {
+                            return Err(error_todo());
                         }
                         Statement::Instruction(ast::Instruction::Call {
                             arguments: ast::CallArgs { func, .. },

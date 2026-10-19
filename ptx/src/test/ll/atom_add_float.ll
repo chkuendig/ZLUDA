@@ -1,4 +1,4 @@
-@shared_mem = internal addrspace(3) global [1024 x i8] undef, align 4
+@shared_mem = external addrspace(3) global [1024 x i8], align 4
 
 define amdgpu_kernel void @atom_add_float(ptr addrspace(4) byref(i64) %"45", ptr addrspace(4) byref(i64) %"46") #0 {
   %"47" = alloca i64, align 8, addrspace(5)
@@ -43,4 +43,4 @@ define amdgpu_kernel void @atom_add_float(ptr addrspace(4) byref(i64) %"45", ptr
   ret void
 }
 
-attributes #0 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

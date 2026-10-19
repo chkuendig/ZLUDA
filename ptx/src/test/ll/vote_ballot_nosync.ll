@@ -1,4 +1,4 @@
-declare hidden i32 @__zluda_ptx_impl_vote_sync_ballot_b32(i1, i32) #0
+declare hidden i32 @__zluda_ptx_impl_vote_ballot_b32(i1) #0
 
 declare hidden i32 @__zluda_ptx_impl_sreg_tid(i8) #0
 
@@ -22,7 +22,7 @@ define amdgpu_kernel void @vote_ballot_nosync(ptr addrspace(4) byref(i64) %"45")
   %4 = icmp uge i32 %3, 34
   store i1 %4, ptr addrspace(5) %"47", align 1
   %5 = load i1, ptr addrspace(5) %"47", align 1
-  %"64" = call i32 @__zluda_ptx_impl_vote_sync_ballot_b32(i1 %5, i32 -1)
+  %"64" = call i32 @__zluda_ptx_impl_vote_ballot_b32(i1 %5)
   store i32 %"64", ptr addrspace(5) %"48", align 4
   %6 = load i32, ptr addrspace(5) %"46", align 4
   %7 = zext i32 %6 to i64
@@ -40,4 +40,4 @@ define amdgpu_kernel void @vote_ballot_nosync(ptr addrspace(4) byref(i64) %"45")
 }
 
 attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { "amdgpu-flat-work-group-size"="1,1024" "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

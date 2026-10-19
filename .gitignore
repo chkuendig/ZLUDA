@@ -6,20 +6,3 @@ Cargo.lock
 
 ptx/lib/zluda_ptx_impl.ll
 ptx/lib/zluda_ptx_impl_constrained.ll
-
-# Downloaded ROCm packages / local runtime symlink (reproducible via script)
-ext/rocm
-ext/rocm/
-
-# Debug artifacts
-module_*.ll
-perf.data
-perf.data.old
-test_compile.rs
-test_ptx_invalid.rs
-test_ptx_parse.sh
-*.core
-gpucore.*
-ext/dbgapi-src/
-ext/physx-debug-symbols/*.dll
-ext/physx-debug-symbols/fatbin*

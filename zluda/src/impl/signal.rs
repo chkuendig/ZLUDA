@@ -58,10 +58,7 @@ mod linux {
     }
 
     fn failed(operation: &str) -> CUerror {
-        super::super::driver::zluda_log_err(&format!(
-            "{operation}: {}",
-            std::io::Error::last_os_error()
-        ));
+        eprintln!("ZLUDA: {operation}: {}", std::io::Error::last_os_error());
         CUerror::UNKNOWN
     }
 

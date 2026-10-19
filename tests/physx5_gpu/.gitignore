@@ -1,7 +1,0 @@
-# Cloned PhysX SDK (large, fetched by setup.sh)
-PhysX/
-
-# ZLUDA test results (machine-specific, regenerated each run)
-zluda_results/
-
-# Keep nvidia_reference/ — checked in as golden reference

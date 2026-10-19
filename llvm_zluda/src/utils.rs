@@ -46,6 +46,12 @@ impl Drop for Context {
 pub struct Module(LLVMModuleRef);
 
 impl Module {
+    /// Test fixtures transfer ownership of a module parsed through the C API.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_raw(module: LLVMModuleRef) -> Self {
+        Self(module)
+    }
+
     pub fn new(ctx: &Context, name: &CStr) -> Self {
         Self(unsafe { LLVMModuleCreateWithNameInContext(name.as_ptr(), ctx.get()) })
     }
@@ -70,12 +76,6 @@ impl Module {
 
     pub fn clone(&self) -> Self {
         Self(unsafe { LLVMCloneModule(self.0) })
-    }
-
-    /// Wrap a raw LLVMModuleRef. Caller must ensure the pointer is valid
-    /// and that no other Module owns this reference.
-    pub unsafe fn from_raw(ptr: LLVMModuleRef) -> Self {
-        Self(ptr)
     }
 
     pub fn get(&self) -> LLVMModuleRef {
