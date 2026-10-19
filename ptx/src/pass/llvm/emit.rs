@@ -302,7 +302,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 get_state_space(var.info.state_space)?,
             )
         };
-        if matches!(var.info.v_type, ast::Type::Texref) {
+        if matches!(var.info.v_type, ast::Type::Texref | ast::Type::Surfref) {
             unsafe { LLVMSetInitializer(global, LLVMGetUndef(llvm_type)) };
             unsafe {
                 LLVMSetAlignment(global, 8);
@@ -502,7 +502,9 @@ fn get_input_argument_type(
             Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
         }
         ast::StateSpace::Reg => get_type(context, v_type),
-        ast::StateSpace::Global | ast::StateSpace::Const if matches!(v_type, ast::Type::Texref) => {
+        ast::StateSpace::Global | ast::StateSpace::Const
+            if matches!(v_type, ast::Type::Texref | ast::Type::Surfref) =>
+        {
             Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
         }
         _ => return Err(error_unreachable()),
@@ -3887,7 +3889,7 @@ fn get_type(context: LLVMContextRef, type_: &ast::Type) -> Result<LLVMTypeRef, T
                     LLVMArrayType2(result, *dimension as u64)
                 })
         }
-        ast::Type::Texref => {
+        ast::Type::Texref | ast::Type::Surfref => {
             // Definitions taken from ROCm LLVM output
             let format_desc =
                 unsafe { LLVMStructCreateNamed(context, c"struct.hipChannelFormatDesc".as_ptr()) };

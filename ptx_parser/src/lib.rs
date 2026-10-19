@@ -1014,6 +1014,7 @@ fn method_parameter<'a, 'input: 'a>(
 
 enum ParsedType {
     Texref,
+    Surfref,
     Type {
         align: Option<u32>,
         vector: Option<NonZeroU8>,
@@ -1021,10 +1022,13 @@ enum ParsedType {
     },
 }
 
-fn texref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ParsedType> {
+fn texref_or_surfref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ParsedType> {
     trace(
-        "texref",
-        alt((Token::DotTexref, Token::DotSurfref)).map(|_| ParsedType::Texref),
+        "texref_or_surfref",
+        alt((
+            Token::DotTexref.map(|_| ParsedType::Texref),
+            Token::DotSurfref.map(|_| ParsedType::Surfref),
+        )),
     )
     .parse_next(stream)
 }
@@ -1054,7 +1058,7 @@ fn variable_info<'a, 'input: 'a>(
         "variable_info",
         move |stream: &mut PtxParser<'a, 'input>| {
             alt((
-                parse_if(state_space == StateSpace::Global, texref),
+                parse_if(state_space == StateSpace::Global, texref_or_surfref),
                 variable_info_non_texref.map(|(align, vector, scalar)| ParsedType::Type {
                     align,
                     vector,
@@ -1104,6 +1108,20 @@ fn multi_variable<'a, 'input: 'a>(
                         info: VariableInfo {
                             align: None,
                             v_type: Type::Texref,
+                            state_space,
+                            array_init: Vec::new(),
+                        },
+                        names,
+                    });
+                }
+                ParsedType::Surfref => {
+                    if count.is_some() {
+                        return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
+                    }
+                    return Ok(MultiVariable::Names {
+                        info: VariableInfo {
+                            align: None,
+                            v_type: Type::Surfref,
                             state_space,
                             array_init: Vec::new(),
                         },
@@ -2075,9 +2093,6 @@ derive_parser!(
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
     pub enum FunnelShiftMode { }
-
-    #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
-    pub enum SurfaceClamp { }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
     pub enum VoteMode {
@@ -4416,7 +4431,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D1,
-                type_: TexType::Texref
+                type_: TexType::Ref
             },
             arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
         }
@@ -4427,7 +4442,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D2,
-                type_: TexType::Texref
+                type_: TexType::Ref
             },
             arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
         }
@@ -4438,7 +4453,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D3,
-                type_: TexType::Texref
+                type_: TexType::Ref
             },
             arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
         }
@@ -4448,52 +4463,88 @@ derive_parser!(
     .ctype: ScalarType = { .s32, .f32 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-suld
-    suld.b.1d{.vec}.dtype.mode  d, [a, b] => {
+    suld.b.1d{.vec}.dtype.clamp  d, [a, b] => {
+        let _ = clamp;
         Instruction::Suld {
-            data: SurfaceData { dims: TexDimensions::D1, vector: vec, type_: dtype, clamp: mode },
-            arguments: SuldArgs { dst: d, src_surface: a, src_coord: b }
-        }
-    }
-    suld.b.2d{.vec}.dtype.mode  d, [a, b] => {
-        Instruction::Suld {
-            data: SurfaceData { dims: TexDimensions::D2, vector: vec, type_: dtype, clamp: mode },
-            arguments: SuldArgs { dst: d, src_surface: a, src_coord: b }
-        }
-    }
-    suld.b.3d{.vec}.dtype.mode  d, [a, b] => {
-        Instruction::Suld {
-            data: SurfaceData { dims: TexDimensions::D3, vector: vec, type_: dtype, clamp: mode },
-            arguments: SuldArgs { dst: d, src_surface: a, src_coord: b }
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, dtype),
+                dims: TexDimensions::D1,
+                type_: TexType::Ref
+            },
+            arguments: SuldArgs { dst: d, src_ptr: a, src_coord: b }
         }
     }
 
+    suld.b.2d{.vec}.dtype.clamp  d, [a, b] => {
+        let _ = clamp;
+        Instruction::Suld {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, dtype),
+                dims: TexDimensions::D2,
+                type_: TexType::Ref
+            },
+            arguments: SuldArgs { dst: d, src_ptr: a, src_coord: b }
+        }
+    }
+
+    suld.b.3d{.vec}.dtype.clamp  d, [a, b] => {
+        let _ = clamp;
+        Instruction::Suld {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, dtype),
+                dims: TexDimensions::D3,
+                type_: TexType::Ref
+            },
+            arguments: SuldArgs { dst: d, src_ptr: a, src_coord: b }
+        }
+    }
+
+    // .cop   = { .ca, .cg, .cs, .cv };
     .vec: VectorPrefix = { .v2, .v4 };
-    .dtype: ScalarType = { .b8, .b16, .b32, .b64 };
-    .mode: SurfaceClamp = { .trap, .clamp, .zero };
+    .dtype: ScalarType = { .b8 , .b16, .b32, .b64 };
+    .clamp: ClampMode = { .trap, .clamp, .zero };
 
-    // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-sust
-    sust.b.1d{.vec}.dtype.mode  [a, b], c => {
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#surface-instructions-sust
+
+    sust.b.1d{.vec}.ctype.clamp  [a, b], c => {
+        let _ = clamp;
         Instruction::Sust {
-            data: SurfaceData { dims: TexDimensions::D1, vector: vec, type_: dtype, clamp: mode },
-            arguments: SustArgs { src_surface: a, src_coord: b, src_value: c }
-        }
-    }
-    sust.b.2d{.vec}.dtype.mode  [a, b], c => {
-        Instruction::Sust {
-            data: SurfaceData { dims: TexDimensions::D2, vector: vec, type_: dtype, clamp: mode },
-            arguments: SustArgs { src_surface: a, src_coord: b, src_value: c }
-        }
-    }
-    sust.b.3d{.vec}.dtype.mode  [a, b], c => {
-        Instruction::Sust {
-            data: SurfaceData { dims: TexDimensions::D3, vector: vec, type_: dtype, clamp: mode },
-            arguments: SustArgs { src_surface: a, src_coord: b, src_value: c }
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, ctype),
+                dims: TexDimensions::D1,
+                type_: TexType::Ref
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
         }
     }
 
-    .vec: VectorPrefix = { .v2, .v4 };
-    .dtype: ScalarType = { .b8, .b16, .b32, .b64 };
-    .mode: SurfaceClamp = { .trap, .clamp, .zero };
+    sust.b.2d{.vec}.ctype.clamp  [a, b], c => {
+        let _ = clamp;
+        Instruction::Sust {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, ctype),
+                dims: TexDimensions::D2,
+                type_: TexType::Ref
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
+
+    sust.b.3d{.vec}.ctype.clamp  [a, b], c => {
+        let _ = clamp;
+        Instruction::Sust {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, ctype),
+                dims: TexDimensions::D3,
+                type_: TexType::Ref
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
+
+    .vec: VectorPrefix   = { .v2, .v4 };
+    .ctype: ScalarType = { .b8 , .b16, .b32, .b64 };
+    .clamp: ClampMode = { .trap, .clamp, .zero };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/
     match.any.sync.type  d, a, membermask => {
@@ -4566,7 +4617,7 @@ mod tests {
 
     #[test]
     fn surface_load_and_store_modifiers_are_independent() {
-        use super::{ast, Instruction, ScalarType, SurfaceClamp, TexDimensions};
+        use super::{ast, Instruction, ScalarType, TexDimensions};
         for (dim, expected_dim, coords) in [
             ("1d", TexDimensions::D1, "0"),
             ("2d", TexDimensions::D2, "{0, 0}"),
@@ -4574,7 +4625,7 @@ mod tests {
         ] {
             for (vector, values) in [("", "%v0"), (".v2", "{%v0, %v1}"), (".v4", "{%v0, %v1, %v2, %v3}")] {
                 for (ty, expected_ty) in [("b8", ScalarType::B8), ("b16", ScalarType::B16), ("b32", ScalarType::B32), ("b64", ScalarType::B64)] {
-                    for (clamp, expected_clamp) in [("trap", SurfaceClamp::Trap), ("clamp", SurfaceClamp::Clamp), ("zero", SurfaceClamp::Zero)] {
+                    for clamp in ["trap", "clamp", "zero"] {
                         let text = format!(".version 6.5\n.target sm_30\n.address_size 64\n.visible .entry k() {{ suld.b.{dim}{vector}.{ty}.{clamp} {values}, [%s, {coords}]; sust.b.{dim}{vector}.{ty}.{clamp} [%s, {coords}], {values}; ret; }}");
                         let module = parse_module_checked(&text).unwrap();
                         let [ast::Directive::Method(_, method)] = &module.directives[..] else { panic!("missing kernel") };
@@ -4583,9 +4634,14 @@ mod tests {
                         let ast::Statement::Instruction(_, Instruction::Sust { data: store, .. }) = &body[1] else { panic!("missing surface store") };
                         for data in [load, store] {
                             assert_eq!(data.dims, expected_dim);
-                            assert!(data.type_ == expected_ty);
-                            assert!(data.clamp == expected_clamp);
-                            assert_eq!(data.vector.map(|v| v.len().get()), match vector { "" => None, ".v2" => Some(2), _ => Some(4) });
+                            let expected_type = match vector {
+                                "" => ast::Type::Scalar(expected_ty),
+                                ".v2" => ast::Type::Vector(2, expected_ty),
+                                _ => ast::Type::Vector(4, expected_ty),
+                            };
+                            assert!(data.dst_type == expected_type);
+                            // Upstream accepts these modifiers but currently
+                            // does not retain their boundary behavior in the AST.
                         }
                     }
                 }

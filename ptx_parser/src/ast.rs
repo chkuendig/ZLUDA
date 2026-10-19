@@ -5,7 +5,7 @@ use super::{
 use crate::{
     BmskMode, CacheLevel, EvictionPriority, FunnelShiftMode, MatrixLayout, MatrixNumber,
     MatrixShape, Mul24Control, PtxError, PtxParserState, Reduction, ShiftDirection, ShuffleMode,
-    SurfaceClamp, VoteMode, VshOp,
+    VoteMode, VshOp,
 };
 use bitflags::bitflags;
 use derive_more::Display;
@@ -923,14 +923,14 @@ ptx_parser_macros::generate_instruction_type!(
                 src_ptr:  {
                     repr: T,
                     type: {
-                        if data.type_ == TexType::Texref {
+                        if data.type_ == TexType::Ref {
                             Type::Texref
                         } else {
                             Type::Scalar(ScalarType::U64)
                         }
                     },
                     space: {
-                        if data.type_ == TexType::Texref {
+                        if data.type_ == TexType::Ref {
                             StateSpace::Global
                         } else {
                             StateSpace::Reg
@@ -947,17 +947,31 @@ ptx_parser_macros::generate_instruction_type!(
         },
         Suld {
             type: !,
-            data: SurfaceData,
+            data: SuldData,
             arguments<T>: {
                 dst: {
                     repr: T,
-                    type: { data.value_type() },
+                    type: { &data.dst_type },
+                    relaxed_type_check: true,
                 },
-                src_surface: {
+                src_ptr: {
                     repr: T,
-                    type: { Type::Scalar(ScalarType::U64) },
+                    type: {
+                        if data.type_ == TexType::Ref {
+                            Type::Surfref
+                        } else {
+                            Type::Scalar(ScalarType::U64)
+                        }
+                    },
+                    space: {
+                        if data.type_ == TexType::Ref {
+                            StateSpace::Global
+                        } else {
+                            StateSpace::Reg
+                        }
+                    },
                 },
-                src_coord: {
+                src_coord:  {
                     repr: T,
                     type: { data.coord_type() },
                 },
@@ -965,19 +979,34 @@ ptx_parser_macros::generate_instruction_type!(
         },
         Sust {
             type: !,
-            data: SurfaceData,
+            data: SuldData,
             arguments<T>: {
-                src_surface: {
+                src_ptr: {
                     repr: T,
-                    type: { Type::Scalar(ScalarType::U64) },
+                    type: {
+                        if data.type_ == TexType::Ref {
+                            Type::Surfref
+                        } else {
+                            Type::Scalar(ScalarType::U64)
+                        }
+                    },
+                    space: {
+                        if data.type_ == TexType::Ref {
+                            StateSpace::Global
+                        } else {
+                            StateSpace::Reg
+                        }
+                    },
                 },
-                src_coord: {
+                src_coord:  {
                     repr: T,
                     type: { data.coord_type() },
+
                 },
-                src_value: {
+                src_data:  {
                     repr: T,
-                    type: { data.value_type() },
+                    type: { &data.dst_type },
+                    relaxed_type_check: true,
                 },
             }
         },
@@ -1292,6 +1321,9 @@ impl<ID: std::fmt::Display> std::fmt::Display for Variable<ID> {
             Type::Texref => {
                 return write!(f, " .texref");
             }
+            Type::Surfref => {
+                return write!(f, " .surfref");
+            }
         };
 
         if let Some(size) = vector_size {
@@ -1326,6 +1358,7 @@ pub enum Type {
     // .param.b32 foo[4];
     Array(Option<NonZeroU8>, ScalarType, Vec<u32>),
     Texref,
+    Surfref,
 }
 
 impl std::fmt::Display for Type {
@@ -1387,6 +1420,7 @@ impl Type {
                 }
             }
             Type::Texref => return None,
+            Type::Surfref => return None,
         })
     }
 }
@@ -2940,15 +2974,25 @@ impl TexData {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct SurfaceData {
-    pub dims: TexDimensions,
-    pub vector: Option<VectorPrefix>,
-    pub type_: ScalarType,
-    pub clamp: SurfaceClamp,
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum TexType {
+    Ref,
+    Obj,
 }
 
-impl SurfaceData {
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VshData {
+    pub mode: FunnelShiftMode,
+    pub op2: VshOp,
+}
+
+pub struct SuldData {
+    pub type_: TexType,
+    pub dst_type: Type,
+    pub dims: TexDimensions,
+}
+
+impl SuldData {
     pub fn coord_type(&self) -> Type {
         let dims = match self.dims {
             TexDimensions::D1 => 1,
@@ -2957,23 +3001,4 @@ impl SurfaceData {
         };
         Type::Vector(dims, ScalarType::S32)
     }
-
-    pub fn value_type(&self) -> Type {
-        match self.vector {
-            Some(vector) => Type::Vector(vector.len().get(), self.type_),
-            None => Type::Scalar(self.type_),
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum TexType {
-    Texref,
-    Texobj,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VshData {
-    pub mode: FunnelShiftMode,
-    pub op2: VshOp,
 }
