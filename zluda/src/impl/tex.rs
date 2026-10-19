@@ -116,6 +116,49 @@ pub(crate) unsafe fn ref_set_mipmap_filter_mode(
     Ok(())
 }
 
+pub(crate) unsafe fn ref_set_mipmap_level_bias(
+    raw_texref: *mut textureReference,
+    bias: f32,
+) -> hipError_t {
+    let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    hipTexRefSetMipmapLevelBias(raw_texref, bias)?;
+    let current = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?.mipmapLevelBias;
+    if previous.mipmapLevelBias.to_bits() != current.to_bits() {
+        hipfix::refresh_texref(raw_texref, previous)?;
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn ref_set_mipmap_level_clamp(
+    raw_texref: *mut textureReference,
+    min_clamp: f32,
+    max_clamp: f32,
+) -> hipError_t {
+    fn clamps(texref: &textureReference) -> (u32, u32) {
+        (texref.minMipmapLevelClamp.to_bits(), texref.maxMipmapLevelClamp.to_bits())
+    }
+    let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    hipTexRefSetMipmapLevelClamp(raw_texref, min_clamp, max_clamp)?;
+    let current = clamps(raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?);
+    if clamps(&previous) != current {
+        hipfix::refresh_texref(raw_texref, previous)?;
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn ref_set_max_anisotropy(
+    raw_texref: *mut textureReference,
+    max_anisotropy: u32,
+) -> hipError_t {
+    let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    hipTexRefSetMaxAnisotropy(raw_texref, max_anisotropy)?;
+    let current = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?.maxAnisotropy;
+    if previous.maxAnisotropy != current {
+        hipfix::refresh_texref(raw_texref, previous)?;
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn ref_set_format(
     raw_texref: *mut textureReference,
     format: hipArray_Format,
@@ -1692,6 +1735,14 @@ mod tests {
         api.cuModuleLoadData(&mut module, ptx.as_ptr().cast());
         let mut texref = std::mem::zeroed();
         api.cuModuleGetTexRef(&mut texref, module, c"legacy_linear".as_ptr());
+        // Setters must also work before binding a resource. Restore the
+        // non-mipmapped settings before testing reads through a linear binding.
+        api.cuTexRefSetMipmapLevelBias(texref, 0.5);
+        api.cuTexRefSetMipmapLevelBias(texref, 0.0);
+        api.cuTexRefSetMipmapLevelClamp(texref, 1.0, 2.0);
+        api.cuTexRefSetMipmapLevelClamp(texref, 0.0, 0.0);
+        api.cuTexRefSetMaxAnisotropy(texref, 4);
+        api.cuTexRefSetMaxAnisotropy(texref, 0);
         let mut function = std::mem::zeroed();
         api.cuModuleGetFunction(&mut function, module, c"sample_linear".as_ptr());
         let mut source = std::mem::zeroed();
@@ -1705,7 +1756,7 @@ mod tests {
         api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
         api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
         api.cuTexRefSetAddress_v2(&mut 0, texref, source, 16);
-        for state in 0..11 {
+        for state in 0..17 {
             match state {
                 0 => {},
                 1 => api.cuTexRefSetFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_POINT),
@@ -1721,12 +1772,15 @@ mod tests {
                 7 => api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4),
                 8 | 10 => api.cuTexRefSetMipmapFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_POINT),
                 9 => api.cuTexRefSetMipmapFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_LINEAR),
+                11 | 14 => api.cuTexRefSetMipmapLevelBias(texref, 0.0),
+                12 | 15 => api.cuTexRefSetMipmapLevelClamp(texref, 0.0, 0.0),
+                13 | 16 => api.cuTexRefSetMaxAnisotropy(texref, 0),
                 _ => unreachable!(),
             }
             let actual = read_linear_texel(&api, function, output);
             let expected = match state {
                 4 => [7, 0, 11, 0],
-                6..=10 => [19, 23, 29, 31],
+                6..=16 => [19, 23, 29, 31],
                 _ => first,
             };
             assert_eq!(actual, expected, "linear texref state {state}");
