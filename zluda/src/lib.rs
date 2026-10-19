@@ -146,6 +146,7 @@ cuda_macros::cuda_function_declarations!(
             cuLibraryLoadData,
             cuLibraryUnload,
             cuMemAlloc_v2,
+            cuMemAllocHost_v2,
             cuMemAllocPitch_v2,
             cuMemcpy2D_v2,
             cuMemcpy2DAsync_v2,

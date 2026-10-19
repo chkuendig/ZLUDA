@@ -156,6 +156,11 @@ pub(crate) unsafe fn free_host(ptr: *mut ::core::ffi::c_void) -> CUresult {
     Ok(hip_result?)
 }
 
+// The legacy pinned-host entry point is still used by APEX Turbulence.
+pub(crate) unsafe fn alloc_host_v2(pp: &mut *mut ::core::ffi::c_void, bytesize: usize) -> CUresult {
+    host_alloc(pp, bytesize, 0)
+}
+
 pub(crate) unsafe fn host_alloc(
     pp: &mut *mut ::core::ffi::c_void,
     bytesize: usize,
@@ -343,4 +348,34 @@ pub(crate) unsafe fn copy_dto_d_v2(
 
 pub(crate) unsafe fn copy_3d_v2(memcpy: HIP_MEMCPY3D) -> hipError_t {
     hipDrvMemcpy3D(&memcpy)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::CudaApi;
+    use cuda_macros::test_cuda;
+    use std::{ffi::c_void, mem, ptr};
+
+    #[test_cuda]
+    unsafe fn alloc_host_v2_cpu_write_and_device_copy(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let mut host = ptr::null_mut::<c_void>();
+        // APEX allocates 64 bytes through this entry point, then clears them.
+        api.cuMemAllocHost_v2(&mut host, 64);
+        assert!(!host.is_null());
+        ptr::write_bytes(host.cast::<u8>(), 0, 64);
+        let expected: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(3));
+        ptr::copy_nonoverlapping(expected.as_ptr(), host.cast::<u8>(), 64);
+        let mut device = mem::zeroed();
+        api.cuMemAlloc_v2(&mut device, 64);
+        api.cuMemcpyHtoD_v2(device, host, 64);
+        let mut actual = [0u8; 64];
+        api.cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), device, 64);
+        assert_eq!(actual, expected);
+        api.cuMemFree_v2(device);
+        api.cuMemFreeHost(host);
+        api.cuCtxDestroy_v2(context);
+    }
 }
