@@ -131,6 +131,9 @@ pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
     #[cfg(not(windows))]
     if super::hardware::is_deck_apu() {
         unsafe { libc::setenv(c"HSA_ENABLE_SDMA".as_ptr(), c"0".as_ptr(), 0) };
+        // Limit hardware queues to avoid ROCm runlist oversubscription.
+        // Preserve explicit overrides and set the default before HIP starts.
+        unsafe { libc::setenv(c"GPU_MAX_HW_QUEUES".as_ptr(), c"2".as_ptr(), 0) };
     }
     hip_init_on_native_thread(flags)
 }
