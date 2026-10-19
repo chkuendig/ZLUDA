@@ -144,3 +144,53 @@ pub(crate) unsafe fn set_cache_config(
 ) -> hipError_t {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::CudaApi;
+    use cuda_macros::test_cuda;
+    use std::{ffi::c_void, mem, ptr};
+
+    #[test_cuda]
+    unsafe fn legacy_votes_include_only_active_lanes(api: impl CudaApi) {
+        let source = concat!(include_str!("test_ptx/legacy_votes.ptx"), "\0");
+        api.cuInit(0);
+        let mut context = mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let mut module = mem::zeroed();
+        api.cuModuleLoadData(&mut module, source.as_ptr().cast());
+        let mut device = mem::zeroed();
+        api.cuMemAlloc_v2(&mut device, 64 * 4);
+        for name in [c"vote_cases", c"divergent_vote_cases"] {
+            let mut function = mem::zeroed();
+            api.cuModuleGetFunction(&mut function, module, name.as_ptr());
+            for threads in [32, 64] {
+                for mut threshold in [0u32, 16, 32] {
+                    let mut output = device;
+                    let mut args = [
+                        ptr::from_mut(&mut output).cast::<c_void>(),
+                        ptr::from_mut(&mut threshold).cast::<c_void>(),
+                    ];
+                    api.cuLaunchKernel(
+                        function, 1, 1, 1, threads, 1, 1, 0,
+                        mem::zeroed(), args.as_mut_ptr(), ptr::null_mut(),
+                    );
+                    api.cuCtxSynchronize();
+                    let mut actual = vec![0u32; threads as usize];
+                    api.cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), device, actual.len() * 4);
+                    for (lane, value) in actual.into_iter().enumerate() {
+                        let expected = if name == c"divergent_vote_cases" {
+                            if lane % 32 < 16 { 3 } else { 12 }
+                        } else {
+                            match threshold { 0 => 12, 16 => 10, 32 => 3, _ => unreachable!() }
+                        };
+                        assert_eq!(value, expected, "kernel={name:?}, threads={threads}, threshold={threshold}, lane={lane}");
+                    }
+                }
+            }
+        }
+        api.cuMemFree_v2(device);
+        api.cuModuleUnload(module);
+        api.cuCtxDestroy_v2(context);
+    }
+}

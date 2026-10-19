@@ -1,0 +1,76 @@
+.version 3.2
+.target sm_30
+.address_size 64
+
+.visible .entry vote_cases(.param .u64 output, .param .u32 threshold)
+{
+    .reg .b64 %out, %address, %offset;
+    .reg .b32 %thread, %lane, %mode, %result, %tmp;
+    .reg .pred %p, %all, %any, %all_not, %any_not, %low;
+    ld.param.u64 %out, [output];
+    ld.param.u32 %mode, [threshold];
+    mov.u32 %thread, %tid.x;
+    and.b32 %lane, %thread, 31;
+    setp.lt.u32 %p, %lane, %mode;
+    vote.all.pred %all, %p;
+    vote.any.pred %any, %p;
+    vote.all.pred %all_not, !%p;
+    vote.any.pred %any_not, !%p;
+    selp.u32 %result, 1, 0, %all;
+    selp.u32 %tmp, 2, 0, %any;
+    or.b32 %result, %result, %tmp;
+    selp.u32 %tmp, 4, 0, %all_not;
+    or.b32 %result, %result, %tmp;
+    selp.u32 %tmp, 8, 0, %any_not;
+    or.b32 %result, %result, %tmp;
+    mul.wide.u32 %offset, %thread, 4;
+    add.u64 %address, %out, %offset;
+    st.global.u32 [%address], %result;
+    ret;
+}
+
+.visible .entry divergent_vote_cases(.param .u64 output, .param .u32 threshold)
+{
+    .reg .b64 %out, %address, %offset;
+    .reg .b32 %thread, %lane, %mode, %result, %tmp;
+    .reg .pred %p, %all, %any, %all_not, %any_not, %low;
+    ld.param.u64 %out, [output];
+    ld.param.u32 %mode, [threshold];
+    mov.u32 %thread, %tid.x;
+    and.b32 %lane, %thread, 31;
+    setp.lt.u32 %low, %lane, 16;
+    @%low bra LOW;
+    setp.ne.u32 %p, %lane, %lane;
+    vote.all.pred %all, %p;
+    vote.any.pred %any, %p;
+    vote.all.pred %all_not, !%p;
+    vote.any.pred %any_not, !%p;
+    selp.u32 %result, 1, 0, %all;
+    selp.u32 %tmp, 2, 0, %any;
+    or.b32 %result, %result, %tmp;
+    selp.u32 %tmp, 4, 0, %all_not;
+    or.b32 %result, %result, %tmp;
+    selp.u32 %tmp, 8, 0, %any_not;
+    or.b32 %result, %result, %tmp;
+    mul.wide.u32 %offset, %thread, 4;
+    add.u64 %address, %out, %offset;
+    st.global.u32 [%address], %result;
+    ret;
+LOW:
+    setp.eq.u32 %p, %lane, %lane;
+    vote.all.pred %all, %p;
+    vote.any.pred %any, %p;
+    vote.all.pred %all_not, !%p;
+    vote.any.pred %any_not, !%p;
+    selp.u32 %result, 1, 0, %all;
+    selp.u32 %tmp, 2, 0, %any;
+    or.b32 %result, %result, %tmp;
+    selp.u32 %tmp, 4, 0, %all_not;
+    or.b32 %result, %result, %tmp;
+    selp.u32 %tmp, 8, 0, %any_not;
+    or.b32 %result, %result, %tmp;
+    mul.wide.u32 %offset, %thread, 4;
+    add.u64 %address, %out, %offset;
+    st.global.u32 [%address], %result;
+    ret;
+}

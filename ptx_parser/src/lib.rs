@@ -4126,34 +4126,24 @@ derive_parser!(
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-vote-sync
 
-    vote.sync.mode.pred  d, {!}a, membermask => {
+    vote{.sync}.mode.pred d, {!}a{, membermask} => {
+        if sync != membermask.is_some() {
+            state.errors.push(PtxError::SyntaxError("vote.sync requires a membermask; legacy vote has none".to_owned()));
+        }
         let (negate, a) = a;
         Instruction::Vote {
-            data: VoteDetails {
-                mode,
-                negate
-            },
-            arguments: VoteArgs { dst: d, src1: a, src2: Some(membermask) }
+            data: VoteDetails { mode, negate },
+            arguments: VoteArgs { dst: d, src1: a, src2: membermask }
         }
     }
-    vote.ballot.b32 d, {!}a => {
-        let (negate, a) = a;
-        Instruction::Vote {
-            data: VoteDetails {
-                mode: VoteMode::Ballot,
-                negate
-            },
-            arguments: VoteArgs { dst: d, src1: a, src2: None }
+    vote{.sync}.ballot.b32 d, {!}a{, membermask} => {
+        if sync != membermask.is_some() {
+            state.errors.push(PtxError::SyntaxError("vote.sync requires a membermask; legacy vote has none".to_owned()));
         }
-    }
-    vote.sync.ballot.b32 d, {!}a, membermask => {
         let (negate, a) = a;
         Instruction::Vote {
-            data: VoteDetails {
-                mode: VoteMode::Ballot,
-                negate
-            },
-            arguments: VoteArgs { dst: d, src1: a, src2: Some(membermask) }
+            data: VoteDetails { mode: VoteMode::Ballot, negate },
+            arguments: VoteArgs { dst: d, src1: a, src2: membermask }
         }
     }
 
@@ -4539,6 +4529,40 @@ mod tests {
     use logos::Logos;
     use logos::Span;
     use winnow::prelude::*;
+
+    #[test]
+    fn legacy_and_sync_votes_keep_mode_negation_and_mask() {
+        let mut source = String::from(".version 6.5\n.target sm_70\n.address_size 64\n.visible .entry k() { .reg .pred %p, %q; .reg .b32 %r;\n");
+        let mut expected = Vec::new();
+        for (mode, kind, dst, typ) in [
+            ("all", super::VoteMode::All, "%q", "pred"),
+            ("any", super::VoteMode::Any, "%q", "pred"),
+            ("ballot", super::VoteMode::Ballot, "%r", "b32"),
+        ] {
+            for sync in [false, true] {
+                for negate in [false, true] {
+                    source.push_str(&format!("vote{}.{mode}.{typ} {dst}, {}%p{};\n", if sync { ".sync" } else { "" }, if negate { "!" } else { "" }, if sync { ", 0xffffffff" } else { "" }));
+                    expected.push((kind, negate, sync));
+                }
+            }
+        }
+        source.push_str("ret; }");
+        let module = parse_module_checked(&source).unwrap();
+        let [super::ast::Directive::Method(_, method)] = &module.directives[..] else { panic!("missing kernel") };
+        let votes = method.body.as_ref().unwrap().iter().filter_map(|statement| match statement {
+            super::ast::Statement::Instruction(_, super::Instruction::Vote { data, arguments }) => Some((data.mode, data.negate, arguments.src2.is_some())),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert!(votes == expected);
+        assert_eq!(votes.len(), 12);
+        for instruction in [
+            "vote.sync.any.pred %q, %p;", "vote.all.pred %q, %p, 0xffffffff;",
+            "vote.sync.ballot.b32 %r, %p;", "vote.ballot.b32 %r, %p, 0xffffffff;",
+        ] {
+            let invalid = format!(".version 6.5 .target sm_70 .address_size 64 .visible .entry k() {{ .reg .pred %p, %q; .reg .b32 %r; {instruction} ret; }}");
+            assert!(parse_module_checked(&invalid).is_err(), "accepted invalid mask: {instruction}");
+        }
+    }
 
     #[test]
     fn surface_load_and_store_modifiers_are_independent() {

@@ -103,6 +103,30 @@ fn run_statements<'input>(
         .into_iter()
         .map(|statement| {
             Ok::<SmallVec<[_; 3]>, _>(match statement {
+                Statement::Instruction(ast::Instruction::Vote { data, mut arguments })
+                    if arguments.src2.is_none() && data.mode != ptx_parser::VoteMode::Ballot =>
+                {
+                    // Legacy any/all reduce the currently active lanes. The existing
+                    // AMD vote helpers already do this and ignore their membermask;
+                    // a full mask satisfies their active-EXEC subset requirement.
+                    let mask = resolver.register_unnamed(Some((
+                        ast::Type::Scalar(ast::ScalarType::U32),
+                        ast::StateSpace::Reg,
+                    )));
+                    arguments.src2 = Some(mask);
+                    smallvec![
+                        Statement::Constant(ConstantDefinition {
+                            dst: mask,
+                            typ: ast::ScalarType::U32,
+                            value: ptx_parser::ImmediateValue::U64(u32::MAX as u64),
+                        }),
+                        Statement::Instruction(run_instruction(
+                            resolver,
+                            fn_declarations,
+                            ast::Instruction::Vote { data, arguments },
+                        )?),
+                    ]
+                }
                 Statement::Instruction(ast::Instruction::Shfl {
                     data,
                     arguments:
