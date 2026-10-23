@@ -10,7 +10,6 @@ pub(super) mod function;
 pub(super) mod graph;
 mod hardware;
 pub(super) mod hipfix;
-mod iofx_bbox;
 pub(super) mod kernel;
 pub(super) mod library;
 pub(super) mod memory;
