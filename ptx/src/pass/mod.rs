@@ -18,6 +18,7 @@ mod hoist_globals;
 mod insert_explicit_load_store;
 mod insert_implicit_conversions;
 mod insert_post_saturation;
+mod insert_shared_war_barriers;
 mod instruction_mode_to_global_mode;
 pub mod llvm;
 mod normalize_basic_blocks;
@@ -97,6 +98,8 @@ pub fn to_llvm_module<'input>(
     on_pass_end("normalize_basic_blocks");
     let directives = remove_unreachable_basic_blocks::run(directives)?;
     on_pass_end("remove_unreachable_basic_blocks");
+    let directives = insert_shared_war_barriers::run(&mut flat_resolver, directives)?;
+    on_pass_end("insert_shared_war_barriers");
     let directives = instruction_mode_to_global_mode::run(&mut flat_resolver, directives)?;
     on_pass_end("instruction_mode_to_global_mode");
     let mut directives = insert_explicit_load_store::run(&mut flat_resolver, directives)?;
