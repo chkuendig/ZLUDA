@@ -424,7 +424,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         self.emit_fn_attribute_string(
             fn_,
             "target-features",
-            "+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory",
+            "+wavefrontsize32,-wavefrontsize64,+cumode",
         )
     }
 
