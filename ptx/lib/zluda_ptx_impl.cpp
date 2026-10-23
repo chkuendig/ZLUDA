@@ -15,6 +15,7 @@ ninja clang llvm-dis llvm-as
 
 then cd to the directory with this file and run this simple command:
 
+../../ext/llvm-project/build/bin/llvm-as zluda_ptx_impl_shfl.ll -o zluda_ptx_impl_shfl.bc && \
 ../../ext/llvm-project/build/bin/clang \
     -DHIP_ENABLE_WARP_SYNC_BUILTINS \
     -std=c++20 \
@@ -29,6 +30,7 @@ then cd to the directory with this file and run this simple command:
     -emit-llvm \
     -c \
     --offload-device-only --offload-arch=gfx1030 \
+    -Xclang -mlink-bitcode-file -Xclang zluda_ptx_impl_shfl.bc \
     -Xclang -mlink-bitcode-file -Xclang /opt/rocm/amdgcn/bitcode/ocml.bc && \
 ../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl.bc -o - \
     | sed '/@llvm.used/d' \
@@ -56,6 +58,7 @@ then cd to the directory with this file and run this simple command:
     -emit-llvm \
     -c \
     --offload-device-only --offload-arch=gfx1030 \
+    -Xclang -mlink-bitcode-file -Xclang zluda_ptx_impl_shfl.bc \
     -Xclang -mlink-bitcode-file -Xclang /opt/rocm/amdgcn/bitcode/ocml.bc && \
 ../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl_constrained.bc -o - \
     | sed '/@llvm.used/d' \
@@ -67,7 +70,8 @@ then cd to the directory with this file and run this simple command:
     | sed 's/\"target-cpu\"=\"gfx1030\"//g' \
     | sed -E 's/\"target-features\"=\"[^\"]+\"//g'| \
 ../../ext/llvm-project/build/bin/llvm-as - -o  zluda_ptx_impl_constrained.bc && \
-../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl_constrained.bc
+../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl_constrained.bc && \
+rm zluda_ptx_impl_shfl.bc
 */
 
 #include <cstddef>
@@ -282,12 +286,15 @@ extern "C"
     int32_t __ockl_wgred_and_i32(int32_t) __device__;
     int32_t __ockl_wgred_or_i32(int32_t) __device__;
 
-    // ds_bpermute reads 0 from source lanes that are inactive in EXEC. Pre-Volta
-    // warp-synchronous code (CUB's radix-sort rank scan in PhysX) reads lanes that
-    // diverged away before the shuffle. Strict whole-wave mode enables every lane
-    // around the permute, so each source lane contributes its register value.
+    // ds_bpermute reads 0 from source lanes inactive in EXEC, which breaks
+    // legacy warp-synchronous scans. Enable all lanes for the permute only:
+    // strict.wwm on the original input also widens earlier guarded arithmetic.
+    // The linked LLVM shim provides an exact-input boundary with unspecified
+    // inactive values, without a C++ uninitialised read or noundef poison.
     extern "C" __attribute__((device, convergent)) int32_t
         __zluda_strict_wwm_i32(int32_t) __asm("llvm.amdgcn.strict.wwm.i32");
+    extern "C" __attribute__((device, convergent)) int32_t
+        __zluda_ptx_impl_shfl_snapshot_i32(int32_t);
 
 #define BAR_RED_IMPL(reducer)                                                                                            \
     bool FUNC(bar_red_##reducer##_pred)(uint32_t barrier __attribute__((unused)), bool predicate, bool invert_predicate) \
@@ -328,8 +335,10 @@ extern "C"
         {                                                                                                                                       \
             idx = self;                                                                                                                         \
         }                                                                                                                                       \
-        int32_t input_wwm = __zluda_strict_wwm_i32((int32_t)input);                                                                             \
-        int32_t output = __zluda_strict_wwm_i32(__builtin_amdgcn_ds_bpermute(idx << 2, input_wwm));                                             \
+        /* Keep both data and the dynamic byte index in exact execution mode. */                                                               \
+        int32_t snapshot = __zluda_ptx_impl_shfl_snapshot_i32((int32_t)input);                                                                 \
+        int32_t index_snapshot = __zluda_ptx_impl_shfl_snapshot_i32(idx << 2);                                                                 \
+        int32_t output = __zluda_strict_wwm_i32(__builtin_amdgcn_ds_bpermute(index_snapshot, snapshot));                                       \
         return {(uint32_t)output, uint32_t(!out_of_bounds)};                                                                                    \
     }                                                                                                                                           \
                                                                                                                                                 \
