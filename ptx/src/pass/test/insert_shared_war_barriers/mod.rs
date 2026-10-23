@@ -81,3 +81,39 @@ fn exempt_accesses() {
         "bar ld st ld st ld st bar"
     );
 }
+
+#[test]
+fn scan4_warp_totals() {
+    // The lane-31 store has no barrier in its own block: the barrier goes at the end of the
+    // warp-scan block, after the last volatile load and before the lane-31 branch.
+    assert_eq!(
+        shared_accesses_and_barriers(include_str!("scan4_warp_totals.ptx")),
+        "ld bar st st ld ld st ld bar st bar ld"
+    );
+}
+
+#[test]
+fn scan4_delayed_warp0() {
+    // The padding block has no barrier; it closes the region entered through the barrier
+    // block, which also holds the delay loop's volatile store.
+    assert_eq!(
+        shared_accesses_and_barriers(include_str!("scan4_delayed_warp0.ptx")),
+        "ld bar st st st ld ld st ld bar st bar ld"
+    );
+}
+
+#[test]
+fn fallback_not_unique() {
+    assert_eq!(
+        shared_accesses_and_barriers(include_str!("fallback_not_unique.ptx")),
+        "bar st bar st st"
+    );
+}
+
+#[test]
+fn warp_scan_volatile_only() {
+    assert_eq!(
+        shared_accesses_and_barriers(include_str!("warp_scan_volatile_only.ptx")),
+        "bar st st ld ld st ld st bar ld ld st bar"
+    );
+}
