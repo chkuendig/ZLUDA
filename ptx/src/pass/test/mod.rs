@@ -9,6 +9,7 @@ use std::{
 
 mod expand_operands;
 mod insert_implicit_conversions;
+mod insert_shared_war_barriers;
 mod instruction_mode_to_global_mode;
 mod normalize_basic_blocks;
 
