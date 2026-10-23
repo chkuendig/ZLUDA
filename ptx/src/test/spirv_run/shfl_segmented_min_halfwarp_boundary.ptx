@@ -1,0 +1,89 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// Minimalized shape of the IOFX_bboxKernel label-gated shfl.down reduction:
+// warp 0 sees one uniform label segment, warp 1 sees a 16/16 label split.
+// Values are chosen so that an incorrect cross-segment reduction would pull
+// the first half of warp 1 down to 0 instead of the correct segment-local 16.
+.visible .entry shfl_segmented_min_halfwarp_boundary(
+    .param .u64 output
+)
+{
+    .reg .pred %p<4>;
+    .reg .u32  %r<24>;
+    .reg .u64  %rd<4>;
+    .shared .align 4 .u32 labels[64];
+
+    ld.param.u64 %rd0, [output];
+    cvta.to.global.u64 %rd1, %rd0;
+
+    mov.u32 %r0, %tid.x;
+    setp.ge.u32 %p0, %r0, 64;
+    @%p0 bra DONE;
+
+    and.b32 %r1, %r0, 31;      // lane
+    shr.u32 %r2, %r0, 5;       // warp
+    mov.u32 %r3, 0;
+    setp.ne.u32 %p1, %r2, 0;
+    @%p1 setp.ge.u32 %p2, %r1, 16;
+    @%p1 selp.u32 %r3, 1, 0, %p2;
+
+    mov.u32 %r4, labels;
+    mul.lo.u32 %r5, %r0, 4;
+    add.u32 %r6, %r4, %r5;
+    st.shared.u32 [%r6], %r3;
+
+    mov.u32 %r7, 31;
+    sub.u32 %r8, %r7, %r1;     // descending values: 31..0 in each warp
+
+    bar.sync 0;
+
+    shfl.down.b32 %r9|%p0, %r8, 1, 31;
+    @%p0 add.u32 %r10, %r0, 1;
+    @%p0 mul.lo.u32 %r11, %r10, 4;
+    @%p0 add.u32 %r12, %r4, %r11;
+    @%p0 ld.shared.u32 %r13, [%r12];
+    @%p0 setp.eq.u32 %p1, %r13, %r3;
+    @%p1 min.u32 %r8, %r8, %r9;
+
+    shfl.down.b32 %r9|%p0, %r8, 2, 31;
+    @%p0 add.u32 %r10, %r0, 2;
+    @%p0 mul.lo.u32 %r11, %r10, 4;
+    @%p0 add.u32 %r12, %r4, %r11;
+    @%p0 ld.shared.u32 %r13, [%r12];
+    @%p0 setp.eq.u32 %p1, %r13, %r3;
+    @%p1 min.u32 %r8, %r8, %r9;
+
+    shfl.down.b32 %r9|%p0, %r8, 4, 31;
+    @%p0 add.u32 %r10, %r0, 4;
+    @%p0 mul.lo.u32 %r11, %r10, 4;
+    @%p0 add.u32 %r12, %r4, %r11;
+    @%p0 ld.shared.u32 %r13, [%r12];
+    @%p0 setp.eq.u32 %p1, %r13, %r3;
+    @%p1 min.u32 %r8, %r8, %r9;
+
+    shfl.down.b32 %r9|%p0, %r8, 8, 31;
+    @%p0 add.u32 %r10, %r0, 8;
+    @%p0 mul.lo.u32 %r11, %r10, 4;
+    @%p0 add.u32 %r12, %r4, %r11;
+    @%p0 ld.shared.u32 %r13, [%r12];
+    @%p0 setp.eq.u32 %p1, %r13, %r3;
+    @%p1 min.u32 %r8, %r8, %r9;
+
+    shfl.down.b32 %r9|%p0, %r8, 16, 31;
+    @%p0 add.u32 %r10, %r0, 16;
+    @%p0 mul.lo.u32 %r11, %r10, 4;
+    @%p0 add.u32 %r12, %r4, %r11;
+    @%p0 ld.shared.u32 %r13, [%r12];
+    @%p0 setp.eq.u32 %p1, %r13, %r3;
+    @%p1 min.u32 %r8, %r8, %r9;
+
+    cvt.u64.u32 %rd2, %r0;
+    mul.lo.u64 %rd2, %rd2, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r8;
+
+DONE:
+    ret;
+}
