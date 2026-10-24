@@ -419,13 +419,15 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
     }
 
     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
-        // precise-memory makes every memory access wait for completion. FluidMark
-        // hits GPU memory faults without it.
-        self.emit_fn_attribute_string(
-            fn_,
-            "target-features",
-            "+wavefrontsize32,-wavefrontsize64,+cumode",
-        )
+        let value = format!(
+            "+wavefrontsize32,-wavefrontsize64,+cumode{}",
+            if cfg!(any(debug_assertions, test)) {
+                ",+precise-memory"
+            } else {
+                ""
+            }
+        );
+        self.emit_fn_attribute_string(fn_, "target-features", &*value)
     }
 
     fn emit_linkage(
