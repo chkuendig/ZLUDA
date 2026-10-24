@@ -544,13 +544,6 @@ impl<'a> MethodEmitContext<'a> {
         &mut self,
         kernel_attrs: Option<KernelAttributes>,
     ) -> Result<(), TranslateError> {
-        // TODO
-        // On Windows, with 32 bit ZLUDA on kernel _Z29KernelDeformableUberCollisionPi in
-        // SampleCloth.exe scalar memory accesses read stale memory. This might also affect
-        // Linux. Until I have a repro that's the best I can do
-        if cfg!(windows) {
-            self.emit_intrinsic(c"llvm.amdgcn.s.dcache.inv", None, Vec::new(), Vec::new())?;
-        }
         if let Some(KernelAttributes {
             rounding_mode_f32,
             rounding_mode_f16f64,
