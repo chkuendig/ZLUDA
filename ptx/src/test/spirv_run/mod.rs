@@ -232,6 +232,12 @@ test_ptx!(
     [8u32]
 );
 test_ptx!(ld_st_offset, [1u32, 2u32], [2u32, 1u32]);
+// Reads input[2]. A scalar load with misaligned offset parts reads input[1].
+test_ptx!(
+    ld_uniform_offset_parts,
+    [4u32, 0x1111u32, 0x2222u32, 0x3333u32],
+    [0x2222u32]
+);
 test_ptx!(ntid, [3u32], [4u32]);
 test_ptx!(reg_local, [12u64], [13u64]);
 test_ptx!(reg_multi, [123u32, 456u32], [123u32, 456u32]);

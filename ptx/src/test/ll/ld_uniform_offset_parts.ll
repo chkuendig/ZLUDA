@@ -1,0 +1,53 @@
+define amdgpu_kernel void @ld_uniform_offset_parts(ptr addrspace(4) byref(i64) %"44", ptr addrspace(4) byref(i64) %"45") #0 {
+  %"46" = alloca i64, align 8, addrspace(5)
+  %"47" = alloca i64, align 8, addrspace(5)
+  %"48" = alloca i32, align 4, addrspace(5)
+  %"49" = alloca i64, align 8, addrspace(5)
+  %"50" = alloca i32, align 4, addrspace(5)
+  br label %1
+
+1:                                                ; preds = %0
+  br label %"43"
+
+"43":                                             ; preds = %1
+  %2 = load i64, ptr addrspace(4) %"44", align 8
+  store i64 %2, ptr addrspace(5) %"46", align 8
+  %3 = load i64, ptr addrspace(4) %"45", align 8
+  store i64 %3, ptr addrspace(5) %"47", align 8
+  %4 = load i64, ptr addrspace(5) %"46", align 8
+  %5 = inttoptr i64 %4 to ptr
+  %6 = addrspacecast ptr %5 to ptr addrspace(1)
+  %"70" = ptrtoint ptr addrspace(1) %6 to i64
+  store i64 %"70", ptr addrspace(5) %"46", align 8
+  %7 = load i64, ptr addrspace(5) %"47", align 8
+  %8 = inttoptr i64 %7 to ptr
+  %9 = addrspacecast ptr %8 to ptr addrspace(1)
+  %"72" = ptrtoint ptr addrspace(1) %9 to i64
+  store i64 %"72", ptr addrspace(5) %"47", align 8
+  %10 = load i64, ptr addrspace(5) %"46", align 8
+  %"74" = inttoptr i64 %10 to ptr addrspace(1)
+  %11 = load i32, ptr addrspace(1) %"74", align 4
+  store i32 %11, ptr addrspace(5) %"48", align 4
+  %12 = load i32, ptr addrspace(5) %"48", align 4
+  %"59" = add i32 %12, 2
+  store i32 %"59", ptr addrspace(5) %"48", align 4
+  %13 = load i32, ptr addrspace(5) %"48", align 4
+  %"61" = zext i32 %13 to i64
+  store i64 %"61", ptr addrspace(5) %"49", align 8
+  %14 = load i64, ptr addrspace(5) %"46", align 8
+  %15 = load i64, ptr addrspace(5) %"49", align 8
+  %"63" = add i64 %14, %15
+  store i64 %"63", ptr addrspace(5) %"46", align 8
+  %16 = load i64, ptr addrspace(5) %"46", align 8
+  %"75" = inttoptr i64 %16 to ptr addrspace(1)
+  %"42" = getelementptr inbounds i8, ptr addrspace(1) %"75", i64 2
+  %17 = load i32, ptr addrspace(1) %"42", align 4
+  store i32 %17, ptr addrspace(5) %"50", align 4
+  %18 = load i64, ptr addrspace(5) %"47", align 8
+  %19 = load i32, ptr addrspace(5) %"50", align 4
+  %"76" = inttoptr i64 %18 to ptr addrspace(1)
+  store i32 %19, ptr addrspace(1) %"76", align 4
+  ret void
+}
+
+attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
