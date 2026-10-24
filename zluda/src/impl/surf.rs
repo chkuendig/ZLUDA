@@ -218,16 +218,8 @@ pub(crate) unsafe fn object_create(
     let pixel_size = pixel_size_from_format_channels(format, num_channels)?;
     let mut hip_surfobj = std::mem::zeroed();
     hipCreateSurfaceObject(&mut hip_surfobj, &resource_desc)?;
-    match to_cuda(hip_surfobj, pixel_size) {
-        Ok(surface) => {
-            *p_tex_object = surface;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = hipDestroySurfaceObject(hip_surfobj);
-            Err(error)
-        }
-    }
+    *p_tex_object = to_cuda(hip_surfobj, pixel_size)?;
+    Ok(())
 }
 
 pub(crate) unsafe fn object_destroy(tex_object: CUsurfObject) -> hipError_t {
@@ -290,7 +282,6 @@ pub(crate) unsafe fn ref_set_array(
     }
     Ok(())
 }
-
 // PhysX also uses array texture-object handles with surface stores. Keep their
 // pixel-shift encoding identical to surfaces, and strip it for HIP and sampling.
 pub(crate) unsafe fn encode_pixel_shift(handle: usize, array: hipArray_t) -> Result<usize, CUerror> {
