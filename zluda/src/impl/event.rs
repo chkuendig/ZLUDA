@@ -1,16 +1,7 @@
 use hip_runtime_sys::*;
 
 pub(crate) unsafe fn create(event: *mut hipEvent_t, flags: ::core::ffi::c_uint) -> hipError_t {
-    // Flag values are compatible between CUDA and HIP for 0,1,2,4.
-    // CUDA applications read mapped host memory once an event completes. HIP
-    // records events with an agent-scope release, which can leave GPU writes
-    // invisible to the host; request a system-scope release instead.
-    // Interprocess events (4) keep their own semantics.
-    let flags = if flags & 4 == 0 {
-        flags | hipEventReleaseToSystem
-    } else {
-        flags
-    };
+    // Flag values are compatible between CUDA and HIP for 0,1,2,4
     hipEventCreateWithFlags(event, flags)
 }
 

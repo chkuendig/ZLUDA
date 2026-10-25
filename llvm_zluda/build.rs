@@ -18,22 +18,11 @@ const COMPONENTS: &[&'static str] = &[
 ];
 
 fn main() {
-    // Optional build tools for regenerating device bitcode with this exact
-    // LLVM revision. Ordinary library builds retain the upstream targets.
-    println!("cargo:rerun-if-env-changed=ZLUDA_BUILD_LLVM_TOOLS");
-    let build_tools = env::var("ZLUDA_BUILD_LLVM_TOOLS").as_deref() == Ok("1");
     let bc_path1 = "src/device-libs/ockl.bc";
     println!("cargo:rerun-if-changed={}", bc_path1);
     check_lfs_file(bc_path1);
 
     let mut cmake = Config::new(r"../ext/llvm-project/llvm");
-    // A Rust upgrade changes Cargo's build fingerprint even when the LLVM
-    // sources and CMake configuration are unchanged. Allow the build caller
-    // to explicitly reuse its verified CMake output tree in that case.
-    println!("cargo:rerun-if-env-changed=ZLUDA_LLVM_BUILD_ROOT");
-    if let Some(root) = env::var_os("ZLUDA_LLVM_BUILD_ROOT") {
-        cmake.out_dir(PathBuf::from(root));
-    }
     try_use_sccache(&mut cmake);
     try_use_ninja(&mut cmake);
     cmake
@@ -54,18 +43,8 @@ fn main() {
         .define("LLVM_BUILD_TOOLS", "OFF")
         .define("LLVM_OPTIMIZED_TABLEGEN", "ON")
         //.define("LLVM_USE_LINKER", "lld")
-        .define("LLVM_TARGETS_TO_BUILD", if build_tools { "AMDGPU;X86" } else { "AMDGPU" })
-        .define("LLVM_ENABLE_PROJECTS", if build_tools { "llvm;lld;clang" } else { "llvm;lld" });
-    if build_tools {
-        cmake.define("CLANG_BUILD_TOOLS", "ON");
-        cmake.define("LLVM_PARALLEL_LINK_JOBS", "1");
-        cmake.define("LLVM_EXTERNAL_PROJECTS", "device-libs");
-        cmake.define(
-            "LLVM_EXTERNAL_DEVICE_LIBS_SOURCE_DIR",
-            PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
-                .join("../ext/llvm-project/amd/device-libs"),
-        );
-    }
+        .define("LLVM_TARGETS_TO_BUILD", "AMDGPU")
+        .define("LLVM_ENABLE_PROJECTS", "llvm;lld");
     // Debug build is so slow that no debugging of ZLUDA is possible.
     // If you want to build with debug symbols, use dev-llvm profile.
     if try_get_build_profile_name() == "debug" {
@@ -77,17 +56,11 @@ fn main() {
         cmake.build_target(c);
         cmake.build();
     }
-    if build_tools {
-        for tool in ["clang", "llvm-as", "llvm-dis", "ocml"] {
-            cmake.build_target(tool);
-            cmake.build();
-        }
-    }
     let cmake_profile = cmake.get_profile();
     let llvm_build_path = get_llvm_build_path(&llvm_dir, cmake_profile);
     println!("cargo:build-path={}", llvm_build_path.display());
     let (cxxflags, ldflags, libdir, lib_names, system_libs) =
-        llvm_config(&llvm_build_path.join("bin/llvm-config"), build_tools).unwrap();
+        llvm_config(&llvm_build_path.join("bin/llvm-config")).unwrap();
     println!("cargo:rustc-link-arg={ldflags}");
     println!("cargo:rustc-link-search=native={libdir}");
     for lib in system_libs.split_ascii_whitespace() {
@@ -167,7 +140,7 @@ fn get_llvm_build_path(llvm_build_dir: &PathBuf, cmake_profile: &str) -> PathBuf
     return llvm_build_path;
 }
 
-fn llvm_config(llvm_config_path: &PathBuf, build_tools: bool) -> io::Result<(String, String, String, String, String)> {
+fn llvm_config(llvm_config_path: &PathBuf) -> io::Result<(String, String, String, String, String)> {
     let mut cmd = Command::new(llvm_config_path);
     cmd.args([
         "--link-static",
@@ -180,11 +153,6 @@ fn llvm_config(llvm_config_path: &PathBuf, build_tools: bool) -> io::Result<(Str
     cmd.arg("core");
     cmd.arg("bitwriter");
     cmd.arg("amdgpu");
-    if build_tools {
-        // LLD initializes every target compiled into its LLVM tree. The
-        // optional Clang/tool build also includes X86 for host-side tools.
-        cmd.arg("x86");
-    }
     cmd.arg("option");
     cmd.arg("codegen");
     cmd.arg("passes");
