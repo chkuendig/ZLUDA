@@ -1449,25 +1449,29 @@ static T surface_load_impl(v8s32 surface, v4s32 raw_coord) __device__
 template <typename T, typename Coord>
 void surface_store(uint64_t raw_surfobj, Coord raw_coord, T value) __device__
 {
+    // Only descriptor storage is immutable for this dispatch; image data stays mutable.
+    // AS4 preserves divergent handle selection; never force readfirstlane here.
     auto [surfobj, shift, coord] = unpack_coord(raw_surfobj, raw_coord);
     uint32_t actual_pixel_size = 1U << shift;
     if (sizeof(T) < sizeof(v4f32) && actual_pixel_size > sizeof(T)) [[unlikely]]
     {
-        v4f32 tmp = surface_load_impl<v4f32>(*(GLOBAL_SPACE v8s32 *)surfobj, coord);
+        v4f32 tmp = surface_load_impl<v4f32>(*(CONSTANT_SPACE v8s32 *)surfobj, coord);
         memcpy(&tmp, &value, sizeof(T));
-        surface_store_impl(*(GLOBAL_SPACE v8s32 *)surfobj, coord, tmp);
+        surface_store_impl(*(CONSTANT_SPACE v8s32 *)surfobj, coord, tmp);
     }
     else
     {
-        surface_store_impl(*(GLOBAL_SPACE v8s32 *)surfobj, coord, zext_or_trunc<surface_pixel_type_t<T>>(value));
+        surface_store_impl(*(CONSTANT_SPACE v8s32 *)surfobj, coord, zext_or_trunc<surface_pixel_type_t<T>>(value));
     }
 }
 
 template <typename T, typename Coord>
 T surface_load(uint64_t raw_surfobj, Coord raw_coord) __device__
 {
+    // Only descriptor storage is immutable for this dispatch; image data stays mutable.
+    // AS4 preserves divergent handle selection; never force readfirstlane here.
     auto [surfobj, shift, coord] = unpack_coord(raw_surfobj, raw_coord);
-    return zext_or_trunc<T, surface_pixel_type_t<T>>(surface_load_impl<surface_pixel_type_t<T>>(*(GLOBAL_SPACE v8s32 *)surfobj, coord));
+    return zext_or_trunc<T, surface_pixel_type_t<T>>(surface_load_impl<surface_pixel_type_t<T>>(*(CONSTANT_SPACE v8s32 *)surfobj, coord));
 }
 
 extern "C"
