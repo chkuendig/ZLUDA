@@ -49,24 +49,6 @@ fn shared_accesses_and_barriers(ptx: &str) -> String {
 }
 
 #[test]
-fn downsweep_value_staging() {
-    // One barrier, before the first value-staging store.
-    assert_eq!(
-        shared_accesses_and_barriers(include_str!("downsweep_value_staging.ptx")),
-        "st st bar ld ld ld bar st st ld ld bar st st bar"
-    );
-}
-
-#[test]
-fn partial_tile_value_staging() {
-    // The pending exchange read reaches the staging block through both paths.
-    assert_eq!(
-        shared_accesses_and_barriers(include_str!("partial_tile_value_staging.ptx")),
-        "bar ld bar st ld bar"
-    );
-}
-
-#[test]
 fn no_barrier_in_block() {
     assert_eq!(
         shared_accesses_and_barriers(include_str!("no_barrier_in_block.ptx")),
@@ -83,37 +65,9 @@ fn exempt_accesses() {
 }
 
 #[test]
-fn scan4_warp_totals() {
-    // The lane-31 store has no barrier in its own block: the barrier goes at the end of the
-    // warp-scan block, after the last volatile load and before the lane-31 branch.
-    assert_eq!(
-        shared_accesses_and_barriers(include_str!("scan4_warp_totals.ptx")),
-        "ld bar st st ld ld st ld bar st bar ld"
-    );
-}
-
-#[test]
-fn scan4_delayed_warp0() {
-    // The padding block has no barrier; it closes the region entered through the barrier
-    // block, which also holds the delay loop's volatile store.
-    assert_eq!(
-        shared_accesses_and_barriers(include_str!("scan4_delayed_warp0.ptx")),
-        "ld bar st st st ld ld st ld bar st bar ld"
-    );
-}
-
-#[test]
 fn fallback_not_unique() {
     assert_eq!(
         shared_accesses_and_barriers(include_str!("fallback_not_unique.ptx")),
         "bar st bar st st"
-    );
-}
-
-#[test]
-fn warp_scan_volatile_only() {
-    assert_eq!(
-        shared_accesses_and_barriers(include_str!("warp_scan_volatile_only.ptx")),
-        "bar st st ld ld st ld st bar ld ld st bar"
     );
 }

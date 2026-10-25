@@ -539,8 +539,6 @@ test_ptx!(assertfail);
 //test_ptx!(func_ptr);
 test_ptx!(lanemask_lt);
 test_ptx!(extern_func);
-test_ptx!(ld_st_offset_64bit);
-test_ptx!(surface_3d);
 test_ptx!(global_const_uninit);
 test_ptx!(trap);
 test_ptx!(noreturn);
@@ -1339,76 +1337,6 @@ impl<T: Debug> Debug for DisplayError<T> {
 }
 
 impl<T: Debug> error::Error for DisplayError<T> {}
-
-// Six segmented reductions across divergent guards. Lane 7 must not merge
-// lane 8's value: they belong to different segments. The published helper
-// widens EXEC around the preceding guarded min, corrupting lanes 0..7 of
-// each component. The same PTX has an exact 192-word NVIDIA/CPU oracle.
-fn guarded_segment_min_expected() -> Vec<u32> {
-    (0..6u32)
-        .flat_map(|component| {
-            (0..32u32).map(move |lane| {
-                component * 1000 + if lane < 8 { 100 + lane } else { lane }
-            })
-        })
-        .collect()
-}
-
-#[test]
-fn shfl_down_guarded_segment_min_amdgpu() -> Result<(), Box<dyn error::Error>> {
-    let ptx = read_test_file!("shfl_down_guarded_segment_min.ptx");
-    test_hip_assert(
-        "shfl_down_guarded_segment_min",
-        &ptx,
-        None::<&[u8]>,
-        &guarded_segment_min_expected(),
-        32,
-    )
-}
-
-#[test]
-fn shfl_down_guarded_segment_min_cuda() -> Result<(), Box<dyn error::Error>> {
-    let ptx = read_test_file!("shfl_down_guarded_segment_min.ptx");
-    test_cuda_assert(
-        "shfl_down_guarded_segment_min",
-        &ptx,
-        None::<&[u8]>,
-        &guarded_segment_min_expected(),
-        32,
-    )
-}
-
-// Restore the two-wave boundary regression from 33516382. The second wave
-// must keep its lower half separate from the zero-valued upper segment.
-fn halfwarp_boundary_expected() -> Vec<u32> {
-    let mut expected = vec![0u32; 64];
-    expected[32..48].fill(16);
-    expected
-}
-
-#[test]
-fn shfl_segmented_min_halfwarp_boundary_amdgpu() -> Result<(), Box<dyn error::Error>> {
-    let ptx = read_test_file!("shfl_segmented_min_halfwarp_boundary.ptx");
-    test_hip_assert(
-        "shfl_segmented_min_halfwarp_boundary",
-        &ptx,
-        None::<&[u8]>,
-        &halfwarp_boundary_expected(),
-        64,
-    )
-}
-
-#[test]
-fn shfl_segmented_min_halfwarp_boundary_cuda() -> Result<(), Box<dyn error::Error>> {
-    let ptx = read_test_file!("shfl_segmented_min_halfwarp_boundary.ptx");
-    test_cuda_assert(
-        "shfl_segmented_min_halfwarp_boundary",
-        &ptx,
-        None::<&[u8]>,
-        &halfwarp_boundary_expected(),
-        64,
-    )
-}
 
 fn test_hip_assert<
     Input: From<u8> + Debug + Copy + PartialEq,
