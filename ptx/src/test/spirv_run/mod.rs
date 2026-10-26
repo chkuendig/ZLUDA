@@ -539,6 +539,7 @@ test_ptx!(assertfail);
 //test_ptx!(func_ptr);
 test_ptx!(lanemask_lt);
 test_ptx!(extern_func);
+test_ptx!(global_const_uninit);
 test_ptx!(trap);
 test_ptx!(noreturn);
 test_ptx!(createpolicy);
