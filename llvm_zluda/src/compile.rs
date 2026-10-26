@@ -114,6 +114,9 @@ pub fn compile(
 
     linked.verify()?;
 
+    unsafe { crate::ffi::LLVMZludaInlineImageWrappers(linked.get()) };
+    linked.verify()?;
+
     if let Some(hook) = compiler_hook {
         // Run compiler hook on human-readable LLVM IR
         let message = linked.print_module_to_string();

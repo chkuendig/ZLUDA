@@ -4,6 +4,9 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Module.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <lld/Common/Driver.h>
 #include <lld/Common/CommonLinkerContext.h>
 #include <llvm/Support/raw_ostream.h>
@@ -138,6 +141,64 @@ static FastMathFlags mapFromLLVMFastMathFlags(LLVMFastMathFlags FMF)
 }
 
 LLVM_C_EXTERN_C_BEGIN
+
+// OCKL's image-intrinsic wrappers have their own default FP attributes. The
+// ordinary inliner can retain these calls when a PTX caller uses a different
+// denormal mode. A transparent wrapper contains no FP arithmetic or mode
+// changes: expose its image intrinsic without changing either function's FP
+// attributes, the descriptor operands, or the intrinsic's memory effects.
+unsigned LLVMZludaInlineImageWrappers(LLVMModuleRef ModuleRef)
+{
+    SmallVector<CallInst *, 32> Calls;
+    for (Function &F : *unwrap(ModuleRef)) {
+        if (!F.getName().starts_with("__llvm_amdgcn_image_") ||
+            F.size() != 1 || F.isVarArg() ||
+            F.hasFnAttribute(Attribute::NoInline) ||
+            F.hasFnAttribute(Attribute::OptimizeNone))
+            continue;
+        BasicBlock &BB = F.front();
+        if (BB.size() != 2)
+            continue;
+        auto *Image = dyn_cast<CallInst>(&BB.front());
+        auto *Return = dyn_cast<ReturnInst>(&BB.back());
+        if (!Image || !Return || Image->hasOperandBundles())
+            continue;
+        Function *Intrinsic = Image->getCalledFunction();
+        if (!Intrinsic || !Intrinsic->isIntrinsic() ||
+            !Intrinsic->getName().starts_with("llvm.amdgcn.image.") ||
+            !Image->doesNotThrow())
+            continue;
+        if (F.getReturnType()->isVoidTy() ? Return->getReturnValue() != nullptr
+                                        : Return->getReturnValue() != Image)
+            continue;
+        bool Transparent = true;
+        for (Value *Arg : Image->args()) {
+            auto *Parameter = dyn_cast<Argument>(Arg);
+            if (!isa<Constant>(Arg) && (!Parameter || Parameter->getParent() != &F)) {
+                Transparent = false;
+                break;
+            }
+        }
+        if (!Transparent)
+            continue;
+        for (User *U : F.users()) {
+            auto *Call = dyn_cast<CallInst>(U);
+            if (Call && Call->getCalledFunction() == &F &&
+                !Call->hasOperandBundles() && !Call->isMustTailCall() &&
+                !Call->hasFnAttr(Attribute::NoInline))
+                Calls.push_back(Call);
+        }
+    }
+    unsigned Inlined = 0;
+    for (CallInst *Call : Calls) {
+        InlineFunctionInfo Info;
+        // Do not merge wrapper FP attributes into the caller. Eligibility
+        // above excludes arithmetic, control flow and other helper calls.
+        if (InlineFunction(*Call, Info, /*MergeAttributes=*/false).isSuccess())
+            ++Inlined;
+    }
+    return Inlined;
+}
 
 LLVMValueRef LLVMZludaBuildAlloca(LLVMBuilderRef B, LLVMTypeRef Ty, unsigned AddrSpace,
                                   const char *Name)
