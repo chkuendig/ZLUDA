@@ -15,6 +15,7 @@ ninja clang llvm-dis llvm-as
 
 then cd to the directory with this file and run this simple command:
 
+../../ext/llvm-project/build/bin/llvm-as zluda_ptx_impl_shfl.ll -o zluda_ptx_impl_shfl.bc && \
 ../../ext/llvm-project/build/bin/clang \
     -DHIP_ENABLE_WARP_SYNC_BUILTINS \
     -std=c++20 \
@@ -29,6 +30,7 @@ then cd to the directory with this file and run this simple command:
     -emit-llvm \
     -c \
     --offload-device-only --offload-arch=gfx1030 \
+    -Xclang -mlink-bitcode-file -Xclang zluda_ptx_impl_shfl.bc \
     -Xclang -mlink-bitcode-file -Xclang /opt/rocm/amdgcn/bitcode/ocml.bc && \
 ../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl.bc -o - \
     | sed '/@llvm.used/d' \
@@ -56,6 +58,7 @@ then cd to the directory with this file and run this simple command:
     -emit-llvm \
     -c \
     --offload-device-only --offload-arch=gfx1030 \
+    -Xclang -mlink-bitcode-file -Xclang zluda_ptx_impl_shfl.bc \
     -Xclang -mlink-bitcode-file -Xclang /opt/rocm/amdgcn/bitcode/ocml.bc && \
 ../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl_constrained.bc -o - \
     | sed '/@llvm.used/d' \
@@ -67,7 +70,8 @@ then cd to the directory with this file and run this simple command:
     | sed 's/\"target-cpu\"=\"gfx1030\"//g' \
     | sed -E 's/\"target-features\"=\"[^\"]+\"//g'| \
 ../../ext/llvm-project/build/bin/llvm-as - -o  zluda_ptx_impl_constrained.bc && \
-../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl_constrained.bc
+../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl_constrained.bc && \
+rm zluda_ptx_impl_shfl.bc
 */
 
 #include <cstddef>
@@ -282,6 +286,16 @@ extern "C"
     int32_t __ockl_wgred_and_i32(int32_t) __device__;
     int32_t __ockl_wgred_or_i32(int32_t) __device__;
 
+    // ds_bpermute reads 0 from source lanes inactive in EXEC, which breaks
+    // legacy warp-synchronous scans. Enable all lanes for the permute only:
+    // strict.wwm on the original input also widens earlier guarded arithmetic.
+    // The linked LLVM shim provides an exact-input boundary with unspecified
+    // inactive values, without a C++ uninitialised read or noundef poison.
+    extern "C" __attribute__((device, convergent)) int32_t
+        __zluda_strict_wwm_i32(int32_t) __asm("llvm.amdgcn.strict.wwm.i32");
+    extern "C" __attribute__((device, convergent)) int32_t
+        __zluda_ptx_impl_shfl_snapshot_i32(int32_t);
+
 #define BAR_RED_IMPL(reducer)                                                                                            \
     bool FUNC(bar_red_##reducer##_pred)(uint32_t barrier __attribute__((unused)), bool predicate, bool invert_predicate) \
     {                                                                                                                    \
@@ -321,7 +335,10 @@ extern "C"
         {                                                                                                                                       \
             idx = self;                                                                                                                         \
         }                                                                                                                                       \
-        int32_t output = __builtin_amdgcn_ds_bpermute(idx << 2, (int32_t)input);                                                                \
+        /* Keep both data and the dynamic byte index in exact execution mode. */                                                               \
+        int32_t snapshot = __zluda_ptx_impl_shfl_snapshot_i32((int32_t)input);                                                                 \
+        int32_t index_snapshot = __zluda_ptx_impl_shfl_snapshot_i32(idx << 2);                                                                 \
+        int32_t output = __zluda_strict_wwm_i32(__builtin_amdgcn_ds_bpermute(index_snapshot, snapshot));                                       \
         return {(uint32_t)output, uint32_t(!out_of_bounds)};                                                                                    \
     }                                                                                                                                           \
                                                                                                                                                 \
@@ -1161,6 +1178,9 @@ extern "C"
 
     static std::pair<GLOBAL_SPACE void *, GLOBAL_SPACE void *> get_image_and_sampler(uint64_t texobj) __device__
     {
+        // Array texture objects carry the pixel shift in their low 3 bits, like
+        // surface handles (see surf.rs)
+        texobj &= ~uint64_t(7);
         unsigned int GLOBAL_SPACE *image = (unsigned int GLOBAL_SPACE *)texobj;
         unsigned int GLOBAL_SPACE *sampler = image + HIP_SAMPLER_OBJECT_OFFSET_DWORD;
         return {image, sampler};
@@ -1429,25 +1449,29 @@ static T surface_load_impl(v8s32 surface, v4s32 raw_coord) __device__
 template <typename T, typename Coord>
 void surface_store(uint64_t raw_surfobj, Coord raw_coord, T value) __device__
 {
+    // Only descriptor storage is immutable for this dispatch; image data stays mutable.
+    // AS4 preserves divergent handle selection; never force readfirstlane here.
     auto [surfobj, shift, coord] = unpack_coord(raw_surfobj, raw_coord);
     uint32_t actual_pixel_size = 1U << shift;
     if (sizeof(T) < sizeof(v4f32) && actual_pixel_size > sizeof(T)) [[unlikely]]
     {
-        v4f32 tmp = surface_load_impl<v4f32>(*(GLOBAL_SPACE v8s32 *)surfobj, coord);
+        v4f32 tmp = surface_load_impl<v4f32>(*(CONSTANT_SPACE v8s32 *)surfobj, coord);
         memcpy(&tmp, &value, sizeof(T));
-        surface_store_impl(*(GLOBAL_SPACE v8s32 *)surfobj, coord, tmp);
+        surface_store_impl(*(CONSTANT_SPACE v8s32 *)surfobj, coord, tmp);
     }
     else
     {
-        surface_store_impl(*(GLOBAL_SPACE v8s32 *)surfobj, coord, zext_or_trunc<surface_pixel_type_t<T>>(value));
+        surface_store_impl(*(CONSTANT_SPACE v8s32 *)surfobj, coord, zext_or_trunc<surface_pixel_type_t<T>>(value));
     }
 }
 
 template <typename T, typename Coord>
 T surface_load(uint64_t raw_surfobj, Coord raw_coord) __device__
 {
+    // Only descriptor storage is immutable for this dispatch; image data stays mutable.
+    // AS4 preserves divergent handle selection; never force readfirstlane here.
     auto [surfobj, shift, coord] = unpack_coord(raw_surfobj, raw_coord);
-    return zext_or_trunc<T, surface_pixel_type_t<T>>(surface_load_impl<surface_pixel_type_t<T>>(*(GLOBAL_SPACE v8s32 *)surfobj, coord));
+    return zext_or_trunc<T, surface_pixel_type_t<T>>(surface_load_impl<surface_pixel_type_t<T>>(*(CONSTANT_SPACE v8s32 *)surfobj, coord));
 }
 
 extern "C"
