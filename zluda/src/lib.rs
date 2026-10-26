@@ -83,6 +83,7 @@ cuda_macros::cuda_function_declarations!(
     implemented
         <= [
             cuArray3DCreate_v2,
+            cuArray3DGetDescriptor_v2,
             cuArrayCreate_v2,
             cuArrayDestroy,
             cuCtxCreate_v2,
@@ -163,6 +164,7 @@ cuda_macros::cuda_function_declarations!(
             cuMemAllocHost_v2,
             cuMemAllocPitch_v2,
             cuMemcpy2D_v2,
+            cuMemcpy2DAsync_v2,
             cuMemcpy2DUnaligned_v2,
             cuMemcpy3D_v2,
             cuMemcpyAsync,
@@ -231,6 +233,10 @@ cuda_macros::cuda_function_declarations!(
             cuTexRefSetFilterMode,
             cuTexRefSetFlags,
             cuTexRefSetFormat,
+            cuTexRefSetMaxAnisotropy,
+            cuTexRefSetMipmapFilterMode,
+            cuTexRefSetMipmapLevelBias,
+            cuTexRefSetMipmapLevelClamp,
             cuThreadExchangeStreamCaptureMode,
         ],
     implemented_in_function <= [cuLaunchKernel,],
