@@ -1,8 +1,8 @@
 [submodule "ext/llvm-project"]
 	path = ext/llvm-project
-	url = https://github.com/vosen/llvm-project.git
-	branch = main
-	shallow = true
+	url = https://github.com/chkuendig/llvm-project
+	branch = v7-preview.15-proton
+
 [submodule "ext/HiGHS"]
 	path = ext/HiGHS
 	url = https://github.com/ERGO-Code/HiGHS.git
