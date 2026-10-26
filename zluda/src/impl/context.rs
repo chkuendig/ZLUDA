@@ -17,6 +17,9 @@ pub(crate) struct Context {
 
 pub(crate) struct ContextState {
     pub(crate) ref_count: u32,
+    pub(crate) primary_active: bool,
+    pub(crate) runtime_owned: bool,
+    pub(crate) flags_configured: bool,
     pub(crate) flags: u32,
     pub(crate) modules: FxHashSet<CUmodule>,
     pub(crate) storage: FxHashMap<usize, StorageData>,
@@ -34,6 +37,9 @@ impl ContextState {
     pub(crate) fn new() -> Self {
         ContextState {
             ref_count: 0,
+            primary_active: false,
+            runtime_owned: false,
+            flags_configured: false,
             flags: 0,
             modules: FxHashSet::default(),
             storage: FxHashMap::default(),
@@ -41,6 +47,14 @@ impl ContextState {
     }
 
     pub(crate) fn reset(&mut self) -> CUresult {
+        self.reset_resources(false)
+    }
+
+    pub(crate) fn reset_for_runtime(&mut self) -> CUresult {
+        self.reset_resources(true)
+    }
+
+    fn reset_resources(&mut self, preserve_retains: bool) -> CUresult {
         for (key, data) in self.storage.iter_mut() {
             if let Some(_cb) = data.reset_cb {
                 // TODO: check that these callbacks do not call into the CUDA driver
@@ -48,7 +62,12 @@ impl ContextState {
                 _cb(data.handle, *key as *mut c_void, data.value as *mut c_void);
             }
         }
-        self.ref_count = 0;
+        if !preserve_retains {
+            self.ref_count = 0;
+        }
+        self.primary_active = false;
+        self.runtime_owned = false;
+        self.flags_configured = false;
         self.flags = 0;
         // drop all modules and return first error if any
         let result = self.modules.drain().fold(Ok(()), |res: CUresult, hmod| {
