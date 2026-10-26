@@ -122,9 +122,53 @@ pub(crate) fn global_state() -> Result<&'static GlobalState, CUerror> {
 }
 
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
-    unsafe { hipInit(flags) }?;
+    // ROCclr reads AMD_OPT_FLUSH once, at runtime initialization. With the
+    // default agent-scope dispatch acquire/release, concurrent same-stream
+    // kernel chains read stale values on gfx1030; 0 selects SYSTEM scope.
+    // An explicit user setting is preserved.
+    #[cfg(not(windows))]
+    unsafe {
+        libc::setenv(c"AMD_OPT_FLUSH".as_ptr(), c"0".as_ptr(), 0)
+    };
+    // SDMA engine copies on the Steam Deck APU intermittently lose their
+    // completion signal. Restrict this to the Deck; keep explicit settings.
+    #[cfg(not(windows))]
+    if super::hardware::is_deck_apu() {
+        unsafe { libc::setenv(c"HSA_ENABLE_SDMA".as_ptr(), c"0".as_ptr(), 0) };
+        // Limit hardware queues to avoid ROCm runlist oversubscription.
+        // Preserve explicit overrides and set the default before HIP starts.
+        unsafe { libc::setenv(c"GPU_MAX_HW_QUEUES".as_ptr(), c"2".as_ptr(), 0) };
+    }
+    hip_init_on_native_thread(flags)
+}
+
+fn init_hip_and_state(flags: ::core::ffi::c_uint) -> CUresult {
+    super::signal::with_preserved_state(|| {
+        unsafe { hipInit(flags) }?;
+        Ok(())
+    })?;
+    // Primary contexts create streams, which compile HIP's blit kernels.
     global_state()?;
     Ok(())
+}
+
+/// Wine threads have low NT stack addresses that break ROCm's thread setup
+/// (`free(): invalid pointer` inside hipInit), and comgr replaces the calling
+/// thread's alternate stack. Initialize HIP and all primary contexts on a
+/// native pthread instead of the caller's thread.
+#[cfg(not(windows))]
+fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> CUresult {
+    std::thread::Builder::new()
+        .name("zluda-hip-init".into())
+        .spawn(move || init_hip_and_state(flags))
+        .map_err(|_| CUerror::UNKNOWN)?
+        .join()
+        .map_err(|_| CUerror::UNKNOWN)?
+}
+
+#[cfg(windows)]
+fn hip_init_on_native_thread(flags: ::core::ffi::c_uint) -> CUresult {
+    init_hip_and_state(flags)
 }
 
 struct UnknownBuffer<const S: usize> {
