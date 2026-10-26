@@ -204,9 +204,13 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         dev: cuda_types::cuda::CUdevice,
         flags: u32,
     ) -> cuda_types::cuda::CUresult {
-        let mut ctx = mem::zeroed();
-        device::primary_context_retain(&mut ctx, dev)?;
-        device::primary_context_set_flags_v2(dev, flags)
+        device::primary_context_init_for_runtime(dev, flags)
+    }
+
+    unsafe extern "system" fn primary_ctx_reset(
+        dev: cuda_types::cuda::CUdevice,
+    ) -> cuda_types::cuda::CUresult {
+        device::primary_context_reset_for_runtime(dev)
     }
 
     unsafe extern "system" fn get_module_from_cubin(
@@ -921,6 +925,207 @@ mod tests {
         let mut primary_ctx = std::mem::zeroed();
         api.cuDevicePrimaryCtxRetain(&mut primary_ctx, 0);
         assert_eq!(dark_ctx.0, primary_ctx.0);
+    }
+
+    unsafe fn cudart_interface(api: &impl CudaApi) -> dark_api::cuda::CudartInterface {
+        api.cuInit(0);
+        let mut table_ptr = std::ptr::null();
+        api.cuGetExportTable(&mut table_ptr, &dark_api::cuda::CudartInterface::GUID);
+        dark_api::cuda::CudartInterface::new(table_ptr)
+    }
+
+    fn primary_state(api: &impl CudaApi) -> (u32, i32) {
+        let mut flags = u32::MAX;
+        let mut active = i32::MAX;
+        api.cuDevicePrimaryCtxGetState(0, &mut flags, &mut active);
+        (flags, active)
+    }
+
+    fn current_context(api: &impl CudaApi) -> CUcontext {
+        let mut current = CUcontext(std::ptr::null_mut());
+        api.cuCtxGetCurrent(&mut current);
+        current
+    }
+
+    #[test_cuda]
+    unsafe fn primary_ctx_runtime_repeat_does_not_retain(api: impl CudaApi) {
+        let iface = cudart_interface(&api);
+        iface.primary_ctx_reset(0).unwrap();
+        let current = current_context(&api);
+        iface.primary_ctx_retain_with_flags(0, 2).unwrap();
+        assert_eq!(primary_state(&api), (2, 1));
+        assert_eq!(current_context(&api), current);
+        for flags in [4, 0, 2] {
+            assert_eq!(
+                iface.primary_ctx_retain_with_flags(0, flags),
+                Err(CUerror::PRIMARY_CONTEXT_ACTIVE)
+            );
+            assert_eq!(primary_state(&api), (2, 1));
+            assert_eq!(current_context(&api), current);
+        }
+        let mut primary = std::mem::zeroed();
+        api.cuDevicePrimaryCtxRetain(&mut primary, 0);
+        api.cuDevicePrimaryCtxRelease(0);
+        assert_eq!(
+            api.cuDevicePrimaryCtxRelease_unchecked(0),
+            Err(CUerror::INVALID_CONTEXT)
+        );
+        assert_eq!(primary_state(&api), (2, 1));
+        iface.primary_ctx_reset(0).unwrap();
+        assert_eq!(primary_state(&api), (0, 0));
+    }
+
+    #[test_cuda]
+    unsafe fn primary_ctx_runtime_owns_already_active_context(api: impl CudaApi) {
+        let iface = cudart_interface(&api);
+        iface.primary_ctx_reset(0).unwrap();
+        api.cuDevicePrimaryCtxSetFlags(0, 2);
+        let mut primary = std::mem::zeroed();
+        api.cuDevicePrimaryCtxRetain(&mut primary, 0);
+        assert_eq!(primary_state(&api), (2, 1));
+        assert_eq!(
+            iface.primary_ctx_retain_with_flags(0, 4),
+            Err(CUerror::PRIMARY_CONTEXT_ACTIVE)
+        );
+        api.cuDevicePrimaryCtxRelease(0);
+        assert_eq!(primary_state(&api), (2, 1));
+        assert_eq!(
+            api.cuDevicePrimaryCtxRelease_unchecked(0),
+            Err(CUerror::INVALID_CONTEXT)
+        );
+        iface.primary_ctx_reset(0).unwrap();
+        assert_eq!(primary_state(&api), (0, 0));
+    }
+
+    #[test_cuda]
+    unsafe fn primary_ctx_runtime_preserves_preconfigured_flags(api: impl CudaApi) {
+        let iface = cudart_interface(&api);
+        // Explicit auto scheduling must win too, even though its value is zero.
+        for (flags, v2) in [(0, false), (2, false), (0, true), (2, true)] {
+            iface.primary_ctx_reset(0).unwrap();
+            if v2 {
+                api.cuDevicePrimaryCtxSetFlags_v2(0, flags);
+            } else {
+                api.cuDevicePrimaryCtxSetFlags(0, flags);
+            }
+            assert_eq!(primary_state(&api), (flags, 0));
+            iface.primary_ctx_retain_with_flags(0, 4).unwrap();
+            assert_eq!(primary_state(&api), (flags, 1));
+            assert_eq!(
+                api.cuDevicePrimaryCtxSetFlags_unchecked(0, 1),
+                Err(CUerror::PRIMARY_CONTEXT_ACTIVE)
+            );
+            assert_eq!(primary_state(&api), (flags, 1));
+            if v2 {
+                api.cuDevicePrimaryCtxSetFlags_v2(0, 1);
+                assert_eq!(primary_state(&api), (1, 1));
+                assert_eq!(
+                    iface.primary_ctx_retain_with_flags(0, 2),
+                    Err(CUerror::PRIMARY_CONTEXT_ACTIVE)
+                );
+                assert_eq!(primary_state(&api), (1, 1));
+            }
+        }
+        iface.primary_ctx_reset(0).unwrap();
+    }
+
+    #[test_cuda]
+    unsafe fn primary_ctx_runtime_reset_keeps_retain_and_current(api: impl CudaApi) {
+        let iface = cudart_interface(&api);
+        iface.primary_ctx_reset(0).unwrap();
+        iface.primary_ctx_retain_with_flags(0, 2).unwrap();
+        let mut primary = std::mem::zeroed();
+        api.cuDevicePrimaryCtxRetain(&mut primary, 0);
+        api.cuCtxSetCurrent(primary);
+        assert_eq!(current_context(&api), primary);
+        for _ in 0..2 {
+            iface.primary_ctx_reset(0).unwrap();
+            assert_eq!(primary_state(&api), (0, 0));
+            assert_eq!(current_context(&api), primary);
+        }
+        // Slot 5 deactivated the context without erasing this public retain.
+        api.cuDevicePrimaryCtxRelease(0);
+        assert_eq!(primary_state(&api), (0, 0));
+        assert_eq!(current_context(&api), primary);
+        assert_eq!(
+            api.cuDevicePrimaryCtxRelease_unchecked(0),
+            Err(CUerror::INVALID_CONTEXT)
+        );
+        // Reset cleared both the initialization flags and configured bit.
+        iface.primary_ctx_retain_with_flags(0, 4).unwrap();
+        assert_eq!(primary_state(&api), (4, 1));
+        assert_eq!(current_context(&api), primary);
+        iface.primary_ctx_reset(0).unwrap();
+        api.cuCtxSetCurrent(CUcontext(std::ptr::null_mut()));
+    }
+
+    #[test_cuda]
+    unsafe fn primary_ctx_runtime_validates_flags_and_device(api: impl CudaApi) {
+        let iface = cudart_interface(&api);
+        iface.primary_ctx_reset(0).unwrap();
+        let mut count = 0;
+        api.cuDeviceGetCount(&mut count);
+        for dev in [-1, count] {
+            assert_eq!(
+                iface.primary_ctx_retain_with_flags(dev, 2),
+                Err(CUerror::INVALID_DEVICE)
+            );
+            assert_eq!(iface.primary_ctx_reset(dev), Err(CUerror::INVALID_DEVICE));
+            assert_eq!(primary_state(&api), (0, 0));
+        }
+        for flags in [3, 5, 6, 7, 0x100, 0x1ff, u32::MAX] {
+            assert_eq!(
+                iface.primary_ctx_retain_with_flags(0, flags),
+                Err(CUerror::INVALID_VALUE)
+            );
+            assert_eq!(primary_state(&api), (0, 0));
+        }
+        iface.primary_ctx_retain_with_flags(0, 2).unwrap();
+        assert_eq!(
+            iface.primary_ctx_retain_with_flags(0, 3),
+            Err(CUerror::INVALID_VALUE)
+        );
+        assert_eq!(iface.primary_ctx_reset(-1), Err(CUerror::INVALID_DEVICE));
+        assert_eq!(primary_state(&api), (2, 1));
+        iface.primary_ctx_reset(0).unwrap();
+    }
+
+    #[test_cuda]
+    unsafe fn primary_ctx_runtime_normalizes_map_host_flags(api: impl CudaApi) {
+        let iface = cudart_interface(&api);
+        for (flags, expected) in [
+            (0, 0), (1, 1), (2, 2), (4, 4), (8, 0), (10, 2), (0x12, 0x12), (0xfa, 0xf2),
+        ] {
+            iface.primary_ctx_reset(0).unwrap();
+            iface.primary_ctx_retain_with_flags(0, flags).unwrap();
+            assert_eq!(primary_state(&api), (expected, 1));
+        }
+        iface.primary_ctx_reset(0).unwrap();
+    }
+
+    #[test_cuda]
+    unsafe fn primary_ctx_runtime_preserves_unrelated_current_context(api: impl CudaApi) {
+        let iface = cudart_interface(&api);
+        iface.primary_ctx_reset(0).unwrap();
+        let mut count = 0;
+        api.cuDeviceGetCount(&mut count);
+        let other_device = if count > 1 { 1 } else { 0 };
+        let mut other = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut other, 0, other_device);
+        assert_eq!(current_context(&api), other);
+        iface.primary_ctx_retain_with_flags(0, 2).unwrap();
+        assert_eq!(current_context(&api), other);
+        let mut current_device = -1;
+        api.cuCtxGetDevice(&mut current_device);
+        assert_eq!(current_device, other_device);
+        assert_eq!(primary_state(&api), (2, 1));
+        iface.primary_ctx_reset(0).unwrap();
+        assert_eq!(current_context(&api), other);
+        api.cuCtxGetDevice(&mut current_device);
+        assert_eq!(current_device, other_device);
+        assert_eq!(primary_state(&api), (0, 0));
+        api.cuCtxSetCurrent(CUcontext(std::ptr::null_mut()));
+        api.cuCtxDestroy_v2(other);
     }
 
     #[test_cuda]

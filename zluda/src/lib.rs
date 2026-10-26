@@ -122,6 +122,7 @@ cuda_macros::cuda_function_declarations!(
             cuDevicePrimaryCtxRelease_v2,
             cuDevicePrimaryCtxRelease,
             cuDevicePrimaryCtxReset,
+            cuDevicePrimaryCtxReset_v2,
             cuDevicePrimaryCtxRetain,
             cuDevicePrimaryCtxSetFlags_v2,
             cuDevicePrimaryCtxSetFlags,

@@ -394,6 +394,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApiTrace {
                 dev: cuda_types::cuda::CUdevice,
                 flags: u32
             ) -> cuda_types::cuda::CUresult,
+            [5] = primary_ctx_reset(dev: cuda_types::cuda::CUdevice) -> cuda_types::cuda::CUresult,
             [7] = cudart_interface_fn7(arg1: usize) -> (),
             [12] = load_compilers() -> cuda_types::cuda::CUresult
         }
