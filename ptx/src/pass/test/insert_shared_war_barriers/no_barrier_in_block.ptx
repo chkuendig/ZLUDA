@@ -1,0 +1,30 @@
+// The store sits in a block without a barrier of its own: the pass must not touch it,
+// even though a load of the same buffer is still pending from the previous block.
+.version 6.5
+.target sm_30
+.address_size 64
+
+.shared .align 4 .b8 temp_storage[8864];
+
+.visible .entry no_barrier_in_block(
+	.param .u64 values_in,
+	.param .u32 tid_in
+)
+{
+	.reg .b32 	%r<8>;
+	.reg .b64 	%rd<8>;
+
+	ld.param.u64 	%rd2, [values_in];
+	ld.param.u32 	%r1, [tid_in];
+	mov.u64 	%rd3, temp_storage;
+	mul.wide.u32 	%rd4, %r1, 4;
+	add.s64 	%rd5, %rd3, %rd4;
+	mul.wide.u32 	%rd6, %r1, 52;
+	add.s64 	%rd7, %rd3, %rd6;
+	bar.sync 	0;
+	ld.shared.u32 	%r3, [%rd5+136];
+	bra.uni 	BB_STAGE;
+BB_STAGE:
+	st.shared.u32 	[%rd7+136], %r3;
+	ret;
+}
