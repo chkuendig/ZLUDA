@@ -231,6 +231,8 @@ pub(crate) unsafe fn unmap_resources(
     resources: *mut hipGraphicsResource_t,
     stream: hipStream_t,
 ) -> hipError_t {
+    // Mapped arrays of unmapped resources may come back under the same handle.
+    super::tex::arrays_changed()?;
     hipGraphicsUnmapResources(count as i32, resources, stream)
 }
 

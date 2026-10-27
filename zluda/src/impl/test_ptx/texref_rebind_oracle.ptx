@@ -1,0 +1,52 @@
+.version 6.5
+.target sm_30
+.address_size 64
+.global .texref oracle;
+.visible .entry sample_linear(.param .u64 output, .param .u32 spin) {
+ .reg .u64 %p;
+ .reg .u32 %v<4>;
+ .reg .u32 %n;
+ .reg .u32 %acc;
+ .reg .s32 %i;
+ .reg .pred %more;
+ ld.param.u64 %p, [output];
+ ld.param.u32 %n, [spin];
+ mov.u32 %acc, 0;
+ setp.eq.u32 %more, %n, 0;
+ @%more bra DONE;
+LOOP:
+ mad.lo.u32 %acc, %acc, 1664525, 1013904223;
+ sub.u32 %n, %n, 1;
+ setp.ne.u32 %more, %n, 0;
+ @%more bra LOOP;
+DONE:
+ mov.s32 %i, 0;
+ tex.1d.v4.u32.s32 {%v0,%v1,%v2,%v3}, [oracle, {%i}];
+ st.global.v4.u32 [%p], {%v0,%v1,%v2,%v3};
+ st.global.u32 [%p+16], %acc;
+ ret;
+}
+.visible .entry sample_array(.param .u64 output, .param .u32 spin) {
+ .reg .u64 %p;
+ .reg .u32 %v<4>;
+ .reg .u32 %n;
+ .reg .u32 %acc;
+ .reg .f32 %x;
+ .reg .pred %more;
+ ld.param.u64 %p, [output];
+ ld.param.u32 %n, [spin];
+ mov.u32 %acc, 0;
+ setp.eq.u32 %more, %n, 0;
+ @%more bra DONE;
+LOOP:
+ mad.lo.u32 %acc, %acc, 1664525, 1013904223;
+ sub.u32 %n, %n, 1;
+ setp.ne.u32 %more, %n, 0;
+ @%more bra LOOP;
+DONE:
+ mov.f32 %x, 0f3F000000;
+ tex.1d.v4.u32.f32 {%v0,%v1,%v2,%v3}, [oracle, {%x}];
+ st.global.v4.u32 [%p], {%v0,%v1,%v2,%v3};
+ st.global.u32 [%p+16], %acc;
+ ret;
+}

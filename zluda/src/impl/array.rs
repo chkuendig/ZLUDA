@@ -8,6 +8,7 @@ pub(crate) unsafe fn create_v2(
 }
 
 pub(crate) unsafe fn destroy(array: hipArray_t) -> hipError_t {
+    super::tex::arrays_changed()?;
     hipArrayDestroy(array)
 }
 
