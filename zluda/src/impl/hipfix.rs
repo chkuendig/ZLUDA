@@ -26,6 +26,7 @@ pub(crate) unsafe fn refresh_texref(
     if texref.textureObject.is_null() {
         return Ok(());
     }
+    super::tex::forget(raw_texref)?;
     hipTexObjectGetResourceDesc(&mut res_desc, texref.textureObject)?;
     rebind_texref(raw_texref, &res_desc).or_else(|error| {
         // HIP destroys the bound object before creating the new one and keeps

@@ -1,6 +1,9 @@
-use crate::r#impl::{hipfix, surf};
+use crate::r#impl::{context, hipfix, surf};
 use cuda_types::cuda::CUresult;
 use hip_runtime_sys::*;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 pub(crate) unsafe fn object_create(
     p_tex_object: *mut hipTextureObject_t,
@@ -34,6 +37,204 @@ pub(crate) unsafe fn object_destroy(tex_object: hipTextureObject_t) -> hipError_
     hipDestroyTextureObject(surf::strip_pixel_shift(tex_object as usize) as hipTextureObject_t)
 }
 
+// HIP rebuilds a legacy texture reference on every bind and unbind: it frees
+// the bound texture object, which waits for every stream of the device, then
+// creates a new one and copies it to the module global with a blocking copy.
+// In CUDA these are host-side state changes, and PhysX unbinds its texrefs
+// after every launch and binds them again for the next one. So remember what
+// each texref last published: an unbind only hides the object from the
+// texref, and a bind that would publish the same state again shows it again
+// without calling HIP. The hidden object stays in the module global until the
+// next real bind or the module unload frees it, which waits for the launches
+// that may still read it.
+struct Published {
+    object: usize,
+    key: BindKey,
+    byte_offset: usize,
+    format: (hipArray_Format, i32),
+    unbound: bool,
+}
+
+#[derive(PartialEq)]
+struct BindKey {
+    device: hipDevice_t,
+    resource: Resource,
+    state: [u32; 19],
+}
+
+#[derive(PartialEq)]
+enum Resource {
+    // HIP aligns the address down only if the caller asks for the offset.
+    Linear { ptr: usize, bytes: usize, offset: bool },
+    // A destroyed array's handle can come back for a new array.
+    Array { array: usize, generation: u64 },
+}
+
+static PUBLISHED: Mutex<BTreeMap<usize, Published>> = Mutex::new(BTreeMap::new());
+static ARRAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+// Everything HIP reads from the texref to build the texture object. Array
+// binds take the format from the array.
+fn bind_state(texref: &textureReference, with_format: bool) -> [u32; 19] {
+    let (format, channels) = if with_format {
+        (texref.format.0, texref.numChannels as u32)
+    } else {
+        (0, 0)
+    };
+    [
+        texref.normalized as u32,
+        texref.readMode.0,
+        texref.filterMode.0,
+        texref.addressMode[0].0,
+        texref.addressMode[1].0,
+        texref.addressMode[2].0,
+        texref.channelDesc.x as u32,
+        texref.channelDesc.y as u32,
+        texref.channelDesc.z as u32,
+        texref.channelDesc.w as u32,
+        texref.channelDesc.f.0,
+        texref.sRGB as u32,
+        texref.maxAnisotropy,
+        texref.mipmapFilterMode.0,
+        texref.mipmapLevelBias.to_bits(),
+        texref.minMipmapLevelClamp.to_bits(),
+        texref.maxMipmapLevelClamp.to_bits(),
+        format,
+        channels,
+    ]
+}
+
+unsafe fn release(published: Published) -> hipError_t {
+    if published.unbound {
+        hipDestroyTextureObject(published.object as hipTextureObject_t)?;
+    }
+    Ok(())
+}
+
+// Whether the texref still shows the object it last published.
+fn is_current(published: &Published, object: hipTextureObject_t) -> bool {
+    if published.unbound {
+        object.is_null()
+    } else {
+        object as usize == published.object
+    }
+}
+
+// HIP mutates the texref through the raw pointer, so this only accesses it
+// through place expressions and keeps no reference across HIP calls.
+unsafe fn bind(
+    texref: *mut textureReference,
+    resource: Resource,
+    byte_offset: *mut usize,
+    hip_bind: impl FnOnce() -> hipError_t,
+) -> hipError_t {
+    if texref.is_null() {
+        return hip_bind();
+    }
+    let with_format = matches!(resource, Resource::Linear { .. });
+    let key = context::get_current_device().ok().map(|device| BindKey {
+        device,
+        resource,
+        state: bind_state(&*texref, with_format),
+    });
+    let previous = {
+        let mut published = PUBLISHED.lock().map_err(|_| hipErrorCode_t::Unknown)?;
+        match (&key, published.remove(&(texref as usize))) {
+            (Some(key), Some(previous))
+                if previous.key == *key && is_current(&previous, (*texref).textureObject) =>
+            {
+                (*texref).textureObject = previous.object as hipTextureObject_t;
+                ((*texref).format, (*texref).numChannels) = previous.format;
+                if let Some(byte_offset) = byte_offset.as_mut() {
+                    *byte_offset = previous.byte_offset;
+                }
+                published.insert(
+                    texref as usize,
+                    Published {
+                        unbound: false,
+                        ..previous
+                    },
+                );
+                return Ok(());
+            }
+            (_, previous) => previous,
+        }
+    };
+    if let Some(previous) = previous {
+        release(previous)?;
+    }
+    hip_bind()?;
+    if let Some(key) = key {
+        let published = Published {
+            object: (*texref).textureObject as usize,
+            key,
+            byte_offset: byte_offset.as_ref().copied().unwrap_or(0),
+            format: ((*texref).format, (*texref).numChannels),
+            unbound: false,
+        };
+        PUBLISHED
+            .lock()
+            .map_err(|_| hipErrorCode_t::Unknown)?
+            .insert(texref as usize, published);
+    }
+    Ok(())
+}
+
+unsafe fn unbind(texref: *mut textureReference) -> hipError_t {
+    if texref.is_null() {
+        return hipUnbindTexture(texref);
+    }
+    let previous = {
+        let mut published = PUBLISHED.lock().map_err(|_| hipErrorCode_t::Unknown)?;
+        if let Some(previous) = published.get_mut(&(texref as usize)) {
+            if is_current(previous, (*texref).textureObject) {
+                previous.unbound = true;
+                (*texref).textureObject = std::ptr::null_mut();
+                return Ok(());
+            }
+        }
+        published.remove(&(texref as usize))
+    };
+    if let Some(previous) = previous {
+        release(previous)?;
+    }
+    hipUnbindTexture(texref)
+}
+
+// The texref is about to be rebuilt or destroyed outside of `bind`.
+pub(crate) unsafe fn forget(texref: *mut textureReference) -> hipError_t {
+    let previous = PUBLISHED
+        .lock()
+        .map_err(|_| hipErrorCode_t::Unknown)?
+        .remove(&(texref as usize));
+    match previous {
+        Some(previous) => release(previous),
+        None => Ok(()),
+    }
+}
+
+// An array is about to be destroyed: no recorded array state may match again,
+// and hidden objects must not keep destroyed arrays alive.
+pub(crate) unsafe fn arrays_changed() -> hipError_t {
+    ARRAY_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let hidden = {
+        let mut published = PUBLISHED.lock().map_err(|_| hipErrorCode_t::Unknown)?;
+        let texrefs = published
+            .iter()
+            .filter(|(_, p)| p.unbound && matches!(p.key.resource, Resource::Array { .. }))
+            .map(|(texref, _)| *texref)
+            .collect::<Vec<_>>();
+        texrefs
+            .into_iter()
+            .filter_map(|texref| published.remove(&texref))
+            .collect::<Vec<_>>()
+    };
+    for published in hidden {
+        release(published)?;
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn ref_set_array(
     texref: *mut textureReference,
     array: hipArray_t,
@@ -44,7 +245,16 @@ pub(crate) unsafe fn ref_set_array(
     if flags & !hipfix::HIP_TRSA_OVERRIDE_FORMAT != 0 {
         return Err(hipErrorCode_t::InvalidValue);
     }
-    hipTexRefSetArray(texref, array, hipfix::HIP_TRSA_OVERRIDE_FORMAT)
+    if array.is_null() {
+        return hipTexRefSetArray(texref, array, hipfix::HIP_TRSA_OVERRIDE_FORMAT);
+    }
+    let resource = Resource::Array {
+        array: array as usize,
+        generation: ARRAY_GENERATION.load(Ordering::Relaxed),
+    };
+    bind(texref, resource, std::ptr::null_mut(), || {
+        hipTexRefSetArray(texref, array, hipfix::HIP_TRSA_OVERRIDE_FORMAT)
+    })
 }
 
 pub(crate) unsafe fn ref_set_flags(
@@ -184,7 +394,7 @@ pub(crate) unsafe fn ref_set_address_v2(
     bytes: usize,
 ) -> hipError_t {
     if dev_ptr.0.is_null() {
-        return hipUnbindTexture(texref);
+        return unbind(texref);
     }
     // CUDA accepts an empty range, HIP rejects it. Nothing can be read
     // through an empty range, so keep the current binding.
@@ -194,7 +404,14 @@ pub(crate) unsafe fn ref_set_address_v2(
         }
         return Ok(());
     }
-    hipTexRefSetAddress(byte_offset, texref, dev_ptr, bytes)
+    let resource = Resource::Linear {
+        ptr: dev_ptr.0 as usize,
+        bytes,
+        offset: !byte_offset.is_null(),
+    };
+    bind(texref, resource, byte_offset, || {
+        hipTexRefSetAddress(byte_offset, texref, dev_ptr, bytes)
+    })
 }
 
 #[cfg(test)]
@@ -2568,6 +2785,501 @@ mod tests {
         assert_eq!(read_linear_texel(&api, function, output), texel, "repeated format");
         api.cuModuleUnload(module);
         api.cuMemFree_v2(source);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    const TEXREF_REBIND_ORACLE_PTX: &str =
+        concat!(include_str!("test_ptx/texref_rebind_oracle.ptx"), "\0");
+    const A: [u32; 4] = [1, 2, 3, 4];
+    const A2: [u32; 4] = [41, 42, 43, 44];
+    const B: [u32; 4] = [5, 6, 7, 8];
+    const C: [u32; 4] = [9, 10, 11, 12];
+    const X: [u32; 4] = [21, 22, 23, 24];
+    const Y: [u32; 4] = [31, 32, 33, 34];
+    const Z: [u32; 4] = [51, 52, 53, 54];
+    // Enough for the host to unbind and rebind while the kernel runs.
+    const SPIN: u32 = 1 << 21;
+
+    // A legacy texref with a linear and an array sampling kernel. Each launch
+    // writes the texel at index 0, so it shows which binding it read.
+    struct Oracle {
+        module: CUmodule,
+        texref: CUtexref,
+        linear: CUfunction,
+        array: CUfunction,
+    }
+
+    impl Oracle {
+        unsafe fn load(api: &impl CudaApi) -> Self {
+            let mut module = std::mem::zeroed();
+            api.cuModuleLoadData(&mut module, TEXREF_REBIND_ORACLE_PTX.as_ptr().cast());
+            let mut texref = std::mem::zeroed();
+            api.cuModuleGetTexRef(&mut texref, module, c"oracle".as_ptr());
+            api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
+            api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
+            let mut linear = std::mem::zeroed();
+            api.cuModuleGetFunction(&mut linear, module, c"sample_linear".as_ptr());
+            let mut array = std::mem::zeroed();
+            api.cuModuleGetFunction(&mut array, module, c"sample_array".as_ptr());
+            Self {
+                module,
+                texref,
+                linear,
+                array,
+            }
+        }
+
+        unsafe fn bind(&self, api: &impl CudaApi, ptr: CUdeviceptr) {
+            let mut offset = usize::MAX;
+            api.cuTexRefSetAddress_v2(&mut offset, self.texref, ptr, 16);
+            assert_eq!(offset, 0);
+        }
+
+        unsafe fn unbind(&self, api: &impl CudaApi) {
+            api.cuTexRefSetAddress_v2(
+                std::ptr::null_mut(),
+                self.texref,
+                CUdeviceptr_v2(std::ptr::null_mut()),
+                0,
+            );
+        }
+
+        unsafe fn bind_array(&self, api: &impl CudaApi, array: CUarray) {
+            api.cuTexRefSetArray(self.texref, array, CU_TRSA_OVERRIDE_FORMAT);
+        }
+
+        unsafe fn launch(
+            &self,
+            api: &impl CudaApi,
+            function: CUfunction,
+            output: CUdeviceptr,
+            spin: u32,
+            stream: CUstream,
+        ) {
+            let mut output = output;
+            let mut spin = spin;
+            let mut params = [
+                &mut output as *mut CUdeviceptr as *mut c_void,
+                &mut spin as *mut u32 as *mut c_void,
+            ];
+            api.cuLaunchKernel(
+                function,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+        }
+
+        unsafe fn read(
+            &self,
+            api: &impl CudaApi,
+            function: CUfunction,
+            output: CUdeviceptr,
+        ) -> [u32; 4] {
+            api.cuMemsetD32_v2(output, 0, 8);
+            self.launch(api, function, output, 0, CUstream(std::ptr::null_mut()));
+            texel(api, output)
+        }
+    }
+
+    unsafe fn texel(api: &impl CudaApi, output: CUdeviceptr) -> [u32; 4] {
+        api.cuCtxSynchronize();
+        let mut actual = [0u32; 4];
+        api.cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), output, 16);
+        actual
+    }
+
+    unsafe fn linear_texels(api: &impl CudaApi, texels: &[(usize, [u32; 4])], bytes: usize) -> CUdeviceptr {
+        let mut buffer = std::mem::zeroed();
+        api.cuMemAlloc_v2(&mut buffer, bytes);
+        api.cuMemsetD32_v2(buffer, 0, bytes / 4);
+        for (offset, texel) in texels {
+            api.cuMemcpyHtoD_v2(
+                CUdeviceptr_v2(buffer.0.cast::<u8>().add(*offset).cast()),
+                texel.as_ptr().cast(),
+                16,
+            );
+        }
+        buffer
+    }
+
+    unsafe fn array_texel(api: &impl CudaApi, texel: [u32; 4]) -> CUarray {
+        let desc = CUDA_ARRAY_DESCRIPTOR {
+            Width: 4,
+            Height: 0,
+            Format: CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32,
+            NumChannels: 4,
+        };
+        let mut array = std::mem::zeroed();
+        api.cuArrayCreate_v2(&mut array, &desc);
+        let texels = [texel, [0; 4], [0; 4], [0; 4]];
+        api.cuMemcpyHtoA_v2(array, 0, texels.as_ptr().cast(), 64);
+        array
+    }
+
+    // Unbinds, rebinds of the same state and real changes, for linear memory
+    // and arrays, must all leave each launch reading its launch-time binding.
+    #[test_cuda]
+    unsafe fn legacy_texref_rebind_sequences(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let buffer = linear_texels(&api, &[(0, A), (1024, A2)], 2048);
+        let other = linear_texels(&api, &[(0, B)], 16);
+        let output = linear_texels(&api, &[], 32);
+        let (x, y) = (array_texel(&api, X), array_texel(&api, Y));
+        let at = |offset: usize| CUdeviceptr_v2(buffer.0.cast::<u8>().add(offset).cast());
+        let linear = |step: &str, expected: [u32; 4]| {
+            assert_eq!(oracle.read(&api, oracle.linear, output), expected, "{step}");
+        };
+        let array = |step: &str, expected: [u32; 4]| {
+            assert_eq!(oracle.read(&api, oracle.array, output), expected, "{step}");
+        };
+        oracle.bind(&api, buffer);
+        linear("first bind", A);
+        oracle.bind(&api, buffer);
+        linear("same bind", A);
+        oracle.unbind(&api);
+        oracle.bind(&api, buffer);
+        linear("unbind, same bind", A);
+        oracle.bind(&api, other);
+        linear("other buffer", B);
+        oracle.unbind(&api);
+        oracle.bind(&api, other);
+        linear("unbind, same other buffer", B);
+        oracle.unbind(&api);
+        oracle.unbind(&api);
+        oracle.bind(&api, buffer);
+        linear("two unbinds, first buffer", A);
+        let mut offset = usize::MAX;
+        api.cuTexRefSetAddress_v2(&mut offset, oracle.texref, other, 0);
+        assert_eq!(offset, 0);
+        oracle.unbind(&api);
+        api.cuTexRefSetAddress_v2(&mut offset, oracle.texref, other, 0);
+        oracle.bind(&api, buffer);
+        linear("unbind, empty range, same bind", A);
+        oracle.bind(&api, at(1024));
+        linear("inner address", A2);
+        oracle.unbind(&api);
+        oracle.bind(&api, at(1024));
+        linear("unbind, same inner address", A2);
+        oracle.bind(&api, buffer);
+        linear("back to the start", A);
+        api.cuTexRefSetFormat(oracle.texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT16, 4);
+        linear("format changed while bound", [1, 0, 2, 0]);
+        oracle.bind(&api, buffer);
+        linear("same bind after a format change", [1, 0, 2, 0]);
+        oracle.unbind(&api);
+        api.cuTexRefSetFormat(oracle.texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
+        oracle.bind(&api, buffer);
+        linear("format changed while unbound", A);
+        oracle.bind_array(&api, x);
+        array("array", X);
+        oracle.bind_array(&api, x);
+        array("same array", X);
+        api.cuTexRefSetArray(oracle.texref, x, 0);
+        array("same array, zero flags", X);
+        oracle.bind_array(&api, y);
+        array("other array", Y);
+        oracle.unbind(&api);
+        oracle.bind_array(&api, y);
+        array("unbind, same array", Y);
+        oracle.bind(&api, buffer);
+        linear("array to linear", A);
+        oracle.bind_array(&api, x);
+        array("linear to array", X);
+        oracle.unbind(&api);
+        oracle.bind(&api, buffer);
+        linear("unbound array to linear", A);
+        api.cuModuleUnload(oracle.module);
+        api.cuArrayDestroy(x);
+        api.cuArrayDestroy(y);
+        api.cuMemFree_v2(buffer);
+        api.cuMemFree_v2(other);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StreamKind {
+        Null,
+        Legacy,
+        PerThread,
+        Blocking,
+        NonBlocking,
+    }
+
+    unsafe fn stream(api: &impl CudaApi, kind: StreamKind) -> CUstream {
+        match kind {
+            StreamKind::Null => CUstream(std::ptr::null_mut()),
+            StreamKind::Legacy => CUstream(1 as *mut _),
+            StreamKind::PerThread => CUstream(2 as *mut _),
+            StreamKind::Blocking | StreamKind::NonBlocking => {
+                let flags = match kind {
+                    StreamKind::NonBlocking => CUstream_flags::CU_STREAM_NON_BLOCKING.0,
+                    _ => 0,
+                };
+                let mut stream = std::mem::zeroed();
+                api.cuStreamCreate(&mut stream, flags);
+                stream
+            }
+        }
+    }
+
+    // A rebind on the host while a launch that reads the texref is still
+    // running must not change what that launch reads, whatever streams the
+    // two launches use.
+    unsafe fn legacy_texref_in_flight(api: impl CudaApi, first: StreamKind) {
+        const KINDS: [StreamKind; 5] = [
+            StreamKind::Null,
+            StreamKind::Legacy,
+            StreamKind::PerThread,
+            StreamKind::Blocking,
+            StreamKind::NonBlocking,
+        ];
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let buffer = linear_texels(&api, &[(0, A)], 16);
+        let other = linear_texels(&api, &[(0, B)], 16);
+        let (out1, out2) = (linear_texels(&api, &[], 32), linear_texels(&api, &[], 32));
+        let first_stream = stream(&api, first);
+        for second in KINDS {
+            let second_stream = stream(&api, second);
+            for action in 0..3 {
+                oracle.bind(&api, buffer);
+                api.cuMemsetD32_v2(out1, 0, 8);
+                api.cuMemsetD32_v2(out2, 0, 8);
+                api.cuCtxSynchronize();
+                oracle.launch(&api, oracle.linear, out1, SPIN, first_stream);
+                let expected = match action {
+                    0 => {
+                        oracle.unbind(&api);
+                        oracle.bind(&api, buffer);
+                        A
+                    }
+                    1 => {
+                        oracle.unbind(&api);
+                        oracle.bind(&api, other);
+                        B
+                    }
+                    _ => {
+                        oracle.bind(&api, other);
+                        B
+                    }
+                };
+                oracle.launch(&api, oracle.linear, out2, 0, second_stream);
+                let case = format!("{first:?} then {second:?}, action {action}");
+                assert_eq!(texel(&api, out1), A, "in-flight launch, {case}");
+                assert_eq!(texel(&api, out2), expected, "next launch, {case}");
+            }
+            if matches!(second, StreamKind::Blocking | StreamKind::NonBlocking) {
+                api.cuStreamDestroy_v2(second_stream);
+            }
+        }
+        if matches!(first, StreamKind::Blocking | StreamKind::NonBlocking) {
+            api.cuStreamDestroy_v2(first_stream);
+        }
+        api.cuModuleUnload(oracle.module);
+        api.cuMemFree_v2(buffer);
+        api.cuMemFree_v2(other);
+        api.cuMemFree_v2(out1);
+        api.cuMemFree_v2(out2);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    #[test_cuda]
+    unsafe fn legacy_texref_in_flight_null_stream(api: impl CudaApi) {
+        legacy_texref_in_flight(api, StreamKind::Null);
+    }
+
+    #[test_cuda]
+    unsafe fn legacy_texref_in_flight_legacy_stream(api: impl CudaApi) {
+        legacy_texref_in_flight(api, StreamKind::Legacy);
+    }
+
+    #[test_cuda]
+    unsafe fn legacy_texref_in_flight_per_thread_stream(api: impl CudaApi) {
+        legacy_texref_in_flight(api, StreamKind::PerThread);
+    }
+
+    #[test_cuda]
+    unsafe fn legacy_texref_in_flight_blocking_stream(api: impl CudaApi) {
+        legacy_texref_in_flight(api, StreamKind::Blocking);
+    }
+
+    #[test_cuda]
+    unsafe fn legacy_texref_in_flight_non_blocking_stream(api: impl CudaApi) {
+        legacy_texref_in_flight(api, StreamKind::NonBlocking);
+    }
+
+    // Each context loads its own module, so the same texref name in two
+    // contexts publishes to two module globals.
+    #[test_cuda]
+    unsafe fn legacy_texref_two_contexts(api: impl CudaApi) {
+        api.cuInit(0);
+        let (mut first, mut second) = (std::mem::zeroed(), std::mem::zeroed());
+        api.cuCtxCreate_v2(&mut first, 0, 0);
+        let first_oracle = Oracle::load(&api);
+        let first_buffer = linear_texels(&api, &[(0, A)], 16);
+        let first_other = linear_texels(&api, &[(0, C)], 16);
+        let first_output = linear_texels(&api, &[], 32);
+        api.cuCtxCreate_v2(&mut second, 0, 0);
+        let second_oracle = Oracle::load(&api);
+        let second_buffer = linear_texels(&api, &[(0, B)], 16);
+        let second_output = linear_texels(&api, &[], 32);
+        api.cuCtxSetCurrent(first);
+        first_oracle.bind(&api, first_buffer);
+        api.cuCtxSetCurrent(second);
+        second_oracle.bind(&api, second_buffer);
+        for round in 0..3 {
+            api.cuCtxSetCurrent(first);
+            let actual = first_oracle.read(&api, first_oracle.linear, first_output);
+            assert_eq!(actual, A, "first context, round {round}");
+            first_oracle.unbind(&api);
+            first_oracle.bind(&api, first_buffer);
+            api.cuCtxSetCurrent(second);
+            let actual = second_oracle.read(&api, second_oracle.linear, second_output);
+            assert_eq!(actual, B, "second context, round {round}");
+            second_oracle.unbind(&api);
+            second_oracle.bind(&api, second_buffer);
+        }
+        api.cuCtxSetCurrent(first);
+        first_oracle.bind(&api, first_other);
+        let actual = first_oracle.read(&api, first_oracle.linear, first_output);
+        assert_eq!(actual, C, "first context rebound");
+        api.cuCtxSetCurrent(second);
+        let actual = second_oracle.read(&api, second_oracle.linear, second_output);
+        assert_eq!(actual, B, "second context after the first rebound");
+        api.cuModuleUnload(second_oracle.module);
+        api.cuCtxDestroy_v2(second);
+        api.cuCtxSetCurrent(first);
+        api.cuModuleUnload(first_oracle.module);
+        api.cuCtxDestroy_v2(first);
+    }
+
+    // A freed buffer or array can come back at the same address or handle
+    // with other contents; the launch must read the new contents.
+    #[test_cuda]
+    unsafe fn legacy_texref_free_and_reallocate(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let output = linear_texels(&api, &[], 32);
+        for unbind_first in [true, false] {
+            let buffer = linear_texels(&api, &[(0, A)], 4096);
+            oracle.bind(&api, buffer);
+            assert_eq!(oracle.read(&api, oracle.linear, output), A);
+            if unbind_first {
+                oracle.unbind(&api);
+            }
+            api.cuMemFree_v2(buffer);
+            let reused = linear_texels(&api, &[(0, C)], 4096);
+            eprintln!("unbind {unbind_first}: same address {}", reused.0 == buffer.0);
+            oracle.bind(&api, reused);
+            let actual = oracle.read(&api, oracle.linear, output);
+            assert_eq!(actual, C, "reallocated buffer, unbind {unbind_first}");
+            oracle.unbind(&api);
+            oracle.bind(&api, reused);
+            let actual = oracle.read(&api, oracle.linear, output);
+            assert_eq!(actual, C, "reallocated buffer rebound, unbind {unbind_first}");
+            api.cuMemFree_v2(reused);
+        }
+        for unbind_first in [true, false] {
+            let array = array_texel(&api, X);
+            oracle.bind_array(&api, array);
+            assert_eq!(oracle.read(&api, oracle.array, output), X);
+            if unbind_first {
+                oracle.unbind(&api);
+            }
+            api.cuArrayDestroy(array);
+            let reused = array_texel(&api, Z);
+            eprintln!("unbind {unbind_first}: same array handle {}", reused == array);
+            oracle.bind_array(&api, reused);
+            let actual = oracle.read(&api, oracle.array, output);
+            assert_eq!(actual, Z, "recreated array, unbind {unbind_first}");
+            oracle.unbind(&api);
+            oracle.bind_array(&api, reused);
+            let actual = oracle.read(&api, oracle.array, output);
+            assert_eq!(actual, Z, "recreated array rebound, unbind {unbind_first}");
+            api.cuArrayDestroy(reused);
+        }
+        api.cuModuleUnload(oracle.module);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // Rejected binds leave the previous binding, and unbinds of nothing
+    // succeed.
+    #[test_cuda]
+    unsafe fn legacy_texref_error_paths(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        oracle.unbind(&api);
+        oracle.unbind(&api);
+        let buffer = linear_texels(&api, &[(0, A)], 16);
+        let output = linear_texels(&api, &[], 32);
+        let x = array_texel(&api, X);
+        let null_texref = std::ptr::null_mut();
+        assert!(api.cuTexRefSetAddress_v2_unchecked(&mut 0, null_texref, buffer, 16).is_err());
+        let null_ptr = CUdeviceptr_v2(std::ptr::null_mut());
+        assert!(api.cuTexRefSetAddress_v2_unchecked(&mut 0, null_texref, null_ptr, 0).is_err());
+        assert!(api.cuTexRefSetArray_unchecked(null_texref, x, CU_TRSA_OVERRIDE_FORMAT).is_err());
+        oracle.bind_array(&api, x);
+        assert_eq!(oracle.read(&api, oracle.array, output), X);
+        assert!(api.cuTexRefSetArray_unchecked(oracle.texref, x, 2).is_err());
+        let actual = oracle.read(&api, oracle.array, output);
+        assert_eq!(actual, X, "after rejected flags");
+        let null_array = std::ptr::null_mut();
+        let result = api.cuTexRefSetArray_unchecked(oracle.texref, null_array, CU_TRSA_OVERRIDE_FORMAT);
+        eprintln!("null array: {result:?}");
+        oracle.unbind(&api);
+        assert!(api.cuTexRefSetArray_unchecked(oracle.texref, x, 2).is_err());
+        oracle.bind_array(&api, x);
+        let actual = oracle.read(&api, oracle.array, output);
+        assert_eq!(actual, X, "rebound after rejected flags");
+        oracle.bind(&api, buffer);
+        assert_eq!(oracle.read(&api, oracle.linear, output), A);
+        api.cuModuleUnload(oracle.module);
+        api.cuArrayDestroy(x);
+        api.cuMemFree_v2(buffer);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // A module unloaded with an unbound texref, then loaded again.
+    #[test_cuda]
+    unsafe fn legacy_texref_unload_after_unbind(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let buffer = linear_texels(&api, &[(0, A)], 16);
+        let output = linear_texels(&api, &[], 32);
+        for round in 0..3 {
+            let oracle = Oracle::load(&api);
+            let mut again = std::mem::zeroed();
+            api.cuModuleGetTexRef(&mut again, oracle.module, c"oracle".as_ptr());
+            assert_eq!(again, oracle.texref, "same texref for the same name");
+            oracle.bind(&api, buffer);
+            let actual = oracle.read(&api, oracle.linear, output);
+            assert_eq!(actual, A, "round {round}");
+            oracle.unbind(&api);
+            api.cuModuleUnload(oracle.module);
+        }
+        api.cuMemFree_v2(buffer);
         api.cuMemFree_v2(output);
         api.cuCtxDestroy_v2(context);
     }
