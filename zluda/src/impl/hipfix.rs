@@ -21,6 +21,12 @@ pub(crate) unsafe fn refresh_texref(
     raw_texref: *mut textureReference,
     previous: textureReference,
 ) -> hipError_t {
+    if let Some(result) = super::tex::refresh_registered(raw_texref) {
+        if result.is_err() {
+            *raw_texref = previous;
+        }
+        return result;
+    }
     let texref = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
     let mut res_desc = std::mem::zeroed();
     if texref.textureObject.is_null() {

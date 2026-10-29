@@ -203,7 +203,7 @@ pub(crate) fn set_cache_config(config: CUfunc_cache) -> CUresult {
 }
 
 pub(crate) fn synchronize() -> hipError_t {
-    unsafe { hipDeviceSynchronize() }
+    unsafe { super::tex::synchronize_device() }
 }
 
 pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {
@@ -215,7 +215,7 @@ pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {
     } else {
         None
     };
-    unsafe { hipDeviceSynchronize() }
+    unsafe { super::tex::synchronize_device() }
 }
 
 struct SetDeviceOnDrop(i32);

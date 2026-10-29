@@ -33,7 +33,7 @@ impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, *mut CUsurfr
     }
 }
 
-fn convert_resource_desc(desc: &HIP_RESOURCE_DESC) -> Result<hipResourceDesc, hipErrorCode_t> {
+pub(super) fn convert_resource_desc(desc: &HIP_RESOURCE_DESC) -> Result<hipResourceDesc, hipErrorCode_t> {
     let (type_, desc) = match desc.resType {
         hipResourcetype::HIP_RESOURCE_TYPE_ARRAY => (
             hipResourceType::hipResourceTypeArray,

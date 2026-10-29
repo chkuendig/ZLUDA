@@ -44,9 +44,11 @@ unsafe fn fill_with_zero_and_register(
 }
 
 pub(crate) unsafe fn free_v2(dptr: hipDeviceptr_t) -> CUresult {
+    let forgotten = super::tex::memory_freed(dptr);
     let hip_result = hipFree(dptr.0);
     remove_allocation(dptr.0)?;
-    Ok(hip_result?)
+    hip_result?;
+    Ok(forgotten?)
 }
 
 pub(crate) fn copy_dto_h_v2(
