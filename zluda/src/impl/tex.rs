@@ -2,8 +2,10 @@ use crate::r#impl::{context, hipfix, surf};
 use cuda_types::cuda::CUresult;
 use hip_runtime_sys::*;
 use std::collections::BTreeMap;
+use std::ffi::CStr;
+use std::mem::offset_of;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 pub(crate) unsafe fn object_create(
     p_tex_object: *mut hipTextureObject_t,
@@ -55,14 +57,14 @@ struct Published {
     unbound: bool,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct BindKey {
     device: hipDevice_t,
     resource: Resource,
     state: [u32; 19],
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Resource {
     // HIP aligns the address down only if the caller asks for the offset.
     Linear { ptr: usize, bytes: usize, offset: bool },
@@ -120,6 +122,722 @@ fn is_current(published: &Published, object: hipTextureObject_t) -> bool {
     }
 }
 
+// Registered texrefs own immutable HIP objects. Both hits and misses only
+// change the host binding; launch publishes its handle in stream order.
+// Eviction retires an object, never destroys it. HIP's destroy releases the
+// image before its unconditional SyncAllStreams, so destruction must follow
+// a completed device wait, not merely an event query or a stream wait.
+const CACHED_STATES: usize = 8;
+const LIVE_PER_TEXREF: usize = 128;
+const LIVE_TOTAL: usize = 4096;
+const REAP_BATCH: usize = 32;
+
+struct Cached {
+    key: BindKey,
+    object: usize,
+    byte_offset: usize,
+    format: (hipArray_Format, i32),
+    used: u64,
+}
+
+struct Registered {
+    module: usize,
+    // Device address of the global's textureObject field.
+    global: usize,
+    owner: hipDevice_t,
+    cache: Vec<Cached>,
+    retired: Vec<Cached>,
+    // The cached object the texref shows; None while unbound, or while HIP
+    // owns what it shows.
+    shown: Option<usize>,
+    // The handle in the global, None if unknown.
+    device: Option<usize>,
+    // The module's launch count when the global was last written.
+    written_at: u64,
+    writer: Option<StreamKey>,
+    // A launch or a write since the last device drain may still use the
+    // global.
+    in_flight: bool,
+}
+
+// The legacy default stream is shared by all threads, the per-thread default
+// stream is not.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StreamKey {
+    stream: usize,
+    thread: Option<u64>,
+}
+
+struct Reader {
+    stream: StreamKey,
+    launch: u64,
+    event: usize,
+}
+
+struct ModuleTexrefs {
+    owner: hipDevice_t,
+    texrefs: Vec<usize>,
+    launches: u64,
+    // The last launch on each stream.
+    readers: Vec<Reader>,
+    // Keep completed-tail handles when a stream is destroyed. Its numeric
+    // stream handle can be reused, but its old event remains a valid fence.
+    orphaned: Vec<Reader>,
+    unfenced: bool,
+}
+
+struct Registry {
+    texrefs: BTreeMap<usize, Registered>,
+    modules: BTreeMap<usize, ModuleTexrefs>,
+    // One tail event per device/stream/thread to wait for other streams.
+    events: BTreeMap<(hipDevice_t, StreamKey), usize>,
+    used: u64,
+}
+
+static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
+    texrefs: BTreeMap::new(),
+    modules: BTreeMap::new(),
+    events: BTreeMap::new(),
+    used: 0,
+});
+
+static NEXT_THREAD: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static THREAD: u64 = NEXT_THREAD.fetch_add(1, Ordering::Relaxed);
+}
+
+fn this_thread() -> u64 {
+    THREAD.with(|thread| *thread)
+}
+
+fn stream_key(stream: hipStream_t) -> StreamKey {
+    match stream.0 as usize {
+        // hipStreamLegacy
+        0 | 1 => StreamKey {
+            stream: 0,
+            thread: None,
+        },
+        // hipStreamPerThread
+        2 => StreamKey {
+            stream: 2,
+            thread: Some(this_thread()),
+        },
+        stream => StreamKey {
+            stream,
+            thread: None,
+        },
+    }
+}
+
+fn lock_registry() -> Result<MutexGuard<'static, Registry>, hipErrorCode_t> {
+    REGISTRY.lock().map_err(|_| hipErrorCode_t::Unknown)
+}
+
+unsafe fn destroy(object: usize) -> hipError_t {
+    hipDestroyTextureObject(object as hipTextureObject_t)
+}
+
+// A texref returned by cuModuleGetTexRef. Without its global it keeps the
+// path above.
+pub(crate) unsafe fn register(texref: *mut textureReference, module: hipModule_t, name: &CStr) {
+    let mut global = hipDeviceptr_t(std::ptr::null_mut());
+    let mut bytes = 0;
+    if hipModuleGetGlobal(&mut global, &mut bytes, module, name.as_ptr()).is_err()
+        || bytes != std::mem::size_of::<textureReference>()
+    {
+        return;
+    }
+    let Ok(owner) = context::get_current_device() else {
+        return;
+    };
+    let Ok(mut registry) = lock_registry() else {
+        return;
+    };
+    let registry = &mut *registry;
+    registry.texrefs.insert(
+        texref as usize,
+        Registered {
+            module: module.0 as usize,
+            global: global.0 as usize + offset_of!(textureReference, textureObject),
+            owner,
+            cache: Vec::new(),
+            retired: Vec::new(),
+            shown: None,
+            device: None,
+            written_at: 0,
+            writer: None,
+            in_flight: false,
+        },
+    );
+    registry
+        .modules
+        .entry(module.0 as usize)
+        .or_insert_with(|| ModuleTexrefs {
+            owner,
+            texrefs: Vec::new(),
+            launches: 0,
+            readers: Vec::new(),
+            orphaned: Vec::new(),
+            unfenced: false,
+        })
+        .texrefs
+        .push(texref as usize);
+}
+
+pub(crate) unsafe fn unregister_module(module: hipModule_t) -> hipError_t {
+    let mut registry = lock_registry()?;
+    if let Some(module) = registry.modules.remove(&(module.0 as usize)) {
+        for texref in module.texrefs {
+            registry.texrefs.remove(&texref);
+        }
+    }
+    Ok(())
+}
+
+// Whether the texref still shows what was last bound through here.
+fn shows(registered: &Registered, object: hipTextureObject_t) -> bool {
+    registered.shown.unwrap_or(0) == object as usize
+}
+
+// The texref changed outside of these functions (a setter rebuilt it, a HIP
+// call failed) or goes away. Free the cached objects except the one it
+// shows, which HIP owns again.
+unsafe fn reset(registered: &mut Registered, object: hipTextureObject_t) -> hipError_t {
+    registered.shown = None;
+    registered.device = None;
+    registered.writer = None;
+    let mut result = Ok(());
+    if registered.in_flight {
+        hipDeviceSynchronize()?;
+        registered.in_flight = false;
+    }
+    for cached in registered.cache.drain(..).chain(registered.retired.drain(..)) {
+        if cached.object != object as usize {
+            result = result.and(destroy(cached.object));
+        }
+    }
+    result
+}
+
+// Resource free invalidates every matching state, so a new allocation at the
+// same address never hits an old object. The shown object only leaves the
+// cache: the texref stays bound, as with HIP's own binding, and the global
+// may hold it. Kernels launched without a rebind still read it.
+unsafe fn drop_cached(
+    registered: &mut Registered,
+    mut stale: impl FnMut(&Cached) -> bool,
+) -> hipError_t {
+    if registered.cache.iter().chain(registered.retired.iter()).any(&mut stale) {
+        hipDeviceSynchronize()?;
+        registered.in_flight = false;
+    }
+    let mut result = Ok(());
+    let mut index = 0;
+    while index < registered.cache.len() {
+        let cached = &registered.cache[index];
+        if !stale(cached) {
+            index += 1;
+            continue;
+        }
+        let cached = registered.cache.swap_remove(index);
+        if Some(cached.object) == registered.shown {
+            registered.retired.push(cached);
+            continue;
+        }
+        registered.device = None;
+        registered.writer = None;
+        match destroy(cached.object) {
+            // Freeing waited for every stream of the device.
+            Ok(()) => registered.in_flight = false,
+            Err(error) => result = result.and(Err(error)),
+        }
+    }
+    let mut index = 0;
+    while index < registered.retired.len() {
+        let object = registered.retired[index].object;
+        if Some(object) == registered.shown || !stale(&registered.retired[index]) {
+            index += 1;
+            continue;
+        }
+        destroy(object)?;
+        registered.retired.swap_remove(index);
+        if Some(object) == registered.device {
+            registered.device = None;
+            registered.writer = None;
+        }
+    }
+    result
+}
+
+// A hard bound includes cached and retired objects. At pressure, wait once
+// and reclaim a batch on this device. No object creation can exceed either
+// bound, even if all slots are current bindings and cannot be reclaimed.
+fn live(registered: &Registered) -> usize {
+    registered.cache.len() + registered.retired.len()
+}
+
+// The caller has completed a device wait while holding the launch lock.
+fn reap_registered(
+    registered: &mut Registered,
+    remaining: &mut usize,
+    cached: bool,
+    mut release: impl FnMut(usize) -> hipError_t,
+) -> hipError_t {
+    let objects = if cached { &mut registered.cache } else { &mut registered.retired };
+    let mut index = 0;
+    while *remaining != 0 && index < objects.len() {
+        let object = objects[index].object;
+        // A freed resource's object stays alive while the texref shows it.
+        if Some(object) == registered.shown {
+            index += 1;
+            continue;
+        }
+        release(object)?;
+        objects.swap_remove(index);
+        *remaining -= 1;
+        // Invalidate the global shadow only if its object was freed.
+        if Some(object) == registered.device {
+            registered.device = None;
+            registered.writer = None;
+        }
+    }
+    Ok(())
+}
+
+unsafe fn reap_device(
+    registry: &mut Registry,
+    device: hipDevice_t,
+    texref: Option<usize>,
+    pressure: bool,
+    remaining: &mut usize,
+) -> hipError_t {
+    for registered in registry.texrefs.values_mut().filter(|r| r.owner == device) {
+        registered.in_flight = false;
+    }
+    for cached in [false, true] {
+        // Preserve warm states unless pressure has no retired victim.
+        if cached && (!pressure || *remaining != REAP_BATCH) {
+            break;
+        }
+        for (address, registered) in registry.texrefs.iter_mut() {
+            if registered.owner == device && texref.map_or(true, |texref| texref == *address) {
+                reap_registered(registered, remaining, cached, |object| destroy(object))?;
+            }
+        }
+    }
+    // A completed device wait also supersedes all old tail fences.
+    let mut orphan_events = std::collections::BTreeSet::new();
+    for module in registry.modules.values_mut().filter(|m| m.owner == device) {
+        orphan_events.extend(module.orphaned.drain(..).map(|reader| reader.event));
+        module.readers.clear();
+        module.unfenced = false;
+    }
+    for event in orphan_events {
+        hipEventDestroy(event as hipEvent_t)?;
+    }
+    Ok(())
+}
+
+unsafe fn wait_and_reap(
+    registry: &mut Registry,
+    device: hipDevice_t,
+    texref: Option<usize>,
+    pressure: bool,
+) -> hipError_t {
+    hipDeviceSynchronize()?;
+    let mut remaining = REAP_BATCH;
+    reap_device(registry, device, texref, pressure, &mut remaining)
+}
+
+unsafe fn make_room(registry: &mut Registry, texref: usize) -> hipError_t {
+    let registered = &registry.texrefs[&texref];
+    let per_texref = live(registered) >= LIVE_PER_TEXREF;
+    if !per_texref
+        && registry.texrefs.values().map(live).sum::<usize>() < LIVE_TOTAL
+    {
+        return Ok(());
+    }
+    let device = registered.owner;
+    // Local pressure reclaims only this texref. Total pressure can reclaim
+    // across the device, but both paths share one small destruction budget.
+    wait_and_reap(registry, device, per_texref.then_some(texref), true)?;
+    if live(&registry.texrefs[&texref]) >= LIVE_PER_TEXREF
+        || registry.texrefs.values().map(live).sum::<usize>() >= LIVE_TOTAL
+    {
+        return Err(hipErrorCode_t::OutOfMemory);
+    }
+    Ok(())
+}
+
+unsafe fn current_device() -> Result<hipDevice_t, hipErrorCode_t> {
+    let mut device = 0;
+    hipGetDevice(&mut device)?;
+    Ok(device)
+}
+
+// Hold the launch lock across the application's wait and cleanup, otherwise
+// another host thread could launch between the wait and image release.
+// A stream wait does not establish device idleness and does not reap.
+pub(crate) unsafe fn synchronize_device() -> hipError_t {
+    let mut registry = lock_registry()?;
+    wait_and_reap(&mut registry, current_device()?, None, false)
+}
+
+// Build the same sampler/resource as HIP's legacy bind, but do not destroy
+// or copy a textureReference. In ROCm 7.2.4 this create path has no stream
+// wait. Keep the object untagged: low-bit pixel-shift tags belong to surfrefs.
+unsafe fn create_binding(
+    texref: *mut textureReference,
+    resource: &Resource,
+) -> Result<(usize, usize, (hipArray_Format, i32)), hipErrorCode_t> {
+    let state = *texref;
+    let mut desc: HIP_RESOURCE_DESC = std::mem::zeroed();
+    let mut offset = 0;
+    let format = match *resource {
+        Resource::Linear { ptr, bytes, offset: requested } => {
+            let mut alignment = 0;
+            hipDeviceGetAttribute(
+                &mut alignment,
+                hipDeviceAttribute_t::hipDeviceAttributeTextureAlignment,
+                current_device()?,
+            )?;
+            if alignment <= 0 {
+                return Err(hipErrorCode_t::InvalidValue);
+            }
+            // Match ihipGetTextureAlignmentOffset and hipTexRefSetAddress.
+            let alignment = alignment as usize;
+            offset = (alignment - ptr % alignment) % alignment;
+            if offset != 0 && !requested {
+                return Err(hipErrorCode_t::InvalidValue);
+            }
+            desc.resType = HIPresourcetype::HIP_RESOURCE_TYPE_LINEAR;
+            desc.res.linear.devPtr = hipDeviceptr_t((ptr - offset) as *mut _);
+            desc.res.linear.sizeInBytes = bytes;
+            desc.res.linear.format = state.format;
+            desc.res.linear.numChannels = state.numChannels as u32;
+            (state.format, state.numChannels)
+        }
+        Resource::Array { array, .. } => {
+            let mut array_desc = std::mem::zeroed();
+            hipArray3DGetDescriptor(&mut array_desc, array as hipArray_t)?;
+            desc.resType = HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY;
+            desc.res.array.hArray = array as hipArray_t;
+            (array_desc.Format, array_desc.NumChannels as i32)
+        }
+    };
+    let resource = surf::convert_resource_desc(&desc)?;
+    let sampler = hipTextureDesc {
+        addressMode: state.addressMode,
+        filterMode: state.filterMode,
+        readMode: state.readMode,
+        sRGB: state.sRGB,
+        normalizedCoords: state.normalized,
+        maxAnisotropy: state.maxAnisotropy,
+        mipmapFilterMode: state.mipmapFilterMode,
+        mipmapLevelBias: state.mipmapLevelBias,
+        minMipmapLevelClamp: state.minMipmapLevelClamp,
+        maxMipmapLevelClamp: state.maxMipmapLevelClamp,
+        ..std::mem::zeroed()
+    };
+    let mut object = std::ptr::null_mut();
+    // An array view with the array's own format is equivalent to retaining
+    // the image. HIP creates a view itself for normalized/sRGB reads.
+    hipCreateTextureObject(&mut object, &resource, &sampler, std::ptr::null())?;
+    Ok((object as usize, offset, format))
+}
+
+unsafe fn bind_registered(
+    registry: &mut Registry,
+    texref: *mut textureReference,
+    key: BindKey,
+    byte_offset: *mut usize,
+) -> hipError_t {
+    let address = texref as usize;
+    if key.device != registry.texrefs[&address].owner {
+        return Err(hipErrorCode_t::InvalidContext);
+    }
+    if !shows(&registry.texrefs[&address], (*texref).textureObject) {
+        // An untracked HIP path (for example SetAddress2D) owns this one.
+        // Take ownership only after completing all its readers.
+        hipDeviceSynchronize()?;
+        reset(registry.texrefs.get_mut(&address).unwrap(), (*texref).textureObject)?;
+        destroy((*texref).textureObject as usize)?;
+        (*texref).textureObject = std::ptr::null_mut();
+    }
+    registry.used += 1;
+    let used = registry.used;
+    let registered = registry.texrefs.get_mut(&address).unwrap();
+    if let Some(cached) = registered.cache.iter_mut().find(|cached| cached.key == key) {
+        cached.used = used;
+        (*texref).textureObject = cached.object as hipTextureObject_t;
+        ((*texref).format, (*texref).numChannels) = cached.format;
+        if let Some(byte_offset) = byte_offset.as_mut() {
+            *byte_offset = cached.byte_offset;
+        }
+        registered.shown = Some(cached.object);
+        return Ok(());
+    }
+    make_room(registry, address)?;
+    // Failure leaves the old binding and its ownership intact.
+    let (object, offset, format) = create_binding(texref, &key.resource)?;
+    let registered = registry.texrefs.get_mut(&address).unwrap();
+    if registered.cache.len() == CACHED_STATES {
+        let victim = registered.cache.iter().enumerate()
+            .min_by_key(|(_, cached)| cached.used).unwrap().0;
+        registered.retired.push(registered.cache.swap_remove(victim));
+    }
+    registered.cache.push(Cached { key, object, byte_offset: offset, format, used });
+    registered.shown = Some(object);
+    (*texref).textureObject = object as hipTextureObject_t;
+    ((*texref).format, (*texref).numChannels) = format;
+    if let Some(byte_offset) = byte_offset.as_mut() {
+        *byte_offset = offset;
+    }
+    Ok(())
+}
+
+// Setters use the same miss path as binds, rather than destroying the old
+// object through HIP. Unregistered texrefs/surfrefs retain HIP's path.
+pub(crate) unsafe fn refresh_registered(texref: *mut textureReference) -> Option<hipError_t> {
+    let resource = {
+        let registry = match lock_registry() { Ok(r) => r, Err(e) => return Some(Err(e)) };
+        let registered = registry.texrefs.get(&(texref as usize))?;
+        if (*texref).textureObject.is_null() {
+            return Some(Ok(()));
+        }
+        registered.cache.iter().chain(registered.retired.iter())
+            .find(|cached| Some(cached.object) == registered.shown)?
+            .key.resource.clone()
+    };
+    Some(bind(texref, resource, &mut 0, || Err(hipErrorCode_t::NotSupported)))
+}
+
+unsafe fn capturing(stream: hipStream_t) -> Result<bool, hipErrorCode_t> {
+    let mut status = hipStreamCaptureStatus::hipStreamCaptureStatusNone;
+    hipStreamIsCapturing(stream, &mut status)?;
+    Ok(status == hipStreamCaptureStatus::hipStreamCaptureStatusActive)
+}
+
+unsafe fn event_for(
+    events: &mut BTreeMap<(hipDevice_t, StreamKey), usize>,
+    stream: StreamKey,
+) -> Result<hipEvent_t, hipErrorCode_t> {
+    let mut device = 0;
+    hipGetDevice(&mut device)?;
+    if let Some(event) = events.get(&(device, stream)) {
+        return Ok(*event as hipEvent_t);
+    }
+    let mut event = std::ptr::null_mut();
+    hipEventCreateWithFlags(&mut event, hipEventDisableTiming)?;
+    events.insert((device, stream), event as usize);
+    Ok(event)
+}
+
+// Writes the object the texref shows into the global, in order on `stream`.
+// The write counts as a launch on `stream`, so a later write on another
+// stream waits for it even if the launch after it fails.
+unsafe fn write_global(
+    registered: &mut Registered,
+    module: &mut ModuleTexrefs,
+    stream: hipStream_t,
+) -> hipError_t {
+    let Some(object) = registered.shown else {
+        return Ok(());
+    };
+    let own = stream_key(stream);
+    let captured = capturing(stream)?;
+    if !captured {
+        if module.unfenced {
+            hipDeviceSynchronize()?;
+            module.unfenced = false;
+        }
+        // Even an unchanged binding needs to wait for its last publish on
+        // another stream. Events were recorded on the actual launch thread,
+        // so per-thread and destroyed streams need no device-wait fallback.
+        let changed = registered.device != Some(object);
+        for (reader, orphaned) in module.readers.iter().map(|r| (r, false))
+            .chain(module.orphaned.iter().map(|r| (r, true))) {
+            if (orphaned || reader.stream != own)
+                && (if changed { reader.launch > registered.written_at }
+                    else { Some(reader.stream) == registered.writer })
+            {
+                hipStreamWaitEvent(stream, reader.event as hipEvent_t, 0)?;
+            }
+        }
+    }
+    if registered.device == Some(object) {
+        return Ok(());
+    }
+    // HIP's handles of one process mostly share their upper half.
+    let same_high = registered.device.map(|device| device >> 32) == Some(object >> 32);
+    registered.device = None;
+    registered.in_flight = true;
+    let global = registered.global;
+    hipMemsetD32Async(hipDeviceptr_t(global as *mut _), object as u32 as i32, 1, stream)?;
+    if !same_high {
+        let high = (object >> 32) as u32 as i32;
+        hipMemsetD32Async(hipDeviceptr_t((global + 4) as *mut _), high, 1, stream)?;
+    }
+    registered.written_at = module.launches;
+    registered.writer = Some(own);
+    // After a captured write the global stays unknown, so the next eager
+    // launch writes it again.
+    if !captured {
+        registered.device = Some(object);
+    }
+    Ok(())
+}
+
+unsafe fn record_launch(
+    module: &mut ModuleTexrefs,
+    texrefs: &mut BTreeMap<usize, Registered>,
+    events: &mut BTreeMap<(hipDevice_t, StreamKey), usize>,
+    stream: hipStream_t,
+) -> hipError_t {
+    module.launches += 1;
+    let launch = module.launches;
+    for texref in &module.texrefs {
+        if let Some(registered) = texrefs.get_mut(texref) {
+            registered.in_flight = true;
+        }
+    }
+    // A failure after a partial publish must not leave an unfenced write.
+    module.unfenced = true;
+    if capturing(stream)? {
+        return Ok(());
+    }
+    let key = stream_key(stream);
+    let event = event_for(events, key)?;
+    // HIP 7.2.4 StreamWaitEvent dereferences a raw legacy captureStream_ sentinel.
+    let rec = if stream.0 as usize == 1 { hipStream_t(std::ptr::null_mut()) } else { stream };
+    hipEventRecord(event, rec)?;
+    match module.readers.iter_mut().find(|reader| reader.stream == key) {
+        Some(reader) => { reader.launch = launch; reader.event = event as usize; }
+        None => module.readers.push(Reader { stream: key, launch, event: event as usize }),
+    }
+    module.unfenced = false;
+    Ok(())
+}
+
+// Every kernel launch. The lock keeps other threads from writing the
+// module's globals until this launch is enqueued. It is also held while a
+// bind or a free waits for the device, so a kernel that waits for another
+// thread's next launch would hang, as CUDA calls from stream callbacks do.
+pub(crate) unsafe fn launch(
+    module: hipModule_t,
+    stream: hipStream_t,
+    hip_launch: impl FnOnce() -> hipError_t,
+) -> hipError_t {
+    let mut registry = lock_registry()?;
+    if !registry.modules.contains_key(&(module.0 as usize)) {
+        drop(registry);
+        return hip_launch();
+    }
+    let Registry {
+        texrefs,
+        modules,
+        events,
+        ..
+    } = &mut *registry;
+    let module = modules
+        .get_mut(&(module.0 as usize))
+        .ok_or(hipErrorCode_t::Unknown)?;
+    let result = (|| {
+        for texref in module.texrefs.clone() {
+            if let Some(registered) = texrefs.get_mut(&texref) {
+                write_global(registered, module, stream)?;
+            }
+        }
+        hip_launch()
+    })();
+    let fenced = record_launch(module, texrefs, events, stream);
+    result.and(fenced)
+}
+
+// Kernel nodes read the globals when the graph runs, so write every changed
+// binding of the current device first.
+pub(crate) unsafe fn launch_graph(
+    stream: hipStream_t,
+    hip_launch: impl FnOnce() -> hipError_t,
+) -> hipError_t {
+    let mut registry = lock_registry()?;
+    if registry.modules.is_empty() {
+        drop(registry);
+        return hip_launch();
+    }
+    let device = current_device()?;
+    let Registry {
+        texrefs,
+        modules,
+        events,
+        ..
+    } = &mut *registry;
+    for module in modules.values_mut().filter(|m| m.owner == device) {
+        for texref in module.texrefs.clone() {
+            let Some(registered) = texrefs.get_mut(&texref) else {
+                continue;
+            };
+            if registered.owner == device {
+                write_global(registered, module, stream)?;
+            }
+        }
+    }
+    hip_launch()?;
+    for module in modules.values_mut().filter(|m| m.owner == device) {
+        record_launch(module, texrefs, events, stream)?;
+    }
+    // The graph may replay writes captured with an older binding.
+    for registered in texrefs.values_mut().filter(|r| r.owner == device) {
+        registered.device = None;
+    }
+    Ok(())
+}
+
+// A destroyed stream's handle can come back for a new stream.
+pub(crate) unsafe fn stream_destroyed(stream: hipStream_t) -> hipError_t {
+    let stream = stream_key(stream);
+    let mut registry = lock_registry()?;
+    let device = current_device()?;
+    registry.events.remove(&(device, stream));
+    for module in registry.modules.values_mut().filter(|m| m.owner == device) {
+        if let Some(index) = module.readers.iter().position(|reader| reader.stream == stream) {
+            let reader = module.readers.swap_remove(index);
+            module.orphaned.push(reader);
+        }
+    }
+    Ok(())
+}
+
+// Cached and retired objects keep their buffer alive. Invalidate them before
+// freeing an allocation, after waiting for their pending readers. The current
+// binding keeps its buffer until the texref changes, as HIP's binding does.
+// Reading a freed resource without rebinding is undefined.
+pub(crate) unsafe fn memory_freed(dptr: hipDeviceptr_t) -> hipError_t {
+    let mut registry = lock_registry()?;
+    let linear = |cached: &Cached| matches!(cached.key.resource, Resource::Linear { .. });
+    if !registry
+        .texrefs
+        .values()
+        .any(|registered| registered.cache.iter().chain(registered.retired.iter()).any(linear))
+    {
+        return Ok(());
+    }
+    let (mut base, mut size) = (hipDeviceptr_t(std::ptr::null_mut()), 0);
+    if hipMemGetAddressRange(&mut base, &mut size, dptr).is_err() {
+        return Ok(());
+    }
+    let range = base.0 as usize..base.0 as usize + size;
+    let mut result = Ok(());
+    let device = current_device()?;
+    for registered in registry.texrefs.values_mut().filter(|r| r.owner == device) {
+        result = result.and(drop_cached(registered, |cached| {
+            matches!(cached.key.resource, Resource::Linear { ptr, .. } if range.contains(&ptr))
+        }));
+    }
+    result
+}
+
 // HIP mutates the texref through the raw pointer, so this only accesses it
 // through place expressions and keeps no reference across HIP calls.
 unsafe fn bind(
@@ -137,6 +855,15 @@ unsafe fn bind(
         resource,
         state: bind_state(&*texref, with_format),
     });
+    {
+        let mut registry = lock_registry()?;
+        if registry.texrefs.contains_key(&(texref as usize)) {
+            if let Some(key) = key {
+                return bind_registered(&mut registry, texref, key, byte_offset);
+            }
+            return Err(hipErrorCode_t::InvalidDevice);
+        }
+    }
     let previous = {
         let mut published = PUBLISHED.lock().map_err(|_| hipErrorCode_t::Unknown)?;
         match (&key, published.remove(&(texref as usize))) {
@@ -184,6 +911,21 @@ unsafe fn unbind(texref: *mut textureReference) -> hipError_t {
     if texref.is_null() {
         return hipUnbindTexture(texref);
     }
+    {
+        let mut registry = lock_registry()?;
+        if let Some(registered) = registry.texrefs.get_mut(&(texref as usize)) {
+            let shown = (*texref).textureObject;
+            if shows(registered, shown) {
+                // The global keeps the object: reading an unbound texref is
+                // undefined.
+                registered.shown = None;
+                (*texref).textureObject = std::ptr::null_mut();
+                return Ok(());
+            }
+            reset(registered, shown)?;
+            return hipUnbindTexture(texref);
+        }
+    }
     let previous = {
         let mut published = PUBLISHED.lock().map_err(|_| hipErrorCode_t::Unknown)?;
         if let Some(previous) = published.get_mut(&(texref as usize)) {
@@ -203,6 +945,14 @@ unsafe fn unbind(texref: *mut textureReference) -> hipError_t {
 
 // The texref is about to be rebuilt or destroyed outside of `bind`.
 pub(crate) unsafe fn forget(texref: *mut textureReference) -> hipError_t {
+    {
+        let mut registry = lock_registry()?;
+        if let Some(registered) = registry.texrefs.get_mut(&(texref as usize)) {
+            reset(registered, std::ptr::null_mut())?;
+            (*texref).textureObject = std::ptr::null_mut();
+            return Ok(());
+        }
+    }
     let previous = PUBLISHED
         .lock()
         .map_err(|_| hipErrorCode_t::Unknown)?
@@ -232,7 +982,15 @@ pub(crate) unsafe fn arrays_changed() -> hipError_t {
     for published in hidden {
         release(published)?;
     }
-    Ok(())
+    let mut registry = lock_registry()?;
+    let mut result = Ok(());
+    let device = current_device()?;
+    for registered in registry.texrefs.values_mut().filter(|r| r.owner == device) {
+        result = result.and(drop_cached(registered, |cached| {
+            matches!(cached.key.resource, Resource::Array { .. })
+        }));
+    }
+    result
 }
 
 pub(crate) unsafe fn ref_set_array(
@@ -2807,6 +3565,7 @@ mod tests {
         module: CUmodule,
         texref: CUtexref,
         linear: CUfunction,
+        indexed: CUfunction,
         array: CUfunction,
     }
 
@@ -2820,12 +3579,15 @@ mod tests {
             api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
             let mut linear = std::mem::zeroed();
             api.cuModuleGetFunction(&mut linear, module, c"sample_linear".as_ptr());
+            let mut indexed = std::mem::zeroed();
+            api.cuModuleGetFunction(&mut indexed, module, c"sample_linear_index".as_ptr());
             let mut array = std::mem::zeroed();
             api.cuModuleGetFunction(&mut array, module, c"sample_array".as_ptr());
             Self {
                 module,
                 texref,
                 linear,
+                indexed,
                 array,
             }
         }
@@ -2876,6 +3638,20 @@ mod tests {
                 params.as_mut_ptr(),
                 std::ptr::null_mut(),
             );
+        }
+
+        unsafe fn launch_index(
+            &self, api: &impl CudaApi, output: CUdeviceptr,
+            mut index: i32, mut spin: u32, stream: CUstream,
+        ) {
+            let mut output = output;
+            let mut params = [
+                &mut output as *mut CUdeviceptr as *mut c_void,
+                &mut spin as *mut u32 as *mut c_void,
+                &mut index as *mut i32 as *mut c_void,
+            ];
+            api.cuLaunchKernel(self.indexed, 1, 1, 1, 1, 1, 1, 0, stream,
+                params.as_mut_ptr(), std::ptr::null_mut());
         }
 
         unsafe fn read(
@@ -3283,4 +4059,487 @@ mod tests {
         api.cuMemFree_v2(output);
         api.cuCtxDestroy_v2(context);
     }
+
+    fn distinct_texel(index: usize) -> [u32; 4] {
+        let index = index as u32;
+        [100 + index, 200 + index, 300 + index, 400 + index]
+    }
+
+    // Rebinds that cycle through fewer and more states than are cached, with
+    // and without unbinds in between, for linear memory and arrays.
+    #[test_cuda]
+    unsafe fn legacy_texref_cached_states(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let output = linear_texels(&api, &[], 32);
+        let texels = (0..super::CACHED_STATES + 4).map(distinct_texel).collect::<Vec<_>>();
+        let buffers = texels
+            .iter()
+            .map(|texel| linear_texels(&api, &[(0, *texel)], 16))
+            .collect::<Vec<_>>();
+        let (x, y) = (array_texel(&api, X), array_texel(&api, Y));
+        for states in [3, buffers.len()] {
+            for round in 0..3 {
+                for state in 0..states {
+                    oracle.bind(&api, buffers[state]);
+                    let actual = oracle.read(&api, oracle.linear, output);
+                    assert_eq!(actual, texels[state], "{states} states, round {round}, state {state}");
+                    if (round + state) % 2 == 0 {
+                        oracle.unbind(&api);
+                    }
+                }
+            }
+        }
+        for round in 0..3 {
+            oracle.bind_array(&api, x);
+            assert_eq!(oracle.read(&api, oracle.array, output), X, "array x, round {round}");
+            oracle.bind(&api, buffers[0]);
+            let actual = oracle.read(&api, oracle.linear, output);
+            assert_eq!(actual, texels[0], "linear between arrays, round {round}");
+            oracle.bind_array(&api, y);
+            assert_eq!(oracle.read(&api, oracle.array, output), Y, "array y, round {round}");
+            oracle.unbind(&api);
+        }
+        api.cuModuleUnload(oracle.module);
+        api.cuArrayDestroy(x);
+        api.cuArrayDestroy(y);
+        for buffer in buffers {
+            api.cuMemFree_v2(buffer);
+        }
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // Launches queued without host synchronization, each after a rebind to a
+    // cached state: on one stream, alternating between two streams, and
+    // across every kind of stream. Some launches spin before they read, so a
+    // later write of the global would overtake them if it were not ordered.
+    #[test_cuda]
+    unsafe fn legacy_texref_cached_launch_order(api: impl CudaApi) {
+        const LAUNCHES: usize = 60;
+        const KINDS: [StreamKind; 5] = [
+            StreamKind::Null,
+            StreamKind::Legacy,
+            StreamKind::PerThread,
+            StreamKind::Blocking,
+            StreamKind::NonBlocking,
+        ];
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let texels = [A, B, C];
+        let buffers = texels.map(|texel| linear_texels(&api, &[(0, texel)], 16));
+        let output = linear_texels(&api, &[], 32 * LAUNCHES);
+        let slot = |i: usize| CUdeviceptr_v2(output.0.cast::<u8>().add(32 * i).cast());
+        let streams = KINDS.map(|kind| stream(&api, kind));
+        for (buffer, texel) in buffers.iter().zip(texels) {
+            oracle.bind(&api, *buffer);
+            assert_eq!(oracle.read(&api, oracle.linear, slot(0)), texel, "warm-up");
+        }
+        for pattern in 0..3 {
+            api.cuMemsetD32_v2(output, 0, 8 * LAUNCHES);
+            api.cuCtxSynchronize();
+            let mut expected = Vec::new();
+            for i in 0..LAUNCHES {
+                let state = (i + i / 3) % 3;
+                oracle.bind(&api, buffers[state]);
+                let stream = match pattern {
+                    0 => streams[3],
+                    1 => streams[3 + i % 2],
+                    _ => streams[i % KINDS.len()],
+                };
+                let spin = if i % 4 == 0 { SPIN / 4 } else { 0 };
+                oracle.launch(&api, oracle.linear, slot(i), spin, stream);
+                expected.push(texels[state]);
+                if i % 5 == 4 {
+                    oracle.unbind(&api);
+                }
+            }
+            for (i, expected) in expected.into_iter().enumerate() {
+                assert_eq!(texel(&api, slot(i)), expected, "pattern {pattern}, launch {i}");
+            }
+        }
+        for (kind, stream) in KINDS.into_iter().zip(streams) {
+            if matches!(kind, StreamKind::Blocking | StreamKind::NonBlocking) {
+                api.cuStreamDestroy_v2(stream);
+            }
+        }
+        api.cuModuleUnload(oracle.module);
+        for buffer in buffers {
+            api.cuMemFree_v2(buffer);
+        }
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // A stream destroyed while a launch on it may still read the texref.
+    #[test_cuda]
+    unsafe fn legacy_texref_cached_destroyed_stream(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let buffer = linear_texels(&api, &[(0, A)], 16);
+        let other = linear_texels(&api, &[(0, B)], 16);
+        let (out1, out2) = (linear_texels(&api, &[], 32), linear_texels(&api, &[], 32));
+        oracle.bind(&api, other);
+        assert_eq!(oracle.read(&api, oracle.linear, out2), B);
+        for round in 0..3 {
+            oracle.bind(&api, buffer);
+            let mut first = std::mem::zeroed();
+            api.cuStreamCreate(&mut first, CUstream_flags::CU_STREAM_NON_BLOCKING.0);
+            oracle.launch(&api, oracle.linear, out1, SPIN, first);
+            api.cuStreamDestroy_v2(first);
+            let mut second = std::mem::zeroed();
+            api.cuStreamCreate(&mut second, CUstream_flags::CU_STREAM_NON_BLOCKING.0);
+            oracle.bind(&api, other);
+            oracle.launch(&api, oracle.linear, out2, 0, second);
+            assert_eq!(texel(&api, out1), A, "launch on the destroyed stream, round {round}");
+            assert_eq!(texel(&api, out2), B, "next launch, round {round}");
+            api.cuStreamDestroy_v2(second);
+        }
+        api.cuModuleUnload(oracle.module);
+        api.cuMemFree_v2(buffer);
+        api.cuMemFree_v2(other);
+        api.cuMemFree_v2(out1);
+        api.cuMemFree_v2(out2);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // A buffer freed while one of its states is cached but not shown, then
+    // another allocation, possibly at the same address.
+    #[test_cuda]
+    unsafe fn legacy_texref_cached_free(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let output = linear_texels(&api, &[], 32);
+        let other = linear_texels(&api, &[(0, B)], 16);
+        for round in 0..3 {
+            let buffer = linear_texels(&api, &[(0, A)], 4096);
+            oracle.bind(&api, buffer);
+            assert_eq!(oracle.read(&api, oracle.linear, output), A, "round {round}");
+            oracle.bind(&api, other);
+            assert_eq!(oracle.read(&api, oracle.linear, output), B, "round {round}");
+            api.cuMemFree_v2(buffer);
+            let reused = linear_texels(&api, &[(0, C)], 4096);
+            eprintln!("round {round}: same address {}", reused.0 == buffer.0);
+            oracle.bind(&api, reused);
+            let actual = oracle.read(&api, oracle.linear, output);
+            assert_eq!(actual, C, "reallocated buffer, round {round}");
+            oracle.bind(&api, other);
+            let actual = oracle.read(&api, oracle.linear, output);
+            assert_eq!(actual, B, "cached state after the free, round {round}");
+            oracle.bind(&api, reused);
+            let actual = oracle.read(&api, oracle.linear, output);
+            assert_eq!(actual, C, "reallocated buffer again, round {round}");
+            oracle.unbind(&api);
+            api.cuMemFree_v2(reused);
+        }
+        api.cuModuleUnload(oracle.module);
+        api.cuMemFree_v2(other);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // Setters rebuild the texref through HIP; cached states of the old
+    // sampler state must not come back.
+    #[test_cuda]
+    unsafe fn legacy_texref_cached_setters(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let buffer = linear_texels(&api, &[(0, A)], 16);
+        let other = linear_texels(&api, &[(0, B)], 16);
+        let output = linear_texels(&api, &[], 32);
+        let linear = |step: &str, expected: [u32; 4]| {
+            assert_eq!(oracle.read(&api, oracle.linear, output), expected, "{step}");
+        };
+        for round in 0..2 {
+            oracle.bind(&api, buffer);
+            linear("first buffer", A);
+            oracle.bind(&api, other);
+            linear("other buffer", B);
+            api.cuTexRefSetFormat(oracle.texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT16, 4);
+            linear("format changed while bound", [5, 0, 6, 0]);
+            oracle.bind(&api, buffer);
+            linear("first buffer in the new format", [1, 0, 2, 0]);
+            oracle.bind(&api, other);
+            linear("other buffer in the new format", [5, 0, 6, 0]);
+            oracle.unbind(&api);
+            api.cuTexRefSetFormat(oracle.texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
+            oracle.bind(&api, buffer);
+            linear(&format!("first buffer back in the old format, round {round}"), A);
+            oracle.bind(&api, other);
+            linear(&format!("other buffer back in the old format, round {round}"), B);
+        }
+        api.cuModuleUnload(oracle.module);
+        api.cuMemFree_v2(buffer);
+        api.cuMemFree_v2(other);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // A module unloaded while its texref caches states, shown or not, then
+    // loaded again.
+    #[test_cuda]
+    unsafe fn legacy_texref_unload_with_cached_states(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let buffer = linear_texels(&api, &[(0, A)], 16);
+        let other = linear_texels(&api, &[(0, B)], 16);
+        let output = linear_texels(&api, &[], 32);
+        for round in 0..4 {
+            let oracle = Oracle::load(&api);
+            oracle.bind(&api, buffer);
+            assert_eq!(oracle.read(&api, oracle.linear, output), A, "round {round}");
+            oracle.bind(&api, other);
+            assert_eq!(oracle.read(&api, oracle.linear, output), B, "round {round}");
+            oracle.bind(&api, buffer);
+            oracle.launch(&api, oracle.linear, output, 0, CUstream(std::ptr::null_mut()));
+            assert_eq!(texel(&api, output), A, "last launch before the unload, round {round}");
+            if round % 2 == 1 {
+                oracle.unbind(&api);
+            }
+            api.cuModuleUnload(oracle.module);
+        }
+        api.cuMemFree_v2(buffer);
+        api.cuMemFree_v2(other);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+    // Every bind has a different byte limit, including limits that cannot
+    // contain the preceding launch's index. No host wait between launches.
+    #[test_cuda]
+    unsafe fn legacy_texref_real_rebind_launch_order(api: impl CudaApi) {
+        const N: usize = 100;
+        let kinds = [StreamKind::Null, StreamKind::Legacy, StreamKind::PerThread,
+            StreamKind::Blocking, StreamKind::NonBlocking];
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let values = (0..N).map(|i| (16 * i, distinct_texel(i))).collect::<Vec<_>>();
+        let buffer = linear_texels(&api, &values, N * 16);
+        let output = linear_texels(&api, &[], N * 64);
+        let streams = kinds.map(|kind| stream(&api, kind));
+        for i in 0..N {
+            let count = (i * 37) % N + 1;
+            let mut offset = usize::MAX;
+            api.cuTexRefSetAddress_v2(&mut offset, oracle.texref, buffer, 16 * count);
+            assert_eq!(offset, 0);
+            let dst = CUdeviceptr_v2(output.0.cast::<u8>().add(i * 64).cast());
+            oracle.launch_index(&api, dst, count as i32 - 1, SPIN / 16, streams[i % 5]);
+            // The same handle on another stream must wait for its publish.
+            let next = CUdeviceptr_v2(dst.0.cast::<u8>().add(32).cast());
+            oracle.launch_index(&api, next, count as i32 - 1, 0, streams[(i + 1) % 5]);
+        }
+        api.cuCtxSynchronize();
+        for i in 0..N {
+            let expected = distinct_texel((i * 37) % N);
+            for duplicate in 0..2 {
+                let dst = CUdeviceptr_v2(output.0.cast::<u8>().add(i * 64 + duplicate * 32).cast());
+                assert_eq!(texel(&api, dst), expected, "launch {i}/{duplicate}");
+            }
+        }
+        for (kind, stream) in kinds.into_iter().zip(streams) {
+            if matches!(kind, StreamKind::Blocking | StreamKind::NonBlocking) {
+                api.cuStreamDestroy_v2(stream);
+            }
+        }
+        api.cuModuleUnload(oracle.module);
+        api.cuMemFree_v2(buffer);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // Force retirement, leave a reader pending, then free without a prior
+    // wait. Resource invalidation must remove every old byte-size key.
+    #[test_cuda]
+    unsafe fn legacy_texref_deferred_free_pending(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let buffer = linear_texels(&api, &[(0, A)], 4096);
+        let output = linear_texels(&api, &[], 64);
+        let stream = stream(&api, StreamKind::NonBlocking);
+        for count in 1..=super::CACHED_STATES + 4 {
+            api.cuTexRefSetAddress_v2(&mut 0, oracle.texref, buffer, 16 * count);
+            oracle.launch(&api, oracle.linear, output, SPIN / 32, stream);
+        }
+        oracle.unbind(&api);
+        api.cuMemFree_v2(buffer);
+        assert_eq!(texel(&api, output), A, "reader before free");
+        let reused = linear_texels(&api, &[(0, C)], 4096);
+        api.cuTexRefSetAddress_v2(&mut 0, oracle.texref, reused, 16);
+        assert_eq!(oracle.read(&api, oracle.linear, output), C, "reallocated resource");
+        api.cuModuleUnload(oracle.module);
+        api.cuStreamDestroy_v2(stream);
+        api.cuMemFree_v2(reused);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    // Repeated pressure waits must preserve every queued read, including a
+    // shown array object that unrelated-array invalidation has retired.
+    #[test_cuda]
+    unsafe fn legacy_texref_reclaim_batches_launch_order(api: impl CudaApi) {
+        const N: usize = 260;
+        let kinds = [StreamKind::Null, StreamKind::Legacy, StreamKind::PerThread,
+            StreamKind::Blocking, StreamKind::NonBlocking];
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let stable = Oracle::load(&api);
+        let values = (0..N).map(|i| (16 * i, distinct_texel(i))).collect::<Vec<_>>();
+        let buffer = linear_texels(&api, &values, N * 16);
+        let output = linear_texels(&api, &[], 64 * N);
+        let slot = |i: usize| CUdeviceptr_v2(output.0.cast::<u8>().add(32 * i).cast());
+        let bound = array_texel(&api, A);
+        stable.bind_array(&api, bound);
+        assert_eq!(stable.read(&api, stable.array, slot(0)), A);
+        api.cuArrayDestroy(array_texel(&api, B));
+        let streams = kinds.map(|kind| stream(&api, kind));
+        for i in 0..N {
+            api.cuTexRefSetAddress_v2(&mut 0, oracle.texref, buffer, 16 * (i + 1));
+            oracle.launch_index(&api, slot(i), i as i32, SPIN / 512, streams[i % 5]);
+            stable.launch(&api, stable.array, slot(N + i), 0, streams[(i + 1) % 5]);
+        }
+        api.cuCtxSynchronize();
+        for i in 0..N {
+            assert_eq!(texel(&api, slot(i)), distinct_texel(i), "linear launch {i}");
+            assert_eq!(texel(&api, slot(N + i)), A, "retired shown array, launch {i}");
+        }
+        for (kind, stream) in kinds.into_iter().zip(streams) {
+            if matches!(kind, StreamKind::Blocking | StreamKind::NonBlocking) {
+                api.cuStreamDestroy_v2(stream);
+            }
+        }
+        api.cuModuleUnload(oracle.module);
+        api.cuModuleUnload(stable.module);
+        api.cuArrayDestroy(bound);
+        api.cuMemFree_v2(buffer);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
+    fn reclaim_state() -> super::Registered {
+        let mut registered = super::Registered {
+            module: 0, global: 0, owner: 0, cache: Vec::new(), retired: Vec::new(),
+            shown: Some(1), device: Some(2), written_at: 0,
+            writer: Some(super::stream_key(hip_runtime_sys::hipStream_t(std::ptr::null_mut()))),
+            in_flight: false,
+        };
+        for object in 1..=super::REAP_BATCH + 8 {
+            registered.retired.push(super::Cached {
+                key: super::BindKey {
+                    device: 0, state: [0; 19],
+                    resource: super::Resource::Linear { ptr: 0, bytes: 16, offset: false },
+                },
+                object, byte_offset: 0,
+                format: (hip_runtime_sys::hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32, 4),
+                used: object as u64,
+            });
+        }
+        registered
+    }
+
+    #[test]
+    fn texref_reclaim_shared_budget_and_shown() {
+        let mut first = reclaim_state();
+        let mut second = reclaim_state();
+        let mut remaining = super::REAP_BATCH;
+        let mut freed = Vec::new();
+        for registered in [&mut first, &mut second] {
+            super::reap_registered(registered, &mut remaining, false, |object| {
+                assert_ne!(object, 1);
+                freed.push(object);
+                Ok(())
+            }).unwrap();
+        }
+        assert_eq!(freed.len(), super::REAP_BATCH);
+        assert_eq!(first.retired.len(), 8);
+        assert_eq!(second.retired.len(), super::REAP_BATCH + 8);
+        assert!(first.retired.iter().any(|cached| cached.object == 1));
+        assert_eq!(first.device, None);
+        assert!(first.writer.is_none());
+        assert_eq!(second.device, Some(2));
+    }
+
+    #[test]
+    fn texref_reclaim_failure_keeps_ownership() {
+        let mut registered = reclaim_state();
+        let mut remaining = super::REAP_BATCH;
+        let error = hip_runtime_sys::hipErrorCode_t::Unknown;
+        assert_eq!(super::reap_registered(&mut registered, &mut remaining, false, |_| Err(error)), Err(error));
+        assert_eq!(remaining, super::REAP_BATCH);
+        assert_eq!(registered.retired.len(), super::REAP_BATCH + 8);
+        assert_eq!(registered.device, Some(2));
+        assert!(registered.writer.is_some());
+    }
+
+    #[test]
+    fn texref_reclaim_cached_shown_and_shadow() {
+        let mut registered = reclaim_state();
+        registered.cache = std::mem::take(&mut registered.retired);
+        registered.cache.truncate(super::CACHED_STATES);
+        registered.device = registered.shown;
+        let mut remaining = super::REAP_BATCH;
+        super::reap_registered(&mut registered, &mut remaining, true, |object| {
+            assert_ne!(object, 1);
+            Ok(())
+        }).unwrap();
+        assert_eq!(registered.cache.len(), 1);
+        assert_eq!(remaining, super::REAP_BATCH - super::CACHED_STATES + 1);
+        assert!(registered.cache.iter().any(|cached| cached.object == 1));
+        assert_eq!(registered.device, registered.shown);
+        assert!(registered.writer.is_some());
+    }
+
+    // Destroying another array, as the D3D11 relay does when a resource is
+    // unregistered, must leave a bound array texref usable without a rebind.
+    // Each read synchronizes the context, which also reaps retired objects.
+    #[test_cuda]
+    unsafe fn legacy_texref_bound_array_survives_other_destroy(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let oracle = Oracle::load(&api);
+        let output = linear_texels(&api, &[], 64);
+        let stream = stream(&api, StreamKind::NonBlocking);
+        let bound = array_texel(&api, A);
+        oracle.bind_array(&api, bound);
+        assert_eq!(oracle.read(&api, oracle.array, output), A, "before");
+        for round in 0..4 {
+            let other = array_texel(&api, B);
+            api.cuArrayDestroy(other);
+            assert_eq!(oracle.read(&api, oracle.array, output), A, "after destroy, round {round}");
+            // A reader still pending across the destroy, then one queued after it.
+            let pending = CUdeviceptr_v2(output.0.cast::<u8>().add(32).cast());
+            api.cuMemsetD32_v2(output, 0, 16);
+            oracle.launch(&api, oracle.array, pending, SPIN / 32, stream);
+            let other = array_texel(&api, B);
+            api.cuArrayDestroy(other);
+            oracle.launch(&api, oracle.array, output, 0, stream);
+            assert_eq!(texel(&api, pending), A, "pending reader, round {round}");
+            assert_eq!(texel(&api, output), A, "reader after destroy, round {round}");
+        }
+        // The same array bound again is a new state after a destroy.
+        oracle.bind_array(&api, bound);
+        assert_eq!(oracle.read(&api, oracle.array, output), A, "rebound");
+        api.cuModuleUnload(oracle.module);
+        api.cuStreamDestroy_v2(stream);
+        api.cuArrayDestroy(bound);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
+
 }

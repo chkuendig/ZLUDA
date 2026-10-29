@@ -46,6 +46,7 @@ impl ModuleMutable {
                 unsafe { hipModuleGetFunction(&mut func_handle, module, entry.key().as_ptr()) }?;
                 let func = Box::new(Function {
                     base: func_handle,
+                    module,
                     sm_version,
                     explicit_args_size_align,
                 });
@@ -71,7 +72,8 @@ impl ZludaObject for Module {
         let forgotten = texrefs
             .chain(surfrefs)
             .map(|texref| unsafe { tex::forget(texref) })
-            .fold(Ok(()), Result::and);
+            .fold(Ok(()), Result::and)
+            .and(unsafe { tex::unregister_module(self.base) });
         unsafe { hipModuleUnload(self.base) }?;
         Ok(forgotten?)
     }
@@ -457,6 +459,7 @@ pub(crate) unsafe fn get_tex_ref(
         hash_map::Entry::Occupied(entry) => *entry.get() as *mut textureReference,
         hash_map::Entry::Vacant(entry) => {
             hipModuleGetTexRef(texref, hmod.base, entry.key().as_ptr())?;
+            tex::register(*texref, hmod.base, entry.key());
             *entry.insert(*texref as usize) as *mut textureReference
         }
     };
