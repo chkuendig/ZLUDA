@@ -74,7 +74,7 @@ if not template.exists():
     print(f'wineboot exit={code} seconds={secs}', flush=True)
 
 
-def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, extra_ld=()):
+def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, extra_ld=(), extra_env=None):
     prefix = work / ('prefix-' + name)
     shutil.rmtree(prefix, ignore_errors=True)
     shutil.copytree(template, prefix, symlinks=True)
@@ -89,7 +89,7 @@ def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, ex
     shutil.copy(inp / build / 'zluda64_server.exe', c / 'zluda/zluda64_server.exe')
     (c / 'probe').mkdir()
     shutil.copy(inp / 'probe' / probe, c / 'probe' / probe)
-    env = base_env(prefix, sync, libcuda, extra_ld)
+    env = dict(base_env(prefix, sync, libcuda, extra_ld), **(extra_env or {}))
     # GE's Wine takes ntsync whenever /dev/ntsync opens, whatever WINENTSYNC says.
     if Path('/dev/ntsync').exists():
         subprocess.run(['sudo', 'chmod', '666' if sync == 'ntsync' else '000', '/dev/ntsync'], check=False)
@@ -119,6 +119,11 @@ for sync in ('ntsync', 'fsync', 'esync', 'server'):
     results.append(arm(f'patched-stub-msvc-{sync}', 'msvc', 'patched', stub, sync))
 results.append(arm('patched-stub-gnu-ntsync', 'gnu', 'patched', stub, 'ntsync'))
 results.append(arm('patched-stub-direct64-ntsync', 'msvc', 'patched', stub, 'fsync', probe='probe64.exe'))
+# cuDeviceGetLuid: SveSop's registry lookup finds no GPU in a headless prefix, so
+# CUDA_FAKE_LUID=1 (SveSop's UUID-hash LUID) checks that both paths return the same bytes.
+for probe, bits in (('probe32.exe', 32), ('probe64.exe', 64)):
+    results.append(arm(f'luid-fake-{bits}', 'msvc', 'patched', stub, 'ntsync', probe=probe,
+                       extra_env={'CUDA_FAKE_LUID': '1'}))
 zl = inp / 'zluda-linux'
 if (zl / 'libcuda.so.1').exists():
     results.append(arm('patched-zluda-norocm', 'msvc', 'patched', zl, 'ntsync', timeout=60))

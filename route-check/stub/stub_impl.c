@@ -36,6 +36,14 @@ CUresult cuDeviceGetName(char *name, int len, int dev)
 }
 CUresult cuDeviceTotalMem_v2(size_t *bytes, int dev) { *bytes = (size_t)1 << 30; return 0; }
 CUresult cuDeviceComputeCapability(int *major, int *minor, int dev) { *major = 8; *minor = 6; return 0; }
+CUresult cuDeviceGetUuid(CUuuid *uuid, int dev)
+{
+    static const unsigned char id[16] = {0x5a, 0x4c, 0x55, 0x44, 0x41, 0x33, 0x32, 0x2d,
+                                         0x72, 0x6f, 0x75, 0x74, 0x65, 0x2d, 0x30, 0x31};
+    LOG("cuDeviceGetUuid(%d)", dev);
+    memcpy(uuid->bytes, id, 16);
+    return 0;
+}
 CUresult cuDeviceGetAttribute(int *pi, int attrib, int dev) { *pi = 1; return 0; }
 CUresult cuDevicePrimaryCtxRetain(void **ctx, int dev) { LOG("cuDevicePrimaryCtxRetain(%d)", dev); *ctx = FAKE_CTX; return 0; }
 CUresult cuCtxCreate_v2(void **ctx, unsigned flags, int dev) { *ctx = FAKE_CTX; return 0; }

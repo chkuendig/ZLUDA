@@ -27,6 +27,7 @@ static CUresult (API *p_cuDeviceGet)(CUdevice *, int);
 static CUresult (API *p_cuDeviceGetName)(char *, int, CUdevice);
 static CUresult (API *p_cuDeviceTotalMem_v2)(size_t *, CUdevice);
 static CUresult (API *p_cuDeviceComputeCapability)(int *, int *, CUdevice);
+static CUresult (API *p_cuDeviceGetLuid)(char *, unsigned *, CUdevice);
 static CUresult (API *p_cuCtxCreate_v2)(CUcontext *, unsigned, CUdevice);
 static CUresult (API *p_cuModuleLoadData)(CUmodule *, const void *);
 static CUresult (API *p_cuModuleGetFunction)(CUfunction *, CUmodule, const char *);
@@ -95,7 +96,7 @@ int main(int argc, char **argv)
     if (!lib)
         return 2;
     LOAD(cuInit); LOAD(cuDriverGetVersion); LOAD(cuDeviceGetCount); LOAD(cuDeviceGet);
-    LOAD(cuDeviceGetName); LOAD(cuDeviceTotalMem_v2); LOAD(cuDeviceComputeCapability);
+    LOAD(cuDeviceGetName); LOAD(cuDeviceTotalMem_v2); LOAD(cuDeviceComputeCapability); LOAD(cuDeviceGetLuid);
     LOAD(cuCtxCreate_v2); LOAD(cuModuleLoadData); LOAD(cuModuleGetFunction); LOAD(cuMemAlloc_v2);
     LOAD(cuMemcpyHtoD_v2); LOAD(cuMemcpyDtoHAsync_v2); LOAD(cuLaunchKernel);
     /* A MinGW PE32 build can export stdcall names decorated (cuInit@4). */
@@ -124,6 +125,13 @@ int main(int argc, char **argv)
     t0 = now_us(); r = p_cuDeviceGetName(name, sizeof(name), dev); step("cuDeviceGetName", r, now_us() - t0);
     t0 = now_us(); r = p_cuDeviceTotalMem_v2(&mem, dev); step("cuDeviceTotalMem_v2", r, now_us() - t0);
     t0 = now_us(); r = p_cuDeviceComputeCapability(&major, &minor, dev); step("cuDeviceComputeCapability", r, now_us() - t0);
+    {
+        unsigned char luid[8] = {0};
+        unsigned mask = 0;
+        r = p_cuDeviceGetLuid ? p_cuDeviceGetLuid((char *)luid, &mask, dev) : -1;
+        printf("{\"luid\":{\"result\":%d,\"bytes\":\"%02x%02x%02x%02x%02x%02x%02x%02x\",\"node_mask\":%u}}\n", r,
+               luid[0], luid[1], luid[2], luid[3], luid[4], luid[5], luid[6], luid[7], mask);
+    }
     printf("{\"device\":{\"version\":%d,\"count\":%d,\"ordinal\":%d,\"name\":\"%s\",\"mem\":%llu,\"cc\":\"%d.%d\"}}\n",
            version, count, dev, name, (unsigned long long)mem, major, minor);
     fflush(stdout);
