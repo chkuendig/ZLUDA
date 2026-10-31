@@ -1,6 +1,9 @@
 name: Wine bridge production and independent tests
 
 on:
+  push:
+    branches: [bridge/zluda-wine-20261031]
+    paths: ['wine/**', '.github/workflows/wine-bridge.yml']
   workflow_dispatch:
 
 permissions:
