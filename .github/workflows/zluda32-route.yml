@@ -114,8 +114,9 @@ jobs:
         run: |
           find build -type f | sort
           mkdir -p out/stock out/patched
-          cp "$(find build/nvcuda-stock -name nvcuda.dll.so | head -1)" out/stock/
-          cp "$(find build/nvcuda-patched -name nvcuda.dll.so | head -1)" out/patched/
+          # package-release.sh installs the winelib as x64/nvcuda.dll; GE ships it as nvcuda.dll.so.
+          cp build/nvcuda-stock/x64/nvcuda.dll out/stock/nvcuda.dll.so
+          cp build/nvcuda-patched/x64/nvcuda.dll out/patched/nvcuda.dll.so
           sha256sum out/*/* | tee out/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
