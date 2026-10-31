@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "zluda_wine"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Opt-in x64 Wine CUDA bridge pilot; not a release replacement"
+
+# Keep the pilot out of the backend workspace and its locked build graph.
+[workspace]
+
+[lib]
+name = "nvcuda"
+crate-type = ["cdylib", "staticlib"]
+
+[build-dependencies]
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+
+[profile.release]
+panic = "abort"
