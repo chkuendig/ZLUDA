@@ -1348,6 +1348,12 @@ impl CudaDarkApi for DarkApi32 {
     ) -> cuda_types::cuda::CUresult {
         Err(CUerror::NOT_SUPPORTED)
     }
+
+    unsafe extern "system" fn primary_ctx_reset(
+        _dev: cuda_types::cuda::CUdevice,
+    ) -> cuda_types::cuda::CUresult {
+        Err(CUerror::NOT_SUPPORTED)
+    }
 }
 
 const DLL_PROCESS_DETACH: u32 = 0;
