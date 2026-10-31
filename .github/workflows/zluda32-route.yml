@@ -1,0 +1,191 @@
+name: zluda32 route check (2a)
+
+on:
+  push:
+    branches: [route/zluda32-20261031]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "3"
+  SVESOP_NVCUDA: 772b344a3594fca916999c5c5288d875332de482
+  GE_RELEASE: GE-Proton11-7
+
+jobs:
+  msvc:
+    name: zluda32 + zluda64_server (MSVC, upstream recipe)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc
+          rustc -Vv
+      - name: Build
+        run: |
+          cargo build --locked --release -p zluda32 --target i686-pc-windows-msvc
+          cargo build --locked --release -p zluda64_server --target x86_64-pc-windows-msvc
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p out
+          cp target/i686-pc-windows-msvc/release/nvcuda.dll out/
+          cp target/x86_64-pc-windows-msvc/release/zluda64_server.exe out/
+          sha256sum out/* | tee out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msvc
+          path: out
+
+  gnu:
+    name: zluda32 + zluda64_server (MinGW cross) + probe + stub
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 binutils-mingw-w64
+          rustup toolchain install stable --profile minimal
+          rustup target add i686-pc-windows-gnu x86_64-pc-windows-gnu
+          rustc -Vv
+      - name: Build
+        run: |
+          cargo build --locked --release -p zluda32 --target i686-pc-windows-gnu
+          cargo build --locked --release -p zluda64_server --target x86_64-pc-windows-gnu
+      - name: Probe and stub
+        run: |
+          mkdir -p out/gnu out/probe out/stub
+          cp target/i686-pc-windows-gnu/release/nvcuda.dll out/gnu/
+          cp target/x86_64-pc-windows-gnu/release/zluda64_server.exe out/gnu/
+          i686-w64-mingw32-gcc -O2 -static -o out/probe/probe32.exe route-check/probe/probe.c
+          x86_64-w64-mingw32-gcc -O2 -static -o out/probe/probe64.exe route-check/probe/probe.c
+          curl -fsSL "https://raw.githubusercontent.com/SveSop/nvcuda/$SVESOP_NVCUDA/dlls/nvcuda/nvcuda.c" -o /tmp/nvcuda.c
+          python3 route-check/stub/gen_stub.py /tmp/nvcuda.c /tmp/stub.c
+          gcc -O2 -shared -fPIC -Iroute-check/stub -Wl,-soname,libcuda.so.1 -o out/stub/libcuda.so.1 /tmp/stub.c
+      - name: Export tables
+        run: |
+          for f in out/gnu/nvcuda.dll out/gnu/zluda64_server.exe out/probe/probe32.exe; do
+            echo "== $f"; i686-w64-mingw32-objdump -p "$f" | sed -n '/Export Address Table/,/^$/p;/\[Ordinal\/Name Pointer\] Table/,/^$/p' | head -20
+          done | tee out/gnu/objdump-head.txt
+          x86_64-w64-mingw32-objdump -p out/gnu/zluda64_server.exe | grep -A3 "DLL Name: nvcuda" | tee -a out/gnu/objdump-head.txt
+          sha256sum out/*/* | tee out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gnu
+          path: out
+
+  svesop:
+    name: SveSop nvcuda (stock and with the ZLUDA32_INTERNAL table)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: zluda
+      - uses: actions/checkout@v4
+        with:
+          repository: SveSop/nvcuda
+          ref: ${{ env.SVESOP_NVCUDA }}
+          path: stock
+      - name: Prepare patched tree
+        run: |
+          cp -a stock patched
+          cd patched
+          patch -Np1 --no-backup-if-mismatch < ../zluda/route-check/patches/nvidia-libs/nvcuda/0001-forward-zluda32-internal-export-table.patch
+          git diff --stat
+      - name: Build stock
+        uses: SveSop/ubuntu-mingw-github-action@v3
+        with:
+          command: |
+            cd stock && ./package-release.sh stock ../build
+      - name: Build patched
+        uses: SveSop/ubuntu-mingw-github-action@v3
+        with:
+          command: |
+            cd patched && ./package-release.sh patched ../build
+      - name: Collect
+        run: |
+          find build -type f | sort
+          mkdir -p out/stock out/patched
+          cp "$(find build/nvcuda-stock -name nvcuda.dll.so | head -1)" out/stock/
+          cp "$(find build/nvcuda-patched -name nvcuda.dll.so | head -1)" out/patched/
+          sha256sum out/*/* | tee out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: svesop
+          path: out
+
+  wine-chain:
+    name: Chain in GE-Proton11-7 Wine (WoW64)
+    needs: [msvc, gnu, svesop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: inputs
+      - name: Arrange inputs
+        run: |
+          mv inputs/gnu inputs/gnu-artifact
+          mv inputs/gnu-artifact/gnu inputs/gnu-artifact/probe inputs/gnu-artifact/stub inputs/
+          ls -R inputs
+      - name: GE-Proton
+        run: |
+          curl -fsSL -o ge.tar.gz "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/$GE_RELEASE/$GE_RELEASE-x86_64.tar.gz"
+          curl -fsSL -o ge.sha512sum "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/$GE_RELEASE/$GE_RELEASE-x86_64.sha512sum"
+          echo "$(cut -d' ' -f1 ge.sha512sum)  ge.tar.gz" | sha512sum -c
+          mkdir ge && tar -xzf ge.tar.gz -C ge --strip-components=1
+          cat ge/files/lib/wine/nvidia-libs/nvcuda/version
+          sha256sum ge/files/lib/wine/nvidia-libs/nvcuda/x86_64-windows/nvcuda.dll.so inputs/svesop/stock/nvcuda.dll.so
+      - name: Real ZLUDA (upstream v6 Linux release) and host facts
+        run: |
+          curl -fsSL -o zl.tar.gz https://github.com/vosen/ZLUDA/releases/download/v6/zluda-linux-3fe12063.tar.gz
+          mkdir zl && tar -xzf zl.tar.gz -C zl
+          mkdir -p inputs/zluda-linux
+          lib=$(find zl -name 'libcuda.so*' -o -name libnvcuda.so | head -1); echo "$lib"
+          cp -L "$lib" inputs/zluda-linux/libcuda.so.1
+          objdump -p inputs/zluda-linux/libcuda.so.1 | grep NEEDED
+          uname -a
+          sudo modprobe ntsync || true
+          ls -l /dev/ntsync || true
+          sudo chmod 666 /dev/ntsync || true
+      - name: ROCm HIP runtime (no GPU)
+        continue-on-error: true
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2 noble main" | sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends hip-runtime-amd
+          ls -l /opt/rocm/lib/libamdhip64* || true
+      - name: Run the chain
+        run: |
+          python3 route-check/run-chain.py --ge ge --inputs inputs --work work --iterations 20000
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json
+          for r in json.load(open('work/RESULT.json')):
+              print('==', r['arm'], 'exit', r['exit'], 'seconds', r['seconds'], r['sync_messages'])
+              for row in r['rows']:
+                  print('  ', json.dumps(row))
+              for l in r['stub_lines'][:12] + r['nvcuda_lines'][:8]:
+                  print('   |', l)
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wine-chain
+          path: |
+            work/RESULT.json
+            work/logs
+            work/wineboot.stderr

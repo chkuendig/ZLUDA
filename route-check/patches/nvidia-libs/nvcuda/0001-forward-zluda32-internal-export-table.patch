@@ -1,0 +1,83 @@
+--- a/dlls/nvcuda/internal.c	2026-10-31 19:49:51.611914266 +0100
++++ b/dlls/nvcuda/internal.c	2026-10-31 19:50:08.371936525 +0100
+@@ -193,6 +193,9 @@
+ static const CUuuid UUID_Relay14                    = {{0xDA, 0x91, 0x51, 0xD3, 0x3A, 0xE6, 0xCC, 0x41,
+                                                         0xA5, 0xC0, 0x4F, 0x26, 0xD5, 0x33, 0xE3, 0x28}};
+                                                     // {da9151d3-3ae6-cc41-a5c0-4f26d533e328}
++static const CUuuid UUID_Zluda32Internal            = {{0xEE, 0x37, 0x6A, 0x1B, 0xB8, 0x58, 0x42, 0xEB,
++                                                        0xA5, 0x2D, 0x9A, 0x10, 0x6D, 0x50, 0xD9, 0x14}};
++                                                    // {ee376a1b-b858-42eb-a52d-9a106d50d914}
+ 
+ struct cuda_table
+ {
+@@ -993,6 +996,51 @@
+     void* (*func5)(void *param0, void *param1);
+ } *Relay14_orig = NULL;
+ 
++/*
++ * Zluda32Internal
++ *
++ * Provided by ZLUDA's libcuda for its 64-bit helper process that serves
++ * 32-bit applications. The table has no size field, only the two entries.
++ * The NVIDIA driver does not provide it.
++ */
++struct Zluda32Internal_table
++{
++    CUresult (WINAPI* get_module_globals)(unsigned char **names, const unsigned char **initializers,
++                                          unsigned int *sizes, unsigned int *alignments,
++                                          unsigned int *count, CUmodule module);
++    CUresult (WINAPI* get_function_info)(void *explicit_arguments, unsigned int *explicit_argument_count,
++                                         CUfunction func);
++};
++static const struct
++{
++    CUresult (*get_module_globals)(unsigned char **names, const unsigned char **initializers,
++                                   unsigned int *sizes, unsigned int *alignments,
++                                   unsigned int *count, CUmodule module);
++    CUresult (*get_function_info)(void *explicit_arguments, unsigned int *explicit_argument_count,
++                                  CUfunction func);
++} *Zluda32Internal_orig = NULL;
++
++static CUresult WINAPI Zluda32Internal_get_module_globals(unsigned char **names, const unsigned char **initializers,
++                                                          unsigned int *sizes, unsigned int *alignments,
++                                                          unsigned int *count, CUmodule module)
++{
++    TRACE("(%p, %p, %p, %p, %p, %p)\n", names, initializers, sizes, alignments, count, module);
++    return Zluda32Internal_orig->get_module_globals(names, initializers, sizes, alignments, count, module);
++}
++
++static CUresult WINAPI Zluda32Internal_get_function_info(void *explicit_arguments, unsigned int *explicit_argument_count,
++                                                         CUfunction func)
++{
++    TRACE("(%p, %p, %p)\n", explicit_arguments, explicit_argument_count, func);
++    return Zluda32Internal_orig->get_function_info(explicit_arguments, explicit_argument_count, func);
++}
++
++static const struct Zluda32Internal_table Zluda32Internal_Impl =
++{
++    Zluda32Internal_get_module_globals,
++    Zluda32Internal_get_function_info,
++};
++
+ static void* WINAPI Relay1_func0(void *param0, void *param1)
+ {
+     TRACE("(%p, %p)\n", param0, param1);
+@@ -3661,6 +3709,18 @@
+         *table = (void *)&Relay14_Impl;
+         return CUDA_SUCCESS;
+     }
++    else if (cuda_equal_uuid(uuid, &UUID_Zluda32Internal))
++    {
++        TRACE("(%p, Zluda32Internal_UUID: %s)\n", table, cuda_print_uuid(uuid, buffer, sizeof(buffer)));
++        if (orig_result)
++            return orig_result;
++        if (!orig_table)
++            return CUDA_ERROR_UNKNOWN;
++
++        Zluda32Internal_orig = orig_table;
++        *table = (void *)&Zluda32Internal_Impl;
++        return CUDA_SUCCESS;
++    }
+ 
+     FIXME("Unknown UUID: %s, error: %d\n", cuda_print_uuid(uuid, buffer, sizeof(buffer)), orig_result);
+     return CUDA_ERROR_UNKNOWN;
