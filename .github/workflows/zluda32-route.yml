@@ -12,6 +12,7 @@ env:
   CARGO_TERM_COLOR: never
   CARGO_BUILD_JOBS: "3"
   SVESOP_NVCUDA: 772b344a3594fca916999c5c5288d875332de482
+  SVESOP_NVCUDA32: 1993a7c745e08f8bfb11502b7489dd7fba70a08f
   GE_RELEASE: GE-Proton11-7
 
 jobs:
@@ -51,7 +52,7 @@ jobs:
       - name: Toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 binutils-mingw-w64
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 binutils-mingw-w64 gcc-multilib
           rustup toolchain install stable --profile minimal
           rustup target add i686-pc-windows-gnu x86_64-pc-windows-gnu
           rustc -Vv
@@ -69,6 +70,13 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/SveSop/nvcuda/$SVESOP_NVCUDA/dlls/nvcuda/nvcuda.c" -o /tmp/nvcuda.c
           python3 route-check/stub/gen_stub.py /tmp/nvcuda.c /tmp/stub.c
           gcc -O2 -shared -fPIC -Iroute-check/stub -Wl,-soname,libcuda.so.1 -o out/stub/libcuda.so.1 /tmp/stub.c
+          # L32: i386 stub for GE's shipped SveSop nvcuda32 (classic multilib Wine)
+          mkdir -p out/stub32 out/pingpong
+          curl -fsSL "https://raw.githubusercontent.com/SveSop/nvcuda/$SVESOP_NVCUDA32/dlls/nvcuda/nvcuda.c" -o /tmp/nvcuda32.c
+          python3 route-check/stub/gen_stub.py /tmp/nvcuda32.c /tmp/stub32.c
+          gcc -m32 -O2 -shared -fPIC -Iroute-check/stub -Wl,-soname,libcuda.so.1 -o out/stub32/libcuda.so.1 /tmp/stub32.c
+          gcc -O2 -o out/pingpong/pingpong64 route-check/pingpong.c
+          gcc -m32 -O2 -o out/pingpong/pingpong32 route-check/pingpong.c
       - name: Export tables
         run: |
           for f in out/gnu/nvcuda.dll out/gnu/zluda64_server.exe out/probe/probe32.exe; do
@@ -136,7 +144,8 @@ jobs:
       - name: Arrange inputs
         run: |
           mv inputs/gnu inputs/gnu-artifact
-          mv inputs/gnu-artifact/gnu inputs/gnu-artifact/probe inputs/gnu-artifact/stub inputs/
+          mv inputs/gnu-artifact/gnu inputs/gnu-artifact/probe inputs/gnu-artifact/stub inputs/gnu-artifact/stub32 inputs/gnu-artifact/pingpong inputs/
+          chmod +x inputs/pingpong/*
           ls -R inputs
       - name: GE-Proton
         run: |
@@ -144,7 +153,10 @@ jobs:
           curl -fsSL -o ge.sha512sum "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/$GE_RELEASE/$GE_RELEASE-x86_64.sha512sum"
           echo "$(cut -d' ' -f1 ge.sha512sum)  ge.tar.gz" | sha512sum -c
           mkdir ge && tar -xzf ge.tar.gz -C ge --strip-components=1
-          cat ge/files/lib/wine/nvidia-libs/nvcuda/version
+          cat ge/files/lib/wine/nvidia-libs/nvcuda/version ge/files/lib/wine/nvidia-libs/nvcuda/version-i386
+          mkdir -p inputs/nvcuda32 && cp ge/files/lib/wine/nvidia-libs/nvcuda/i386-windows/nvcuda.dll.so inputs/nvcuda32/
+          # Classic multilib Wine needs the host's i386 C runtime (Steam's runtime provides it on the Deck).
+          sudo apt-get install -y --no-install-recommends gcc-multilib
           sha256sum ge/files/lib/wine/nvidia-libs/nvcuda/x86_64-windows/nvcuda.dll.so inputs/svesop/stock/nvcuda.dll.so
       - name: Real ZLUDA (upstream v6 Linux release) and host facts
         run: |
@@ -168,6 +180,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends hip-runtime-amd
           ls -l /opt/rocm/lib/libamdhip64* || true
+      - name: Linux futex round trip (L32 IPC estimate)
+        run: |
+          for c in 32 64; do
+            inputs/pingpong/pingpong64 server /z32pp$c & sleep 0.5
+            inputs/pingpong/pingpong$c client /z32pp$c 20000 | tee -a work-pingpong.jsonl
+            wait
+          done
       - name: Run the chain
         run: |
           python3 route-check/run-chain.py --ge ge --inputs inputs --work work --iterations 20000
@@ -190,4 +209,5 @@ jobs:
           path: |
             work/RESULT.json
             work/logs
-            work/wineboot.stderr
+            work/wineboot*.stderr
+            work-pingpong.jsonl

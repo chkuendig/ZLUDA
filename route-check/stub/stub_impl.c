@@ -66,10 +66,12 @@ CUresult cuModuleGetFunction(void **fn, void *module, const char *name)
     *fn = FAKE_FUNCTION;
     return 0;
 }
-CUresult cuMemAlloc_v2(uint64_t *dptr, size_t size) { LOG("cuMemAlloc_v2(%zu)", size); *dptr = 0x7f0000000000ull; return 0; }
-CUresult cuMemcpyHtoD_v2(uint64_t dst, const void *src, size_t n) { return 0; }
-CUresult cuMemcpyHtoDAsync_v2(uint64_t dst, const void *src, size_t n, void *stream) { return 0; }
-CUresult cuMemcpyDtoHAsync_v2(void *dst, uint64_t src, size_t n, void *stream) { memset(dst, 0, n); return 0; }
+/* CUdeviceptr is pointer-sized: 64-bit on x86_64, 32-bit for the i386 build. */
+typedef uintptr_t CUdeviceptr;
+CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t size) { LOG("cuMemAlloc_v2(%zu)", size); *dptr = (CUdeviceptr)0x7f000000u << (sizeof(CUdeviceptr) > 4 ? 8 : 0); return 0; }
+CUresult cuMemcpyHtoD_v2(CUdeviceptr dst, const void *src, size_t n) { return 0; }
+CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dst, const void *src, size_t n, void *stream) { return 0; }
+CUresult cuMemcpyDtoHAsync_v2(void *dst, CUdeviceptr src, size_t n, void *stream) { memset(dst, 0, n); return 0; }
 CUresult cuLaunchKernel(void *f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz,
                         unsigned shmem, void *stream, void **params, void **extra)
 {

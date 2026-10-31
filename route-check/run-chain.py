@@ -28,11 +28,13 @@ work.mkdir(parents=True, exist_ok=True)
 files = ge / 'files'
 
 
-def base_env(prefix, sync, libcuda_dir, extra_ld=()):
+def base_env(prefix, sync, libcuda_dir, extra_ld=(), classic=False):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('WINE', 'PROTON_', 'ZLUDA', 'LD_'))}
     ld = [str(libcuda_dir)] if libcuda_dir else []
     ld += list(extra_ld) + [str(files / 'lib/wine/x86_64-unix'), str(files / 'lib/x86_64-linux-gnu'),
                             str(files / 'lib/i386-linux-gnu')]
+    if classic:
+        ld.append(str(files / 'lib/wine/i386-unix'))
     env.update(WINEPREFIX=str(prefix), WINEARCH='wow64', WINELOADER=str(files / 'bin/wine'),
                WINESERVER=str(files / 'bin/wineserver'), WINEDLLPATH=str(files / 'lib/wine'),
                LD_LIBRARY_PATH=':'.join(ld), WINEDLLOVERRIDES='nvcuda=n,b;winemenubuilder.exe=d;mscoree,mshtml=',
@@ -41,6 +43,10 @@ def base_env(prefix, sync, libcuda_dir, extra_ld=()):
                WINENTSYNC='1' if sync == 'ntsync' else '0', LC_ALL='C',
                PATH=str(files / 'bin') + ':' + os.environ.get('PATH', '/usr/bin:/bin'))
     env.pop('DISPLAY', None)
+    if classic:
+        # Classic multilib mode: a win64 prefix with GE's i386 Unix side (no WINEARCH=wow64).
+        del env['WINEARCH']
+        env.pop('ZLUDA64_PATH')
     return env
 
 
@@ -65,13 +71,17 @@ def kill(env):
     subprocess.run([env['WINESERVER'], '-w'], env=env, timeout=60, check=False)
 
 
+def make_template(path, classic=False):
+    if not path.exists():
+        env = base_env(path, 'none', None, classic=classic)
+        code, out, err, secs = wine(env, ['wineboot', '-i'], 600)
+        kill(env)
+        (work / ('wineboot-classic.stderr' if classic else 'wineboot.stderr')).write_text(err[-20000:])
+        print(f'wineboot classic={classic} exit={code} seconds={secs}', flush=True)
+
+
 template = work / 'prefix-template'
-if not template.exists():
-    env = base_env(template, 'none', None)
-    code, out, err, secs = wine(env, ['wineboot', '-i'], 600)
-    kill(env)
-    (work / 'wineboot.stderr').write_text(err[-20000:])
-    print(f'wineboot exit={code} seconds={secs}', flush=True)
+make_template(template)
 
 
 def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, extra_ld=(), extra_env=None):
@@ -130,4 +140,37 @@ if (zl / 'libcuda.so.1').exists():
     rocm = Path(os.environ.get('ROCM_LIB', '/opt/rocm/lib'))
     if (rocm / 'libamdhip64.so.7').exists() or (rocm / 'libamdhip64.so').exists():
         results.append(arm('patched-zluda-rocm', 'msvc', 'patched', zl, 'ntsync', timeout=60, extra_ld=[str(rocm)]))
+
+
+def arm_classic(name, probe='probe32.exe', libcuda=inp / 'stub32', timeout=120):
+    """L32 check: GE's shipped SveSop nvcuda32 (i386 winelib) in classic multilib mode."""
+    tmpl = work / 'prefix-template-classic'
+    make_template(tmpl, classic=True)
+    prefix = work / ('prefix-' + name)
+    shutil.rmtree(prefix, ignore_errors=True)
+    shutil.copytree(tmpl, prefix, symlinks=True)
+    c = prefix / 'drive_c'
+    syswow = c / 'windows/syswow64/nvcuda.dll'
+    if syswow.exists() or syswow.is_symlink():
+        syswow.unlink()
+    # GE copies nvcuda32 this way when wow64 is off (proton: use_nvcuda and not disable_nvlibs32).
+    shutil.copy(inp / 'nvcuda32' / 'nvcuda.dll.so', syswow)
+    (c / 'probe').mkdir()
+    shutil.copy(inp / 'probe' / probe, c / 'probe' / probe)
+    env = base_env(prefix, 'ntsync', libcuda, classic=True)
+    if Path('/dev/ntsync').exists():
+        subprocess.run(['sudo', 'chmod', '666', '/dev/ntsync'], check=False)
+    code, out, err, secs = wine(env, ['C:\\probe\\' + probe, '2000'], timeout)
+    kill(env)
+    rows = [json.loads(l) for l in out.splitlines() if l.startswith('{')]
+    logs = work / 'logs'
+    (logs / f'{name}.stdout').write_text(out)
+    (logs / f'{name}.stderr').write_text(err[-200000:])
+    res = {'arm': name, 'classic': True, 'exit': code, 'seconds': secs, 'rows': rows,
+           'stub_lines': [l for l in err.splitlines() if l.startswith('STUB:')][:40], 'tail': err.splitlines()[-25:]}
+    print(json.dumps({k: res[k] for k in ('arm', 'exit', 'seconds')}), flush=True)
+    return res
+
+
+results.append(arm_classic('l32-classic-nvcuda32-stub'))
 (work / 'RESULT.json').write_text(json.dumps(results, indent=1))
