@@ -1,0 +1,83 @@
+name: Wine bridge production and independent tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "3"
+      CARGO_TERM_COLOR: never
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/wine-cpu-acceptance
+      ZLUDA_WINE_DECLARATIONS_ONLY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin the local review toolchain version
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Run every non-oracle Python test
+        run: |
+          for name in production_admission candidate_import lifecycle pe_artifact stack_probe wine_runner; do
+            python3 -m unittest discover -s wine/zluda_wine/tests -p "test_${name}.py"
+          done
+      - name: Verify the reviewed production input closure
+        run: python3 wine/zluda_wine/tests/check_production_inputs.py
+      - name: Check production with the LGPL package absent
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e wine/zluda_wine/tests/lgpl
+          test ! -e wine/nvcuda
+          cargo +1.99.0 check --locked -j 3 --lib --manifest-path wine/zluda_wine/Cargo.toml
+      - name: Check both GNU Windows declaration targets
+        run: |
+          rustup target add --toolchain 1.99.0 x86_64-pc-windows-gnu i686-pc-windows-gnu
+          for target in x86_64-pc-windows-gnu i686-pc-windows-gnu; do
+            cargo +1.99.0 check --locked -j 3 --lib --target "$target" --manifest-path wine/zluda_wine/Cargo.toml
+          done
+      - name: Check the canonical dark descriptors
+        run: python3 wine/zluda_wine/tests/abi/check-dark-layouts.py
+      - name: Run every non-oracle Rust unit test and ELF scope fixture
+        run: python3 wine/zluda_wine/tests/run_native_tests.py
+  pe32-luid:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: "3"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/pe32-luid
+      ZLUDA_WINE_DECLARATIONS_ONLY: "1"
+    steps:
+      - name: Preserve the pinned source byte identities
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust and PE32 standard library
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup target add --toolchain 1.99.0 i686-pc-windows-msvc
+      - name: Run actual PE32 stdcall and LUID failure-path probe
+        run: |
+          python3 wine/zluda_wine/tools/import_native_dark.py --check
+          python wine/zluda_wine/tests/run_pe32_luid.py
+
+  fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fixture cross compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 mingw-w64-x86-64-dev mingw-w64-i686-dev
+      - name: Build the independent W1 fixtures
+        run: bash wine/w1-fixtures/build.sh "$RUNNER_TEMP/w1-fixtures"
+      - name: Run the counter self-test
+        run: bash wine/w1-fixtures/tools/cuda-count/selftest.sh "$RUNNER_TEMP/w1-fixtures/linux"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: w1-fixtures
+          path: ${{ runner.temp }}/w1-fixtures
+          if-no-files-found: error
