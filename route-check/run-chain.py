@@ -90,6 +90,9 @@ def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, ex
     (c / 'probe').mkdir()
     shutil.copy(inp / 'probe' / probe, c / 'probe' / probe)
     env = base_env(prefix, sync, libcuda, extra_ld)
+    # GE's Wine takes ntsync whenever /dev/ntsync opens, whatever WINENTSYNC says.
+    if Path('/dev/ntsync').exists():
+        subprocess.run(['sudo', 'chmod', '666' if sync == 'ntsync' else '000', '/dev/ntsync'], check=False)
     code, out, err, secs = wine(env, ['C:\\probe\\' + probe, str(args.iterations)], timeout)
     procs = processes()
     kill(env)
@@ -103,6 +106,7 @@ def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, ex
            'probe': probe, 'exit': code, 'seconds': secs, 'rows': rows,
            'processes_at_end': procs, 'sync_messages': sync_lines[:5],
            'stub_lines': [l for l in err.splitlines() if l.startswith('STUB:')][:40],
+           'tail': err.splitlines()[-25:],
            'nvcuda_lines': [l for l in err.splitlines() if 'nvcuda' in l][:20]}
     print(json.dumps({k: res[k] for k in ('arm', 'exit', 'seconds', 'sync_messages')}), flush=True)
     return res
@@ -110,15 +114,15 @@ def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, ex
 
 stub = inp / 'stub'
 results = []
-results.append(arm('stock-stub-msvc', 'msvc', 'stock', stub, 'fsync', timeout=60))
-for sync in ('fsync', 'esync', 'ntsync', 'server'):
+results.append(arm('stock-stub-msvc', 'msvc', 'stock', stub, 'ntsync', timeout=60))
+for sync in ('ntsync', 'fsync', 'esync', 'server'):
     results.append(arm(f'patched-stub-msvc-{sync}', 'msvc', 'patched', stub, sync))
-results.append(arm('patched-stub-gnu-fsync', 'gnu', 'patched', stub, 'fsync'))
-results.append(arm('patched-stub-direct64-fsync', 'msvc', 'patched', stub, 'fsync', probe='probe64.exe'))
+results.append(arm('patched-stub-gnu-ntsync', 'gnu', 'patched', stub, 'ntsync'))
+results.append(arm('patched-stub-direct64-ntsync', 'msvc', 'patched', stub, 'fsync', probe='probe64.exe'))
 zl = inp / 'zluda-linux'
 if (zl / 'libcuda.so.1').exists():
-    results.append(arm('patched-zluda-norocm', 'msvc', 'patched', zl, 'fsync', timeout=60))
+    results.append(arm('patched-zluda-norocm', 'msvc', 'patched', zl, 'ntsync', timeout=60))
     rocm = Path(os.environ.get('ROCM_LIB', '/opt/rocm/lib'))
     if (rocm / 'libamdhip64.so.7').exists() or (rocm / 'libamdhip64.so').exists():
-        results.append(arm('patched-zluda-rocm', 'msvc', 'patched', zl, 'fsync', timeout=60, extra_ld=[str(rocm)]))
+        results.append(arm('patched-zluda-rocm', 'msvc', 'patched', zl, 'ntsync', timeout=60, extra_ld=[str(rocm)]))
 (work / 'RESULT.json').write_text(json.dumps(results, indent=1))

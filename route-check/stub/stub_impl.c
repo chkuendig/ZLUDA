@@ -43,6 +43,7 @@ CUresult cuCtxSetCurrent(void *ctx) { LOG("cuCtxSetCurrent(%p)", ctx); return ct
 CUresult cuCtxGetDevice(int *dev) { *dev = 0; return 0; }
 CUresult cuCtxGetApiVersion(void *ctx, unsigned *v) { *v = 3020; return 0; }
 CUresult cuCtxSynchronize(void) { return 0; }
+CUresult cuStreamSynchronize(void *stream) { return 0; }
 CUresult cuModuleLoadData(void **module, const void *image)
 {
     LOG("cuModuleLoadData(%.40s...)", (const char *)image);
