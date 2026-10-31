@@ -1,0 +1,790 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Reviewed revision 3: name, kind, PE64 ordinal, PE32 stack bytes, PE32 ordinal, per-parameter bytes
+cuArray3DCreate	stdcall	1	8	1	4 4
+cuArray3DCreate_v2	stdcall	2	8	2	4 4
+cuArray3DGetDescriptor	stdcall	3	8	3	4 4
+cuArray3DGetDescriptor_v2	stdcall	4	8	4	4 4
+cuArrayCreate	stdcall	5	8	5	4 4
+cuArrayCreate_v2	stdcall	6	8	6	4 4
+cuArrayDestroy	stdcall	7	4	7	4
+cuArrayGetDescriptor	stdcall	8	8	8	4 4
+cuArrayGetDescriptor_v2	stdcall	9	8	9	4 4
+cuCtxAttach	stdcall	10	8	27	4 4
+cuCtxCreate	stdcall	11	12	28	4 4 4
+cuCtxCreate_v2	stdcall	12	12	29	4 4 4
+cuCtxCreate_v3	stdcall	13	20	30	4 4 4 4 4
+cuCtxCreate_v4	stdcall	14	16	31	4 4 4 4
+cuCtxDestroy	stdcall	15	4	32	4
+cuCtxDestroy_v2	stdcall	16	4	33	4
+cuCtxDetach	stdcall	17	4	34	4
+cuCtxDisablePeerAccess	stdcall	18	4	35	4
+cuCtxEnablePeerAccess	stdcall	19	8	36	4 4
+cuCtxGetApiVersion	stdcall	20	8	38	4 4
+cuCtxGetCacheConfig	stdcall	21	4	39	4
+cuCtxGetCurrent	stdcall	22	4	40	4
+cuCtxGetDevice	stdcall	23	4	42	4
+cuCtxGetFlags	stdcall	24	4	45	4
+cuCtxGetLimit	stdcall	25	8	47	4 4
+cuCtxGetSharedMemConfig	stdcall	26	4	48	4
+cuCtxGetStreamPriorityRange	stdcall	27	8	49	4 4
+cuCtxPopCurrent	stdcall	28	4	50	4
+cuCtxPopCurrent_v2	stdcall	29	4	51	4
+cuCtxPushCurrent	stdcall	30	4	52	4
+cuCtxPushCurrent_v2	stdcall	31	4	53	4
+cuCtxSetCacheConfig	stdcall	32	4	56	4
+cuCtxSetCurrent	stdcall	33	4	57	4
+cuCtxSetLimit	stdcall	34	8	59	4 4
+cuCtxSetSharedMemConfig	stdcall	35	4	60	4
+cuCtxSynchronize	stdcall	36	0	61	
+cuD3D10CtxCreate	stub	37	0	0	
+cuD3D10CtxCreateOnDevice	stub	38	0	0	
+cuD3D10CtxCreate_v2	stub	39	0	0	
+cuD3D10GetDevice	stdcall	40	8	64	4 4
+cuD3D10GetDevices	stub	41	0	0	
+cuD3D10GetDirect3DDevice	stub	42	0	0	
+cuD3D10MapResources	stub	43	0	0	
+cuD3D10RegisterResource	stub	44	0	0	
+cuD3D10ResourceGetMappedArray	stub	45	0	0	
+cuD3D10ResourceGetMappedPitch	stub	46	0	0	
+cuD3D10ResourceGetMappedPitch_v2	stub	47	0	0	
+cuD3D10ResourceGetMappedPointer	stub	48	0	0	
+cuD3D10ResourceGetMappedPointer_v2	stub	49	0	0	
+cuD3D10ResourceGetMappedSize	stub	50	0	0	
+cuD3D10ResourceGetMappedSize_v2	stub	51	0	0	
+cuD3D10ResourceGetSurfaceDimensions	stub	52	0	0	
+cuD3D10ResourceGetSurfaceDimensions_v2	stub	53	0	0	
+cuD3D10ResourceSetMapFlags	stub	54	0	0	
+cuD3D10UnmapResources	stub	55	0	0	
+cuD3D10UnregisterResource	stub	56	0	0	
+cuD3D11CtxCreate	stdcall	57	16	65	4 4 4 4
+cuD3D11CtxCreate_v2	stdcall	58	16	66	4 4 4 4
+cuD3D11CtxCreateOnDevice	stub	59	0	0	
+cuD3D11GetDevice	stdcall	60	8	67	4 4
+cuD3D11GetDevices	stub	61	0	0	
+cuD3D11GetDirect3DDevice	stub	62	0	0	
+cuD3D9Begin	stub	63	0	0	
+cuD3D9CtxCreate	stdcall	64	16	68	4 4 4 4
+cuD3D9CtxCreateOnDevice	stub	65	0	0	
+cuD3D9CtxCreate_v2	stub	66	0	0	
+cuD3D9End	stub	67	0	0	
+cuD3D9GetDevice	stdcall	68	8	69	4 4
+cuD3D9GetDevices	stub	69	0	0	
+cuD3D9GetDirect3DDevice	stub	70	0	0	
+cuD3D9MapResources	stub	71	0	0	
+cuD3D9MapVertexBuffer	stub	72	0	0	
+cuD3D9MapVertexBuffer_v2	stub	73	0	0	
+cuD3D9RegisterResource	stub	74	0	0	
+cuD3D9RegisterVertexBuffer	stub	75	0	0	
+cuD3D9ResourceGetMappedArray	stub	76	0	0	
+cuD3D9ResourceGetMappedPitch	stub	77	0	0	
+cuD3D9ResourceGetMappedPitch_v2	stub	78	0	0	
+cuD3D9ResourceGetMappedPointer	stub	79	0	0	
+cuD3D9ResourceGetMappedPointer_v2	stub	80	0	0	
+cuD3D9ResourceGetMappedSize	stub	81	0	0	
+cuD3D9ResourceGetMappedSize_v2	stub	82	0	0	
+cuD3D9ResourceGetSurfaceDimensions	stub	83	0	0	
+cuD3D9ResourceGetSurfaceDimensions_v2	stub	84	0	0	
+cuD3D9ResourceSetMapFlags	stub	85	0	0	
+cuD3D9UnmapResources	stub	86	0	0	
+cuD3D9UnmapVertexBuffer	stub	87	0	0	
+cuD3D9UnregisterResource	stub	88	0	0	
+cuD3D9UnregisterVertexBuffer	stub	89	0	0	
+cuDestroyExternalMemory	stdcall	90	4	70	4
+cuDestroyExternalSemaphore	stdcall	91	4	71	4
+cuDeviceCanAccessPeer	stdcall	92	12	75	4 4 4
+cuDeviceComputeCapability	stdcall	93	12	76	4 4 4
+cuDeviceGet	stdcall	94	8	77	4 4
+cuDeviceGetAttribute	stdcall	95	12	78	4 4 4
+cuDeviceGetByPCIBusId	stdcall	96	8	79	4 4
+cuDeviceGetCount	stdcall	97	4	80	4
+cuDeviceGetDefaultMemPool	stdcall	98	8	81	4 4
+cuDeviceGetGraphMemAttribute	stdcall	99	12	84	4 4 4
+cuDeviceGetLuid	stdcall	100	12	86	4 4 4
+cuDeviceGetName	stdcall	101	12	88	4 4 4
+cuDeviceGetP2PAttribute	stdcall	102	16	90	4 4 4 4
+cuDeviceGetPCIBusId	stdcall	103	12	91	4 4 4
+cuDeviceGetProperties	stdcall	104	8	92	4 4
+cuDeviceGetUuid	stdcall	105	8	94	4 4
+cuDeviceGraphMemTrim	stdcall	106	4	96	4
+cuDevicePrimaryCtxGetState	stdcall	107	12	97	4 4 4
+cuDevicePrimaryCtxRelease	stdcall	108	4	98	4
+cuDevicePrimaryCtxReset	stdcall	109	4	100	4
+cuDevicePrimaryCtxRetain	stdcall	110	8	102	4 4
+cuDevicePrimaryCtxSetFlags	stdcall	111	8	103	4 4
+cuDeviceTotalMem	stdcall	112	8	108	4 4
+cuDeviceTotalMem_v2	stdcall	113	8	109	4 4
+cuDriverGetVersion	stdcall	114	4	112	4
+cuEventCreate	stdcall	115	8	113	4 4
+cuEventDestroy	stdcall	116	4	114	4
+cuEventDestroy_v2	stdcall	117	4	115	4
+cuEventElapsedTime	stdcall	118	12	116	4 4 4
+cuEventQuery	stdcall	119	4	118	4
+cuEventRecord	stdcall	120	8	119	4 4
+cuEventRecord_ptsz	stdcall	121	8	122	4 4
+cuEventSynchronize	stdcall	122	4	123	4
+cuExternalMemoryGetMappedBuffer	stdcall	123	12	124	4 4 4
+cuExternalMemoryGetMappedMipmappedArray	stdcall	124	12	125	4 4 4
+cuFuncGetAttribute	stdcall	125	12	127	4 4 4
+cuFuncSetAttribute	stdcall	126	12	134	4 4 4
+cuFuncSetBlockShape	stdcall	127	16	135	4 4 4 4
+cuFuncSetCacheConfig	stdcall	128	8	136	4 4
+cuFuncSetSharedMemConfig	stdcall	129	8	137	4 4
+cuFuncSetSharedSize	stdcall	130	8	138	4 4
+cuGLCtxCreate	stdcall	131	12	139	4 4 4
+cuGLCtxCreate_v2	stdcall	132	12	140	4 4 4
+cuGLGetDevices	stdcall	133	16	141	4 4 4 4
+cuGLGetDevices_v2	stdcall	134	16	142	4 4 4 4
+cuGLInit	stdcall	135	0	143	
+cuGLMapBufferObject	stdcall	136	12	144	4 4 4
+cuGLMapBufferObjectAsync	stdcall	137	16	145	4 4 4 4
+cuGLMapBufferObjectAsync_v2	stdcall	138	16	146	4 4 4 4
+cuGLMapBufferObjectAsync_v2_ptsz	stdcall	139	16	147	4 4 4 4
+cuGLMapBufferObject_v2	stdcall	140	12	148	4 4 4
+cuGLMapBufferObject_v2_ptds	stdcall	141	12	149	4 4 4
+cuGLRegisterBufferObject	stdcall	142	4	150	4
+cuGLSetBufferObjectMapFlags	stdcall	143	8	151	4 4
+cuGLUnmapBufferObject	stdcall	144	4	152	4
+cuGLUnmapBufferObjectAsync	stdcall	145	8	153	4 4
+cuGLUnregisterBufferObject	stdcall	146	4	154	4
+cuGetErrorName	stdcall	147	8	155	4 4
+cuGetErrorString	stdcall	148	8	156	4 4
+cuGetExportTable	stdcall	149	8	157	4 4
+cuGraphAddChildGraphNode	stdcall	150	20	161	4 4 4 4 4
+cuGraphAddDependencies	stdcall	151	16	162	4 4 4 4
+cuGraphAddEmptyNode	stdcall	152	16	164	4 4 4 4
+cuGraphAddHostNode	stdcall	153	20	169	4 4 4 4 4
+cuGraphAddKernelNode	stdcall	154	20	170	4 4 4 4 4
+cuGraphAddMemAllocNode	stdcall	155	20	172	4 4 4 4 4
+cuGraphAddMemFreeNode	stdcall	156	20	173	4 4 4 4 4
+cuGraphAddMemcpyNode	stdcall	157	24	174	4 4 4 4 4 4
+cuGraphAddMemsetNode	stdcall	158	24	175	4 4 4 4 4 4
+cuGraphChildGraphNodeGetGraph	stdcall	159	8	180	4 4
+cuGraphClone	stdcall	160	8	181	4 4
+cuGraphCreate	stdcall	161	8	183	4 4
+cuGraphDestroy	stdcall	162	4	185	4
+cuGraphDestroyNode	stdcall	163	4	186	4
+cuGraphExecDestroy	stdcall	164	4	193	4
+cuGraphExecKernelNodeSetParams	stdcall	165	12	201	4 4 4
+cuGraphGetEdges	stdcall	166	16	212	4 4 4 4
+cuGraphGetNodes	stdcall	167	12	215	4 4 4
+cuGraphGetRootNodes	stdcall	168	12	216	4 4 4
+cuGraphHostNodeGetParams	stdcall	169	8	217	4 4
+cuGraphHostNodeSetParams	stdcall	170	8	218	4 4
+cuGraphInstantiate	stdcall	171	20	219	4 4 4 4 4
+cuGraphInstantiate_v2	stdcall	172	20	223	4 4 4 4 4
+cuGraphKernelNodeGetParams	stdcall	173	8	226	4 4
+cuGraphKernelNodeSetParams	stdcall	174	8	229	4 4
+cuGraphLaunch	stdcall	175	8	231	4 4
+cuGraphLaunch_ptsz	stdcall	176	8	232	4 4
+cuGraphMemcpyNodeGetParams	stdcall	177	8	235	4 4
+cuGraphMemcpyNodeSetParams	stdcall	178	8	236	4 4
+cuGraphMemsetNodeGetParams	stdcall	179	8	237	4 4
+cuGraphMemsetNodeSetParams	stdcall	180	8	238	4 4
+cuGraphNodeFindInClone	stdcall	181	12	239	4 4 4
+cuGraphNodeGetDependencies	stdcall	182	12	241	4 4 4
+cuGraphNodeGetDependentNodes	stdcall	183	12	243	4 4 4
+cuGraphNodeGetType	stdcall	184	8	249	4 4
+cuGraphRemoveDependencies	stdcall	185	16	253	4 4 4 4
+cuGraphicsD3D9RegisterResource	stdcall	186	12	260	4 4 4
+cuGraphicsD3D10RegisterResource	stdcall	187	12	258	4 4 4
+cuGraphicsD3D11RegisterResource	stdcall	188	12	259	4 4 4
+cuGraphicsGLRegisterBuffer	stdcall	189	12	261	4 4 4
+cuGraphicsGLRegisterImage	stdcall	190	16	262	4 4 4 4
+cuGraphicsMapResources	stdcall	191	12	263	4 4 4
+cuGraphicsMapResources_ptsz	stdcall	192	12	264	4 4 4
+cuGraphicsResourceGetMappedMipmappedArray	stdcall	193	8	265	4 4
+cuGraphicsResourceGetMappedPointer	stdcall	194	12	266	4 4 4
+cuGraphicsResourceGetMappedPointer_v2	stdcall	195	12	267	4 4 4
+cuGraphicsResourceSetMapFlags	stdcall	196	8	268	4 4
+cuGraphicsResourceSetMapFlags_v2	stdcall	197	8	269	4 4
+cuGraphicsSubResourceGetMappedArray	stdcall	198	16	270	4 4 4 4
+cuGraphicsUnmapResources	stdcall	199	12	271	4 4 4
+cuGraphicsUnmapResources_ptsz	stdcall	200	12	272	4 4 4
+cuGraphicsUnregisterResource	stdcall	201	4	273	4
+cuImportExternalMemory	stdcall	202	8	281	4 4
+cuImportExternalSemaphore	stdcall	203	8	282	4 4
+cuInit	stdcall	204	4	283	4
+cuIpcCloseMemHandle	stdcall	205	4	284	4
+cuIpcGetEventHandle	stdcall	206	8	285	4 4
+cuIpcGetMemHandle	stdcall	207	8	286	4 4
+cuIpcOpenEventHandle	stdcall	208	68	287	4 64
+cuIpcOpenMemHandle	stdcall	209	72	288	4 64 4
+cuIpcOpenMemHandle_v2	stdcall	210	72	289	4 64 4
+cuLaunch	stdcall	211	4	298	4
+cuLaunchCooperativeKernel	stdcall	212	40	299	4 4 4 4 4 4 4 4 4 4
+cuLaunchCooperativeKernelMultiDevice	stdcall	213	12	300	4 4 4
+cuLaunchCooperativeKernel_ptsz	stub	214	0	0	
+cuLaunchGrid	stdcall	215	12	301	4 4 4
+cuLaunchGridAsync	stdcall	216	16	302	4 4 4 4
+cuLaunchHostFunc	stdcall	217	12	303	4 4 4
+cuLaunchHostFunc_ptsz	stdcall	218	12	304	4 4 4
+cuLaunchKernel	stdcall	219	44	307	4 4 4 4 4 4 4 4 4 4 4
+cuLaunchKernel_ptsz	stdcall	220	44	310	4 4 4 4 4 4 4 4 4 4 4
+cuLaunchKernelEx	stdcall	221	16	308	4 4 4 4
+cuLaunchKernelEx_ptsz	stdcall	222	16	309	4 4 4 4
+cuLinkAddData	stdcall	223	32	321	4 4 4 4 4 4 4 4
+cuLinkAddData_v2	stdcall	224	32	322	4 4 4 4 4 4 4 4
+cuLinkAddFile	stdcall	225	24	323	4 4 4 4 4 4
+cuLinkAddFile_v2	stdcall	226	24	324	4 4 4 4 4 4
+cuLinkComplete	stdcall	227	12	325	4 4 4
+cuLinkCreate	stdcall	228	16	326	4 4 4 4
+cuLinkCreate_v2	stdcall	229	16	327	4 4 4 4
+cuLinkDestroy	stdcall	230	4	328	4
+cuMemAdvise	stdcall	231	16	336	4 4 4 4
+cuMemAlloc	stdcall	232	8	338	4 4
+cuMemAllocAsync	stdcall	233	12	339	4 4 4
+cuMemAllocAsync_ptsz	stdcall	234	12	340	4 4 4
+cuMemAllocHost	stdcall	235	8	343	4 4
+cuMemAllocHost_v2	stdcall	236	8	344	4 4
+cuMemAllocManaged	stdcall	237	12	345	4 4 4
+cuMemAllocPitch	stdcall	238	20	346	4 4 4 4 4
+cuMemAllocPitch_v2	stdcall	239	20	347	4 4 4 4 4
+cuMemAlloc_v2	stdcall	240	8	348	4 4
+cuMemBatchDecompressAsync	stdcall	241	20	349	4 4 4 4 4
+cuMemBatchDecompressAsync_ptsz	stdcall	242	20	350	4 4 4 4 4
+cuMemFree	stdcall	243	4	357	4
+cuMemGetAllocationGranularity	stdcall	244	12	365	4 4 4
+cuMemFreeAsync	stdcall	245	8	358	4 4
+cuMemFreeAsync_ptsz	stdcall	246	8	359	4 4
+cuMemFreeHost	stdcall	247	4	360	4
+cuMemFree_v2	stdcall	248	4	361	4
+cuMemGetAddressRange	stdcall	249	12	363	4 4 4
+cuMemGetAddressRange_v2	stdcall	250	12	364	4 4 4
+cuMemGetHandleForAddressRange	stdcall	251	24	368	4 4 4 4 8
+cuMemGetInfo	stdcall	252	8	369	4 4
+cuMemGetInfo_v2	stdcall	253	8	370	4 4
+cuMemHostAlloc	stdcall	254	12	372	4 4 4
+cuMemHostGetDevicePointer	stdcall	255	12	373	4 4 4
+cuMemHostGetDevicePointer_v2	stdcall	256	12	374	4 4 4
+cuMemHostGetFlags	stdcall	257	8	375	4 4
+cuMemHostRegister	stdcall	258	12	376	4 4 4
+cuMemHostRegister_v2	stdcall	259	12	377	4 4 4
+cuMemHostUnregister	stdcall	260	4	378	4
+cuMemPoolSetAttribute	stdcall	261	12	392	4 4 4
+cuMemPrefetchAsync	stdcall	262	16	394	4 4 4 4
+cuMemPrefetchAsync_ptsz	stdcall	263	16	395	4 4 4 4
+cuMemRangeGetAttribute	stdcall	264	20	400	4 4 4 4 4
+cuMemRangeGetAttributes	stdcall	265	24	401	4 4 4 4 4 4
+cuMemcpy	stdcall	266	12	407	4 4 4
+cuMemcpy2D	stdcall	267	4	408	4
+cuMemcpy2DAsync	stdcall	268	8	409	4 4
+cuMemcpy2DAsync_v2	stdcall	269	8	410	4 4
+cuMemcpy2DAsync_v2_ptsz	stdcall	270	8	411	4 4
+cuMemcpy2DUnaligned	stdcall	271	4	412	4
+cuMemcpy2DUnaligned_v2	stdcall	272	4	413	4
+cuMemcpy2DUnaligned_v2_ptds	stdcall	273	4	414	4
+cuMemcpy2D_v2	stdcall	274	4	415	4
+cuMemcpy2D_v2_ptds	stdcall	275	4	416	4
+cuMemcpy3D	stdcall	276	4	417	4
+cuMemcpy3DAsync	stdcall	277	8	418	4 4
+cuMemcpy3DAsync_v2	stdcall	278	8	419	4 4
+cuMemcpy3DAsync_v2_ptsz	stdcall	279	8	420	4 4
+cuMemcpy3DPeer	stdcall	280	4	425	4
+cuMemcpy3DPeerAsync	stdcall	281	8	426	4 4
+cuMemcpy3DPeerAsync_ptsz	stdcall	282	8	427	4 4
+cuMemcpy3DPeer_ptds	stdcall	283	4	428	4
+cuMemcpy3D_v2	stdcall	284	4	431	4
+cuMemcpy3D_v2_ptds	stdcall	285	4	432	4
+cuMemcpyAsync	stdcall	286	16	433	4 4 4 4
+cuMemcpyAsync_ptsz	stdcall	287	16	434	4 4 4 4
+cuMemcpyAtoA	stdcall	288	20	435	4 4 4 4 4
+cuMemcpyAtoA_v2	stdcall	289	20	436	4 4 4 4 4
+cuMemcpyAtoA_v2_ptds	stdcall	290	20	437	4 4 4 4 4
+cuMemcpyAtoD	stdcall	291	16	438	4 4 4 4
+cuMemcpyAtoD_v2	stdcall	292	16	439	4 4 4 4
+cuMemcpyAtoD_v2_ptds	stdcall	293	16	440	4 4 4 4
+cuMemcpyAtoH	stdcall	294	16	441	4 4 4 4
+cuMemcpyAtoHAsync	stdcall	295	20	442	4 4 4 4 4
+cuMemcpyAtoHAsync_v2	stdcall	296	20	443	4 4 4 4 4
+cuMemcpyAtoHAsync_v2_ptsz	stdcall	297	20	444	4 4 4 4 4
+cuMemcpyAtoH_v2	stdcall	298	16	445	4 4 4 4
+cuMemcpyAtoH_v2_ptds	stdcall	299	16	446	4 4 4 4
+cuMemcpyDtoA	stdcall	300	16	451	4 4 4 4
+cuMemcpyDtoA_v2	stdcall	301	16	452	4 4 4 4
+cuMemcpyDtoA_v2_ptds	stdcall	302	16	453	4 4 4 4
+cuMemcpyDtoD	stdcall	303	12	454	4 4 4
+cuMemcpyDtoDAsync	stdcall	304	16	455	4 4 4 4
+cuMemcpyDtoDAsync_v2	stdcall	305	16	456	4 4 4 4
+cuMemcpyDtoDAsync_v2_ptsz	stdcall	306	16	457	4 4 4 4
+cuMemcpyDtoD_v2	stdcall	307	12	458	4 4 4
+cuMemcpyDtoD_v2_ptds	stdcall	308	12	459	4 4 4
+cuMemcpyDtoH	stdcall	309	12	460	4 4 4
+cuMemcpyDtoHAsync	stdcall	310	16	461	4 4 4 4
+cuMemcpyDtoHAsync_v2	stdcall	311	16	462	4 4 4 4
+cuMemcpyDtoHAsync_v2_ptsz	stdcall	312	16	463	4 4 4 4
+cuMemcpyDtoH_v2	stdcall	313	12	464	4 4 4
+cuMemcpyDtoH_v2_ptds	stdcall	314	12	465	4 4 4
+cuMemcpyHtoA	stdcall	315	16	466	4 4 4 4
+cuMemcpyHtoAAsync	stdcall	316	20	467	4 4 4 4 4
+cuMemcpyHtoAAsync_v2	stdcall	317	20	468	4 4 4 4 4
+cuMemcpyHtoAAsync_v2_ptsz	stdcall	318	20	469	4 4 4 4 4
+cuMemcpyHtoA_v2	stdcall	319	16	470	4 4 4 4
+cuMemcpyHtoA_v2_ptds	stdcall	320	16	471	4 4 4 4
+cuMemcpyHtoD	stdcall	321	12	472	4 4 4
+cuMemcpyHtoDAsync	stdcall	322	16	473	4 4 4 4
+cuMemcpyHtoDAsync_v2	stdcall	323	16	474	4 4 4 4
+cuMemcpyHtoDAsync_v2_ptsz	stdcall	324	16	475	4 4 4 4
+cuMemcpyHtoD_v2	stdcall	325	12	476	4 4 4
+cuMemcpyHtoD_v2_ptds	stdcall	326	12	477	4 4 4
+cuMemcpyPeer	stdcall	327	20	478	4 4 4 4 4
+cuMemcpyPeerAsync	stdcall	328	24	479	4 4 4 4 4 4
+cuMemcpyPeerAsync_ptsz	stdcall	329	24	480	4 4 4 4 4 4
+cuMemcpyPeer_ptds	stdcall	330	20	481	4 4 4 4 4
+cuMemcpy_ptds	stdcall	331	12	484	4 4 4
+cuMemsetD16	stdcall	332	12	485	4 4 4
+cuMemsetD16Async	stdcall	333	16	486	4 4 4 4
+cuMemsetD16Async_ptsz	stdcall	334	16	487	4 4 4 4
+cuMemsetD16_v2	stdcall	335	12	488	4 4 4
+cuMemsetD16_v2_ptds	stdcall	336	12	489	4 4 4
+cuMemsetD2D16	stdcall	337	20	490	4 4 4 4 4
+cuMemsetD2D16Async	stdcall	338	24	491	4 4 4 4 4 4
+cuMemsetD2D16Async_ptsz	stdcall	339	24	492	4 4 4 4 4 4
+cuMemsetD2D16_v2	stdcall	340	20	493	4 4 4 4 4
+cuMemsetD2D16_v2_ptds	stdcall	341	20	494	4 4 4 4 4
+cuMemsetD2D32	stdcall	342	20	495	4 4 4 4 4
+cuMemsetD2D32Async	stdcall	343	24	496	4 4 4 4 4 4
+cuMemsetD2D32Async_ptsz	stdcall	344	24	497	4 4 4 4 4 4
+cuMemsetD2D32_v2	stdcall	345	20	498	4 4 4 4 4
+cuMemsetD2D32_v2_ptds	stdcall	346	20	499	4 4 4 4 4
+cuMemsetD2D8	stdcall	347	20	500	4 4 4 4 4
+cuMemsetD2D8Async	stdcall	348	24	501	4 4 4 4 4 4
+cuMemsetD2D8Async_ptsz	stdcall	349	24	502	4 4 4 4 4 4
+cuMemsetD2D8_v2	stdcall	350	20	503	4 4 4 4 4
+cuMemsetD2D8_v2_ptds	stdcall	351	20	504	4 4 4 4 4
+cuMemsetD32	stdcall	352	12	505	4 4 4
+cuMemsetD32Async	stdcall	353	16	506	4 4 4 4
+cuMemsetD32Async_ptsz	stdcall	354	16	507	4 4 4 4
+cuMemsetD32_v2	stdcall	355	12	508	4 4 4
+cuMemsetD32_v2_ptds	stdcall	356	12	509	4 4 4
+cuMemsetD8	stdcall	357	12	510	4 4 4
+cuMemsetD8Async	stdcall	358	16	511	4 4 4 4
+cuMemsetD8Async_ptsz	stdcall	359	16	512	4 4 4 4
+cuMemsetD8_v2	stdcall	360	12	513	4 4 4
+cuMemsetD8_v2_ptds	stdcall	361	12	514	4 4 4
+cuMipmappedArrayCreate	stdcall	362	12	515	4 4 4
+cuMipmappedArrayDestroy	stdcall	363	4	516	4
+cuMipmappedArrayGetLevel	stdcall	364	12	517	4 4 4
+cuModuleGetFunction	stdcall	365	12	521	4 4 4
+cuModuleGetGlobal	stdcall	366	16	523	4 4 4 4
+cuModuleGetGlobal_v2	stdcall	367	16	524	4 4 4 4
+cuModuleGetLoadingMode	stdcall	368	4	525	4
+cuModuleGetSurfRef	stdcall	369	12	526	4 4 4
+cuModuleGetTexRef	stdcall	370	12	527	4 4 4
+cuModuleLoad	stdcall	371	8	528	4 4
+cuModuleLoadData	stdcall	372	8	529	4 4
+cuModuleLoadDataEx	stdcall	373	20	530	4 4 4 4 4
+cuModuleLoadFatBinary	stdcall	374	8	531	4 4
+cuModuleUnload	stdcall	375	4	532	4
+cuOccupancyMaxActiveBlocksPerMultiprocessor	stdcall	376	16	542	4 4 4 4
+cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags	stdcall	377	20	543	4 4 4 4 4
+cuOccupancyMaxActiveClusters	stdcall	378	12	544	4 4 4
+cuOccupancyMaxPotentialBlockSize	stdcall	379	24	545	4 4 4 4 4 4
+cuOccupancyMaxPotentialBlockSizeWithFlags	stdcall	380	28	546	4 4 4 4 4 4 4
+cuOccupancyMaxPotentialClusterSize	stdcall	381	12	547	4 4 4
+cuParamSetSize	stdcall	382	8	548	4 4
+cuParamSetTexRef	stdcall	383	12	549	4 4 4
+cuParamSetf	stdcall	384	12	550	4 4 4
+cuParamSeti	stdcall	385	12	551	4 4 4
+cuParamSetv	stdcall	386	16	552	4 4 4 4
+cuPointerGetAttribute	stdcall	387	12	553	4 4 4
+cuPointerGetAttributes	stdcall	388	16	554	4 4 4 4
+cuPointerSetAttribute	stdcall	389	12	555	4 4 4
+cuProfilerInitialize	stdcall	390	12	556	4 4 4
+cuProfilerStart	stdcall	391	0	557	
+cuProfilerStop	stdcall	392	0	558	
+cuSignalExternalSemaphoresAsync	stdcall	393	16	559	4 4 4 4
+cuSignalExternalSemaphoresAsync_ptsz	stdcall	394	16	560	4 4 4 4
+cuStreamAddCallback	stdcall	395	16	561	4 4 4 4
+cuStreamAddCallback_ptsz	stdcall	396	16	562	4 4 4 4
+cuStreamAttachMemAsync	stdcall	397	16	563	4 4 4 4
+cuStreamAttachMemAsync_ptsz	stdcall	398	16	564	4 4 4 4
+cuStreamBatchMemOp	stdcall	399	16	565	4 4 4 4
+cuStreamBatchMemOp_ptsz	stdcall	400	16	566	4 4 4 4
+cuStreamBeginCapture	stdcall	401	4	569	4
+cuStreamBeginCapture_ptsz	stdcall	402	4	574	4
+cuStreamBeginCapture_v2	stdcall	403	8	575	4 4
+cuStreamBeginCapture_v2_ptsz	stdcall	404	8	576	4 4
+cuStreamCreate	stdcall	405	8	579	4 4
+cuStreamCreateWithPriority	stdcall	406	12	580	4 4 4
+cuStreamDestroy	stdcall	407	4	581	4
+cuStreamDestroy_v2	stdcall	408	4	582	4
+cuStreamEndCapture	stdcall	409	8	583	4 4
+cuStreamEndCapture_ptsz	stdcall	410	8	586	4 4
+cuStreamGetCaptureInfo	stdcall	411	12	589	4 4 4
+cuStreamGetCaptureInfo_ptsz	stdcall	412	12	590	4 4 4
+cuStreamGetCaptureInfo_v2	stdcall	413	24	591	4 4 4 4 4 4
+cuStreamGetCaptureInfo_v2_ptsz	stdcall	414	24	592	4 4 4 4 4 4
+cuStreamGetCtx	stdcall	415	8	595	4 4
+cuStreamGetCtx_ptsz	stdcall	416	8	596	4 4
+cuStreamGetCtx_v2	stdcall	417	12	597	4 4 4
+cuStreamGetCtx_v2_ptsz	stdcall	418	12	598	4 4 4
+cuStreamGetFlags	stdcall	419	8	603	4 4
+cuStreamGetFlags_ptsz	stdcall	420	8	604	4 4
+cuStreamGetPriority	stdcall	421	8	608	4 4
+cuStreamGetPriority_ptsz	stdcall	422	8	609	4 4
+cuStreamIsCapturing	stdcall	423	8	610	4 4
+cuStreamIsCapturing_ptsz	stdcall	424	8	611	4 4
+cuStreamQuery	stdcall	425	4	612	4
+cuStreamQuery_ptsz	stdcall	426	4	613	4
+cuStreamSynchronize	stdcall	427	4	616	4
+cuStreamSynchronize_ptsz	stdcall	428	4	617	4
+cuStreamWaitEvent	stdcall	429	12	622	4 4 4
+cuStreamWaitEvent_ptsz	stdcall	430	12	623	4 4 4
+cuStreamWaitValue32	stdcall	431	16	624	4 4 4 4
+cuStreamWaitValue32_ptsz	stdcall	432	16	625	4 4 4 4
+cuStreamWaitValue64	stdcall	433	20	628	4 4 8 4
+cuStreamWaitValue64_ptsz	stdcall	434	20	629	4 4 8 4
+cuStreamWriteValue32	stdcall	435	16	632	4 4 4 4
+cuStreamWriteValue32_ptsz	stdcall	436	16	633	4 4 4 4
+cuStreamWriteValue64	stdcall	437	20	636	4 4 8 4
+cuStreamWriteValue64_ptsz	stdcall	438	20	637	4 4 8 4
+cuSurfObjectCreate	stdcall	439	8	639	4 4
+cuSurfObjectDestroy	stdcall	440	8	640	8
+cuSurfObjectGetResourceDesc	stdcall	441	12	641	4 8
+cuSurfRefGetArray	stdcall	442	8	642	4 4
+cuSurfRefSetArray	stdcall	443	12	643	4 4 4
+cuTexObjectCreate	stdcall	444	16	648	4 4 4 4
+cuTexObjectDestroy	stdcall	445	8	649	8
+cuTexObjectGetResourceDesc	stdcall	446	12	650	4 8
+cuTexObjectGetResourceViewDesc	stdcall	447	12	651	4 8
+cuTexObjectGetTextureDesc	stdcall	448	12	652	4 8
+cuTexRefCreate	stdcall	449	4	653	4
+cuTexRefDestroy	stdcall	450	4	654	4
+cuTexRefGetAddress	stdcall	451	8	655	4 4
+cuTexRefGetAddressMode	stdcall	452	12	656	4 4 4
+cuTexRefGetAddress_v2	stdcall	453	8	657	4 4
+cuTexRefGetArray	stdcall	454	8	658	4 4
+cuTexRefGetBorderColor	stdcall	455	8	659	4 4
+cuTexRefGetFilterMode	stdcall	456	8	660	4 4
+cuTexRefGetFlags	stdcall	457	8	661	4 4
+cuTexRefGetFormat	stdcall	458	12	662	4 4 4
+cuTexRefGetMaxAnisotropy	stdcall	459	8	663	4 4
+cuTexRefGetMipmapFilterMode	stdcall	460	8	664	4 4
+cuTexRefGetMipmapLevelBias	stdcall	461	8	665	4 4
+cuTexRefGetMipmapLevelClamp	stdcall	462	12	666	4 4 4
+cuTexRefGetMipmappedArray	stdcall	463	8	667	4 4
+cuTexRefSetAddress	stdcall	464	16	668	4 4 4 4
+cuTexRefSetAddress2D	stdcall	465	16	669	4 4 4 4
+cuTexRefSetAddress2D_v2	stdcall	466	16	670	4 4 4 4
+cuTexRefSetAddress2D_v3	stdcall	467	16	671	4 4 4 4
+cuTexRefSetAddressMode	stdcall	468	12	672	4 4 4
+cuTexRefSetAddress_v2	stdcall	469	16	673	4 4 4 4
+cuTexRefSetArray	stdcall	470	12	674	4 4 4
+cuTexRefSetBorderColor	stdcall	471	8	675	4 4
+cuTexRefSetFilterMode	stdcall	472	8	676	4 4
+cuTexRefSetFlags	stdcall	473	8	677	4 4
+cuTexRefSetFormat	stdcall	474	12	678	4 4 4
+cuTexRefSetMaxAnisotropy	stdcall	475	8	679	4 4
+cuTexRefSetMipmapFilterMode	stdcall	476	8	680	4 4
+cuTexRefSetMipmapLevelBias	stdcall	477	8	681	4 4
+cuTexRefSetMipmapLevelClamp	stdcall	478	12	682	4 4 4
+cuTexRefSetMipmappedArray	stdcall	479	12	683	4 4 4
+cuThreadExchangeStreamCaptureMode	stdcall	480	4	684	4
+cuWGLGetDevice	stdcall	481	8	688	4 4
+cuWaitExternalSemaphoresAsync	stdcall	482	16	689	4 4 4 4
+cuWaitExternalSemaphoresAsync_ptsz	stdcall	483	16	690	4 4 4 4
+cuArrayGetPlane	stdcall	484	12	11	4 4 4
+cuArrayGetSparseProperties	stdcall	485	8	12	4 4
+cuCtxGetExecAffinity	stdcall	486	8	44	4 4
+cuCtxResetPersistingL2Cache	stdcall	487	0	55	
+cuDeviceGetExecAffinitySupport	stdcall	488	12	83	4 4 4
+cuDeviceGetMemPool	stdcall	489	8	87	4 4
+cuDeviceGetTexture1DLinearMaxWidth	stdcall	490	16	93	4 4 4 4
+cuDeviceGetUuid_v2	stdcall	491	8	95	4 4
+cuDevicePrimaryCtxRelease_v2	stdcall	492	4	99	4
+cuDevicePrimaryCtxReset_v2	stdcall	493	4	101	4
+cuDevicePrimaryCtxSetFlags_v2	stdcall	494	8	104	4 4
+cuDeviceSetGraphMemAttribute	stdcall	495	12	106	4 4 4
+cuDeviceSetMemPool	stdcall	496	8	107	4 4
+cuEventRecordWithFlags	stdcall	497	12	120	4 4 4
+cuEventRecordWithFlags_ptsz	stdcall	498	12	121	4 4 4
+cuFlushGPUDirectRDMAWrites	stdcall	499	8	126	4 4
+cuFuncGetModule	stdcall	500	8	128	4 4
+cuGraphAddEventRecordNode	stdcall	501	20	165	4 4 4 4 4
+cuGraphAddEventWaitNode	stdcall	502	20	166	4 4 4 4 4
+cuGraphAddExternalSemaphoresSignalNode	stdcall	503	20	167	4 4 4 4 4
+cuGraphAddExternalSemaphoresWaitNode	stdcall	504	20	168	4 4 4 4 4
+cuGraphDebugDotPrint	stdcall	505	12	184	4 4 4
+cuGraphEventRecordNodeGetEvent	stdcall	506	8	187	4 4
+cuGraphEventRecordNodeSetEvent	stdcall	507	8	188	4 4
+cuGraphEventWaitNodeGetEvent	stdcall	508	8	189	4 4
+cuGraphEventWaitNodeSetEvent	stdcall	509	8	190	4 4
+cuGraphExecChildGraphNodeSetParams	stdcall	510	12	192	4 4 4
+cuGraphExecEventRecordNodeSetEvent	stdcall	511	12	194	4 4 4
+cuGraphExecEventWaitNodeSetEvent	stdcall	512	12	195	4 4 4
+cuGraphExecExternalSemaphoresSignalNodeSetParams	stdcall	513	12	196	4 4 4
+cuGraphExecExternalSemaphoresWaitNodeSetParams	stdcall	514	12	197	4 4 4
+cuGraphExecHostNodeSetParams	stdcall	515	12	200	4 4 4
+cuGraphExecMemcpyNodeSetParams	stdcall	516	16	203	4 4 4 4
+cuGraphExecMemsetNodeSetParams	stdcall	517	16	204	4 4 4 4
+cuGraphExecUpdate	stdcall	518	16	206	4 4 4 4
+cuGraphExternalSemaphoresSignalNodeGetParams	stdcall	519	8	208	4 4
+cuGraphExternalSemaphoresSignalNodeSetParams	stdcall	520	8	209	4 4
+cuGraphExternalSemaphoresWaitNodeGetParams	stdcall	521	8	210	4 4
+cuGraphExternalSemaphoresWaitNodeSetParams	stdcall	522	8	211	4 4
+cuGraphInstantiateWithFlags	stdcall	523	16	220	4 4 8
+cuGraphKernelNodeCopyAttributes	stdcall	524	8	224	4 4
+cuGraphKernelNodeGetAttribute	stdcall	525	12	225	4 4 4
+cuGraphKernelNodeSetAttribute	stdcall	526	12	228	4 4 4
+cuGraphMemAllocNodeGetParams	stdcall	527	8	233	4 4
+cuGraphMemFreeNodeGetParams	stdcall	528	8	234	4 4
+cuGraphReleaseUserObject	stdcall	529	12	252	4 4 4
+cuGraphRetainUserObject	stdcall	530	16	255	4 4 4 4
+cuGraphUpload	stdcall	531	8	256	4 4
+cuGraphUpload_ptsz	stdcall	532	8	257	4 4
+cuMemAddressFree	stdcall	533	8	334	4 4
+cuMemAddressReserve	stdcall	534	24	335	4 4 4 4 8
+cuMemAllocFromPoolAsync	stdcall	535	16	341	4 4 4 4
+cuMemAllocFromPoolAsync_ptsz	stdcall	536	16	342	4 4 4 4
+cuMemCreate	stdcall	537	20	351	4 4 4 8
+cuMemExportToShareableHandle	stdcall	538	24	356	4 8 4 8
+cuMemGetAccess	stdcall	539	12	362	4 4 4
+cuMemGetAllocationPropertiesFromHandle	stdcall	540	12	366	4 8
+cuMemImportFromShareableHandle	stdcall	541	12	379	4 4 4
+cuMemMap	stdcall	542	28	380	4 4 4 8 8
+cuMemMapArrayAsync	stdcall	543	12	381	4 4 4
+cuMemMapArrayAsync_ptsz	stdcall	544	12	382	4 4 4
+cuMemPoolCreate	stdcall	545	8	383	4 4
+cuMemPoolDestroy	stdcall	546	4	384	4
+cuMemPoolExportPointer	stdcall	547	8	385	4 4
+cuMemPoolExportToShareableHandle	stdcall	548	20	386	4 4 4 8
+cuMemPoolGetAccess	stdcall	549	12	387	4 4 4
+cuMemPoolGetAttribute	stdcall	550	12	388	4 4 4
+cuMemPoolImportFromShareableHandle	stdcall	551	20	389	4 4 4 8
+cuMemPoolImportPointer	stdcall	552	12	390	4 4 4
+cuMemPoolSetAccess	stdcall	553	12	391	4 4 4
+cuMemPoolTrimTo	stdcall	554	8	393	4 4
+cuMemRelease	stdcall	555	8	402	8
+cuMemRetainAllocationHandle	stdcall	556	8	403	4 4
+cuMemSetAccess	stdcall	557	16	404	4 4 4 4
+cuMemUnmap	stdcall	558	8	406	4 4
+cuMipmappedArrayGetSparseProperties	stdcall	559	8	519	4 4
+cuOccupancyAvailableDynamicSMemPerBlock	stdcall	560	16	541	4 4 4 4
+cuStreamCopyAttributes	stdcall	561	8	577	4 4
+cuStreamCopyAttributes_ptsz	stdcall	562	8	578	4 4
+cuStreamGetAttribute	stdcall	563	12	587	4 4 4
+cuStreamGetAttribute_ptsz	stdcall	564	12	588	4 4 4
+cuStreamSetAttribute	stdcall	565	12	614	4 4 4
+cuStreamSetAttribute_ptsz	stdcall	566	12	615	4 4 4
+cuStreamUpdateCaptureDependencies	stdcall	567	16	618	4 4 4 4
+cuStreamUpdateCaptureDependencies_ptsz	stdcall	568	16	619	4 4 4 4
+cuUserObjectCreate	stdcall	569	20	685	4 4 4 4 4
+cuUserObjectRelease	stdcall	570	8	686	4 4
+cuUserObjectRetain	stdcall	571	8	687	4 4
+cuDeviceGetNvSciSyncAttributes	stub	572	0	0	
+cuEGLStreamConsumerAcquireFrame	stub	573	0	0	
+cuEGLStreamConsumerConnect	stub	574	0	0	
+cuEGLStreamConsumerConnectWithFlags	stub	575	0	0	
+cuEGLStreamConsumerDisconnect	stub	576	0	0	
+cuEGLStreamConsumerReleaseFrame	stub	577	0	0	
+cuEGLStreamProducerConnect	stub	578	0	0	
+cuEGLStreamProducerDisconnect	stub	579	0	0	
+cuEGLStreamProducerPresentFrame	stub	580	0	0	
+cuEGLStreamProducerReturnFrame	stub	581	0	0	
+cuEventCreateFromEGLSync	stub	582	0	0	
+cuGraphicsEGLRegisterImage	stub	583	0	0	
+cuGraphicsResourceGetMappedEglFrame	stub	584	0	0	
+cuGraphicsVDPAURegisterOutputSurface	stub	585	0	0	
+cuGraphicsVDPAURegisterVideoSurface	stub	586	0	0	
+cuVDPAUCtxCreate	stub	587	0	0	
+cuVDPAUCtxCreate_v2	stub	588	0	0	
+cuVDPAUGetDevice	stub	589	0	0	
+cuArrayGetMemoryRequirements	stdcall	590	12	10	4 4 4
+cuMipmappedArrayGetMemoryRequirements	stdcall	591	12	518	4 4 4
+cuGraphNodeSetEnabled	stdcall	592	12	250	4 4 4
+cuGraphNodeGetEnabled	stdcall	593	12	245	4 4 4
+cudbgApiAttach	stub	594	0	0	
+cudbgApiClientPid	stub	595	0	0	
+cudbgApiClientRevision	stub	596	0	0	
+cudbgApiDetach	stub	597	0	0	
+cudbgApiInit	stub	598	0	0	
+cudbgAttachHandlerAvailable	stub	599	0	0	
+cudbgDebuggerCapabilities	stub	600	0	0	
+cudbgDebuggerInitialized	stub	601	0	0	
+cudbgDetachSuspendedDevicesMask	stub	602	0	0	
+cudbgEnableIntegratedMemcheck	stub	603	0	0	
+cudbgEnableLaunchBlocking	stub	604	0	0	
+cudbgEnablePreemptionDebugging	stub	605	0	0	
+cudbgGetAPI	stub	606	0	0	
+cudbgGetAPIVersion	stub	607	0	0	
+cudbgInjectionPath	stub	608	0	0	
+cudbgIpcFlag	stub	609	0	0	
+cudbgMain	stub	610	0	0	
+cudbgReportDriverApiError	stub	611	0	0	
+cudbgReportDriverApiErrorFlags	stub	612	0	0	
+cudbgReportDriverInternalError	stub	613	0	0	
+cudbgReportedDriverApiErrorCode	stub	614	0	0	
+cudbgReportedDriverApiErrorFuncNameAddr	stub	615	0	0	
+cudbgReportedDriverApiErrorFuncNameSize	stub	616	0	0	
+cudbgReportedDriverInternalErrorCode	stub	617	0	0	
+cudbgResumeForAttachDetach	stub	618	0	0	
+cudbgRpcEnabled	stub	619	0	0	
+cudbgSessionId	stub	620	0	0	
+cudbgUseExternalDebugger	stub	621	0	0	
+cuGraphAddBatchMemOpNode	stdcall	622	20	160	4 4 4 4 4
+cuGraphBatchMemOpNodeGetParams	stdcall	623	8	178	4 4
+cuGraphBatchMemOpNodeSetParams	stdcall	624	8	179	4 4
+cuGraphExecBatchMemOpNodeSetParams	stdcall	625	12	191	4 4 4
+cuStreamBatchMemOp_v2	stdcall	626	16	567	4 4 4 4
+cuStreamBatchMemOp_v2_ptsz	stdcall	627	16	568	4 4 4 4
+cuStreamWaitValue32_v2	stdcall	628	16	626	4 4 4 4
+cuStreamWaitValue64_v2	stdcall	629	20	630	4 4 8 4
+cuStreamWaitValue64_v2_ptsz	stdcall	630	20	631	4 4 8 4
+cuStreamWriteValue32_v2	stdcall	631	16	634	4 4 4 4
+cuStreamWriteValue32_v2_ptsz	stdcall	632	16	635	4 4 4 4
+cuStreamWriteValue64_v2	stdcall	633	20	638	4 4 8 4
+cuStreamWaitValue32_v2_ptsz	stdcall	634	16	627	4 4 4 4
+cuCtxGetId	stdcall	635	8	46	4 4
+cuStreamGetId	stdcall	636	8	606	4 4
+cuStreamGetId_ptsz	stdcall	637	8	607	4 4
+cuGraphAddKernelnNode	stub	638	0	0	
+cuGraphExecGetFlags	stdcall	639	8	198	4 4
+cuTensorMapEncodeTiled	stdcall	640	48	646	4 4 4 4 4 4 4 4 4 4 4 4
+cuTensorMapEncodeIm2col	stdcall	641	60	644	4 4 4 4 4 4 4 4 4 4 4 4 4 4 4
+cuTensorMapReplaceAddress	stdcall	642	8	647	4 4
+cuLibraryLoadData	stdcall	643	32	318	4 4 4 4 4 4 4 4
+cuLibraryLoadFromFile	stdcall	644	32	319	4 4 4 4 4 4 4 4
+cuLibraryUnload	stdcall	645	4	320	4
+cuLibraryGetKernel	stdcall	646	12	313	4 4 4
+cuLibraryGetModule	stdcall	647	8	316	4 4
+cuKernelGetFunction	stdcall	648	8	291	4 4
+cuLibraryGetGlobal	stdcall	649	16	312	4 4 4 4
+cuLibraryGetManaged	stdcall	650	16	315	4 4 4 4
+cuKernelGetAttribute	stdcall	651	16	290	4 4 4 4
+cuKernelSetAttribute	stdcall	652	16	296	4 4 4 4
+cuKernelSetCacheConfig	stdcall	653	12	297	4 4 4
+cuLibraryGetUnifiedFunction	stdcall	654	12	317	4 4 4
+cuGraphInstantiateWithParams	stdcall	655	12	221	4 4 4
+cuGraphInstantiateWithParams_ptsz	stdcall	656	12	222	4 4 4
+cuCtxSetFlags	stdcall	657	4	58	4
+cuCoredumpGetAttribute	stdcall	658	12	21	4 4 4
+cuCoredumpGetAttributeGlobal	stdcall	659	12	22	4 4 4
+cuCoredumpSetAttribute	stdcall	660	12	25	4 4 4
+cuCoredumpSetAttributeGlobal	stdcall	661	12	26	4 4 4
+cuEGLApiInit	stub	662	0	0	
+cuGraphAddKernelNode_v2	stdcall	663	20	171	4 4 4 4 4
+cuGraphAddNode	stdcall	664	20	176	4 4 4 4 4
+cuGraphExecKernelNodeSetParams_v2	stdcall	665	12	202	4 4 4
+cuGraphExecNodeSetParams	stdcall	666	12	205	4 4 4
+cuGraphExecUpdate_v2	stdcall	667	12	207	4 4 4
+cuGraphKernelNodeGetParams_v2	stdcall	668	8	227	4 4
+cuGraphKernelNodeSetParams_v2	stdcall	669	8	230	4 4
+cuGraphNodeSetParams	stdcall	670	8	251	4 4
+cuMemAdvise_v2	stdcall	671	20	337	4 4 4 8
+cuMemGetAttribute	stub	672	0	0	
+cuMemGetAttribute_v2	stub	673	0	0	
+cuMemPrefetchAsync_v2	stdcall	674	24	396	4 4 8 4 4
+cuMemPrefetchAsync_v2_ptsz	stdcall	675	24	397	4 4 8 4 4
+cuMulticastAddDevice	stdcall	676	12	533	8 4
+cuMulticastBindAddr	stdcall	677	28	534	8 4 4 4 8
+cuMulticastBindAddr_v2	stdcall	678	32	535	8 4 4 4 4 8
+cuMulticastBindMem	stdcall	679	36	536	8 4 8 4 4 8
+cuMulticastBindMem_v2	stdcall	680	40	537	8 4 4 8 4 4 8
+cuMulticastCreate	stdcall	681	8	538	4 4
+cuMulticastGetGranularity	stdcall	682	12	539	4 4 4
+cuMulticastUnbind	stdcall	683	20	540	8 4 4 4
+cuGetProcAddress	stdcall	684	20	158	4 4 4 8
+cuGetProcAddress_v2	stdcall	685	24	159	4 4 4 8 4
+cuKernelGetName	stdcall	686	8	293	4 4
+cuFuncGetName	stdcall	687	8	129	4 4
+cuGraphGetEdges_v2	stdcall	688	20	213	4 4 4 4 4
+cuGraphNodeGetDependencies_v2	stdcall	689	16	242	4 4 4 4
+cuGraphNodeGetDependentNodes_v2	stdcall	690	16	244	4 4 4 4
+cuGraphAddDependencies_v2	stdcall	691	20	163	4 4 4 4 4
+cuGraphRemoveDependencies_v2	stdcall	692	20	254	4 4 4 4 4
+cuStreamBeginCaptureToGraph	stdcall	693	24	572	4 4 4 4 4 4
+cuStreamBeginCaptureToGraph_ptsz	stdcall	694	24	573	4 4 4 4 4 4
+cuStreamGetCaptureInfo_v3	stdcall	695	28	593	4 4 4 4 4 4 4
+cuStreamGetCaptureInfo_v3_ptsz	stdcall	696	28	594	4 4 4 4 4 4 4
+cuStreamUpdateCaptureDependencies_v2	stdcall	697	20	620	4 4 4 4 4
+cuStreamUpdateCaptureDependencies_v2_ptsz	stdcall	698	20	621	4 4 4 4 4
+cuGraphAddNode_v2	stdcall	699	24	177	4 4 4 4 4 4
+cuGraphConditionalHandleCreate	stdcall	700	20	182	4 4 4 4 4
+cuFuncGetParamInfo	stdcall	701	16	131	4 4 4 4
+cuFuncIsLoaded	stdcall	702	8	132	4 4
+cuFuncLoad	stdcall	703	4	133	4
+cuModuleGetFunctionCount	stdcall	704	8	522	4 4
+cuModuleEnumerateFunctions	stdcall	705	12	520	4 4 4
+cuLibraryGetKernelCount	stdcall	706	8	314	4 4
+cuLibraryEnumerateKernels	stdcall	707	12	311	4 4 4
+cuKernelGetParamInfo	stdcall	708	16	295	4 4 4 4
+cuDeviceRegisterAsyncNotification	stdcall	709	16	105	4 4 4 4
+cuDeviceUnregisterAsyncNotification	stdcall	710	8	110	4 4
+cuGreenCtxCreate	stdcall	711	16	274	4 4 4 4
+cuGreenCtxDestroy	stdcall	712	4	275	4
+cuDeviceGetDevResource	stdcall	713	12	82	4 4 4
+cuCtxGetDevResource	stdcall	714	12	41	4 4 4
+cuGreenCtxGetDevResource	stdcall	715	12	276	4 4 4
+cuGreenCtxRecordEvent	stdcall	716	8	278	4 4
+cuGreenCtxWaitEvent	stdcall	717	8	280	4 4
+cuDevResourceGenerateDesc	stdcall	718	12	72	4 4 4
+cuDevSmResourceSplitByCount	stdcall	719	24	74	4 4 4 4 4 4
+cuStreamGetGreenCtx	stdcall	720	8	605	4 4
+cuCtxFromGreenCtx	stdcall	721	8	37	4 4
+cuKernelGetLibrary	stdcall	722	8	292	4 4
+cuCtxRecordEvent	stdcall	723	8	54	4 4
+cuCtxWaitEvent	stdcall	724	8	63	4 4
+cuGreenCtxStreamCreate	stdcall	725	16	279	4 4 4 4
+cuMemcpyBatchAsync	stdcall	726	36	447	4 4 4 4 4 4 4 4 4
+cuMemcpyBatchAsync_ptsz	stdcall	727	36	448	4 4 4 4 4 4 4 4 4
+cuMemcpy3DBatchAsync	stdcall	728	24	421	4 4 4 8 4
+cuMemcpy3DBatchAsync_ptsz	stdcall	729	24	422	4 4 4 8 4
+cuStreamGetDevice	stdcall	730	8	601	4 4
+cuStreamGetDevice_ptsz	stdcall	731	8	602	4 4
+cuEventElapsedTime_v2	stdcall	732	12	117	4 4 4
+cuTensorMapEncodeIm2colWide	stdcall	733	64	645	4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4
+cuCheckpointProcessGetRestoreThreadId	stdcall	734	8	14	4 4
+cuCheckpointProcessGetState	stdcall	735	8	15	4 4
+cuCheckpointProcessLock	stdcall	736	8	16	4 4
+cuCheckpointProcessCheckpoint	stdcall	737	8	13	4 4
+cuCheckpointProcessRestore	stdcall	738	8	17	4 4
+cuCheckpointProcessUnlock	stdcall	739	8	18	4 4
+cuLogsRegisterCallback	stdcall	740	12	332	4 4 4
+cuLogsUnregisterCallback	stdcall	741	4	333	4
+cuLogsCurrent	stdcall	742	8	329	4 4
+cuLogsDumpToFile	stdcall	743	12	330	4 4 4
+cuLogsDumpToMemory	stdcall	744	16	331	4 4 4 4
+cuGreenCtxGetId	stdcall	745	8	277	4 4
+cuDeviceGetHostAtomicCapabilities	stdcall	746	16	85	4 4 4 4
+cuCtxGetDevice_v2	stdcall	747	8	43	4 4
+cuCtxSynchronize_v2	stdcall	748	4	62	4
+cuMemcpyBatchAsync_v2	stdcall	749	32	449	4 4 4 4 4 4 4 4
+cuMemcpyBatchAsync_v2_ptsz	stdcall	750	32	450	4 4 4 4 4 4 4 4
+cuMemcpy3DBatchAsync_v2	stdcall	751	20	423	4 4 8 4
+cuMemcpy3DBatchAsync_v2_ptsz	stdcall	752	20	424	4 4 8 4
+cuMemGetDefaultMemPool	stdcall	753	12	367	4 4 4
+cuMemGetMemPool	stdcall	754	12	371	4 4 4
+cuMemSetMemPool	stdcall	755	12	405	4 4 4
+cuMemPrefetchBatchAsync	stdcall	756	36	398	4 4 4 4 4 4 8 4
+cuMemPrefetchBatchAsync_ptsz	stdcall	757	36	399	4 4 4 4 4 4 8 4
+cuMemDiscardBatchAsync	stdcall	758	24	354	4 4 4 8 4
+cuMemDiscardBatchAsync_ptsz	stdcall	759	24	355	4 4 4 8 4
+cuMemDiscardAndPrefetchBatchAsync	stdcall	760	36	352	4 4 4 4 4 4 8 4
+cuMemDiscardAndPrefetchBatchAsync_ptsz	stdcall	761	36	353	4 4 4 4 4 4 8 4
+cuDeviceGetP2PAtomicCapabilities	stdcall	762	20	89	4 4 4 4 4
+cuGraphNodeGetContainingGraph	stdcall	763	8	240	4 4
+cuGraphNodeGetLocalId	stdcall	764	8	246	4 4
+cuGraphNodeGetToolsId	stdcall	765	8	248	4 4
+cuGraphGetId	stdcall	766	8	214	4 4
+cuGraphExecGetId	stdcall	767	8	199	4 4
+cuStreamGetDevResource	stdcall	768	12	599	4 4 4
+cuStreamGetDevResource_ptsz	stdcall	769	12	600	4 4 4
+cuDevSmResourceSplit	stdcall	770	24	73	4 4 4 4 4 4
+cuDriverGetGpuCodeIsaVersion	stdcall	771	8	111	4 4
+cuMemcpyWithAttributesAsync_ptsz	stdcall	772	20	483	4 4 4 4 4
+cuMemcpy3DWithAttributesAsync_ptsz	stdcall	773	16	430	4 8 4
+cuStreamBeginCaptureToCig	stdcall	774	8	570	4 4
+cuStreamBeginCaptureToCig_ptsz	stdcall	775	8	571	4 4
+cuStreamEndCaptureToCig	stdcall	776	4	584	4
+cuStreamEndCaptureToCig_ptsz	stdcall	777	4	585	4
+cuFuncGetParamCount	stdcall	778	8	130	4 4
+cuGraphNodeGetParams	stdcall	779	8	247	4 4
+cuMemcpyWithAttributesAsync	stdcall	780	20	482	4 4 4 4 4
+cuMemcpy3DWithAttributesAsync	stdcall	781	16	429	4 8 4
+cuKernelGetParamCount	stdcall	782	8	294	4 4
+cuCoredumpRegisterStartCallback	stdcall	783	12	24	4 4 4
+cuCoredumpRegisterCompleteCallback	stdcall	784	12	23	4 4 4
+cuCoredumpDeregisterStartCallback	stdcall	785	4	20	4
+cuCoredumpDeregisterCompleteCallback	stdcall	786	4	19	4
+cuLaunchHostFunc_v2	stdcall	787	16	305	4 4 4 4
+cuLaunchHostFunc_v2_ptsz	stdcall	788	16	306	4 4 4 4

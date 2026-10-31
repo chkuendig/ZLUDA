@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Independently retained native C prototype types from fa81f481 wow64/unix.c
+cuInit	unsigned
+cuDriverGetVersion	int *
+cuDeviceGetCount	int *
+cuDeviceGet	int *, int
+cuDeviceGetName	char *, int, int
+cuDeviceGetAttribute	int *, int, int
+cuDeviceGetProperties	void *, int
+cuDeviceComputeCapability	int *, int *, int
+cuDeviceTotalMem_v2	size_t *, int
+cuCtxCreate_v2	void **, unsigned, int
+cuCtxDestroy_v2	void *
+cuCtxGetCurrent	void **
+cuCtxSetCurrent	void *
+cuCtxGetDevice	int *
+cuCtxGetApiVersion	void *, unsigned *
+cuCtxPushCurrent_v2	void *
+cuCtxPopCurrent_v2	void **
+cuCtxSynchronize	void
+cuMemAlloc_v2	uint64_t *, size_t
+cuMemFree_v2	uint64_t
+cuMemcpyHtoD_v2	uint64_t, const void *, size_t
+cuMemcpyDtoH_v2	void *, uint64_t, size_t
+cuMemcpyHtoDAsync_v2	uint64_t, const void *, size_t, void *
+cuMemcpyDtoHAsync_v2	void *, uint64_t, size_t, void *
+cuMemcpyDtoD_v2	uint64_t, uint64_t, size_t
+cuMemcpyDtoDAsync_v2	uint64_t, uint64_t, size_t, void *
+cuEventCreate	void **, unsigned
+cuEventDestroy_v2	void *
+cuEventRecord	void *, void *
+cuEventSynchronize	void *
+cuEventQuery	void *
+cuEventElapsedTime	float *, void *, void *
+cuStreamCreate	void **, unsigned
+cuStreamDestroy_v2	void *
+cuStreamSynchronize	void *
+cuStreamQuery	void *
+cuStreamWaitEvent	void *, void *, unsigned
+cuMemsetD32_v2	uint64_t, unsigned, size_t
+cuMemsetD8_v2	uint64_t, unsigned char, size_t
+cuMemsetD16_v2	uint64_t, unsigned short, size_t
+cuMemsetD8Async	uint64_t, unsigned char, size_t, void *
+cuMemsetD16Async	uint64_t, unsigned short, size_t, void *
+cuMemsetD32Async	uint64_t, unsigned, size_t, void *
+cuModuleLoadData	void **, const void *
+cuModuleUnload	void *
+cuModuleGetFunction	void **, void *, const char *
+cuModuleGetTexRef	void **, void *, const char *
+cuTexRefSetFormat	void *, int, int
+cuTexRefSetFlags	void *, unsigned
+cuTexRefSetFilterMode	void *, int
+cuTexRefSetAddressMode	void *, int, int
+cuTexRefSetMipmapFilterMode	void *, int
+cuTexRefSetMipmapLevelBias	void *, float
+cuTexRefSetMipmapLevelClamp	void *, float, float
+cuTexRefSetMaxAnisotropy	void *, unsigned
+cuTexRefSetAddress_v2	size_t *, void *, uint64_t, size_t
+cuLaunchKernel	void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *, void **, void **
+cuGetExportTable	const void **, const void *
