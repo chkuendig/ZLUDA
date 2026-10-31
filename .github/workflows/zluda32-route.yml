@@ -151,8 +151,8 @@ jobs:
           curl -fsSL -o zl.tar.gz https://github.com/vosen/ZLUDA/releases/download/v6/zluda-linux-3fe12063.tar.gz
           mkdir zl && tar -xzf zl.tar.gz -C zl
           mkdir -p inputs/zluda-linux
-          # zluda/trace/ holds the zluda_trace wrapper; take the driver itself.
-          lib=$(find zl -path '*/trace' -prune -o \( -name libnvcuda.so -o -name libcuda.so \) -print | head -1); echo "$lib"
+          # trace/ and trace_nvidia/ hold the zluda_trace wrapper; take the driver itself.
+          lib=zl/zluda/libnvcuda.so
           cp -L "$lib" inputs/zluda-linux/libcuda.so.1
           objdump -p inputs/zluda-linux/libcuda.so.1 | grep NEEDED
           uname -a
