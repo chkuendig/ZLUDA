@@ -348,6 +348,13 @@ fn main() -> std::io::Result<()> {
                     |input| cu_device_get_name(&mut state, input),
                 );
             }
+            Some(Opcode::cuDeviceGetLuid) => {
+                handle_cuda_function::<cuDeviceGetLuidIn, cuDeviceGetLuidOut>(
+                    &mut local,
+                    &mut remote,
+                    cu_device_get_luid,
+                );
+            }
             Some(Opcode::cuDeviceTotalMem_v2) => {
                 handle_cuda_function::<cuDeviceTotalMem_v2In, cuDeviceTotalMem_v2Out>(
                     &mut local,
@@ -810,6 +817,22 @@ fn cu_device_get_properties(
     let mut props = unsafe { mem::zeroed() };
     unsafe { cuDeviceGetProperties(&mut props, input.dev.to_native()) }?;
     Ok(cuDeviceGetPropertiesOut { prop: props.into() })
+}
+
+fn cu_device_get_luid(input: &ArchivedcuDeviceGetLuidIn) -> Result<cuDeviceGetLuidOut, CUerror> {
+    let mut luid = [0u8; 8];
+    let mut device_node_mask = 0;
+    unsafe {
+        cuDeviceGetLuid(
+            luid.as_mut_ptr().cast(),
+            &mut device_node_mask,
+            input.dev.to_native(),
+        )
+    }?;
+    Ok(cuDeviceGetLuidOut {
+        luid,
+        device_node_mask: u32_le::from_native(device_node_mask),
+    })
 }
 
 fn cu_device_compute_capability(
@@ -1291,6 +1314,7 @@ cuda_function_declarations! {
         // cuDeviceGet,
         cuDeviceGetAttribute,
         // cuDeviceGetCount,
+        cuDeviceGetLuid,
         cuDeviceGetName,
         cuDeviceGetProperties,
         cuDeviceTotalMem_v2,
