@@ -52,7 +52,7 @@ fn pci_parity_child(){unsafe{
             words.write(0x11223344);words.add(1).write(0xcccccccc);words.add(2).write(0xaabbccdd);
             let address=if null{0}else{output as usize as u64};
             let mut x64=unixlib::Call::new(unixlib::function_id("cuDeviceGetAttribute"));
-            x64.args[..3].copy_from_slice(&[address,unixlib::pack(CUdevice_attribute(attr)),unixlib::pack(dev)]);
+            x64.args[..3].copy_from_slice(&[address,unixlib::pack(CUdevice_attribute(attr as u32)),unixlib::pack(dev)]);
             assert_eq!(crate::unix_wrappers::dispatch((&mut x64 as *mut unixlib::Call).cast()),0);
             let expected=output.read();assert_eq!(CALLS.load(Ordering::Relaxed),before+1);
             output.write(0xccccccccu32 as i32);
