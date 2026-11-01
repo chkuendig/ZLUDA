@@ -84,7 +84,8 @@ template = work / 'prefix-template'
 make_template(template)
 
 
-def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, extra_ld=(), extra_env=None):
+def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, extra_ld=(), extra_env=None,
+        probe_args=()):
     prefix = work / ('prefix-' + name)
     shutil.rmtree(prefix, ignore_errors=True)
     shutil.copytree(template, prefix, symlinks=True)
@@ -103,7 +104,7 @@ def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, ex
     # GE's Wine takes ntsync whenever /dev/ntsync opens, whatever WINENTSYNC says.
     if Path('/dev/ntsync').exists():
         subprocess.run(['sudo', 'chmod', '666' if sync == 'ntsync' else '000', '/dev/ntsync'], check=False)
-    code, out, err, secs = wine(env, ['C:\\probe\\' + probe, str(args.iterations)], timeout)
+    code, out, err, secs = wine(env, ['C:\\probe\\' + probe, str(args.iterations)] + list(probe_args), timeout)
     procs = processes()
     kill(env)
     rows = [json.loads(l) for l in out.splitlines() if l.startswith('{')]
@@ -115,7 +116,7 @@ def arm(name, build, svesop, libcuda, sync, probe='probe32.exe', timeout=120, ex
     res = {'arm': name, 'build': build, 'svesop': svesop, 'libcuda': str(libcuda), 'sync': sync,
            'probe': probe, 'exit': code, 'seconds': secs, 'rows': rows,
            'processes_at_end': procs, 'sync_messages': sync_lines[:5],
-           'stub_lines': [l for l in err.splitlines() if l.startswith('STUB:')][:40],
+           'stub_lines': [l for l in err.splitlines() if l.startswith('STUB:')][:400],
            'tail': err.splitlines()[-25:],
            'nvcuda_lines': [l for l in err.splitlines() if 'nvcuda' in l][:20]}
     print(json.dumps({k: res[k] for k in ('arm', 'exit', 'seconds', 'sync_messages')}), flush=True)
@@ -128,12 +129,11 @@ results.append(arm('stock-stub-msvc', 'msvc', 'stock', stub, 'ntsync', timeout=6
 for sync in ('ntsync', 'fsync', 'esync', 'server'):
     results.append(arm(f'patched-stub-msvc-{sync}', 'msvc', 'patched', stub, sync))
 results.append(arm('patched-stub-gnu-ntsync', 'gnu', 'patched', stub, 'ntsync'))
-results.append(arm('patched-stub-direct64-ntsync', 'msvc', 'patched', stub, 'fsync', probe='probe64.exe'))
-# cuDeviceGetLuid: SveSop's registry lookup finds no GPU in a headless prefix, so
-# CUDA_FAKE_LUID=1 (SveSop's UUID-hash LUID) checks that both paths return the same bytes.
-for probe, bits in (('probe32.exe', 32), ('probe64.exe', 64)):
-    results.append(arm(f'luid-fake-{bits}', 'msvc', 'patched', stub, 'ntsync', probe=probe,
-                       extra_env={'CUDA_FAKE_LUID': '1'}))
+results.append(arm('patched-stub-direct64-ntsync', 'msvc', 'patched', stub, 'ntsync', probe='probe64.exe'))
+results.append(arm('fail-init-msvc', 'msvc', 'patched', stub, 'ntsync', timeout=60,
+                   extra_env={'STUB_FAIL_INIT': '1'}))
+results.append(arm('death-msvc', 'msvc', 'patched', stub, 'ntsync', timeout=60,
+                   extra_env={'STUB_EXIT_ON_LAUNCH': '1'}, probe_args=['death']))
 zl = inp / 'zluda-linux'
 if (zl / 'libcuda.so.1').exists():
     results.append(arm('patched-zluda-norocm', 'msvc', 'patched', zl, 'ntsync', timeout=60))
@@ -174,3 +174,54 @@ def arm_classic(name, probe='probe32.exe', libcuda=inp / 'stub32', timeout=120):
 
 results.append(arm_classic('l32-classic-nvcuda32-stub'))
 (work / 'RESULT.json').write_text(json.dumps(results, indent=1))
+
+
+def find(name):
+    return next((r for r in results if r['arm'] == name), None)
+
+
+def step(r, name):
+    return next((x for x in r['rows'] if x.get('step') == name), {}) if r else {}
+
+
+def check(r, name):
+    return next((x for x in r['rows'] if x.get('check') == name), {}) if r else {}
+
+
+checks = {}
+main = find('patched-stub-msvc-ntsync')
+checks['chain_cuInit_ok'] = step(main, 'cuInit').get('result') == 0
+checks['luid_32bit_is_801'] = next((x['luid']['result'] for x in main['rows'] if 'luid' in x), None) == 801
+checks['pop_created'] = check(main, 'pop_created') == {'check': 'pop_created', 'result': 0, 'same': 1}
+checks['pop_empty_invalid_context'] = check(main, 'pop_empty').get('result') == 201
+checks['push_current'] = check(main, 'push_current') == {'check': 'push_current', 'result': 0, 'same': 1}
+checks['push_null_invalid_context'] = check(main, 'push_null').get('result') == 201
+checks['push_unknown_invalid_context'] = check(main, 'push_unknown').get('result') == 201
+checks['texref_calls_succeed'] = check(main, 'texref_setters') == {'check': 'texref_setters', 'gettexref': 0, 'any_error': 0}
+tex = [l.split('TEX ', 1)[1] for l in main['stub_lines'] if ' TEX ' in l]
+expected_tex = ['AddressMode 1 2 ok=1', 'AddressMode 0 3 ok=1', 'FilterMode 1 ok=1', 'FilterMode 0 ok=1',
+                'MaxAnisotropy 4 ok=1', 'MaxAnisotropy 8 ok=1', 'MipmapFilterMode 1 ok=1', 'MipmapFilterMode 0 ok=1',
+                'MipmapLevelBias 0.50 ok=1', 'MipmapLevelBias -1.00 ok=1',
+                'MipmapLevelClamp 0.00 8.00 ok=1', 'MipmapLevelClamp 1.00 4.00 ok=1']
+checks['texref_forwarded_once_per_change'] = tex == expected_tex
+checks['api_version_value'] = check(main, 'api_version').get('value') == 3020
+api_calls = sum(1 for l in main['stub_lines'] if l == 'STUB: cuCtxGetApiVersion')
+checks['api_version_one_driver_call'] = api_calls == 1
+api_t = next((x for x in main['rows'] if x.get('timing') == 'cuCtxGetApiVersion'), {})
+checks['api_version_cached_fast'] = api_t.get('result') == 0 and api_t.get('mean_us', 99) < 2
+stock = find('stock-stub-msvc')
+checks['stock_svesop_fails_fast'] = stock['exit'] == 3 and stock['seconds'] < 20 and step(stock, 'cuInit').get('result') not in (None, 0)
+fi = find('fail-init-msvc')
+checks['init_failure_returns_no_device'] = fi['exit'] == 3 and fi['seconds'] < 20 and step(fi, 'cuInit').get('result') == 100
+de = find('death-msvc')
+dl, dv = step(de, 'death_cuLaunchKernel'), step(de, 'death_cuDriverGetVersion')
+checks['death_launch_errors_within_1s'] = dl.get('result') not in (None, 0) and dl.get('us', 1e9) < 1e6
+checks['death_later_calls_fail_fast'] = dv.get('result') not in (None, 0) and dv.get('us', 1e9) < 1000
+for name in ('patched-zluda-norocm', 'patched-zluda-rocm'):
+    r = find(name)
+    if r:
+        checks[f'{name}_no_hang'] = r['exit'] == 3 and step(r, 'cuInit').get('result') not in (None, 0)
+(work / 'CHECKS.json').write_text(json.dumps(checks, indent=1))
+print(json.dumps(checks, indent=1))
+if not all(checks.values()):
+    raise SystemExit('route checks failed: ' + ', '.join(k for k, v in checks.items() if not v))

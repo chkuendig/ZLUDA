@@ -196,10 +196,10 @@ jobs:
           python3 - <<'EOF'
           import json
           for r in json.load(open('work/RESULT.json')):
-              print('==', r['arm'], 'exit', r['exit'], 'seconds', r['seconds'], r['sync_messages'])
+              print('==', r['arm'], 'exit', r['exit'], 'seconds', r['seconds'], r.get('sync_messages'))
               for row in r['rows']:
                   print('  ', json.dumps(row))
-              for l in r['stub_lines'][:12] + r['nvcuda_lines'][:8]:
+              for l in r.get('stub_lines', [])[:12] + r.get('nvcuda_lines', [])[:8]:
                   print('   |', l)
           EOF
       - uses: actions/upload-artifact@v4
@@ -208,6 +208,7 @@ jobs:
           name: wine-chain
           path: |
             work/RESULT.json
+            work/CHECKS.json
             work/logs
             work/wineboot*.stderr
             work-pingpong.jsonl

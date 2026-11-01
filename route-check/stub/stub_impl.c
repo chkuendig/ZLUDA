@@ -24,7 +24,14 @@ static int verbose(void)
 
 static void stub_unimplemented(const char *name) { LOG("unimplemented %s", name); }
 
-CUresult cuInit(unsigned flags) { LOG("cuInit(%u)", flags); return 0; }
+#include <unistd.h>
+#define FAKE_TEXREF ((void *)0x40000)
+/* STUB_FAIL_INIT=1: behave like a driver without a usable GPU. */
+CUresult cuInit(unsigned flags)
+{
+    LOG("cuInit(%u)", flags);
+    return getenv("STUB_FAIL_INIT") ? 100 : 0;
+}
 CUresult cuDriverGetVersion(int *v) { *v = 12020; return 0; }
 CUresult cuDeviceGetCount(int *c) { LOG("cuDeviceGetCount"); *c = 1; return 0; }
 CUresult cuDeviceGet(int *d, int ordinal) { LOG("cuDeviceGet(%d)", ordinal); *d = ordinal; return ordinal ? 101 : 0; }
@@ -49,7 +56,7 @@ CUresult cuDevicePrimaryCtxRetain(void **ctx, int dev) { LOG("cuDevicePrimaryCtx
 CUresult cuCtxCreate_v2(void **ctx, unsigned flags, int dev) { *ctx = FAKE_CTX; return 0; }
 CUresult cuCtxSetCurrent(void *ctx) { LOG("cuCtxSetCurrent(%p)", ctx); return ctx == FAKE_CTX ? 0 : 201; }
 CUresult cuCtxGetDevice(int *dev) { *dev = 0; return 0; }
-CUresult cuCtxGetApiVersion(void *ctx, unsigned *v) { *v = 3020; return 0; }
+CUresult cuCtxGetApiVersion(void *ctx, unsigned *v) { LOG("cuCtxGetApiVersion"); *v = 3020; return 0; }
 CUresult cuCtxSynchronize(void) { return 0; }
 CUresult cuStreamSynchronize(void *stream) { return 0; }
 CUresult cuModuleLoadData(void **module, const void *image)
@@ -75,8 +82,26 @@ CUresult cuMemcpyDtoHAsync_v2(void *dst, CUdeviceptr src, size_t n, void *stream
 CUresult cuLaunchKernel(void *f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz,
                         unsigned shmem, void *stream, void **params, void **extra)
 {
+    /* STUB_EXIT_ON_LAUNCH=1: the driver process dies mid-session. */
+    if (getenv("STUB_EXIT_ON_LAUNCH"))
+        _exit(3);
     return f == FAKE_FUNCTION ? 0 : 400;
 }
+CUresult cuModuleGetTexRef(void **tex, void *module, const char *name)
+{
+    LOG("cuModuleGetTexRef(%p, %s)", module, name);
+    if (module != FAKE_MODULE)
+        return 400;
+    *tex = FAKE_TEXREF;
+    return 0;
+}
+/* Texture sampler setters log every call that reaches the driver. */
+CUresult cuTexRefSetAddressMode(void *t, int dim, int am) { LOG("TEX AddressMode %d %d ok=%d", dim, am, t == FAKE_TEXREF); return 0; }
+CUresult cuTexRefSetFilterMode(void *t, int fm) { LOG("TEX FilterMode %d ok=%d", fm, t == FAKE_TEXREF); return 0; }
+CUresult cuTexRefSetMaxAnisotropy(void *t, unsigned a) { LOG("TEX MaxAnisotropy %u ok=%d", a, t == FAKE_TEXREF); return 0; }
+CUresult cuTexRefSetMipmapFilterMode(void *t, int fm) { LOG("TEX MipmapFilterMode %d ok=%d", fm, t == FAKE_TEXREF); return 0; }
+CUresult cuTexRefSetMipmapLevelBias(void *t, float b) { LOG("TEX MipmapLevelBias %.2f ok=%d", b, t == FAKE_TEXREF); return 0; }
+CUresult cuTexRefSetMipmapLevelClamp(void *t, float lo, float hi) { LOG("TEX MipmapLevelClamp %.2f %.2f ok=%d", lo, hi, t == FAKE_TEXREF); return 0; }
 
 /* ZLUDA32_INTERNAL {EE376A1B-B858-42EB-A52D-9A106D50D914}: two entries, no size field. */
 static const unsigned char zluda32_guid[16] = {0xEE, 0x37, 0x6A, 0x1B, 0xB8, 0x58, 0x42, 0xEB,
