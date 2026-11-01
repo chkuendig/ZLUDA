@@ -5,6 +5,13 @@ use crate::cuda::*;
 use std::{process::{Command,Stdio},sync::atomic::{AtomicUsize,Ordering},time::{Duration,Instant}};
 static CALLS:AtomicUsize=AtomicUsize::new(0);
 static LOOKUPS:AtomicUsize=AtomicUsize::new(0);
+// Linking the real dispatcher also retains its strong Wine callback import.
+// This cfg(test) module supplies a failing provider; PCI must never invoke it.
+#[export_name="KeUserModeCallback"]
+unsafe extern "C" fn unexpected_user_callback(_:u32,_:*const c_void,_:u32,_:*mut *mut c_void,_:*mut u32)->i32 {
+    panic!("unexpected Wine callback in PCI-only native test")
+}
+
 unsafe extern "C" fn attribute(out:*mut i32,attr:CUdevice_attribute,dev:CUdevice)->CUresult {
     CALLS.fetch_add(1,Ordering::Relaxed);
     assert!(matches!(attr.0,50|33|34));
@@ -65,8 +72,10 @@ fn pci_parity_child(){unsafe{
         let count=CALLS.load(Ordering::Relaxed);
         let mut reserved=Call32::new(C32_RESERVED_59,&[0xdeadbeef;16]);
         assert_eq!(dispatch32((&mut reserved as *mut Call32).cast()),0);assert_eq!(reserved.result,801);
-        let mut old=Call32::new(C32_DEVICE_ATTR,&[0xdeadbeef,50,0]);old.version=3;
-        assert_eq!(dispatch32((&mut old as *mut Call32).cast()),0xc000000du32 as i32);assert_eq!(old.result,801);
+        for opcode in [C32_DEVICE_ATTR,C32_RESERVED_59] {
+            let mut old=Call32::new(opcode,&[0xdeadbeef,50,0]);old.version=3;
+            assert_eq!(dispatch32((&mut old as *mut Call32).cast()),0xc000000du32 as i32);assert_eq!(old.result,801);
+        }
         assert_eq!(CALLS.load(Ordering::Relaxed),count);assert_eq!(LOOKUPS.load(Ordering::Relaxed),1);
         assert!(STATE.get().is_none(),"PCI and reserved operations must not initialize bounded context state");
     });
