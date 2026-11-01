@@ -67,7 +67,6 @@ cuda_function_declarations! {
         cuDeviceGet,
         cuDeviceGetAttribute,
         cuDeviceGetCount,
-        cuDeviceGetLuid,
         cuDeviceGetName,
         cuDeviceGetProperties,
         cuDeviceTotalMem_v2,
@@ -371,22 +370,6 @@ pub(crate) fn cu_device_get_attribute(
         },
     )?
     .pi;
-    Ok(())
-}
-
-pub(crate) fn cu_device_get_luid(
-    luid: *mut ::core::ffi::c_char,
-    device_node_mask: *mut ::core::ffi::c_uint,
-    dev: CUdevice,
-) -> Result<(), CUerror> {
-    let luid = unsafe { luid.cast::<[u8; 8]>().as_mut() }.ok_or(CUerror::INVALID_VALUE)?;
-    let device_node_mask = unsafe { device_node_mask.as_mut() }.ok_or(CUerror::INVALID_VALUE)?;
-    let result = GlobalState::remote_call_zero_copy::<cuDeviceGetLuidOut>(
-        Opcode::cuDeviceGetLuid,
-        cuDeviceGetLuidIn { dev },
-    )?;
-    *luid = result.luid;
-    *device_node_mask = result.device_node_mask.to_native();
     Ok(())
 }
 

@@ -44,7 +44,6 @@ macro_rules! generate_messages_inout {
             cuMemcpyDtoHAsync_v2,
             cuModuleGetSurfRef,
             cuMemcpyHtoD_v2,
-            cuDeviceGetLuid,
             Startup,
         }
     };
@@ -111,7 +110,6 @@ cuda_function_declarations! {
         cuTexRefSetMipmapLevelClamp,
     ],
     generate_messages_in <= [
-        cuDeviceGetLuid,
         cuDeviceGetName,
         cuDeviceTotalMem_v2
     ]
@@ -258,13 +256,6 @@ pub struct cuDeviceGetNameOut {
 #[derive(Portable, Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
 pub struct cuDeviceTotalMem_v2Out {
     pub bytes: u64_le,
-}
-
-#[repr(C)]
-#[derive(Portable, Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
-pub struct cuDeviceGetLuidOut {
-    pub luid: [u8; 8],
-    pub device_node_mask: u32_le,
 }
 
 #[repr(C)]
