@@ -14,12 +14,41 @@ use zluda_server_common::{Opcode, Serializer};
 pub(crate) struct Server {
     local: zluda_server_common::Endpoint,
     remote: zluda_server_common::Endpoint,
-    _child: Child,
+    child: Child,
     arena: stumpalo::Arena,
+    dead: bool,
+}
+
+// How often a blocked call checks that the server is still alive. Replies
+// normally arrive in microseconds, so this only bounds failure detection.
+const LIVENESS_POLL_MS: u32 = 100;
+
+/// Waits for `event`, returning false if `child` exits first. When `signal`
+/// is given it is set atomically with the start of the wait.
+unsafe fn wait_while_alive(signal: Option<HANDLE>, event: HANDLE, child: HANDLE) -> bool {
+    let mut status = match signal {
+        Some(signal) => SignalObjectAndWait(signal, event, LIVENESS_POLL_MS, false),
+        None => WaitForSingleObject(event, LIVENESS_POLL_MS),
+    };
+    loop {
+        if status == WAIT_OBJECT_0 {
+            return true;
+        }
+        if status != WAIT_TIMEOUT || WaitForSingleObject(child, 0) == WAIT_OBJECT_0 {
+            // The server exited (or the wait itself failed). A reply may have
+            // raced the exit, so take it if it is there.
+            return WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+        }
+        status = WaitForSingleObject(event, LIVENESS_POLL_MS);
+    }
 }
 
 impl Server {
-    pub unsafe fn start() -> Result<Self, Error> {
+    pub unsafe fn start() -> Result<Self, CUerror> {
+        Self::start_impl().map_err(|_| CUerror::NO_DEVICE)
+    }
+
+    unsafe fn start_impl() -> Result<Self, Error> {
         let local = zluda_server_common::Endpoint::new()?;
         let remote = zluda_server_common::Endpoint::new()?;
         let spawn_server = |path: &PathBuf| {
@@ -56,14 +85,32 @@ impl Server {
             (Err(e), None) => return Err(e.into()),
         };
         zluda_windows::kill_child_on_process_exit(child.as_handle().as_raw_handle())?;
+        // A server that cannot open its CUDA driver or initialize it exits
+        // before the handshake; report that instead of waiting forever.
+        if !wait_while_alive(None, *local.event, HANDLE(child.as_raw_handle())) {
+            return Err(Error::new(E_FAIL, "zluda64_server exited during startup"));
+        }
         read_git_version(&local)?;
         let arena = stumpalo::Arena::new();
         Ok(Server {
             local,
             remote,
-            _child: child,
+            child,
             arena,
+            dead: false,
         })
+    }
+
+    fn signal_and_wait(&mut self) -> Result<(), CUerror> {
+        if self.dead {
+            return Err(CUerror::UNKNOWN);
+        }
+        let child = HANDLE(self.child.as_raw_handle());
+        if !unsafe { wait_while_alive(Some(*self.remote.event), *self.local.event, child) } {
+            self.dead = true;
+            return Err(CUerror::UNKNOWN);
+        }
+        Ok(())
     }
 
     pub(crate) fn remote_call_zero_copy<Out: Portable + Clone>(
@@ -73,7 +120,7 @@ impl Server {
     ) -> Result<Out, CUerror> {
         self.remote.shared_memory.write_header(opcode as u32);
         self.remote.shared_memory.write_body(&data);
-        unsafe { SignalObjectAndWait(*self.remote.event, *self.local.event, INFINITE, false) };
+        self.signal_and_wait()?;
         let return_value = self.local.shared_memory.read_header();
         match NonZeroU32::new(return_value) {
             None => Ok(()),
@@ -98,7 +145,7 @@ impl Server {
             old_shmem.write_header(u32::MAX);
             old_shmem.write_buffer(self.remote.shared_memory.name.as_bytes());
         }
-        unsafe { SignalObjectAndWait(*self.remote.event, *self.local.event, INFINITE, false) };
+        self.signal_and_wait()?;
         let return_value = self.local.shared_memory.read_header();
         match NonZeroU32::new(return_value) {
             None => Ok(()),
@@ -117,7 +164,7 @@ impl Server {
     {
         self.remote.shared_memory.write_header(opcode as u32);
         self.remote.shared_memory.write_body(&data);
-        unsafe { SignalObjectAndWait(*self.remote.event, *self.local.event, INFINITE, false) };
+        self.signal_and_wait()?;
         let mut return_value = self.local.shared_memory.read_header();
         if return_value == u32::MAX {
             let new_shmem_name = unsafe {
@@ -138,7 +185,6 @@ impl Server {
 }
 
 fn read_git_version(local: &zluda_server_common::Endpoint) -> Result<(), Error> {
-    unsafe { WaitForSingleObject(*local.event, INFINITE) };
     let opcode = local.shared_memory.read_header();
     if opcode != Opcode::Startup as u32 {
         return Err(Error::empty());

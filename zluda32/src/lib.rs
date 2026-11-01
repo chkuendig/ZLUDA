@@ -60,6 +60,8 @@ cuda_function_declarations! {
         cuCtxGetApiVersion,
         cuCtxGetCurrent,
         cuCtxGetDevice,
+        cuCtxPopCurrent_v2,
+        cuCtxPushCurrent_v2,
         cuCtxSetCacheConfig,
         cuCtxSetCurrent,
         cuCtxSynchronize,
@@ -141,6 +143,19 @@ impl ContextStack {
         }
     }
 
+    fn pop(&self) -> Option<(CUcontext, CUdevice)> {
+        self.0.borrow_mut().pop()
+    }
+
+    fn device_of(&self, ctx: CUcontext) -> Option<CUdevice> {
+        self.0
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(c, _)| *c == ctx)
+            .map(|(_, dev)| *dev)
+    }
+
     fn current(&self) -> (CUcontext, CUdevice) {
         self.0
             .borrow()
@@ -153,6 +168,9 @@ impl ContextStack {
 struct GlobalState {
     server: ipc::Server,
     function_args: FxHashMap<CUfunction, Vec<FunctionArgInfo>>,
+    // Last value forwarded per (texture reference, setter). PhysX re-applies the
+    // same sampler state before every launch; only changes cross the IPC.
+    texref_state: FxHashMap<(u32, Opcode), [u32; 3]>,
     next_context: u32,
     context_state: FxHashMap<
         cuda_types::cuda::CUcontext,
@@ -174,17 +192,18 @@ struct GlobalState {
 
 impl GlobalState {
     fn get() -> Result<&'static Mutex<Self>, CUerror> {
-        static LOCK: OnceLock<Result<Mutex<GlobalState>, windows::core::Error>> = OnceLock::new();
+        static LOCK: OnceLock<Result<Mutex<GlobalState>, CUerror>> = OnceLock::new();
         LOCK.get_or_init(|| {
             Ok(Mutex::new(GlobalState {
                 function_args: FxHashMap::default(),
+                texref_state: FxHashMap::default(),
                 server: unsafe { ipc::Server::start() }?,
                 next_context: 1024 * 1024,
                 context_state: FxHashMap::default(),
             }))
         })
         .as_ref()
-        .map_err(|_| CUerror::UNKNOWN)
+        .map_err(|e| *e)
     }
 
     pub(crate) fn remote_call_zero_copy<Out: Portable + Clone>(
@@ -274,6 +293,14 @@ pub(crate) fn cu_ctx_get_api_version(
 ) -> Result<(), CUerror> {
     let version = unsafe { version.as_mut() }.ok_or(CUerror::INVALID_VALUE)?;
     let ctx = CONTEXT_STACK.with(|s| s.unwrap(ctx))?;
+    // The server answers for its single primary context whatever context is
+    // passed, so the value is fixed for the process once it has been read.
+    static API_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let cached = API_VERSION.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != 0 {
+        *version = cached;
+        return Ok(());
+    }
     *version = CudaEncode::decode(
         GlobalState::remote_call_zero_copy::<cuCtxGetApiVersionOut>(
             Opcode::cuCtxGetApiVersion,
@@ -283,6 +310,7 @@ pub(crate) fn cu_ctx_get_api_version(
         )?
         .version,
     );
+    API_VERSION.store(*version, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -297,6 +325,35 @@ pub(crate) fn cu_ctx_set_current(ctx: CUcontext) -> Result<(), CUerror> {
         return Err(CUerror::NOT_SUPPORTED);
     }
     CONTEXT_STACK.with(|s| s.push(ctx, 0));
+    Ok(())
+}
+
+pub(crate) fn cu_ctx_push_current_v2(ctx: CUcontext) -> Result<(), CUerror> {
+    if ctx.0.is_null() {
+        return Err(CUerror::INVALID_CONTEXT);
+    }
+    let known = GlobalState::get()?
+        .lock()
+        .map_err(|_| CUerror::UNKNOWN)?
+        .context_state
+        .contains_key(&ctx);
+    if !known {
+        return Err(CUerror::INVALID_CONTEXT);
+    }
+    CONTEXT_STACK.with(|s| {
+        let dev = s.device_of(ctx).unwrap_or(0);
+        s.push(ctx, dev)
+    });
+    Ok(())
+}
+
+pub(crate) fn cu_ctx_pop_current_v2(pctx: *mut CUcontext) -> Result<(), CUerror> {
+    let (ctx, _) = CONTEXT_STACK
+        .with(|s| s.pop())
+        .ok_or(CUerror::INVALID_CONTEXT)?;
+    if let Some(pctx) = unsafe { pctx.as_mut() } {
+        *pctx = ctx;
+    }
     Ok(())
 }
 
@@ -831,12 +888,18 @@ pub(crate) fn cu_stream_destroy_v2(stream: CUstream) -> Result<(), CUerror> {
 }
 
 pub(crate) fn cu_tex_ref_set_address_mode(
-    _tex_ref: CUtexref,
-    _dim: ::core::ffi::c_int,
-    _am: CUaddress_mode,
+    tex_ref: CUtexref,
+    dim: ::core::ffi::c_int,
+    am: CUaddress_mode,
 ) -> Result<(), CUerror> {
-    // TODO
-    Ok(())
+    if !(0..3).contains(&dim) {
+        return Err(CUerror::INVALID_VALUE);
+    }
+    // One cache slot per dimension: the three addressing modes are independent.
+    let key = [dim as u32, am.0 as u32, 0];
+    set_texref_state(tex_ref, Opcode::cuTexRefSetAddressMode, key, dim as usize, |hTexRef| {
+        cuTexRefSetAddressModeIn { hTexRef, dim, am: CudaEncode::encode(am) }
+    })
 }
 
 pub(crate) fn cu_tex_ref_set_address_v2(
@@ -860,11 +923,12 @@ pub(crate) fn cu_tex_ref_set_address_v2(
 }
 
 pub(crate) fn cu_tex_ref_set_filter_mode(
-    _tex_ref: CUtexref,
-    _fm: CUfilter_mode,
+    tex_ref: CUtexref,
+    fm: CUfilter_mode,
 ) -> Result<(), CUerror> {
-    // TODO
-    Ok(())
+    set_texref_state(tex_ref, Opcode::cuTexRefSetFilterMode, [fm.0 as u32, 0, 0], 0, |hTexRef| {
+        cuTexRefSetFilterModeIn { hTexRef, fm: CudaEncode::encode(fm) }
+    })
 }
 
 pub(crate) fn cu_tex_ref_set_flags(
@@ -898,37 +962,72 @@ pub(crate) fn cu_tex_ref_set_format(
 }
 
 pub(crate) fn cu_tex_ref_set_max_anisotropy(
-    _tex_ref: CUtexref,
-    _max_aniso: ::core::ffi::c_uint,
+    tex_ref: CUtexref,
+    max_aniso: ::core::ffi::c_uint,
 ) -> Result<(), CUerror> {
-    // TODO
-    Ok(())
+    set_texref_state(tex_ref, Opcode::cuTexRefSetMaxAnisotropy, [max_aniso, 0, 0], 0, |hTexRef| {
+        cuTexRefSetMaxAnisotropyIn { hTexRef, maxAniso: max_aniso }
+    })
 }
 
 pub(crate) fn cu_tex_ref_set_mipmap_filter_mode(
-    _tex_ref: CUtexref,
-    _fm: CUfilter_mode,
+    tex_ref: CUtexref,
+    fm: CUfilter_mode,
 ) -> Result<(), CUerror> {
-    // TODO
-    Ok(())
+    set_texref_state(tex_ref, Opcode::cuTexRefSetMipmapFilterMode, [fm.0 as u32, 0, 0], 0, |hTexRef| {
+        cuTexRefSetMipmapFilterModeIn { hTexRef, fm: CudaEncode::encode(fm) }
+    })
 }
 
 pub(crate) fn cu_tex_ref_set_mipmap_level_bias(
-    _tex_ref: CUtexref,
-    _bias: f32,
+    tex_ref: CUtexref,
+    bias: f32,
 ) -> Result<(), CUerror> {
-    // TODO
-    Ok(())
+    set_texref_state(tex_ref, Opcode::cuTexRefSetMipmapLevelBias, [bias.to_bits(), 0, 0], 0, |hTexRef| {
+        cuTexRefSetMipmapLevelBiasIn { hTexRef, bias }
+    })
 }
 
 pub(crate) fn cu_tex_ref_set_mipmap_level_clamp(
-    _tex_ref: CUtexref,
-    _min_mipmap_level_clamp: f32,
-    _max_mipmap_level_clamp: f32,
+    tex_ref: CUtexref,
+    min_mipmap_level_clamp: f32,
+    max_mipmap_level_clamp: f32,
 ) -> Result<(), CUerror> {
-    // TODO
+    let key = [min_mipmap_level_clamp.to_bits(), max_mipmap_level_clamp.to_bits(), 0];
+    set_texref_state(tex_ref, Opcode::cuTexRefSetMipmapLevelClamp, key, 0, |hTexRef| {
+        cuTexRefSetMipmapLevelClampIn {
+            hTexRef,
+            minMipmapLevelClamp: min_mipmap_level_clamp,
+            maxMipmapLevelClamp: max_mipmap_level_clamp,
+        }
+    })
+}
+
+/// Forwards a texture-reference sampler setter unless the server already has
+/// this exact value. `slot` separates independent values set by one opcode.
+fn set_texref_state<In>(
+    tex_ref: CUtexref,
+    opcode: Opcode,
+    value: [u32; 3],
+    slot: usize,
+    input: impl FnOnce(u32_le) -> In,
+) -> Result<(), CUerror>
+where
+    In: for<'a, 'b> Serialize<zluda_server_common::Serializer<'a, 'b>>,
+{
+    let handle = CudaEncode::encode(tex_ref);
+    let key = (handle.to_native() ^ ((slot as u32) << 30), opcode);
+    let mut state = GlobalState::get()?.lock().map_err(|_| CUerror::UNKNOWN)?;
+    if state.texref_state.get(&key) == Some(&value) {
+        return Ok(());
+    }
+    state.server.remote_call_zero_copy::<Out0>(opcode, input(handle))?;
+    state.texref_state.insert(key, value);
     Ok(())
 }
+
+/// All sampler setters reply with an empty body.
+type Out0 = cuTexRefSetFilterModeOut;
 
 pub(crate) fn cu_event_query(event: cuda_types::cuda::CUevent) -> Result<(), CUerror> {
     GlobalState::remote_call_zero_copy::<cuEventQueryOut>(
@@ -1033,6 +1132,12 @@ pub(crate) fn cu_func_get_attribute(
 }
 
 pub(crate) fn cu_module_unload(hmod: cuda_types::cuda::CUmodule) -> Result<(), CUerror> {
+    // The server frees this module's texture references; forget their state.
+    GlobalState::get()?
+        .lock()
+        .map_err(|_| CUerror::UNKNOWN)?
+        .texref_state
+        .clear();
     GlobalState::remote_call_zero_copy::<cuModuleUnloadOut>(
         Opcode::cuModuleUnload,
         cuModuleUnloadIn {

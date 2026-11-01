@@ -448,6 +448,48 @@ fn main() -> std::io::Result<()> {
                     |input| cu_tex_ref_set_address_v2(&mut state, input),
                 );
             }
+            Some(Opcode::cuTexRefSetAddressMode) => {
+                handle_cuda_function::<cuTexRefSetAddressModeIn, cuTexRefSetAddressModeOut>(
+                    &mut local,
+                    &mut remote,
+                    |input| cu_tex_ref_set_address_mode(&mut state, input),
+                );
+            }
+            Some(Opcode::cuTexRefSetFilterMode) => {
+                handle_cuda_function::<cuTexRefSetFilterModeIn, cuTexRefSetFilterModeOut>(
+                    &mut local,
+                    &mut remote,
+                    |input| cu_tex_ref_set_filter_mode(&mut state, input),
+                );
+            }
+            Some(Opcode::cuTexRefSetMaxAnisotropy) => {
+                handle_cuda_function::<cuTexRefSetMaxAnisotropyIn, cuTexRefSetMaxAnisotropyOut>(
+                    &mut local,
+                    &mut remote,
+                    |input| cu_tex_ref_set_max_anisotropy(&mut state, input),
+                );
+            }
+            Some(Opcode::cuTexRefSetMipmapFilterMode) => {
+                handle_cuda_function::<cuTexRefSetMipmapFilterModeIn, cuTexRefSetMipmapFilterModeOut>(
+                    &mut local,
+                    &mut remote,
+                    |input| cu_tex_ref_set_mipmap_filter_mode(&mut state, input),
+                );
+            }
+            Some(Opcode::cuTexRefSetMipmapLevelBias) => {
+                handle_cuda_function::<cuTexRefSetMipmapLevelBiasIn, cuTexRefSetMipmapLevelBiasOut>(
+                    &mut local,
+                    &mut remote,
+                    |input| cu_tex_ref_set_mipmap_level_bias(&mut state, input),
+                );
+            }
+            Some(Opcode::cuTexRefSetMipmapLevelClamp) => {
+                handle_cuda_function::<cuTexRefSetMipmapLevelClampIn, cuTexRefSetMipmapLevelClampOut>(
+                    &mut local,
+                    &mut remote,
+                    |input| cu_tex_ref_set_mipmap_level_clamp(&mut state, input),
+                );
+            }
             Some(Opcode::cuTexRefSetFlags) => {
                 handle_cuda_function::<cuTexRefSetFlagsIn, cuTexRefSetFlagsOut>(
                     &mut local,
@@ -843,6 +885,60 @@ fn cu_tex_ref_set_format(
         )
     }?;
     Ok(cuTexRefSetFormatOut {})
+}
+
+fn cu_tex_ref_set_address_mode(
+    state: &mut State,
+    input: &ArchivedcuTexRefSetAddressModeIn,
+) -> Result<cuTexRefSetAddressModeOut, CUerror> {
+    let tex_ref = state.handles.get(input.hTexRef.to_native())?;
+    unsafe { cuTexRefSetAddressMode(tex_ref, input.dim.to_native(), CUaddress_mode(input.am.to_native())) }?;
+    Ok(cuTexRefSetAddressModeOut {})
+}
+
+fn cu_tex_ref_set_filter_mode(
+    state: &mut State,
+    input: &ArchivedcuTexRefSetFilterModeIn,
+) -> Result<cuTexRefSetFilterModeOut, CUerror> {
+    let tex_ref = state.handles.get(input.hTexRef.to_native())?;
+    unsafe { cuTexRefSetFilterMode(tex_ref, CUfilter_mode(input.fm.to_native())) }?;
+    Ok(cuTexRefSetFilterModeOut {})
+}
+
+fn cu_tex_ref_set_max_anisotropy(
+    state: &mut State,
+    input: &ArchivedcuTexRefSetMaxAnisotropyIn,
+) -> Result<cuTexRefSetMaxAnisotropyOut, CUerror> {
+    let tex_ref = state.handles.get(input.hTexRef.to_native())?;
+    unsafe { cuTexRefSetMaxAnisotropy(tex_ref, input.maxAniso.to_native()) }?;
+    Ok(cuTexRefSetMaxAnisotropyOut {})
+}
+
+fn cu_tex_ref_set_mipmap_filter_mode(
+    state: &mut State,
+    input: &ArchivedcuTexRefSetMipmapFilterModeIn,
+) -> Result<cuTexRefSetMipmapFilterModeOut, CUerror> {
+    let tex_ref = state.handles.get(input.hTexRef.to_native())?;
+    unsafe { cuTexRefSetMipmapFilterMode(tex_ref, CUfilter_mode(input.fm.to_native())) }?;
+    Ok(cuTexRefSetMipmapFilterModeOut {})
+}
+
+fn cu_tex_ref_set_mipmap_level_bias(
+    state: &mut State,
+    input: &ArchivedcuTexRefSetMipmapLevelBiasIn,
+) -> Result<cuTexRefSetMipmapLevelBiasOut, CUerror> {
+    let tex_ref = state.handles.get(input.hTexRef.to_native())?;
+    unsafe { cuTexRefSetMipmapLevelBias(tex_ref, input.bias.to_native()) }?;
+    Ok(cuTexRefSetMipmapLevelBiasOut {})
+}
+
+fn cu_tex_ref_set_mipmap_level_clamp(
+    state: &mut State,
+    input: &ArchivedcuTexRefSetMipmapLevelClampIn,
+) -> Result<cuTexRefSetMipmapLevelClampOut, CUerror> {
+    let tex_ref = state.handles.get(input.hTexRef.to_native())?;
+    unsafe { cuTexRefSetMipmapLevelClamp(tex_ref, input.minMipmapLevelClamp.to_native(), input.maxMipmapLevelClamp.to_native()) }?;
+    Ok(cuTexRefSetMipmapLevelClampOut {})
 }
 
 fn cu_tex_ref_set_flags(
@@ -1324,15 +1420,15 @@ cuda_function_declarations! {
         cuStreamCreate,
         cuStreamDestroy_v2,
         cuStreamQuery,
-        // cuTexRefSetAddressMode,
+        cuTexRefSetAddressMode,
         cuTexRefSetAddress_v2,
-        // cuTexRefSetFilterMode,
+        cuTexRefSetFilterMode,
         cuTexRefSetFlags,
         cuTexRefSetFormat,
-        // cuTexRefSetMaxAnisotropy,
-        // cuTexRefSetMipmapFilterMode,
-        // cuTexRefSetMipmapLevelBias,
-        // cuTexRefSetMipmapLevelClamp,
+        cuTexRefSetMaxAnisotropy,
+        cuTexRefSetMipmapFilterMode,
+        cuTexRefSetMipmapLevelBias,
+        cuTexRefSetMipmapLevelClamp,
         cuStreamSynchronize,
         cuDevicePrimaryCtxRetain,
         cuCtxSetCurrent,

@@ -24,7 +24,7 @@ macro_rules! generate_messages_inout {
         )*
 
         #[repr(u32)]
-        #[derive(FromRepr)]
+        #[derive(FromRepr, Clone, Copy, PartialEq, Eq, Hash, Debug)]
         #[allow(non_camel_case_types)]
         pub enum Opcode {
             System = 0,
