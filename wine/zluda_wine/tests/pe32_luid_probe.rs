@@ -62,10 +62,12 @@ fn main(){unsafe{
     SERVER_VERSION.store(3,Ordering::Relaxed);
     assert_eq!(wow64_pe::cuDeviceGetAttribute(&mut value,50,0),3);
     assert_eq!(value,0x12345678);
-    let mut old=Call32::new(C32_DEVICE_ATTR,&[0xdeadbeef,50,0]);old.version=3;
-    assert!(!old.valid(),"v4 receiver must reject a v3 packet");
     SERVER_VERSION.store(4,Ordering::Relaxed);
-    assert_eq!(zluda_wine_call((&mut old as *mut Call32).cast()),0xc000000du32 as i32);
-    assert_eq!(old.result,801);
+    for opcode in [C32_DEVICE_ATTR,C32_RESERVED_59] {
+        let mut old=Call32::new(opcode,&[0xdeadbeef,50,0]);old.version=3;
+        assert!(!old.valid(),"v4 receiver must reject a v3 packet");
+        assert_eq!(zluda_wine_call((&mut old as *mut Call32).cast()),0xc000000du32 as i32);
+        assert_eq!(old.result,801);
+    }
     println!("PE32 SCOPE PASS: LUID=801 argument_bytes=12 stack_delta=0 no-LUID-transport; PCI50/33/34 forwarding and v3/v4 refusal passed");
 }}
