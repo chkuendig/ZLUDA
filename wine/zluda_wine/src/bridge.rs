@@ -40,9 +40,9 @@ mod integrity_algorithm { include!(concat!(env!("OUT_DIR"), "/integrity_algorith
 // them; Windows API and module-load behavior still need the real SDK/runtime.
 #[cfg(any(all(windows, target_arch = "x86_64"), all(test,zluda_wine_oracles)))] mod pe_thunks;
 #[cfg(any(all(windows, target_arch = "x86_64"), all(test,zluda_wine_oracles)))] mod pe_wrappers;
-#[cfg(any(windows, all(test,zluda_wine_oracles)))] mod pe_platform;
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test,zluda_wine_oracles)))] mod pe_platform;
 #[cfg(any(windows, all(test,zluda_wine_oracles)))] mod pe_sync;
-#[cfg(any(windows, all(test,zluda_wine_oracles)))] mod pe_luid;
+#[cfg(any(all(windows, target_arch = "x86_64"), all(test,zluda_wine_oracles)))] mod pe_luid;
 #[cfg(any(all(windows, target_arch = "x86_64"), all(test,zluda_wine_oracles)))] mod pe_external;
 #[cfg(any(all(windows, target_arch = "x86_64"), all(test,zluda_wine_oracles)))] mod d3d11;
 #[cfg(any(all(windows, target_arch = "x86_64"), all(test,zluda_wine_oracles)))] mod pe_interop;

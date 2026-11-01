@@ -43,17 +43,6 @@ forward!(cuInit(flags: u32) => C32_INIT [flags]);
 forward!(cuDriverGetVersion(out: *mut i32) => C32_VERSION [pointer(out)]);
 forward!(cuDeviceGetCount(out: *mut i32) => C32_DEVICE_COUNT [pointer(out)]);
 
-#[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
-pub unsafe extern "system" fn cuDeviceGetLuid(out: *mut c_char, node: *mut u32, device: i32) -> i32 {
-    if out.is_null() || node.is_null() { return INVALID; }
-    let mut uuid = crate::cuda::CUuuid { bytes: [0; 16] };
-    let mut fake = 0u32;
-    let status = call(C32_DEVICE_UUID, &[pointer(&mut uuid), device as u32, pointer(&mut fake)]);
-    if status != 0 { return status; }
-    match crate::pe_luid::translate(out, node, &uuid, fake != 0) {
-        Ok(()) => 0, Err(error) => error.0.get() as i32,
-    }
-}
 forward!(cuDeviceGet(out: *mut i32, ordinal: i32) => C32_DEVICE_GET [pointer(out), ordinal as u32]);
 forward!(cuDeviceGetName(out: *mut c_char, bytes: i32, dev: i32) => C32_DEVICE_NAME [pointer(out), bytes as u32, dev as u32]);
 forward!(cuDeviceGetProperties(out: *mut c_void, dev: i32) => C32_DEVICE_PROPERTIES [pointer(out), dev as u32]);
@@ -102,6 +91,8 @@ extern "system" {
 }
 #[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
 pub unsafe extern "system" fn cuDeviceGetAttribute(out: *mut i32, attr: i32, dev: i32) -> i32 {
+    // PCI domain/bus/device (50/33/34) pass unchanged to the native CUDA
+    // attribute route; the native dispatcher preserves PE64 values/statuses.
     if attr != 0x20080402 { return call(C32_DEVICE_ATTR, &[pointer(out), attr as u32, dev as u32]); }
     if out.is_null() { return INVALID; }
     let mut count = 0;

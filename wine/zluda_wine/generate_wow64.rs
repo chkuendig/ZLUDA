@@ -10,7 +10,7 @@ pub fn generate(here:&Path,out:&Path,root:&Path)->String {
     let operations=fs::read_to_string(here.join("api/wow64-opcodes.tsv")).unwrap();
     let required=fs::read_to_string(here.join("api/wow64-required.txt")).unwrap();
     let ops:Vec<_>=operations.lines().filter(|s|!s.starts_with('#')).map(|s|{let (n,k)=s.split_once('\t').unwrap();let n:u32=n.parse().unwrap();let k=format_ident!("{k}");quote!(pub const #k:u32=#n;)}).collect();
-    assert_eq!(ops.len(),60);
+    assert_eq!(ops.len(),60); // 59 active operations and reserved ID 59.
     let symbols:Vec<_>=required.lines().filter(|s|!s.starts_with('#')).map(|n|syn::LitByteStr::new(format!("{n}\0").as_bytes(),format_ident!("_symbol").span())).collect();
     assert_eq!(symbols.len(),58);
     fs::write(out.join("wow64_contract.rs"),quote!(#(#ops)* pub const REQUIRED:&[&[u8]]=&[#(#symbols),*];).to_string()).unwrap();
@@ -40,9 +40,9 @@ pub fn generate(here:&Path,out:&Path,root:&Path)->String {
         if implemented.lines().any(|s|s==row[0]) {real.push(quote!(const _:*const ()=super::wow64_pe::#name as *const ();));}
         else {stubs.push(quote!(#[cfg_attr(all(windows,target_arch="x86"),no_mangle)] pub unsafe extern "system" fn #name(#(#args),*)->i32 {801}));}
     }
-    assert_eq!(real.len(),88);assert_eq!(stubs.len(),602);
+    assert_eq!(real.len(),87);assert_eq!(stubs.len(),603);
     fs::write(out.join("wow64_stubs.rs"),quote!(#[allow(unused_imports)] use crate::{cuda::*,legacy::*}; #(#checks)* #(#stubs)* #(#real)*).to_string()).unwrap();
-    // Include the packet/version and new-operation argument contract in the
+    // Include the packet/version and reserved-operation contract in the
     // shared PE/Unix schema, in addition to operation numbers and exports.
     let protocol_path=here.join("src/wow64_protocol.rs");
     println!("cargo:rerun-if-changed={}",protocol_path.display());

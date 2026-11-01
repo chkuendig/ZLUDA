@@ -86,6 +86,12 @@ class PEContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'directory extent'):
                     self.validate(arch,bytes(b))
 
+    def test_retired_luid_keeps_pe32_ordinal_and_cleanup(self):
+        import link_pe
+        self.assertIn(' cuDeviceGetLuid@12 @86',link_pe.definition('i686').splitlines())
+        implemented=(HERE/'api/pe32-implemented.txt').read_text().splitlines()
+        self.assertNotIn('cuDeviceGetLuid',implemented)
+
     def test_final_link_is_static_libgcc_and_exact_def_for_each_arch(self):
         archive=self.root/'Rust archive.a'; archive.write_bytes(b'fixture only')
         log=self.root/'native-libs.log'; log.write_text('note: native-static-libs: -lkernel32 -lntdll -lkernel32\n')

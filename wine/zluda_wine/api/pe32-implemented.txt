@@ -18,7 +18,6 @@ cuDeviceComputeCapability
 cuDeviceGet
 cuDeviceGetAttribute
 cuDeviceGetCount
-cuDeviceGetLuid
 cuDeviceGetName
 cuDeviceGetProperties
 cuDeviceTotalMem

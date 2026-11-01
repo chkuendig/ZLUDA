@@ -5,11 +5,10 @@
 include!(concat!(env!("OUT_DIR"), "/wow64_contract.rs"));
 include!(concat!(env!("OUT_DIR"), "/schema.rs"));
 pub const MAGIC: u64 = 0x32454e4957414443;
-pub const VERSION: u32 = 3;
-// Owner protocol extension rule: append operations and increment VERSION.
-// C32_DEVICE_UUID (59): args[0] = writable 16-byte CUuuid PE32 pointer;
-// args[1] = signed device low 32 bits; args[2] = writable u32 fake-mode PE32
-// pointer. Pointer words are zero-extended; CUDA status is Call32.result.
+pub const VERSION: u32 = 4;
+// Owner protocol rule: append new operations and bump VERSION for schema
+// changes. Retired IDs stay reserved forever. ID 59 (formerly C32_DEVICE_UUID)
+// is reserved and returns UNSUPPORTED without accessing its argument words.
 pub const HELLO: u32 = u32::MAX;
 pub const INVALID: i32 = 1;
 pub const OOM: i32 = 2;

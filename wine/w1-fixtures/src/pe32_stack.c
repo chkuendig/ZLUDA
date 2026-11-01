@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  *
- * W1.6 / plan §4.6 PE32 stack-balance fixture for the 24 corrected widths.
+ * W1.6 / plan §4.6 PE32 stack-balance fixture for 24 corrected widths and the retired LUID stub.
  *
  *   pe32_stack.exe [--expect correct|old]
  *
@@ -33,6 +33,7 @@ static CUipcMemHandle ipc_mem;
 static CUmemLocation location = {1, 0};
 
 /* typed callers: one per entry, public prototypes */
+typedef CUresult(CUDAAPI *T_Luid)(char *, unsigned int *, CUdevice);
 typedef CUresult(CUDAAPI *T_PPQ)(CUgraphExec *, CUgraph, unsigned long long);
 typedef CUresult(CUDAAPI *T_IpcEvent)(CUevent *, CUipcEventHandle);
 typedef CUresult(CUDAAPI *T_IpcMem)(CUdeviceptr *, CUipcMemHandle, unsigned int);
@@ -66,6 +67,7 @@ static __attribute__((noinline)) CUresult typed_call(const char *name, void *fn,
         ESP(after);                                                                                                \
         goto done;                                                                                                 \
     }
+    T("cuDeviceGetLuid", T_Luid, SP, SP, 0)
     T("cuGraphInstantiateWithFlags", T_PPQ, SP, NULL, 0ULL)
     T("cuIpcOpenEventHandle", T_IpcEvent, SP, ipc_event)
     T("cuIpcOpenMemHandle", T_IpcMem, SP, ipc_mem, 0)
