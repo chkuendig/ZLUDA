@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  *
- * The 24 PE32 CUDAAPI entries whose stdcall cleanup width was corrected
+ * The 24 corrected PE32 CUDAAPI widths plus the retired cuDeviceGetLuid stub.
+ * Historical-width controls keep cuDeviceGetLuid at its unchanged 12 bytes.
+ * Entries whose stdcall cleanup width was corrected
  * (evidence/zluda-wine-license-20261030/PE32-WIDTH-FINDING.md). Columns:
  * export name, correct argument bytes (i386 __stdcall of the public cuda.h
  * prototype), historical wrong bytes, and the argument shape:
@@ -33,4 +35,5 @@
     X(cuMemcpy3DBatchAsync_v2_ptsz, 20, 16, "SPQP")                    \
     X(cuMemcpy3DWithAttributesAsync, 16, 12, "PQP")                    \
     X(cuMemcpy3DWithAttributesAsync_ptsz, 16, 12, "PQP")               \
-    X(cuMulticastBindAddr_v2, 32, 36, "QSSSSQ")
+    X(cuMulticastBindAddr_v2, 32, 36, "QSSSSQ")                       \
+    X(cuDeviceGetLuid, 12, 12, "PPS")

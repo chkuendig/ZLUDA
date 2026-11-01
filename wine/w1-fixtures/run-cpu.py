@@ -16,12 +16,20 @@ Writes WORK/CPU-RESULT.json and exits 1 if any expectation is not met.
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
 BACKENDS = {'absent': '/nonexistent/w1/libcuda.so.1', 'bundled': None}
+STACK_CASES = [(name,int(correct),int(old)) for name,correct,old in re.findall(
+    r'X\((\w+),\s*(\d+),\s*(\d+),',
+    (Path(__file__).resolve().parent/'src/pe32_widths.h').read_text())]
+STACK_TOTAL = len(STACK_CASES)
+STACK_UNCHANGED = sum(correct==old for _,correct,old in STACK_CASES)
+assert STACK_TOTAL==25 and STACK_TOTAL-STACK_UNCHANGED==24
+
 
 
 def environment(tool, work, arch, root, enabled, backend):
@@ -115,11 +123,11 @@ def main():
                  {'W1_NVCUDA': 'w1stub_old.dll'})
     results += [good, old, detect]
     summary = lambda r: (events(r, 'summary') or [{}])[0]
-    expect('self-test: correct stub balanced 24/24', good['exit'] == 0 and summary(good).get('matched') == 24)
-    expect('self-test: old stub shows the exact historical displacement 24/24',
-           old['exit'] == 0 and summary(old).get('matched') == 24)
+    expect('self-test: correct stub balanced 25/25', good['exit'] == 0 and summary(good).get('matched') == STACK_TOTAL)
+    expect('self-test: 24 historical displacements and unchanged LUID cleanup',
+           old['exit'] == 0 and summary(old).get('matched') == STACK_TOTAL)
     expect('self-test: old stub FAILS the correct-width gate on all 24',
-           detect['exit'] == 1 and summary(detect).get('matched') == 0)
+           detect['exit'] == 1 and summary(detect).get('matched') == STACK_UNCHANGED)
     negative = {}
     for backend, path in BACKENDS.items():
         env = environment(a.tool, work, 'wow64', 'zluda', True, path)
@@ -132,7 +140,7 @@ def main():
     loaded = [b for b, v in negative.items() if v['loaded']]
     expect('negative control: 42b557a2 PE32 nvcuda loaded in at least one backend mode', loaded, negative)
     expect('negative control: 42b557a2 FAILS 24/24 with the exact historical displacement',
-           loaded and all(negative[b]['correct_matched'] == 0 and negative[b]['old_matched'] == 24 for b in loaded),
+           loaded and all(negative[b]['correct_matched'] == STACK_UNCHANGED and negative[b]['old_matched'] == STACK_TOTAL for b in loaded),
            negative)
 
     # 2. identity: off = GE empty stub; on = bridge surface (788 / 690 names)

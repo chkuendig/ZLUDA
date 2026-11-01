@@ -59,5 +59,6 @@
 56	C32_TEX_FILTER
 57	C32_TEX_ADDRESS_MODE
 58	C32_TEX_MIPMAP
-# Append-only extension; each new operation bumps the protocol version.
-59	C32_DEVICE_UUID
+# Append-only IDs: retired IDs remain reserved and must never be reused.
+# ID 59 was C32_DEVICE_UUID in version 3; retired in version 4.
+59	C32_RESERVED_59

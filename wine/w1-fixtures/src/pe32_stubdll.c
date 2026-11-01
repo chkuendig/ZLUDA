@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  *
  * Self-test oracle for pe32_stack.exe, not a CUDA implementation: exports the
- * 24 names as __stdcall functions returning 801, popping either the correct
+ * 25 names (24 corrected widths plus retired LUID) returning 801, popping
+ * either the correct
  * byte count (-DW1_STUB_CORRECT -> w1stub_correct.dll) or the historical
  * wrong count (-DW1_STUB_OLD -> w1stub_old.dll). Link with --kill-at so the
  * exports are undecorated like nvcuda's.

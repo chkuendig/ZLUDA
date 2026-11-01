@@ -8,6 +8,7 @@ use std::{ffi::{c_char, c_void, CStr, CString}, sync::{Mutex, OnceLock}};
 #[path = "wow64_modules.rs"] mod modules;
 #[path = "wow64_ops.rs"] mod ops;
 #[cfg(all(test,zluda_wine_oracles))] #[path = "wow64_fixtures.rs"] mod fixtures;
+#[cfg(test)] #[path = "../tests/pci_parity.rs"] mod pci_tests;
 const POOL_BYTES: u32 = 512 * 1024 * 1024;
 const MAX_HANDLES: usize = 2048;
 const MAX_ALLOCS: usize = 256;
@@ -286,20 +287,18 @@ impl State {
     }
 }
 
-// This context-independent request uses the exact PE64 UUID/fake-mode path.
-// It deliberately does not enter State::prepare or acquire the bounded-state
-// mutex: missing unrelated symbols or a current context must not alter LUID.
-unsafe fn device_uuid(a: &[u32; 16]) -> Answer {
-    if a[0] == 0 || a[2] == 0 { return Err(INVALID); }
-    let mut request = unixlib::Call::new(crate::luid_protocol::UUID);
+// PCI identifiers use the same native Call dispatch as PE64, without the
+// unrelated bounded-symbol preflight, state mutex or current-context lookup.
+// In particular, let CUDA decide null-output/device/initialization errors.
+unsafe fn pci_attribute(a: &[u32; 16]) -> i32 {
+    let mut request = unixlib::Call::new(unixlib::function_id("cuDeviceGetAttribute"));
     request.args[0] = u64::from(a[0]);
-    request.args[1] = u64::from(a[1]); // CUdevice consumes its signed low 32 bits.
+    request.args[1] = u64::from(a[1]);
+    request.args[2] = u64::from(a[2]);
     if crate::unix_wrappers::dispatch((&mut request as *mut unixlib::Call).cast()) != 0 {
-        return Err(3); // Same transport failure mapping as PE64.
+        return 3; // Same transport failure mapping as PE64.
     }
-    if request.result != 0 { return Err(request.result as i32); }
-    write32(a[2], request.args[2] as u32);
-    Ok(())
+    request.result as i32
 }
 
 unsafe extern "C" fn dispatch32(pointer: *mut c_void) -> i32 {
@@ -312,8 +311,10 @@ unsafe extern "C" fn dispatch32(pointer: *mut c_void) -> i32 {
     let call = &mut *pointer.cast::<Call32>();
     if !call.valid() { return BAD; }
     if call.opcode == HELLO { call.result = 0; return 0; } // No backend or HIP load.
-    if call.opcode == C32_DEVICE_UUID {
-        call.result = device_uuid(&call.args).err().unwrap_or(0);
+    // The retired operation is a tombstone, never a UUID or native request.
+    if call.opcode == C32_RESERVED_59 { call.result = UNSUPPORTED; return 0; }
+    if call.opcode == C32_DEVICE_ATTR && matches!(call.args[1], 50 | 33 | 34) {
+        call.result = pci_attribute(&call.args);
         return 0;
     }
     if !crate::unix_wrappers::enabled() { call.result = UNSUPPORTED; return 0; }
