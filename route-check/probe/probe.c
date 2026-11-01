@@ -48,6 +48,8 @@ static CUresult (API *p_cuMemcpyDtoHAsync_v2)(void *, CUdeviceptr, size_t, CUstr
 static CUresult (API *p_cuLaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                                         unsigned, CUstream, void **, void **);
 
+/* Self-written empty kernel, only to exercise cuModuleLoadData through the
+   route; not taken from any game or NVIDIA tool. */
 static const char ptx[] =
     ".version 6.0\n.target sm_60\n.address_size 32\n"
     ".global .align 4 .b8 g_stub[16];\n"
