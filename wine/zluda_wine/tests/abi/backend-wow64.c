@@ -141,7 +141,8 @@ int hipHostRegister(void *memory,size_t bytes,unsigned flags)
 {
     if (flags!=3) {audit("BAD-host-register-flags");return 1;}
     int rc=fixture_inner_hipHostRegister(memory,bytes,flags);
-    if (!rc) audit("mapped-host-register");return rc;
+    if (!rc) audit("mapped-host-register");
+    return rc;
 }
 int hipHostUnregister(void *memory)
 { int rc=fixture_inner_hipHostUnregister(memory);if (!rc) audit("host-unregister");return rc; }
