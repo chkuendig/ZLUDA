@@ -153,6 +153,10 @@ static HEAP_TABLE: Table<3> = Table([size_word(3), heap_alloc as *const c_void, 
 
 #[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
 pub unsafe extern "system" fn cuGetExportTable(out: *mut *const c_void, uuid: *const u8) -> i32 {
+    let first = if uuid.is_null() { 0 } else { std::ptr::read_unaligned(uuid.cast::<u32>()) };
+    traced("cuGetExportTable", &[pointer(out), first], || export_table(out, uuid))
+}
+unsafe fn export_table(out: *mut *const c_void, uuid: *const u8) -> i32 {
     if out.is_null() || uuid.is_null() { return INVALID; }
     *out = std::ptr::null();
     let uuid = std::ptr::read_unaligned(uuid.cast::<[u8; 16]>());

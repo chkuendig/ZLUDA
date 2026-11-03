@@ -6,13 +6,17 @@ cuCtxDestroy
 cuCtxDestroy_v2
 cuCtxDetach
 cuCtxGetApiVersion
+cuCtxGetCacheConfig
 cuCtxGetCurrent
 cuCtxGetDevice
+cuCtxGetSharedMemConfig
 cuCtxPopCurrent
 cuCtxPopCurrent_v2
 cuCtxPushCurrent
 cuCtxPushCurrent_v2
+cuCtxSetCacheConfig
 cuCtxSetCurrent
+cuCtxSetSharedMemConfig
 cuCtxSynchronize
 cuDeviceComputeCapability
 cuDeviceGet
@@ -30,6 +34,8 @@ cuEventElapsedTime
 cuEventQuery
 cuEventRecord
 cuEventSynchronize
+cuFuncSetCacheConfig
+cuFuncSetSharedMemConfig
 cuGetExportTable
 cuInit
 cuLaunchKernel
