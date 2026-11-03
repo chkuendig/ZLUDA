@@ -1,7 +1,7 @@
 [submodule "ext/llvm-project"]
 	path = ext/llvm-project
 	url = https://github.com/chkuendig/llvm-project
-	branch = v7-preview.15-proton
+	branch = rebase/v7p20-smem-20261103
 
 [submodule "ext/HiGHS"]
 	path = ext/HiGHS

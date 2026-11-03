@@ -3,6 +3,7 @@
 @counter = addrspace(1) externally_initialized global i32 0, align 4
 @llvm.used = appending global [2 x ptr] [ptr addrspacecast (ptr addrspace(1) @params to ptr), ptr addrspacecast (ptr addrspace(1) @unused_by_kernels to ptr)], section "llvm.metadata"
 
+; Function Attrs: denormal_fpenv(preservesign)
 define amdgpu_kernel void @global_const_uninit(ptr addrspace(4) byref(i64) %"43") #0 {
   %"44" = alloca i64, align 8, addrspace(5)
   %"45" = alloca i32, align 4, addrspace(5)
@@ -30,4 +31,4 @@ define amdgpu_kernel void @global_const_uninit(ptr addrspace(4) byref(i64) %"43"
   ret void
 }
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #0 = { denormal_fpenv(preservesign) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
