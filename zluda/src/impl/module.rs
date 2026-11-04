@@ -1,6 +1,6 @@
 use super::driver;
 use crate::r#impl::{driver::GlobalState, function::Function};
-use crate::r#impl::{function, surf};
+use crate::r#impl::{function, surf, tex};
 use cuda_types::{cuda::*, dark_api::FatbinFileHeader};
 use dark_api::FunctionArgInfo;
 use hip_runtime_sys::*;
@@ -25,6 +25,10 @@ pub(crate) struct Module {
 struct ModuleMutable {
     functions: FxHashMap<CString, Box<Function>>,
     surfrefs: FxHashMap<CString, Box<surf::SurfRefData>>,
+    // HIP returns a new texref on every lookup, CUDA the same one. A second
+    // texref would publish to the same module global behind the first one's
+    // back.
+    texrefs: FxHashMap<CString, usize>,
 }
 
 impl ModuleMutable {
@@ -42,6 +46,7 @@ impl ModuleMutable {
                 unsafe { hipModuleGetFunction(&mut func_handle, module, entry.key().as_ptr()) }?;
                 let func = Box::new(Function {
                     base: func_handle,
+                    module,
                     sm_version,
                     explicit_args_size_align,
                 });
@@ -58,8 +63,19 @@ impl ZludaObject for Module {
     type CudaHandle = CUmodule;
 
     fn drop_checked(&mut self) -> CUresult {
+        let mutable = self
+            .mutable
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let texrefs = mutable.texrefs.values().map(|texref| *texref as *mut textureReference);
+        let surfrefs = mutable.surfrefs.values().map(|surfref| surfref.base);
+        let forgotten = texrefs
+            .chain(surfrefs)
+            .map(|texref| unsafe { tex::forget(texref) })
+            .fold(Ok(()), Result::and)
+            .and(unsafe { tex::unregister_module(self.base) });
         unsafe { hipModuleUnload(self.base) }?;
-        Ok(())
+        Ok(forgotten?)
     }
 }
 
@@ -146,6 +162,7 @@ impl Module {
             mutable: Mutex::new(ModuleMutable {
                 functions: FxHashMap::default(),
                 surfrefs: FxHashMap::default(),
+                texrefs: FxHashMap::default(),
             }),
             bit32,
         }
@@ -273,8 +290,10 @@ fn cow_bytes_to_str<'a>(data: Cow<'a, [u8]>) -> Option<Cow<'a, str>> {
 pub(crate) fn load_hip_module(
     library: CodeLibraryRef,
 ) -> Result<(hipModule_t, u32, Option<Metadata32Bit>), CUerror> {
+    // Resolve lazy initialization first: it takes the same signal-state lock.
     let global_state = driver::global_state()?;
-    get_best_ptx_and_compile(global_state, library)
+    // LLVM and comgr may replace the caller's alternate signal stack.
+    super::signal::with_preserved_state(|| get_best_ptx_and_compile(global_state, library))
 }
 
 #[derive(serde::Serialize)]
@@ -431,7 +450,20 @@ pub(crate) unsafe fn get_tex_ref(
     hmod: &Module,
     name: *const ::core::ffi::c_char,
 ) -> hipError_t {
-    hipModuleGetTexRef(texref, hmod.base, name)
+    if texref.is_null() || name.is_null() {
+        return hipModuleGetTexRef(texref, hmod.base, name);
+    }
+    let name = CStr::from_ptr(name).to_owned();
+    let mut module_mutable = hmod.mutable.lock().map_err(|_| hipErrorCode_t::Unknown)?;
+    *texref = match module_mutable.texrefs.entry(name) {
+        hash_map::Entry::Occupied(entry) => *entry.get() as *mut textureReference,
+        hash_map::Entry::Vacant(entry) => {
+            hipModuleGetTexRef(texref, hmod.base, entry.key().as_ptr())?;
+            tex::register(*texref, hmod.base, entry.key());
+            *entry.insert(*texref as usize) as *mut textureReference
+        }
+    };
+    Ok(())
 }
 
 pub(crate) unsafe fn get_surf_ref(

@@ -17,6 +17,9 @@ pub(crate) struct Context {
 
 pub(crate) struct ContextState {
     pub(crate) ref_count: u32,
+    pub(crate) primary_active: bool,
+    pub(crate) runtime_owned: bool,
+    pub(crate) flags_configured: bool,
     pub(crate) flags: u32,
     pub(crate) modules: FxHashSet<CUmodule>,
     pub(crate) storage: FxHashMap<usize, StorageData>,
@@ -34,6 +37,9 @@ impl ContextState {
     pub(crate) fn new() -> Self {
         ContextState {
             ref_count: 0,
+            primary_active: false,
+            runtime_owned: false,
+            flags_configured: false,
             flags: 0,
             modules: FxHashSet::default(),
             storage: FxHashMap::default(),
@@ -41,6 +47,14 @@ impl ContextState {
     }
 
     pub(crate) fn reset(&mut self) -> CUresult {
+        self.reset_resources(false)
+    }
+
+    pub(crate) fn reset_for_runtime(&mut self) -> CUresult {
+        self.reset_resources(true)
+    }
+
+    fn reset_resources(&mut self, preserve_retains: bool) -> CUresult {
         for (key, data) in self.storage.iter_mut() {
             if let Some(_cb) = data.reset_cb {
                 // TODO: check that these callbacks do not call into the CUDA driver
@@ -48,7 +62,12 @@ impl ContextState {
                 _cb(data.handle, *key as *mut c_void, data.value as *mut c_void);
             }
         }
-        self.ref_count = 0;
+        if !preserve_retains {
+            self.ref_count = 0;
+        }
+        self.primary_active = false;
+        self.runtime_owned = false;
+        self.flags_configured = false;
         self.flags = 0;
         // drop all modules and return first error if any
         let result = self.modules.drain().fold(Ok(()), |res: CUresult, hmod| {
@@ -65,8 +84,18 @@ impl ContextState {
 
 impl Context {
     pub(crate) fn new(device: hipDevice_t) -> Result<Self, CUerror> {
-        let mut alloc_stream = unsafe { std::mem::zeroed() };
-        unsafe { hipStreamCreateWithFlags(&mut alloc_stream, hipStreamNonBlocking) }?;
+        // The first stream on a device builds HIP's blit kernels through comgr,
+        // which replaces the calling thread's alternate signal stack. Select
+        // the device so initialization warms every device's blit program.
+        let alloc_stream = super::signal::with_preserved_state(|| {
+            let mut previous_device = 0;
+            unsafe { hipGetDevice(&mut previous_device) }?;
+            unsafe { hipSetDevice(device) }?;
+            let _restore_device = SetDeviceOnDrop(previous_device);
+            let mut alloc_stream = unsafe { std::mem::zeroed() };
+            unsafe { hipStreamCreateWithFlags(&mut alloc_stream, hipStreamNonBlocking) }?;
+            Ok(alloc_stream)
+        })?;
         Ok(Self {
             device,
             alloc_stream,
@@ -144,7 +173,14 @@ pub(crate) fn get_current_context() -> Result<CUcontext, CUerror> {
     if let Some(ctx) = STACK.with(|stack| stack.borrow().last().copied().map(|(ctx, _)| ctx)) {
         return Ok(ctx);
     }
-    Err(CUerror::INVALID_CONTEXT)
+    // PhysX/APEX query the current context on threads that never set one,
+    // after their probe contexts are gone, and pass the result to Wine's
+    // nvcuda ContextStorage, which dereferences NULL. Fall back to device 0's
+    // primary context.
+    match super::device::get_primary_context(0) {
+        Ok((_, cu_ctx)) => Ok(cu_ctx),
+        Err(_) => Err(CUerror::INVALID_CONTEXT),
+    }
 }
 
 pub(crate) unsafe fn get_limit(pvalue: *mut usize, limit: hipLimit_t) -> hipError_t {
@@ -167,7 +203,7 @@ pub(crate) fn set_cache_config(config: CUfunc_cache) -> CUresult {
 }
 
 pub(crate) fn synchronize() -> hipError_t {
-    unsafe { hipDeviceSynchronize() }
+    unsafe { super::tex::synchronize_device() }
 }
 
 pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {
@@ -179,7 +215,7 @@ pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {
     } else {
         None
     };
-    unsafe { hipDeviceSynchronize() }
+    unsafe { super::tex::synchronize_device() }
 }
 
 struct SetDeviceOnDrop(i32);
@@ -302,8 +338,10 @@ pub(crate) unsafe fn create_v4(
     create_v2(ctx, flags, dev)
 }
 
-pub(crate) unsafe fn destroy_v2(ctx: CUcontext) -> CUresult {
-    zluda_common::drop_checked::<Context>(ctx)
+pub(crate) unsafe fn destroy_v2(_ctx: CUcontext) -> CUresult {
+    // Keep the context alive and current: Wine's nvcuda ContextStorage keeps
+    // using the context PhysX creates through the dark API and then destroys.
+    Ok(())
 }
 
 pub(crate) unsafe fn pop_current_v2(ctx: Option<&mut CUcontext>) -> CUresult {

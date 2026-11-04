@@ -42,6 +42,8 @@ pub const LLVMZludaFastMathAll: ::std::ffi::c_uint = LLVMZludaFastMathAllowReass
 pub type LLVMZludaFastMathFlags = std::ffi::c_uint;
 
 extern "C" {
+    pub fn LLVMZludaInlineImageWrappers(module: LLVMModuleRef) -> u32;
+
     pub fn LLVMZludaBuildAlloca(
         B: LLVMBuilderRef,
         Ty: LLVMTypeRef,

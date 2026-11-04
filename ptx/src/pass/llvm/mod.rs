@@ -58,7 +58,9 @@ fn get_state_space(space: ast::StateSpace) -> Result<u32, TranslateError> {
         ast::StateSpace::ParamFunc => Err(error_todo()),
         ast::StateSpace::Local => Ok(PRIVATE_ADDRESS_SPACE),
         ast::StateSpace::Global => Ok(GLOBAL_ADDRESS_SPACE),
-        ast::StateSpace::Const => Ok(CONSTANT_ADDRESS_SPACE),
+        // CUDA .const memory is device memory that the host writes with
+        // cuMemcpyHtoD. HIP rejects copies into an addrspace(4) global.
+        ast::StateSpace::Const => Ok(GLOBAL_ADDRESS_SPACE),
         ast::StateSpace::Shared => Ok(SHARED_ADDRESS_SPACE),
         ast::StateSpace::SharedCta => Err(error_todo()),
         ast::StateSpace::SharedCluster => Err(error_todo()),

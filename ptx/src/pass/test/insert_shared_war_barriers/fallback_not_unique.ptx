@@ -1,0 +1,38 @@
+// Two blocks, each with its own barrier, leave a volatile store into the same buffer
+// pending, and both branch to a block without a barrier that stores into that buffer.
+// No single block end lies between the store and both volatile stores, so the pass must
+// not insert anything.
+.version 6.5
+.target sm_30
+.address_size 64
+
+.shared .align 4 .b8 buf[1024];
+
+.visible .entry fallback_not_unique(
+	.param .u32 tid_in,
+	.param .u32 sel
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .b32 	%r<8>;
+	.reg .b64 	%rd<8>;
+
+	ld.param.u32 	%r1, [tid_in];
+	ld.param.u32 	%r2, [sel];
+	mov.u64 	%rd1, buf;
+	mul.wide.u32 	%rd2, %r1, 4;
+	add.s64 	%rd3, %rd1, %rd2;
+	setp.eq.u32 	%p1, %r2, 0;
+	@%p1 bra 	BB_RIGHT;
+	bar.sync 	0;
+	mov.u32 	%r3, 0;
+	st.volatile.shared.u32 	[%rd3], %r3;
+	bra.uni 	BB_JOIN;
+BB_RIGHT:
+	bar.sync 	0;
+	mov.u32 	%r4, 1;
+	st.volatile.shared.u32 	[%rd3+128], %r4;
+BB_JOIN:
+	st.shared.u32 	[%rd3+4], %r1;
+	ret;
+}
