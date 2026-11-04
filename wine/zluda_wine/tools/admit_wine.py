@@ -14,7 +14,8 @@ def main():
     if len(expected) != 64 or hashlib.sha256(raw).hexdigest() != expected:
         raise ValueError('reviewer receipt digest must be explicitly pinned')
     r = json.loads(raw)
-    if r['contract'] != 'zluda-wine-prepared-abi-2' or r['wine_pin'] != '46b29104e3741fe23bf5e2547196a253aab88c89':
+    providers = json.loads(Path(__file__).with_name('wine-providers.json').read_text())
+    if r['contract'] != 'zluda-wine-prepared-abi-2' or r['wine_pin'] not in providers['wine_pins']:
         raise ValueError('wrong prepared-Wine contract')
     for flag in ['callback_id_zero', 'same_thread_destructor', 'process_exit', 'thread_exit',
                  'loader_lock_refusal', 'locally_scoped_strong_provider', 'eager_binding']:

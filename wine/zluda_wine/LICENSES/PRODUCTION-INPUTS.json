@@ -60,13 +60,14 @@
     "wine/zluda_wine/src/wow64_protocol.rs": "f4e9608a16b9564a99bfe4cffafcdcbbfac16271921310bf39aa21ad1d2f4726",
     "wine/zluda_wine/src/wow64_trace.rs": "f96de0275c8fe7ee100b73990b3f07356c82c1a62800e86321b807c7aca161e1",
     "wine/zluda_wine/src/wow64_unix.rs": "82f01b91ba6926fb4c1c99ff6debb5a66364567594df696ee2ccc5066426c475",
-    "wine/zluda_wine/tools/admit_wine.py": "1554efce995be1dfbaecef93f120018a920790a1889983687886d927a095c886",
+    "wine/zluda_wine/tools/admit_wine.py": "65f1f28781165702589b3409eba4cd30bb90f3e6d879b169d2920a2dc4d6831f",
     "wine/zluda_wine/tools/import_native_dark.py": "41c89bc5e06aa3926dc4bd8bb2a27a4d0dcacce2c8f865babcec97e44720398a",
     "wine/zluda_wine/tools/link_pe.py": "575f6566fa858541f22a0ad36d4eaf31c09fc6790db6a2d9a0bc9c0afdf01871",
     "wine/zluda_wine/tools/pe_artifact.py": "f1ae488fc963498ceb397b0a8c48d5fb1942882ffd0fccf35539690a03d1daf2",
     "wine/zluda_wine/wine_adapter.c": "979e5dc979f360dfaa5ee086e17608cb20bc4f809f1fdf75d91ee9545809837f",
     "zluda/src/impl/mod.rs": "4b83a64de2a74ae2e98c8357813aca71f7436c72a9ecd871aa6e4d2baa97ca7e",
-    "zluda/src/lib.rs": "de960078b0d9a99022fe64f635765057368471708445fac6b8c559e9a941aa23"
+    "zluda/src/lib.rs": "de960078b0d9a99022fe64f635765057368471708445fac6b8c559e9a941aa23",
+    "wine/zluda_wine/tools/wine-providers.json": "4b38042edd0843ac99ff787385634c2cd6fcb80236a1b1bed1366ec17097c6fa"
   },
   "project_license": "MIT OR Apache-2.0",
   "retained_mit_notice": {
