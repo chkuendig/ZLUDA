@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+/target/
+/wine/zluda_wine/target/
