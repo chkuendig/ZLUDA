@@ -1,0 +1,17 @@
+{
+  "format": "zluda-wine-dark-source-design-1",
+  "scope": "Native declaration metadata only; no supported PE table or trampoline is implemented",
+  "tables": [
+    {"name": "CUDART_INTERFACE", "uuid": "6BD5FB6C-5BF4-E74A-8987-D93912FD9DF9", "native_words": 13, "size_slot": 0},
+    {"name": "TOOLS_TLS", "uuid": "42D85A81-23F6-CB47-8298-F6E78A3AECDC", "native_words": 4, "size_slot": 0},
+    {"name": "TOOLS_RUNTIME_CALLBACK_HOOKS", "uuid": "A094798C-2E74-2E74-93F2-0800200C0A66", "native_words": 7, "size_slot": 0},
+    {"name": "CONTEXT_LOCAL_STORAGE_INTERFACE_V0301", "uuid": "C693336E-1121-DF11-A8C3-68F355D89593", "native_words": 4, "size_slot": null, "c_windows_reference": "Three function-pointer members: Set, Remove, Get; no size header"},
+    {"name": "CTX_CREATE_BYPASS", "uuid": "0CA50B8C-1004-929A-89A7-D0DF10E77286", "native_words": 2, "size_slot": 0},
+    {"name": "HEAP_ACCESS", "uuid": "195BCBF4-D67D-024A-ACC5-1D29CEA631AE", "native_words": 3, "size_slot": 0},
+    {"name": "DEVICE_EXTENDED_RT", "uuid": "B10541E1-F7C7-C74A-9F64-F223BE99F1E2", "native_words": 26, "size_slot": 0},
+    {"name": "INTEGRITY_CHECK", "uuid": "D4082055-BDE6-704B-8D34-BA123C66E1F2", "native_words": 3, "size_slot": 0},
+    {"name": "CONTEXT_CHECKS", "uuid": "263E8860-7CD2-6143-92F6-BBD5006DFA7E", "native_words": 4, "size_slot": 0},
+    {"name": "HYBRID_CUDART", "uuid": "DD9E98A4-F410-4844-99B0-E2AEB7B432B5", "native_words": 3, "size_slot": 0},
+    {"name": "ZLUDA32_INTERNAL", "uuid": "EE376A1B-B858-42EB-A52D-9A106D50D914", "native_words": 2, "size_slot": null}
+  ]
+}
