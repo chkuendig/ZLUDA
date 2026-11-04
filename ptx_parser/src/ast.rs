@@ -1461,6 +1461,9 @@ impl ScalarType {
     }
 
     pub fn bit_size(self) -> u8 {
+        if matches!(self, ScalarType::Pred) {
+            return 1;
+        }
         self.layout().size() as u8 * 8u8
     }
 
@@ -1618,7 +1621,7 @@ pub struct ShfDetails {
     pub direction: ShiftDirection,
     pub mode: FunnelShiftMode,
 }
-#[cfg_attr(any(debug_assertions, test), derive(PartialEq))]
+#[cfg_attr(debug_assertions, derive(PartialEq))]
 #[derive(Clone, Copy, Display, Debug)]
 pub enum RegOrImmediate<Ident> {
     Reg(Ident),
@@ -1695,7 +1698,7 @@ pub trait Operand: Sized {
     fn from_ident(ident: Self::Ident) -> Self;
 }
 
-#[cfg_attr(any(debug_assertions, test), derive(PartialEq))]
+#[cfg_attr(debug_assertions, derive(PartialEq))]
 #[derive(Copy, Clone, Debug)]
 pub enum ImmediateValue {
     U64(u64),

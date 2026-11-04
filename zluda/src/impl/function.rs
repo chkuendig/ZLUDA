@@ -1,4 +1,4 @@
-use crate::r#impl::{driver, tex};
+use crate::r#impl::driver;
 use cuda_types::cuda::{CUerror, CUfunction, CUfunction_attribute, CUkernel};
 use dark_api::FunctionArgInfo;
 use hip_runtime_sys::*;
@@ -6,7 +6,6 @@ use std::mem;
 
 pub(crate) struct Function {
     pub(crate) base: hipFunction_t,
-    pub(crate) module: hipModule_t,
     pub(crate) sm_version: u32,
     pub(crate) explicit_args_size_align: Option<Vec<FunctionArgInfo>>,
 }
@@ -105,40 +104,36 @@ pub(crate) unsafe fn launch_kernel(
                     *size,
                     HIP_LAUNCH_PARAM_END,
                 ];
-                tex::launch(f.module, stream, || {
-                    hipModuleLaunchKernel(
-                        f.base,
-                        grid_dim_x,
-                        grid_dim_y,
-                        grid_dim_z,
-                        block_dim_x,
-                        block_dim_y,
-                        block_dim_z,
-                        shared_mem_bytes,
-                        stream,
-                        kernel_params,
-                        hip_extra.as_mut_ptr().cast(),
-                    )
-                })
+                hipModuleLaunchKernel(
+                    f.base,
+                    grid_dim_x,
+                    grid_dim_y,
+                    grid_dim_z,
+                    block_dim_x,
+                    block_dim_y,
+                    block_dim_z,
+                    shared_mem_bytes,
+                    stream,
+                    kernel_params,
+                    hip_extra.as_mut_ptr().cast(),
+                )
             }
             _ => hipError_t::ErrorInvalidValue,
         }
     } else {
-        tex::launch(f.module, stream, || {
-            hipModuleLaunchKernel(
-                f.base,
-                grid_dim_x,
-                grid_dim_y,
-                grid_dim_z,
-                block_dim_x,
-                block_dim_y,
-                block_dim_z,
-                shared_mem_bytes,
-                stream,
-                kernel_params,
-                extra,
-            )
-        })
+        hipModuleLaunchKernel(
+            f.base,
+            grid_dim_x,
+            grid_dim_y,
+            grid_dim_z,
+            block_dim_x,
+            block_dim_y,
+            block_dim_z,
+            shared_mem_bytes,
+            stream,
+            kernel_params,
+            extra,
+        )
     }
 }
 

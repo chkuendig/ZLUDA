@@ -77,5 +77,5 @@ pub(crate) unsafe fn instantiate_with_flags(
 }
 
 pub(crate) unsafe fn launch(graph_exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t {
-    super::tex::launch_graph(stream, || hipGraphLaunch(graph_exec, stream))
+    hipGraphLaunch(graph_exec, stream)
 }

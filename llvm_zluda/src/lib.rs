@@ -9,6 +9,3 @@ pub mod utils;
 pub use ffi::*;
 
 pub use compile::compile;
-
-#[cfg(test)]
-mod image_wrappers_test;

@@ -1,7 +1,7 @@
 use std::env::VarError;
 
 fn main() -> Result<(), VarError> {
-    if !cfg!(windows) && std::path::Path::new("/opt/rocm/lib").exists() {
+    if !cfg!(windows) {
         println!("cargo:rustc-link-lib=dylib=rocsparse");
         println!("cargo:rustc-link-search=native=/opt/rocm/lib/");
     }
