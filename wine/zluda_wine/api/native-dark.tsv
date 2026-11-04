@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Canonical dark_api/src/lib.rs SHA256 69d27adc2465e27b0cb31d5e67306899ad2f3f4fa2a3d53b76cc49f022afb2dc
+# uuid-raw-hex	table	native-words	slot	entry	Rust-signature	source-line
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	0	SIZE_OF	-	227
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	1	get_module_from_cubin	fn get_module_from_cubin(module: *mut cuda_types::cuda::CUmodule, fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper) -> cuda_types::cuda::CUresult	228
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	2	cudart_interface_fn2	fn cudart_interface_fn2(pctx: *mut cuda_types::cuda::CUcontext, dev: cuda_types::cuda::CUdevice) -> cuda_types::cuda::CUresult	232
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	3	NULL	-	0
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	4	primary_ctx_retain_with_flags	fn primary_ctx_retain_with_flags(dev: cuda_types::cuda::CUdevice, flags: u32) -> cuda_types::cuda::CUresult	236
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	5	primary_ctx_reset	fn primary_ctx_reset(dev: cuda_types::cuda::CUdevice) -> cuda_types::cuda::CUresult	240
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	6	get_module_from_cubin_ext1	fn get_module_from_cubin_ext1(result: *mut cuda_types::cuda::CUmodule, fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper, arg3: *mut std::ffi::c_void, arg4: *mut std::ffi::c_void, arg5: u32) -> cuda_types::cuda::CUresult	241
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	7	cudart_interface_fn7	fn cudart_interface_fn7(arg1: usize) -> ()	248
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	8	get_module_from_cubin_ext2	fn get_module_from_cubin_ext2(fatbin_header: *const cuda_types::dark_api::FatbinHeader, result: *mut cuda_types::cuda::CUmodule, arg3: *mut std::ffi::c_void, arg4: *mut std::ffi::c_void, arg5: u32) -> cuda_types::cuda::CUresult	249
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	9	NULL	-	0
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	10	NULL	-	0
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	11	NULL	-	0
+6bd5fb6c5bf4e74a8987d93912fd9df9	CUDART_INTERFACE	13	12	load_compilers	fn load_compilers() -> cuda_types::cuda::CUresult	257
+42d85a8123f6cb478298f6e78a3aecdc	TOOLS_TLS	4	0	SIZE_OF	-	260
+42d85a8123f6cb478298f6e78a3aecdc	TOOLS_TLS	4	1	NULL	-	0
+42d85a8123f6cb478298f6e78a3aecdc	TOOLS_TLS	4	2	NULL	-	0
+42d85a8123f6cb478298f6e78a3aecdc	TOOLS_TLS	4	3	NULL	-	0
+a094798c2e742e7493f20800200c0a66	TOOLS_RUNTIME_CALLBACK_HOOKS	7	0	SIZE_OF	-	263
+a094798c2e742e7493f20800200c0a66	TOOLS_RUNTIME_CALLBACK_HOOKS	7	1	NULL	-	0
+a094798c2e742e7493f20800200c0a66	TOOLS_RUNTIME_CALLBACK_HOOKS	7	2	get_unknown_buffer1	fn get_unknown_buffer1(ptr: *mut *mut std::ffi::c_void, size: *mut usize) -> ()	264
+a094798c2e742e7493f20800200c0a66	TOOLS_RUNTIME_CALLBACK_HOOKS	7	3	NULL	-	0
+a094798c2e742e7493f20800200c0a66	TOOLS_RUNTIME_CALLBACK_HOOKS	7	4	NULL	-	0
+a094798c2e742e7493f20800200c0a66	TOOLS_RUNTIME_CALLBACK_HOOKS	7	5	NULL	-	0
+a094798c2e742e7493f20800200c0a66	TOOLS_RUNTIME_CALLBACK_HOOKS	7	6	get_unknown_buffer2	fn get_unknown_buffer2(ptr: *mut *mut std::ffi::c_void, size: *mut usize) -> ()	265
+c693336e1121df11a8c368f355d89593	CONTEXT_LOCAL_STORAGE_INTERFACE_V0301	4	0	context_local_storage_put	fn context_local_storage_put(context: cuda_types::cuda::CUcontext, key: *mut std::ffi::c_void, value: *mut std::ffi::c_void, dtor_cb: Option<extern "system" fn( cuda_types::cuda::CUcontext, *mut std::ffi::c_void, *mut std::ffi::c_void, )>) -> cuda_types::cuda::CUresult	268
+c693336e1121df11a8c368f355d89593	CONTEXT_LOCAL_STORAGE_INTERFACE_V0301	4	1	context_local_storage_delete	fn context_local_storage_delete(context: cuda_types::cuda::CUcontext, key: *mut std::ffi::c_void) -> cuda_types::cuda::CUresult	279
+c693336e1121df11a8c368f355d89593	CONTEXT_LOCAL_STORAGE_INTERFACE_V0301	4	2	context_local_storage_get	fn context_local_storage_get(value: *mut *mut std::ffi::c_void, cu_ctx: cuda_types::cuda::CUcontext, key: *mut std::ffi::c_void) -> cuda_types::cuda::CUresult	283
+c693336e1121df11a8c368f355d89593	CONTEXT_LOCAL_STORAGE_INTERFACE_V0301	4	3	NULL	-	0
+0ca50b8c1004929a89a7d0df10e77286	CTX_CREATE_BYPASS	2	0	SIZE_OF	-	290
+0ca50b8c1004929a89a7d0df10e77286	CTX_CREATE_BYPASS	2	1	ctx_create_v2_bypass	fn ctx_create_v2_bypass(pctx: *mut cuda_types::cuda::CUcontext, flags: ::std::os::raw::c_uint, dev: cuda_types::cuda::CUdevice) -> cuda_types::cuda::CUresult	291
+195bcbf4d67d024aacc51d29cea631ae	HEAP_ACCESS	3	0	SIZE_OF	-	298
+195bcbf4d67d024aacc51d29cea631ae	HEAP_ACCESS	3	1	heap_alloc	fn heap_alloc(heap_alloc_record_ptr: *mut *const std::ffi::c_void, arg2: usize, arg3: usize) -> cuda_types::cuda::CUresult	299
+195bcbf4d67d024aacc51d29cea631ae	HEAP_ACCESS	3	2	heap_free	fn heap_free(heap_alloc_record_ptr: *const std::ffi::c_void, arg2: *mut usize) -> cuda_types::cuda::CUresult	304
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	0	SIZE_OF	-	310
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	1	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	2	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	3	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	4	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	5	device_get_attribute_ext	fn device_get_attribute_ext(dev: cuda_types::cuda::CUdevice, attribute: std::ffi::c_uint, unknown: std::ffi::c_int, result: *mut [usize; 2]) -> cuda_types::cuda::CUresult	311
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	6	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	7	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	8	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	9	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	10	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	11	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	12	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	13	device_get_something	fn device_get_something(result: *mut std::ffi::c_uchar, dev: cuda_types::cuda::CUdevice) -> cuda_types::cuda::CUresult	318
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	14	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	15	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	16	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	17	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	18	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	19	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	20	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	21	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	22	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	23	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	24	NULL	-	0
+b10541e1f7c7c74a9f64f223be99f1e2	DEVICE_EXTENDED_RT	26	25	NULL	-	0
+d4082055bde6704b8d34ba123c66e1f2	INTEGRITY_CHECK	3	0	SIZE_OF	-	324
+d4082055bde6704b8d34ba123c66e1f2	INTEGRITY_CHECK	3	1	integrity_check	fn integrity_check(version: u32, unix_seconds: u64, result: *mut [u64;2]) -> cuda_types::cuda::CUresult	325
+d4082055bde6704b8d34ba123c66e1f2	INTEGRITY_CHECK	3	2	NULL	-	0
+263e88607cd2614392f6bbd5006dfa7e	CONTEXT_CHECKS	4	0	SIZE_OF	-	333
+263e88607cd2614392f6bbd5006dfa7e	CONTEXT_CHECKS	4	1	NULL	-	0
+263e88607cd2614392f6bbd5006dfa7e	CONTEXT_CHECKS	4	2	context_check	fn context_check(ctx_in: cuda_types::cuda::CUcontext, result1: *mut u32, result2: *mut *const std::ffi::c_void) -> cuda_types::cuda::CUresult	334
+263e88607cd2614392f6bbd5006dfa7e	CONTEXT_CHECKS	4	3	check_fn3	fn check_fn3() -> u32	339
+dd9e98a4f410484499b0e2aeb7b432b5	HYBRID_CUDART	3	0	SIZE_OF	-	344
+dd9e98a4f410484499b0e2aeb7b432b5	HYBRID_CUDART	3	1	hybrid_runtime_load_get_proc_address	fn hybrid_runtime_load_get_proc_address(name: *const std::ffi::c_char, fn_ptr: *mut *const std::ffi::c_void, token: *mut usize) -> cuda_types::cuda::CUresult	345
+dd9e98a4f410484499b0e2aeb7b432b5	HYBRID_CUDART	3	2	hybrid_runtime_free	fn hybrid_runtime_free(token: usize) -> cuda_types::cuda::CUresult	350
+ee376a1bb85842eba52d9a106d50d914	ZLUDA32_INTERNAL	2	0	get_module_globals	fn get_module_globals(names: *mut *mut u8, initializers: *mut *const u8, sizes: *mut u32, alignments: *mut u32, count: *mut u32, module: cuda_types::cuda::CUmodule) -> cuda_types::cuda::CUresult	404
+ee376a1bb85842eba52d9a106d50d914	ZLUDA32_INTERNAL	2	1	get_function_info	fn get_function_info(explicit_arguments: *mut crate::FunctionArgInfo, explicit_argument_count: *mut u32, func: cuda_types::cuda::CUfunction) -> cuda_types::cuda::CUresult	412
