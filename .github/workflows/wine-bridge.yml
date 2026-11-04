@@ -36,7 +36,7 @@ jobs:
         run: rustup toolchain install 1.99.0 --profile minimal
       - name: Run every non-oracle Python test
         run: |
-          for name in production_admission candidate_import lifecycle pe_artifact stack_probe wine_runner; do
+          for name in production_admission candidate_import lifecycle pe_artifact stack_probe wine_runner backend_source; do
             python3 -m unittest discover -s wine/zluda_wine/tests -p "test_${name}.py"
           done
       - name: Verify the reviewed production input closure
