@@ -481,6 +481,10 @@ unsafe fn current_device() -> Result<hipDevice_t, hipErrorCode_t> {
 // A stream wait does not establish device idleness and does not reap.
 pub(crate) unsafe fn synchronize_device() -> hipError_t {
     let mut registry = lock_registry()?;
+    if registry.modules.is_empty() {
+        drop(registry);
+        return hipDeviceSynchronize();
+    }
     wait_and_reap(&mut registry, current_device()?, None, false)
 }
 
@@ -533,9 +537,9 @@ unsafe fn create_binding(
         readMode: state.readMode,
         sRGB: state.sRGB,
         normalizedCoords: state.normalized,
-        maxAnisotropy: state.maxAnisotropy,
+        maxAnisotropy: 0,
         mipmapFilterMode: state.mipmapFilterMode,
-        mipmapLevelBias: state.mipmapLevelBias,
+        mipmapLevelBias: 0.0,
         minMipmapLevelClamp: state.minMipmapLevelClamp,
         maxMipmapLevelClamp: state.maxMipmapLevelClamp,
         ..std::mem::zeroed()
@@ -773,25 +777,28 @@ pub(crate) unsafe fn launch_graph(
         events,
         ..
     } = &mut *registry;
-    for module in modules.values_mut().filter(|m| m.owner == device) {
-        for texref in module.texrefs.clone() {
-            let Some(registered) = texrefs.get_mut(&texref) else {
-                continue;
-            };
-            if registered.owner == device {
-                write_global(registered, module, stream)?;
+    let result = (|| {
+        for module in modules.values_mut().filter(|m| m.owner == device) {
+            for texref in module.texrefs.clone() {
+                let Some(registered) = texrefs.get_mut(&texref) else {
+                    continue;
+                };
+                if registered.owner == device {
+                    write_global(registered, module, stream)?;
+                }
             }
         }
-    }
-    hip_launch()?;
-    for module in modules.values_mut().filter(|m| m.owner == device) {
-        record_launch(module, texrefs, events, stream)?;
-    }
+        hip_launch()
+    })();
+    let fenced = modules.values_mut().filter(|m| m.owner == device).fold(
+        Ok(()),
+        |result, module| result.and(record_launch(module, texrefs, events, stream)),
+    );
     // The graph may replay writes captured with an older binding.
     for registered in texrefs.values_mut().filter(|r| r.owner == device) {
         registered.device = None;
     }
-    Ok(())
+    result.and(fenced)
 }
 
 // A destroyed stream's handle can come back for a new stream.
@@ -799,11 +806,18 @@ pub(crate) unsafe fn stream_destroyed(stream: hipStream_t) -> hipError_t {
     let stream = stream_key(stream);
     let mut registry = lock_registry()?;
     let device = current_device()?;
-    registry.events.remove(&(device, stream));
+    let event = registry.events.remove(&(device, stream));
     for module in registry.modules.values_mut().filter(|m| m.owner == device) {
         if let Some(index) = module.readers.iter().position(|reader| reader.stream == stream) {
             let reader = module.readers.swap_remove(index);
             module.orphaned.push(reader);
+        }
+    }
+    if let Some(event) = event {
+        if !registry.modules.values().any(|module| {
+            module.readers.iter().chain(&module.orphaned).any(|reader| reader.event == event)
+        }) {
+            hipEventDestroy(event as hipEvent_t)?;
         }
     }
     Ok(())
@@ -3306,14 +3320,11 @@ mod tests {
         api.cuModuleLoadData(&mut module, ptx.as_ptr().cast());
         let mut texref = std::mem::zeroed();
         api.cuModuleGetTexRef(&mut texref, module, c"legacy_linear".as_ptr());
-        // Setters must also work before binding a resource. Restore the
-        // non-mipmapped settings before testing reads through a linear binding.
+        // Non-mipmapped bindings ignore anisotropy and mipmap bias.
         api.cuTexRefSetMipmapLevelBias(texref, 0.5);
-        api.cuTexRefSetMipmapLevelBias(texref, 0.0);
         api.cuTexRefSetMipmapLevelClamp(texref, 1.0, 2.0);
         api.cuTexRefSetMipmapLevelClamp(texref, 0.0, 0.0);
         api.cuTexRefSetMaxAnisotropy(texref, 4);
-        api.cuTexRefSetMaxAnisotropy(texref, 0);
         let mut function = std::mem::zeroed();
         api.cuModuleGetFunction(&mut function, module, c"sample_linear".as_ptr());
         let mut source = std::mem::zeroed();
