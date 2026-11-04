@@ -55,6 +55,15 @@ class ProductionAdmission(unittest.TestCase):
     def test_valid_attestation_needs_no_wine_source_tree(self):
         self.assertEqual(self.admit().splitlines(), ['cargo:rerun-if-changed=' + str(self.provider)])
 
+    def test_explicit_valve_provider_is_admitted(self):
+        self.receipt['wine_pin'] = 'e60892cc2398b0a83c332a2078c7b85e47bdb42b'
+        self.assertIn('cargo:rerun-if-changed=', self.admit())
+
+    def test_unknown_provider_is_refused(self):
+        self.receipt['wine_pin'] = 'f' * 40
+        with self.assertRaisesRegex(ValueError, 'wrong prepared-Wine contract'):
+            self.admit()
+
     def test_wrong_receipt_pin_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'digest'):
             self.admit('f' * 64)

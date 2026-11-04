@@ -1,0 +1,8 @@
+{
+  "contract": "zluda-wine-prepared-abi-2",
+  "wine_pins": {
+    "46b29104e3741fe23bf5e2547196a253aab88c89": "GE-Proton11-7, prepared B5 callback/exit contract",
+    "e60892cc2398b0a83c332a2078c7b85e47bdb42b": "Valve proton-11.0-2e, stock process-exit contract plus Mafia II handler restoration"
+  },
+  "policy": "Reviewer receipt digest and SDK byte hashes remain mandatory. This is an explicit source-provider allowlist, not arbitrary Wine ABI admission."
+}
