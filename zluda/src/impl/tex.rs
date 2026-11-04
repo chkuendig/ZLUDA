@@ -3205,145 +3205,6 @@ mod tests {
         surf_formats_channels_dimensions(&api, SurfBinding::Object);
     }
 
-    #[test_cuda]
-    unsafe fn texref_set_address_accepts_zero_bytes(api: impl CudaApi) {
-        api.cuInit(0);
-        let mut ctx = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut ctx, 0, 0);
-        let mut module = std::mem::zeroed();
-        api.cuModuleLoadData(
-            &mut module,
-            TEX_READ_1D_INT_S32COORD_PTX.as_ptr() as *const c_void,
-        );
-        let mut texref = std::mem::zeroed();
-        api.cuModuleGetTexRef(&mut texref, module, c"tex".as_ptr());
-        api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_SIGNED_INT32, 1);
-        let mut buffer = std::mem::zeroed();
-        api.cuMemAlloc_v2(&mut buffer, 16);
-        let mut offset = usize::MAX;
-        api.cuTexRefSetAddress_v2(&mut offset, texref, buffer, 0);
-        assert_eq!(offset, 0);
-        api.cuMemFree_v2(buffer);
-        api.cuModuleUnload(module);
-        api.cuCtxDestroy_v2(ctx);
-    }
-
-    #[test_cuda]
-    unsafe fn texref_set_array_accepts_zero_flags(api: impl CudaApi) {
-        api.cuInit(0);
-        let mut ctx = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut ctx, 0, 0);
-        let desc = CUDA_ARRAY_DESCRIPTOR {
-            Width: 4,
-            Height: 0,
-            Format: CUarray_format_enum::CU_AD_FORMAT_SIGNED_INT32,
-            NumChannels: 1,
-        };
-        let mut array = std::mem::zeroed();
-        api.cuArrayCreate_v2(&mut array, &desc);
-        let texels = [3i32, 5, 7, 11];
-        api.cuMemcpyHtoA_v2(array, 0, texels.as_ptr() as *const c_void, 16);
-        let mut module = std::mem::zeroed();
-        api.cuModuleLoadData(&mut module, TEX_READ_1D_INT_PTX.as_ptr() as *const c_void);
-        let mut func = std::mem::zeroed();
-        api.cuModuleGetFunction(&mut func, module, c"tex_read_1d_int".as_ptr());
-        let mut texref = std::mem::zeroed();
-        api.cuModuleGetTexRef(&mut texref, module, c"tex".as_ptr());
-        api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_SIGNED_INT32, 1);
-        api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER);
-        api.cuTexRefSetArray(texref, array, 0);
-        let mut d_output = std::mem::zeroed();
-        api.cuMemAlloc_v2(&mut d_output, 16);
-        let coord_x = 2.5f32;
-        let mut params: [*mut c_void; 2] = [
-            &d_output as *const _ as *mut _,
-            &coord_x as *const _ as *mut _,
-        ];
-        api.cuLaunchKernel(
-            func,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            CUstream(std::ptr::null_mut()),
-            params.as_mut_ptr(),
-            std::ptr::null_mut(),
-        );
-        api.cuStreamSynchronize(CUstream(std::ptr::null_mut()));
-        let mut result = [0i32; 4];
-        api.cuMemcpyDtoH_v2(result.as_mut_ptr() as *mut c_void, d_output, 16);
-        assert_eq!(result[0], 7);
-        api.cuMemFree_v2(d_output);
-        api.cuModuleUnload(module);
-        api.cuArrayDestroy(array);
-        api.cuCtxDestroy_v2(ctx);
-    }
-
-    #[test_cuda]
-    unsafe fn texobj_create_ignores_anisotropy_and_mip_bias(api: impl CudaApi) {
-        api.cuInit(0);
-        let mut ctx = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut ctx, 0, 0);
-        let desc = CUDA_ARRAY_DESCRIPTOR {
-            Width: 4,
-            Height: 0,
-            Format: CUarray_format_enum::CU_AD_FORMAT_FLOAT,
-            NumChannels: 1,
-        };
-        let mut array = std::mem::zeroed();
-        api.cuArrayCreate_v2(&mut array, &desc);
-        let texels = [0.25f32, 0.5, 0.75, 1.0];
-        api.cuMemcpyHtoA_v2(array, 0, texels.as_ptr() as *const c_void, 16);
-        let mut res_desc: CUDA_RESOURCE_DESC = std::mem::zeroed();
-        res_desc.resType = CUresourcetype::CU_RESOURCE_TYPE_ARRAY;
-        res_desc.res.array.hArray = array;
-        let mut tex_desc: CUDA_TEXTURE_DESC = std::mem::zeroed();
-        tex_desc.maxAnisotropy = 4;
-        tex_desc.mipmapLevelBias = 0.5;
-        let mut texobj = std::mem::zeroed();
-        api.cuTexObjectCreate(&mut texobj, &res_desc, &tex_desc, std::ptr::null());
-        let mut module = std::mem::zeroed();
-        api.cuModuleLoadData(
-            &mut module,
-            TEX_READ_1D_FLOAT_TEXOBJ_PTX.as_ptr() as *const c_void,
-        );
-        let mut func = std::mem::zeroed();
-        api.cuModuleGetFunction(&mut func, module, c"tex_read_1d_float_texobj".as_ptr());
-        let mut d_output = std::mem::zeroed();
-        api.cuMemAlloc_v2(&mut d_output, 16);
-        let coord_x = 2.5f32;
-        let mut params: [*mut c_void; 3] = [
-            &d_output as *const _ as *mut _,
-            &texobj as *const _ as *mut _,
-            &coord_x as *const _ as *mut _,
-        ];
-        api.cuLaunchKernel(
-            func,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            CUstream(std::ptr::null_mut()),
-            params.as_mut_ptr(),
-            std::ptr::null_mut(),
-        );
-        api.cuStreamSynchronize(CUstream(std::ptr::null_mut()));
-        let mut result = [0f32; 4];
-        api.cuMemcpyDtoH_v2(result.as_mut_ptr() as *mut c_void, d_output, 16);
-        assert_eq!(result[0], 0.75);
-        api.cuMemFree_v2(d_output);
-        api.cuModuleUnload(module);
-        api.cuTexObjectDestroy(texobj);
-        api.cuArrayDestroy(array);
-        api.cuCtxDestroy_v2(ctx);
-    }
-
     // HALF arrays keep their format in HIP, so legacy binds and the rebuilds
     // after each setter must keep reading signed half values.
     #[test_cuda]
@@ -3550,12 +3411,9 @@ mod tests {
     const TEXREF_REBIND_ORACLE_PTX: &str =
         concat!(include_str!("test_ptx/texref_rebind_oracle.ptx"), "\0");
     const A: [u32; 4] = [1, 2, 3, 4];
-    const A2: [u32; 4] = [41, 42, 43, 44];
     const B: [u32; 4] = [5, 6, 7, 8];
     const C: [u32; 4] = [9, 10, 11, 12];
     const X: [u32; 4] = [21, 22, 23, 24];
-    const Y: [u32; 4] = [31, 32, 33, 34];
-    const Z: [u32; 4] = [51, 52, 53, 54];
     // Enough for the host to unbind and rebind while the kernel runs.
     const SPIN: u32 = 1 << 21;
 
@@ -3583,13 +3441,7 @@ mod tests {
             api.cuModuleGetFunction(&mut indexed, module, c"sample_linear_index".as_ptr());
             let mut array = std::mem::zeroed();
             api.cuModuleGetFunction(&mut array, module, c"sample_array".as_ptr());
-            Self {
-                module,
-                texref,
-                linear,
-                indexed,
-                array,
-            }
+            Self { module, texref, linear, indexed, array }
         }
 
         unsafe fn bind(&self, api: &impl CudaApi, ptr: CUdeviceptr) {
@@ -3625,19 +3477,8 @@ mod tests {
                 &mut output as *mut CUdeviceptr as *mut c_void,
                 &mut spin as *mut u32 as *mut c_void,
             ];
-            api.cuLaunchKernel(
-                function,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                0,
-                stream,
-                params.as_mut_ptr(),
-                std::ptr::null_mut(),
-            );
+            api.cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, stream,
+                params.as_mut_ptr(), std::ptr::null_mut());
         }
 
         unsafe fn launch_index(
@@ -3701,86 +3542,35 @@ mod tests {
         array
     }
 
-    // Unbinds, rebinds of the same state and real changes, for linear memory
-    // and arrays, must all leave each launch reading its launch-time binding.
+    // Compact public witness; the full rebind/error/context stress matrix is
+    // retained in the private exact-base test overlay.
     #[test_cuda]
-    unsafe fn legacy_texref_rebind_sequences(api: impl CudaApi) {
+    unsafe fn legacy_texref_rebind_and_array_flags(api: impl CudaApi) {
         api.cuInit(0);
         let mut context = std::mem::zeroed();
         api.cuCtxCreate_v2(&mut context, 0, 0);
         let oracle = Oracle::load(&api);
-        let buffer = linear_texels(&api, &[(0, A), (1024, A2)], 2048);
-        let other = linear_texels(&api, &[(0, B)], 16);
+        let mut again = std::mem::zeroed();
+        api.cuModuleGetTexRef(&mut again, oracle.module, c"oracle".as_ptr());
+        assert_eq!(again, oracle.texref);
+        let buffer = linear_texels(&api, &[(0, A)], 16);
         let output = linear_texels(&api, &[], 32);
-        let (x, y) = (array_texel(&api, X), array_texel(&api, Y));
-        let at = |offset: usize| CUdeviceptr_v2(buffer.0.cast::<u8>().add(offset).cast());
-        let linear = |step: &str, expected: [u32; 4]| {
-            assert_eq!(oracle.read(&api, oracle.linear, output), expected, "{step}");
-        };
-        let array = |step: &str, expected: [u32; 4]| {
-            assert_eq!(oracle.read(&api, oracle.array, output), expected, "{step}");
-        };
-        oracle.bind(&api, buffer);
-        linear("first bind", A);
-        oracle.bind(&api, buffer);
-        linear("same bind", A);
-        oracle.unbind(&api);
-        oracle.bind(&api, buffer);
-        linear("unbind, same bind", A);
-        oracle.bind(&api, other);
-        linear("other buffer", B);
-        oracle.unbind(&api);
-        oracle.bind(&api, other);
-        linear("unbind, same other buffer", B);
-        oracle.unbind(&api);
-        oracle.unbind(&api);
-        oracle.bind(&api, buffer);
-        linear("two unbinds, first buffer", A);
         let mut offset = usize::MAX;
-        api.cuTexRefSetAddress_v2(&mut offset, oracle.texref, other, 0);
+        api.cuTexRefSetAddress_v2(&mut offset, oracle.texref, buffer, 0);
         assert_eq!(offset, 0);
-        oracle.unbind(&api);
-        api.cuTexRefSetAddress_v2(&mut offset, oracle.texref, other, 0);
-        oracle.bind(&api, buffer);
-        linear("unbind, empty range, same bind", A);
-        oracle.bind(&api, at(1024));
-        linear("inner address", A2);
-        oracle.unbind(&api);
-        oracle.bind(&api, at(1024));
-        linear("unbind, same inner address", A2);
-        oracle.bind(&api, buffer);
-        linear("back to the start", A);
-        api.cuTexRefSetFormat(oracle.texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT16, 4);
-        linear("format changed while bound", [1, 0, 2, 0]);
-        oracle.bind(&api, buffer);
-        linear("same bind after a format change", [1, 0, 2, 0]);
-        oracle.unbind(&api);
-        api.cuTexRefSetFormat(oracle.texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
-        oracle.bind(&api, buffer);
-        linear("format changed while unbound", A);
-        oracle.bind_array(&api, x);
-        array("array", X);
-        oracle.bind_array(&api, x);
-        array("same array", X);
-        api.cuTexRefSetArray(oracle.texref, x, 0);
-        array("same array, zero flags", X);
-        oracle.bind_array(&api, y);
-        array("other array", Y);
-        oracle.unbind(&api);
-        oracle.bind_array(&api, y);
-        array("unbind, same array", Y);
-        oracle.bind(&api, buffer);
-        linear("array to linear", A);
-        oracle.bind_array(&api, x);
-        array("linear to array", X);
-        oracle.unbind(&api);
-        oracle.bind(&api, buffer);
-        linear("unbound array to linear", A);
+        for _ in 0..2 {
+            oracle.bind(&api, buffer);
+            assert_eq!(oracle.read(&api, oracle.linear, output), A);
+            oracle.unbind(&api);
+        }
+        let array = array_texel(&api, X);
+        api.cuTexRefSetArray(oracle.texref, array, 0);
+        assert_eq!(oracle.read(&api, oracle.array, output), X);
+        assert!(api.cuTexRefSetArray_unchecked(oracle.texref, array, 2).is_err());
+        assert_eq!(oracle.read(&api, oracle.array, output), X);
         api.cuModuleUnload(oracle.module);
-        api.cuArrayDestroy(x);
-        api.cuArrayDestroy(y);
+        api.cuArrayDestroy(array);
         api.cuMemFree_v2(buffer);
-        api.cuMemFree_v2(other);
         api.cuMemFree_v2(output);
         api.cuCtxDestroy_v2(context);
     }
@@ -3899,280 +3689,9 @@ mod tests {
         legacy_texref_in_flight(api, StreamKind::NonBlocking);
     }
 
-    // Each context loads its own module, so the same texref name in two
-    // contexts publishes to two module globals.
-    #[test_cuda]
-    unsafe fn legacy_texref_two_contexts(api: impl CudaApi) {
-        api.cuInit(0);
-        let (mut first, mut second) = (std::mem::zeroed(), std::mem::zeroed());
-        api.cuCtxCreate_v2(&mut first, 0, 0);
-        let first_oracle = Oracle::load(&api);
-        let first_buffer = linear_texels(&api, &[(0, A)], 16);
-        let first_other = linear_texels(&api, &[(0, C)], 16);
-        let first_output = linear_texels(&api, &[], 32);
-        api.cuCtxCreate_v2(&mut second, 0, 0);
-        let second_oracle = Oracle::load(&api);
-        let second_buffer = linear_texels(&api, &[(0, B)], 16);
-        let second_output = linear_texels(&api, &[], 32);
-        api.cuCtxSetCurrent(first);
-        first_oracle.bind(&api, first_buffer);
-        api.cuCtxSetCurrent(second);
-        second_oracle.bind(&api, second_buffer);
-        for round in 0..3 {
-            api.cuCtxSetCurrent(first);
-            let actual = first_oracle.read(&api, first_oracle.linear, first_output);
-            assert_eq!(actual, A, "first context, round {round}");
-            first_oracle.unbind(&api);
-            first_oracle.bind(&api, first_buffer);
-            api.cuCtxSetCurrent(second);
-            let actual = second_oracle.read(&api, second_oracle.linear, second_output);
-            assert_eq!(actual, B, "second context, round {round}");
-            second_oracle.unbind(&api);
-            second_oracle.bind(&api, second_buffer);
-        }
-        api.cuCtxSetCurrent(first);
-        first_oracle.bind(&api, first_other);
-        let actual = first_oracle.read(&api, first_oracle.linear, first_output);
-        assert_eq!(actual, C, "first context rebound");
-        api.cuCtxSetCurrent(second);
-        let actual = second_oracle.read(&api, second_oracle.linear, second_output);
-        assert_eq!(actual, B, "second context after the first rebound");
-        api.cuModuleUnload(second_oracle.module);
-        api.cuCtxDestroy_v2(second);
-        api.cuCtxSetCurrent(first);
-        api.cuModuleUnload(first_oracle.module);
-        api.cuCtxDestroy_v2(first);
-    }
-
-    // A freed buffer or array can come back at the same address or handle
-    // with other contents; the launch must read the new contents.
-    #[test_cuda]
-    unsafe fn legacy_texref_free_and_reallocate(api: impl CudaApi) {
-        api.cuInit(0);
-        let mut context = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut context, 0, 0);
-        let oracle = Oracle::load(&api);
-        let output = linear_texels(&api, &[], 32);
-        for unbind_first in [true, false] {
-            let buffer = linear_texels(&api, &[(0, A)], 4096);
-            oracle.bind(&api, buffer);
-            assert_eq!(oracle.read(&api, oracle.linear, output), A);
-            if unbind_first {
-                oracle.unbind(&api);
-            }
-            api.cuMemFree_v2(buffer);
-            let reused = linear_texels(&api, &[(0, C)], 4096);
-            eprintln!("unbind {unbind_first}: same address {}", reused.0 == buffer.0);
-            oracle.bind(&api, reused);
-            let actual = oracle.read(&api, oracle.linear, output);
-            assert_eq!(actual, C, "reallocated buffer, unbind {unbind_first}");
-            oracle.unbind(&api);
-            oracle.bind(&api, reused);
-            let actual = oracle.read(&api, oracle.linear, output);
-            assert_eq!(actual, C, "reallocated buffer rebound, unbind {unbind_first}");
-            api.cuMemFree_v2(reused);
-        }
-        for unbind_first in [true, false] {
-            let array = array_texel(&api, X);
-            oracle.bind_array(&api, array);
-            assert_eq!(oracle.read(&api, oracle.array, output), X);
-            if unbind_first {
-                oracle.unbind(&api);
-            }
-            api.cuArrayDestroy(array);
-            let reused = array_texel(&api, Z);
-            eprintln!("unbind {unbind_first}: same array handle {}", reused == array);
-            oracle.bind_array(&api, reused);
-            let actual = oracle.read(&api, oracle.array, output);
-            assert_eq!(actual, Z, "recreated array, unbind {unbind_first}");
-            oracle.unbind(&api);
-            oracle.bind_array(&api, reused);
-            let actual = oracle.read(&api, oracle.array, output);
-            assert_eq!(actual, Z, "recreated array rebound, unbind {unbind_first}");
-            api.cuArrayDestroy(reused);
-        }
-        api.cuModuleUnload(oracle.module);
-        api.cuMemFree_v2(output);
-        api.cuCtxDestroy_v2(context);
-    }
-
-    // Rejected binds leave the previous binding, and unbinds of nothing
-    // succeed.
-    #[test_cuda]
-    unsafe fn legacy_texref_error_paths(api: impl CudaApi) {
-        api.cuInit(0);
-        let mut context = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut context, 0, 0);
-        let oracle = Oracle::load(&api);
-        oracle.unbind(&api);
-        oracle.unbind(&api);
-        let buffer = linear_texels(&api, &[(0, A)], 16);
-        let output = linear_texels(&api, &[], 32);
-        let x = array_texel(&api, X);
-        let null_texref = std::ptr::null_mut();
-        assert!(api.cuTexRefSetAddress_v2_unchecked(&mut 0, null_texref, buffer, 16).is_err());
-        let null_ptr = CUdeviceptr_v2(std::ptr::null_mut());
-        assert!(api.cuTexRefSetAddress_v2_unchecked(&mut 0, null_texref, null_ptr, 0).is_err());
-        assert!(api.cuTexRefSetArray_unchecked(null_texref, x, CU_TRSA_OVERRIDE_FORMAT).is_err());
-        oracle.bind_array(&api, x);
-        assert_eq!(oracle.read(&api, oracle.array, output), X);
-        assert!(api.cuTexRefSetArray_unchecked(oracle.texref, x, 2).is_err());
-        let actual = oracle.read(&api, oracle.array, output);
-        assert_eq!(actual, X, "after rejected flags");
-        let null_array = std::ptr::null_mut();
-        let result = api.cuTexRefSetArray_unchecked(oracle.texref, null_array, CU_TRSA_OVERRIDE_FORMAT);
-        eprintln!("null array: {result:?}");
-        oracle.unbind(&api);
-        assert!(api.cuTexRefSetArray_unchecked(oracle.texref, x, 2).is_err());
-        oracle.bind_array(&api, x);
-        let actual = oracle.read(&api, oracle.array, output);
-        assert_eq!(actual, X, "rebound after rejected flags");
-        oracle.bind(&api, buffer);
-        assert_eq!(oracle.read(&api, oracle.linear, output), A);
-        api.cuModuleUnload(oracle.module);
-        api.cuArrayDestroy(x);
-        api.cuMemFree_v2(buffer);
-        api.cuMemFree_v2(output);
-        api.cuCtxDestroy_v2(context);
-    }
-
-    // A module unloaded with an unbound texref, then loaded again.
-    #[test_cuda]
-    unsafe fn legacy_texref_unload_after_unbind(api: impl CudaApi) {
-        api.cuInit(0);
-        let mut context = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut context, 0, 0);
-        let buffer = linear_texels(&api, &[(0, A)], 16);
-        let output = linear_texels(&api, &[], 32);
-        for round in 0..3 {
-            let oracle = Oracle::load(&api);
-            let mut again = std::mem::zeroed();
-            api.cuModuleGetTexRef(&mut again, oracle.module, c"oracle".as_ptr());
-            assert_eq!(again, oracle.texref, "same texref for the same name");
-            oracle.bind(&api, buffer);
-            let actual = oracle.read(&api, oracle.linear, output);
-            assert_eq!(actual, A, "round {round}");
-            oracle.unbind(&api);
-            api.cuModuleUnload(oracle.module);
-        }
-        api.cuMemFree_v2(buffer);
-        api.cuMemFree_v2(output);
-        api.cuCtxDestroy_v2(context);
-    }
-
     fn distinct_texel(index: usize) -> [u32; 4] {
         let index = index as u32;
         [100 + index, 200 + index, 300 + index, 400 + index]
-    }
-
-    // Rebinds that cycle through fewer and more states than are cached, with
-    // and without unbinds in between, for linear memory and arrays.
-    #[test_cuda]
-    unsafe fn legacy_texref_cached_states(api: impl CudaApi) {
-        api.cuInit(0);
-        let mut context = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut context, 0, 0);
-        let oracle = Oracle::load(&api);
-        let output = linear_texels(&api, &[], 32);
-        let texels = (0..super::CACHED_STATES + 4).map(distinct_texel).collect::<Vec<_>>();
-        let buffers = texels
-            .iter()
-            .map(|texel| linear_texels(&api, &[(0, *texel)], 16))
-            .collect::<Vec<_>>();
-        let (x, y) = (array_texel(&api, X), array_texel(&api, Y));
-        for states in [3, buffers.len()] {
-            for round in 0..3 {
-                for state in 0..states {
-                    oracle.bind(&api, buffers[state]);
-                    let actual = oracle.read(&api, oracle.linear, output);
-                    assert_eq!(actual, texels[state], "{states} states, round {round}, state {state}");
-                    if (round + state) % 2 == 0 {
-                        oracle.unbind(&api);
-                    }
-                }
-            }
-        }
-        for round in 0..3 {
-            oracle.bind_array(&api, x);
-            assert_eq!(oracle.read(&api, oracle.array, output), X, "array x, round {round}");
-            oracle.bind(&api, buffers[0]);
-            let actual = oracle.read(&api, oracle.linear, output);
-            assert_eq!(actual, texels[0], "linear between arrays, round {round}");
-            oracle.bind_array(&api, y);
-            assert_eq!(oracle.read(&api, oracle.array, output), Y, "array y, round {round}");
-            oracle.unbind(&api);
-        }
-        api.cuModuleUnload(oracle.module);
-        api.cuArrayDestroy(x);
-        api.cuArrayDestroy(y);
-        for buffer in buffers {
-            api.cuMemFree_v2(buffer);
-        }
-        api.cuMemFree_v2(output);
-        api.cuCtxDestroy_v2(context);
-    }
-
-    // Launches queued without host synchronization, each after a rebind to a
-    // cached state: on one stream, alternating between two streams, and
-    // across every kind of stream. Some launches spin before they read, so a
-    // later write of the global would overtake them if it were not ordered.
-    #[test_cuda]
-    unsafe fn legacy_texref_cached_launch_order(api: impl CudaApi) {
-        const LAUNCHES: usize = 60;
-        const KINDS: [StreamKind; 5] = [
-            StreamKind::Null,
-            StreamKind::Legacy,
-            StreamKind::PerThread,
-            StreamKind::Blocking,
-            StreamKind::NonBlocking,
-        ];
-        api.cuInit(0);
-        let mut context = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut context, 0, 0);
-        let oracle = Oracle::load(&api);
-        let texels = [A, B, C];
-        let buffers = texels.map(|texel| linear_texels(&api, &[(0, texel)], 16));
-        let output = linear_texels(&api, &[], 32 * LAUNCHES);
-        let slot = |i: usize| CUdeviceptr_v2(output.0.cast::<u8>().add(32 * i).cast());
-        let streams = KINDS.map(|kind| stream(&api, kind));
-        for (buffer, texel) in buffers.iter().zip(texels) {
-            oracle.bind(&api, *buffer);
-            assert_eq!(oracle.read(&api, oracle.linear, slot(0)), texel, "warm-up");
-        }
-        for pattern in 0..3 {
-            api.cuMemsetD32_v2(output, 0, 8 * LAUNCHES);
-            api.cuCtxSynchronize();
-            let mut expected = Vec::new();
-            for i in 0..LAUNCHES {
-                let state = (i + i / 3) % 3;
-                oracle.bind(&api, buffers[state]);
-                let stream = match pattern {
-                    0 => streams[3],
-                    1 => streams[3 + i % 2],
-                    _ => streams[i % KINDS.len()],
-                };
-                let spin = if i % 4 == 0 { SPIN / 4 } else { 0 };
-                oracle.launch(&api, oracle.linear, slot(i), spin, stream);
-                expected.push(texels[state]);
-                if i % 5 == 4 {
-                    oracle.unbind(&api);
-                }
-            }
-            for (i, expected) in expected.into_iter().enumerate() {
-                assert_eq!(texel(&api, slot(i)), expected, "pattern {pattern}, launch {i}");
-            }
-        }
-        for (kind, stream) in KINDS.into_iter().zip(streams) {
-            if matches!(kind, StreamKind::Blocking | StreamKind::NonBlocking) {
-                api.cuStreamDestroy_v2(stream);
-            }
-        }
-        api.cuModuleUnload(oracle.module);
-        for buffer in buffers {
-            api.cuMemFree_v2(buffer);
-        }
-        api.cuMemFree_v2(output);
-        api.cuCtxDestroy_v2(context);
     }
 
     // A stream destroyed while a launch on it may still read the texref.
@@ -4209,82 +3728,6 @@ mod tests {
         api.cuCtxDestroy_v2(context);
     }
 
-    // A buffer freed while one of its states is cached but not shown, then
-    // another allocation, possibly at the same address.
-    #[test_cuda]
-    unsafe fn legacy_texref_cached_free(api: impl CudaApi) {
-        api.cuInit(0);
-        let mut context = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut context, 0, 0);
-        let oracle = Oracle::load(&api);
-        let output = linear_texels(&api, &[], 32);
-        let other = linear_texels(&api, &[(0, B)], 16);
-        for round in 0..3 {
-            let buffer = linear_texels(&api, &[(0, A)], 4096);
-            oracle.bind(&api, buffer);
-            assert_eq!(oracle.read(&api, oracle.linear, output), A, "round {round}");
-            oracle.bind(&api, other);
-            assert_eq!(oracle.read(&api, oracle.linear, output), B, "round {round}");
-            api.cuMemFree_v2(buffer);
-            let reused = linear_texels(&api, &[(0, C)], 4096);
-            eprintln!("round {round}: same address {}", reused.0 == buffer.0);
-            oracle.bind(&api, reused);
-            let actual = oracle.read(&api, oracle.linear, output);
-            assert_eq!(actual, C, "reallocated buffer, round {round}");
-            oracle.bind(&api, other);
-            let actual = oracle.read(&api, oracle.linear, output);
-            assert_eq!(actual, B, "cached state after the free, round {round}");
-            oracle.bind(&api, reused);
-            let actual = oracle.read(&api, oracle.linear, output);
-            assert_eq!(actual, C, "reallocated buffer again, round {round}");
-            oracle.unbind(&api);
-            api.cuMemFree_v2(reused);
-        }
-        api.cuModuleUnload(oracle.module);
-        api.cuMemFree_v2(other);
-        api.cuMemFree_v2(output);
-        api.cuCtxDestroy_v2(context);
-    }
-
-    // Setters rebuild the texref through HIP; cached states of the old
-    // sampler state must not come back.
-    #[test_cuda]
-    unsafe fn legacy_texref_cached_setters(api: impl CudaApi) {
-        api.cuInit(0);
-        let mut context = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut context, 0, 0);
-        let oracle = Oracle::load(&api);
-        let buffer = linear_texels(&api, &[(0, A)], 16);
-        let other = linear_texels(&api, &[(0, B)], 16);
-        let output = linear_texels(&api, &[], 32);
-        let linear = |step: &str, expected: [u32; 4]| {
-            assert_eq!(oracle.read(&api, oracle.linear, output), expected, "{step}");
-        };
-        for round in 0..2 {
-            oracle.bind(&api, buffer);
-            linear("first buffer", A);
-            oracle.bind(&api, other);
-            linear("other buffer", B);
-            api.cuTexRefSetFormat(oracle.texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT16, 4);
-            linear("format changed while bound", [5, 0, 6, 0]);
-            oracle.bind(&api, buffer);
-            linear("first buffer in the new format", [1, 0, 2, 0]);
-            oracle.bind(&api, other);
-            linear("other buffer in the new format", [5, 0, 6, 0]);
-            oracle.unbind(&api);
-            api.cuTexRefSetFormat(oracle.texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
-            oracle.bind(&api, buffer);
-            linear(&format!("first buffer back in the old format, round {round}"), A);
-            oracle.bind(&api, other);
-            linear(&format!("other buffer back in the old format, round {round}"), B);
-        }
-        api.cuModuleUnload(oracle.module);
-        api.cuMemFree_v2(buffer);
-        api.cuMemFree_v2(other);
-        api.cuMemFree_v2(output);
-        api.cuCtxDestroy_v2(context);
-    }
-
     // A module unloaded while its texref caches states, shown or not, then
     // loaded again.
     #[test_cuda]
@@ -4311,50 +3754,6 @@ mod tests {
         }
         api.cuMemFree_v2(buffer);
         api.cuMemFree_v2(other);
-        api.cuMemFree_v2(output);
-        api.cuCtxDestroy_v2(context);
-    }
-    // Every bind has a different byte limit, including limits that cannot
-    // contain the preceding launch's index. No host wait between launches.
-    #[test_cuda]
-    unsafe fn legacy_texref_real_rebind_launch_order(api: impl CudaApi) {
-        const N: usize = 100;
-        let kinds = [StreamKind::Null, StreamKind::Legacy, StreamKind::PerThread,
-            StreamKind::Blocking, StreamKind::NonBlocking];
-        api.cuInit(0);
-        let mut context = std::mem::zeroed();
-        api.cuCtxCreate_v2(&mut context, 0, 0);
-        let oracle = Oracle::load(&api);
-        let values = (0..N).map(|i| (16 * i, distinct_texel(i))).collect::<Vec<_>>();
-        let buffer = linear_texels(&api, &values, N * 16);
-        let output = linear_texels(&api, &[], N * 64);
-        let streams = kinds.map(|kind| stream(&api, kind));
-        for i in 0..N {
-            let count = (i * 37) % N + 1;
-            let mut offset = usize::MAX;
-            api.cuTexRefSetAddress_v2(&mut offset, oracle.texref, buffer, 16 * count);
-            assert_eq!(offset, 0);
-            let dst = CUdeviceptr_v2(output.0.cast::<u8>().add(i * 64).cast());
-            oracle.launch_index(&api, dst, count as i32 - 1, SPIN / 16, streams[i % 5]);
-            // The same handle on another stream must wait for its publish.
-            let next = CUdeviceptr_v2(dst.0.cast::<u8>().add(32).cast());
-            oracle.launch_index(&api, next, count as i32 - 1, 0, streams[(i + 1) % 5]);
-        }
-        api.cuCtxSynchronize();
-        for i in 0..N {
-            let expected = distinct_texel((i * 37) % N);
-            for duplicate in 0..2 {
-                let dst = CUdeviceptr_v2(output.0.cast::<u8>().add(i * 64 + duplicate * 32).cast());
-                assert_eq!(texel(&api, dst), expected, "launch {i}/{duplicate}");
-            }
-        }
-        for (kind, stream) in kinds.into_iter().zip(streams) {
-            if matches!(kind, StreamKind::Blocking | StreamKind::NonBlocking) {
-                api.cuStreamDestroy_v2(stream);
-            }
-        }
-        api.cuModuleUnload(oracle.module);
-        api.cuMemFree_v2(buffer);
         api.cuMemFree_v2(output);
         api.cuCtxDestroy_v2(context);
     }

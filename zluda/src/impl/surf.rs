@@ -452,7 +452,9 @@ mod tests {
         store_half4_texel(
             &api,
             |res_desc| {
-                let tex_desc: CUDA_TEXTURE_DESC = mem::zeroed();
+                let mut tex_desc: CUDA_TEXTURE_DESC = mem::zeroed();
+                tex_desc.maxAnisotropy = 4;
+                tex_desc.mipmapLevelBias = 0.5;
                 let mut texture = 0;
                 api.cuTexObjectCreate(&mut texture, res_desc, &tex_desc, std::ptr::null());
                 texture
