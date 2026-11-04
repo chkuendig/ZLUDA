@@ -5,6 +5,7 @@ import argparse
 import hashlib
 from pathlib import Path
 import re
+from backend_source import backend_source
 
 HERE = Path(__file__).resolve().parents[1]
 
@@ -18,7 +19,7 @@ def close(text, start, opening, closing):
 
 
 def capture():
-    path = HERE.parents[1] / 'dark_api/src/lib.rs'
+    path = backend_source() / 'dark_api/src/lib.rs'
     original = path.read_text()
     # The selected CUDA declarations have no comment-like string contents.
     text = re.sub(r'/\*.*?\*/|//[^\n]*', '', original, flags=re.S)

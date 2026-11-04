@@ -6,11 +6,15 @@ import json
 from pathlib import Path
 import re
 
+import sys
 root = Path(__file__).resolve().parents[3]
 crate = root / 'wine/zluda_wine'
+sys.path.insert(0, str(crate / 'tools'))
+from backend_source import backend_source
+backend = backend_source()
 manifest = json.loads((crate / 'LICENSES/PRODUCTION-INPUTS.json').read_text())
 for name, digest in manifest['source_inputs'].items():
-    path = root / name
+    path = (root if name.startswith('wine/') else backend) / name
     if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         raise SystemExit('Production input changed; review its provenance: ' + name)
     source = path.read_text()

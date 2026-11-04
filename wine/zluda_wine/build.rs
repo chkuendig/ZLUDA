@@ -112,7 +112,13 @@ fn main() {
 
 pub fn generate(here: PathBuf, out: PathBuf) {
     println!("cargo:rustc-check-cfg=cfg(zluda_wine_oracles)");
-    let root = here.join("../..");
+    println!("cargo:rerun-if-env-changed=ZLUDA_WINE_BACKEND_SOURCE");
+    let root = PathBuf::from(env::var_os("ZLUDA_WINE_BACKEND_SOURCE")
+        .expect("explicit pinned ZLUDA_WINE_BACKEND_SOURCE is required"));
+    assert!(root.is_absolute(), "backend source root must be absolute");
+    println!("cargo:rerun-if-changed={}", here.join("../../BACKEND-SOURCE.json").display());
+    assert!(Command::new("python3").arg(here.join("tests/check_production_inputs.py"))
+        .status().unwrap().success(), "production/backend source admission failed");
     println!("cargo:rustc-check-cfg=cfg(zluda_wine_check_only)");
     println!("cargo:rerun-if-env-changed=ZLUDA_WINE_DECLARATIONS_ONLY");
     let check_only = env::var("ZLUDA_WINE_DECLARATIONS_ONLY").as_deref() == Ok("1");

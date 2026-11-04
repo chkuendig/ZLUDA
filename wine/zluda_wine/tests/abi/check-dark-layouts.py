@@ -7,7 +7,10 @@ import re
 import uuid
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[3]
+import sys
+sys.path.insert(0, str(HERE.parents[1] / 'tools'))
+from backend_source import backend_source
+ROOT = backend_source()
 source_path = ROOT / 'dark_api/src/lib.rs'
 source = source_path.read_text()
 tables = json.loads((HERE / 'dark-tables.json').read_text())['tables']

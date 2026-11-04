@@ -2,8 +2,8 @@ name: Wine bridge production and independent tests
 
 on:
   push:
-    branches: [bridge/zluda-wine-20261031]
-    paths: ['wine/**', '.github/workflows/wine-bridge.yml']
+    branches: [component/zluda-wine-20261104]
+    paths: ['wine/**', 'BACKEND-SOURCE.json', '.github/workflows/wine-bridge.yml']
   workflow_dispatch:
 
 permissions:
@@ -14,12 +14,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
+      ZLUDA_WINE_BACKEND_SOURCE: ${{ github.workspace }}/backend-source
       CARGO_BUILD_JOBS: "3"
       CARGO_TERM_COLOR: never
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/wine-cpu-acceptance
       ZLUDA_WINE_DECLARATIONS_ONLY: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout digest-admitted backend declarations
+        uses: actions/checkout@v4
+        with:
+          repository: chkuendig/ZLUDA
+          ref: 854720b624f2a61a447d9c3b69a3f986470a0149
+          path: backend-source
+          sparse-checkout: |
+            cuda_types/src
+            cuda_macros/src
+            dark_api/src
+            zluda/src
       - name: Pin the local review toolchain version
         run: rustup toolchain install 1.99.0 --profile minimal
       - name: Run every non-oracle Python test
@@ -50,6 +62,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     env:
+      ZLUDA_WINE_BACKEND_SOURCE: ${{ github.workspace }}/backend-source
       CARGO_BUILD_JOBS: "3"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/pe32-luid
       ZLUDA_WINE_DECLARATIONS_ONLY: "1"
@@ -57,6 +70,17 @@ jobs:
       - name: Preserve the pinned source byte identities
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+      - name: Checkout digest-admitted backend declarations
+        uses: actions/checkout@v4
+        with:
+          repository: chkuendig/ZLUDA
+          ref: 854720b624f2a61a447d9c3b69a3f986470a0149
+          path: backend-source
+          sparse-checkout: |
+            cuda_types/src
+            cuda_macros/src
+            dark_api/src
+            zluda/src
       - name: Install pinned Rust and PE32 standard library
         run: |
           rustup toolchain install 1.99.0 --profile minimal
@@ -71,6 +95,17 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout digest-admitted backend declarations
+        uses: actions/checkout@v4
+        with:
+          repository: chkuendig/ZLUDA
+          ref: 854720b624f2a61a447d9c3b69a3f986470a0149
+          path: backend-source
+          sparse-checkout: |
+            cuda_types/src
+            cuda_macros/src
+            dark_api/src
+            zluda/src
       - name: Install fixture cross compilers
         run: |
           sudo apt-get update

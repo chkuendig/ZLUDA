@@ -20,7 +20,7 @@
     "wine/zluda_wine/api/wrappers.tsv": "33124eaab5d793c4b6f0f67601f244a45129d81acaf6a63d8324f3bff137a500",
     "wine/zluda_wine/build-bridge.sh": "23e1db22cc17ef860ab7585fe300b45850b783310138e8031af33e9fb61918ab",
     "wine/zluda_wine/build-pilot.sh": "a558875e42f953c128e048299b4703cbcc685f5f0fcc2ed23c0e96765ddaace6",
-    "wine/zluda_wine/build.rs": "8e80c6f0603eb4430a5a385902a55b9e505d1b34c946ac6c70f53438eed94abe",
+    "wine/zluda_wine/build.rs": "b72d58f5c48f555df1591c249fc518a3efd65a843896e7be7156a0d091d3716f",
     "wine/zluda_wine/generate_dark.rs": "030f5106c52b6c15e5c2ded283d3235fd33459f857446cdf2a22119f9e18a439",
     "wine/zluda_wine/generate_wow64.rs": "346dbb31f2d5b69314f54bfd8491fcace6eeb4621add047dfe50287351087307",
     "wine/zluda_wine/src/bridge.rs": "89d09302680c8fee1677f3c21420ff85a2df89a123e94b33b050ae15721216a9",
@@ -61,12 +61,13 @@
     "wine/zluda_wine/src/wow64_trace.rs": "f96de0275c8fe7ee100b73990b3f07356c82c1a62800e86321b807c7aca161e1",
     "wine/zluda_wine/src/wow64_unix.rs": "82f01b91ba6926fb4c1c99ff6debb5a66364567594df696ee2ccc5066426c475",
     "wine/zluda_wine/tools/admit_wine.py": "1554efce995be1dfbaecef93f120018a920790a1889983687886d927a095c886",
-    "wine/zluda_wine/tools/import_native_dark.py": "41c89bc5e06aa3926dc4bd8bb2a27a4d0dcacce2c8f865babcec97e44720398a",
+    "wine/zluda_wine/tools/import_native_dark.py": "1ccae2420703baea9c66e4deef2b3a843cf247718ba86b9a3045cb5fcb0b8392",
     "wine/zluda_wine/tools/link_pe.py": "575f6566fa858541f22a0ad36d4eaf31c09fc6790db6a2d9a0bc9c0afdf01871",
     "wine/zluda_wine/tools/pe_artifact.py": "f1ae488fc963498ceb397b0a8c48d5fb1942882ffd0fccf35539690a03d1daf2",
     "wine/zluda_wine/wine_adapter.c": "979e5dc979f360dfaa5ee086e17608cb20bc4f809f1fdf75d91ee9545809837f",
     "zluda/src/impl/mod.rs": "4b83a64de2a74ae2e98c8357813aca71f7436c72a9ecd871aa6e4d2baa97ca7e",
-    "zluda/src/lib.rs": "de960078b0d9a99022fe64f635765057368471708445fac6b8c559e9a941aa23"
+    "zluda/src/lib.rs": "de960078b0d9a99022fe64f635765057368471708445fac6b8c559e9a941aa23",
+    "wine/zluda_wine/tools/backend_source.py": "4d0ff8d00c80b310a8f7ab3b8d4524cf8296873b51c2492a9f4cea6b2aa7990f"
   },
   "project_license": "MIT OR Apache-2.0",
   "retained_mit_notice": {
@@ -88,5 +89,6 @@
     "tools/check_backend_status.py",
     "tools/report_divergences.py"
   ],
-  "prepared_sdk_admission": "Explicitly pinned source-free ABI-2 receipt: source hashes are metadata only; matching SDK binary/tool files are verified. Wine source/header inputs are not opened by the build."
+  "prepared_sdk_admission": "Explicitly pinned source-free ABI-2 receipt: source hashes are metadata only; matching SDK binary/tool files are verified. Wine source/header inputs are not opened by the build.",
+  "backend_contract": "BACKEND-SOURCE.json"
 }
