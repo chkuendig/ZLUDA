@@ -23,6 +23,48 @@ pub unsafe extern "system" fn DllMain(module: *mut c_void, reason: u32, _: *mut 
     }
     1
 }
+// Optional call trace: ZLUDA_WINE_CALL_LOG=<Unix path> appends one line per
+// export (name, status, microseconds, PE32 argument words) to <path>.<pid>.
+// When unset, each call costs one acquire load of the cached zero handle.
+static TRACE: OnceLock<usize> = OnceLock::new();
+unsafe fn open_trace() -> usize {
+    let Ok(path) = std::env::var("ZLUDA_WINE_CALL_LOG") else { return 0; };
+    if path.is_empty() || path.contains('\0') { return 0; }
+    let Ok(path) = std::ffi::CString::new(format!("{path}.{}", GetCurrentProcessId())) else { return 0; };
+    let kernel32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr().cast());
+    let dos = GetProcAddress(kernel32, b"wine_get_dos_file_name\0".as_ptr().cast());
+    let handle = if path.as_bytes().starts_with(b"/") && !dos.is_null() {
+        let dos: unsafe extern "C" fn(*const c_char) -> *mut u16 = std::mem::transmute(dos); // Wine exports it cdecl.
+        let wide = dos(path.as_ptr());
+        if wide.is_null() { return 0; }
+        let handle = CreateFileW(wide, 4, 3, std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
+        HeapFree(GetProcessHeap(), 0, wide.cast());
+        handle
+    } else {
+        CreateFileA(path.as_ptr(), 4, 3, std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut())
+    };
+    if handle as isize == -1 { 0 } else { handle as usize }
+}
+fn now_us() -> u64 {
+    let (mut ticks, mut frequency) = (0i64, 0i64);
+    unsafe { QueryPerformanceCounter(&mut ticks); QueryPerformanceFrequency(&mut frequency); }
+    if frequency <= 0 { 0 } else { (ticks as u128 * 1_000_000 / frequency as u128) as u64 }
+}
+pub(super) unsafe fn traced(name: &str, args: &[u32], body: impl FnOnce() -> i32) -> i32 {
+    let handle = *TRACE.get_or_init(|| open_trace());
+    if handle == 0 { return body(); }
+    let start = now_us();
+    let status = body();
+    let end = now_us();
+    let mut line = [0u8; 256];
+    let len = crate::wow64_trace::trace_line(&mut line, start, GetCurrentThreadId(), name, status,
+                                              end.saturating_sub(start), args);
+    let mut written = 0u32;
+    WriteFile(handle as *mut c_void, line.as_ptr().cast(), len as u32, &mut written, std::ptr::null_mut());
+    status
+}
+/// Generated body of every unsupported PE32 export.
+pub(super) unsafe fn stub(name: &str) -> i32 { traced(name, &[], || UNSUPPORTED) }
 pub(super) unsafe fn call(op: u32, args: &[u32]) -> i32 {
     if !ATTACHED.load(Ordering::Acquire) { return 3; }
     if !*HANDSHAKE.get_or_init(|| {
@@ -36,7 +78,10 @@ pub(super) unsafe fn call(op: u32, args: &[u32]) -> i32 {
 macro_rules! forward {
     ($name:ident($($arg:ident: $ty:ty),*) => $op:ident [$($value:expr),*]) => {
         #[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
-        pub unsafe extern "system" fn $name($($arg: $ty),*) -> i32 { call($op, &[$($value),*]) }
+        pub unsafe extern "system" fn $name($($arg: $ty),*) -> i32 {
+            let args: &[u32] = &[$($value),*];
+            traced(stringify!($name), args, || call($op, args))
+        }
     };
 }
 forward!(cuInit(flags: u32) => C32_INIT [flags]);
@@ -68,18 +113,72 @@ forward!(cuMemFree_v2(device: u32) => C32_FREE [device]);
 
 #[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
 pub unsafe extern "system" fn cuCtxDestroy_v2(ctx: *mut c_void) -> i32 {
-    let status = call(C32_CTX_DESTROY, &[pointer(ctx)]);
-    if status == 0 { storage_destroy(ctx); }
-    status
+    traced("cuCtxDestroy_v2", &[pointer(ctx)], || {
+        let status = call(C32_CTX_DESTROY, &[pointer(ctx)]);
+        if status == 0 { storage_destroy(ctx); }
+        status
+    })
 }
 #[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
 pub unsafe extern "system" fn cuCtxDestroy(ctx: *mut c_void) -> i32 { cuCtxDestroy_v2(ctx) }
 #[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
 pub unsafe extern "system" fn cuCtxDetach(ctx: *mut c_void) -> i32 {
-    let mut destroyed = 0u32;
-    let status = call(C32_CTX_DETACH, &[pointer(ctx), pointer(&mut destroyed)]);
-    if status == 0 && destroyed != 0 { storage_destroy(ctx); }
-    status
+    traced("cuCtxDetach", &[pointer(ctx)], || {
+        let mut destroyed = 0u32;
+        let status = call(C32_CTX_DETACH, &[pointer(ctx), pointer(&mut destroyed)]);
+        if status == 0 && destroyed != 0 { storage_destroy(ctx); }
+        status
+    })
+}
+
+// Cache and shared-memory configuration are hints. HIP on AMD does not act on
+// them; CUDA validates the value and a current context (or function handle).
+unsafe fn current_context() -> i32 {
+    let mut ctx = 0u32;
+    let status = call(C32_CTX_CURRENT, &[pointer(&mut ctx)]);
+    if status != 0 { status } else if ctx == 0 { INVALID_CONTEXT } else { 0 }
+}
+#[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
+pub unsafe extern "system" fn cuCtxSetCacheConfig(config: i32) -> i32 {
+    traced("cuCtxSetCacheConfig", &[config as u32], || match crate::wow64_trace::cache_config(config) {
+        Ok(()) => current_context(), Err(error) => error })
+}
+#[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
+pub unsafe extern "system" fn cuCtxGetCacheConfig(out: *mut i32) -> i32 {
+    traced("cuCtxGetCacheConfig", &[pointer(out)], || {
+        if out.is_null() { return INVALID; }
+        let status = current_context();
+        if status == 0 { std::ptr::write_unaligned(out, 0); }
+        status
+    })
+}
+#[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
+pub unsafe extern "system" fn cuCtxSetSharedMemConfig(config: i32) -> i32 {
+    traced("cuCtxSetSharedMemConfig", &[config as u32], || match crate::wow64_trace::shared_config(config) {
+        Ok(()) => current_context(), Err(error) => error })
+}
+#[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
+pub unsafe extern "system" fn cuCtxGetSharedMemConfig(out: *mut i32) -> i32 {
+    traced("cuCtxGetSharedMemConfig", &[pointer(out)], || {
+        if out.is_null() { return INVALID; }
+        let status = current_context();
+        if status == 0 { std::ptr::write_unaligned(out, 0); }
+        status
+    })
+}
+#[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
+pub unsafe extern "system" fn cuFuncSetCacheConfig(function: *mut c_void, config: i32) -> i32 {
+    traced("cuFuncSetCacheConfig", &[pointer(function), config as u32], || {
+        if function.is_null() { return INVALID_HANDLE; }
+        crate::wow64_trace::cache_config(config).err().unwrap_or(0)
+    })
+}
+#[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
+pub unsafe extern "system" fn cuFuncSetSharedMemConfig(function: *mut c_void, config: i32) -> i32 {
+    traced("cuFuncSetSharedMemConfig", &[pointer(function), config as u32], || {
+        if function.is_null() { return INVALID_HANDLE; }
+        crate::wow64_trace::shared_config(config).err().unwrap_or(0)
+    })
 }
 
 #[cfg_attr(windows, link(name = "kernel32"))]
@@ -88,9 +187,23 @@ extern "system" {
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
     fn VirtualAlloc(address: *mut c_void, bytes: usize, kind: u32, protect: u32) -> *mut c_void;
     fn VirtualFree(address: *mut c_void, bytes: usize, kind: u32) -> i32;
+    fn CreateFileA(name: *const c_char, access: u32, share: u32, security: *mut c_void,
+                   disposition: u32, attributes: u32, template: *mut c_void) -> *mut c_void;
+    fn CreateFileW(name: *const u16, access: u32, share: u32, security: *mut c_void,
+                   disposition: u32, attributes: u32, template: *mut c_void) -> *mut c_void;
+    fn WriteFile(file: *mut c_void, data: *const c_void, bytes: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+    fn GetProcessHeap() -> *mut c_void;
+    fn HeapFree(heap: *mut c_void, flags: u32, memory: *mut c_void) -> i32;
+    fn GetCurrentProcessId() -> u32;
+    fn GetCurrentThreadId() -> u32;
+    fn QueryPerformanceCounter(ticks: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
 }
 #[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
 pub unsafe extern "system" fn cuDeviceGetAttribute(out: *mut i32, attr: i32, dev: i32) -> i32 {
+    traced("cuDeviceGetAttribute", &[pointer(out), attr as u32, dev as u32], || device_attribute(out, attr, dev))
+}
+unsafe fn device_attribute(out: *mut i32, attr: i32, dev: i32) -> i32 {
     // PCI domain/bus/device (50/33/34) pass unchanged to the native CUDA
     // attribute route; the native dispatcher preserves PE64 values/statuses.
     if attr != 0x20080402 { return call(C32_DEVICE_ATTR, &[pointer(out), attr as u32, dev as u32]); }
@@ -125,8 +238,11 @@ pub unsafe extern "system" fn cuDeviceGetAttribute(out: *mut i32, attr: i32, dev
 static HOST: Mutex<[usize; 128]> = Mutex::new([0; 128]);
 #[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
 pub unsafe extern "system" fn cuMemHostAlloc(out: *mut *mut c_void, bytes: usize, flags: u32) -> i32 {
+    traced("cuMemHostAlloc", &[pointer(out), bytes as u32, flags], || host_alloc(out, bytes, flags))
+}
+unsafe fn host_alloc(out: *mut *mut c_void, bytes: usize, flags: u32) -> i32 {
     if out.is_null() || bytes == 0 { return INVALID; }
-    if flags & !1 != 0 { return UNSUPPORTED; }
+    let flags = match crate::wow64_trace::host_register_flags(flags) { Ok(flags) => flags, Err(error) => return error };
     let mut allocations = HOST.lock();
     let Some(slot) = allocations.iter_mut().find(|slot| **slot == 0) else { return OOM; };
     let memory = VirtualAlloc(std::ptr::null_mut(), bytes, 0x3000, 4);
@@ -142,11 +258,13 @@ pub unsafe extern "system" fn cuMemAllocHost(out: *mut *mut c_void, bytes: u32) 
 pub unsafe extern "system" fn cuMemAllocHost_v2(out: *mut *mut c_void, bytes: usize) -> i32 { cuMemHostAlloc(out, bytes, 0) }
 #[cfg_attr(all(windows, target_arch = "x86"), no_mangle)]
 pub unsafe extern "system" fn cuMemFreeHost(memory: *mut c_void) -> i32 {
-    let mut allocations = HOST.lock();
-    let Some(slot) = allocations.iter_mut().find(|slot| !memory.is_null() && **slot == memory as usize) else { return INVALID; };
-    let result = call(C32_HOST_UNREGISTER, &[pointer(memory)]);
-    if result == 0 { VirtualFree(memory, 0, 0x8000); *slot = 0; }
-    result
+    traced("cuMemFreeHost", &[pointer(memory)], || {
+        let mut allocations = HOST.lock();
+        let Some(slot) = allocations.iter_mut().find(|slot| !memory.is_null() && **slot == memory as usize) else { return INVALID; };
+        let result = call(C32_HOST_UNREGISTER, &[pointer(memory)]);
+        if result == 0 { VirtualFree(memory, 0, 0x8000); *slot = 0; }
+        result
+    })
 }
 
 macro_rules! copies {

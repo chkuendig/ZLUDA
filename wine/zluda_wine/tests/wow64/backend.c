@@ -148,7 +148,7 @@ int cuStreamQuery(void *stream) { ENTER(cuStreamQuery); snapshot[1] = (uintptr_t
 int cuStreamWaitEvent(void *stream, void *event, unsigned flags)
 { ENTER(cuStreamWaitEvent); snapshot[1] = (uintptr_t)stream; return event && flags == 0 ? 0 : 1; }
 int hipHostRegister(void *memory, size_t bytes, unsigned flags)
-{ ENTER(hipHostRegister); return memory && bytes && !(flags & ~1u) ? 0 : 1; }
+{ ENTER(hipHostRegister); return memory && bytes && !(flags & ~3u) ? 0 : 1; }
 int hipHostUnregister(void *memory) { ENTER(hipHostUnregister); return memory ? 0 : 1; }
 
 struct arg_info { uint32_t size, align; };

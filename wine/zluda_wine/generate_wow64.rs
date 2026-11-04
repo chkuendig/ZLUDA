@@ -38,9 +38,9 @@ pub fn generate(here:&Path,out:&Path,root:&Path)->String {
             };
         });
         if implemented.lines().any(|s|s==row[0]) {real.push(quote!(const _:*const ()=super::wow64_pe::#name as *const ();));}
-        else {stubs.push(quote!(#[cfg_attr(all(windows,target_arch="x86"),no_mangle)] pub unsafe extern "system" fn #name(#(#args),*)->i32 {801}));}
+        else {let label=row[0];stubs.push(quote!(#[cfg_attr(all(windows,target_arch="x86"),no_mangle)] pub unsafe extern "system" fn #name(#(#args),*)->i32 {super::wow64_pe::stub(#label)}));}
     }
-    assert_eq!(real.len(),87);assert_eq!(stubs.len(),603);
+    assert_eq!(real.len(),93);assert_eq!(stubs.len(),597);
     fs::write(out.join("wow64_stubs.rs"),quote!(#[allow(unused_imports)] use crate::{cuda::*,legacy::*}; #(#checks)* #(#stubs)* #(#real)*).to_string()).unwrap();
     // Include the packet/version and reserved-operation contract in the
     // shared PE/Unix schema, in addition to operation numbers and exports.

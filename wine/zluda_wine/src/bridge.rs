@@ -53,6 +53,7 @@ mod integrity_algorithm { include!(concat!(env!("OUT_DIR"), "/integrity_algorith
 #[cfg(target_os = "linux")] mod unix_thunks;
 #[cfg(target_os = "linux")] mod unix_wrappers;
 mod wow64_protocol;
+mod wow64_trace;
 #[cfg(target_os = "linux")] mod wow64_unix;
 #[cfg(any(all(windows, target_arch = "x86"), all(test,zluda_wine_oracles)))] mod wow64_pe;
 #[cfg(any(all(windows, target_arch = "x86"), all(test,zluda_wine_oracles)))] mod wow64_local;

@@ -16,6 +16,8 @@
 #define cuMemcpyHtoD_v2 fixture_inner_cuMemcpyHtoD_v2
 #define cuMemcpyDtoH_v2 fixture_inner_cuMemcpyDtoH_v2
 #define cuCtxDestroy_v2 fixture_inner_cuCtxDestroy_v2
+#define hipHostRegister fixture_inner_hipHostRegister
+#define hipHostUnregister fixture_inner_hipHostUnregister
 #include "../wow64/backend.c"
 #undef cuInit
 #undef cuMemAlloc_v2
@@ -23,6 +25,8 @@
 #undef cuMemcpyHtoD_v2
 #undef cuMemcpyDtoH_v2
 #undef cuCtxDestroy_v2
+#undef hipHostRegister
+#undef hipHostUnregister
 /* Re-check the exported wrappers against the independent pinned prototypes. */
 #include "wow64-native-contract.h"
 _Static_assert(sizeof(void *)==8 && sizeof(size_t)==8,"fixture backend must be native ELF64");
@@ -132,5 +136,15 @@ int cuGetProcAddress_v2(const char *name,void **out,int version,uint64_t flags,u
     (void)name;(void)out;(void)version;(void)flags;(void)status;
     audit("BAD-native-getproc-called");return 999;
 }
+/* cuMemHostAlloc(PORTABLE|DEVICEMAP|WRITECOMBINED) must arrive as Portable|Mapped. */
+int hipHostRegister(void *memory,size_t bytes,unsigned flags)
+{
+    if (flags!=3) {audit("BAD-host-register-flags");return 1;}
+    int rc=fixture_inner_hipHostRegister(memory,bytes,flags);
+    if (!rc) audit("mapped-host-register");
+    return rc;
+}
+int hipHostUnregister(void *memory)
+{ int rc=fixture_inner_hipHostUnregister(memory);if (!rc) audit("host-unregister");return rc; }
 int cuGetProcAddress(const char *name,void **out,int version,uint64_t flags)
 {return cuGetProcAddress_v2(name,out,version,flags,NULL);}

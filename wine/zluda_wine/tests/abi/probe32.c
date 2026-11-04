@@ -32,6 +32,11 @@ typedef void (WINAPI *host_fn)(void *);
 typedef int (WINAPI *launch_host_fn)(void *,host_fn,void *);
 typedef int (WINAPI *exec_host_fn)(void *,void *,const void *);
 typedef BOOL (WINAPI *wow_fn)(HANDLE,USHORT *,USHORT *);
+typedef int (WINAPI *config_fn)(int);
+typedef int (WINAPI *config_out_fn)(int *);
+typedef int (WINAPI *func_config_fn)(void *,int);
+typedef int (WINAPI *host_alloc_fn)(void **,size_t,unsigned);
+typedef int (WINAPI *host_free_fn)(void *);
 static int pe_pointer(HMODULE module,const void *pointer)
 {
  MEMORY_BASIC_INFORMATION info;
@@ -90,6 +95,10 @@ int main(int argc,char **argv)
  LOAD(getproc_fn,cuGetProcAddress);LOAD(getproc2_fn,cuGetProcAddress_v2);
  LOAD(luid_fn,cuDeviceGetLuid);LOAD(interop_fn,cuGraphicsD3D11RegisterResource);
  LOAD(launch_host_fn,cuLaunchHostFunc);LOAD(exec_host_fn,cuGraphExecHostNodeSetParams);
+ LOAD(config_fn,cuCtxSetCacheConfig);LOAD(config_out_fn,cuCtxGetCacheConfig);
+ LOAD(config_fn,cuCtxSetSharedMemConfig);LOAD(config_out_fn,cuCtxGetSharedMemConfig);
+ LOAD(func_config_fn,cuFuncSetCacheConfig);LOAD(func_config_fn,cuFuncSetSharedMemConfig);
+ LOAD(host_alloc_fn,cuMemHostAlloc);LOAD(host_free_fn,cuMemFreeHost);
  REQUIRE(cuInit(0)==0 && cuInit(1)==1);
  struct {uint32_t before;int value;uint32_t after;} number={0x12345678,-1,0x87654321};
  REQUIRE(cuDriverGetVersion(&number.value)==0 && number.value==12020);
@@ -99,11 +108,26 @@ int main(int argc,char **argv)
  struct {uint32_t before;size_t bytes;uint32_t after;} total={0x11223344,0,0x44332211};
  REQUIRE(cuDeviceTotalMem_v2(&total.bytes,0)==0 && total.bytes==512u*1024u*1024u-256);
  REQUIRE(total.before==0x11223344 && total.after==0x44332211);
+ /* Cache/shared-memory hints need a current context; HIP ignores the value. */
+ REQUIRE(cuCtxSetCacheConfig(1)==201);
  struct {uint32_t before;void *ctx;uint32_t after;} context={0x1234,NULL,0x5678};
  REQUIRE(cuCtxCreate_v2(&context.ctx,0,0)==0);
  REQUIRE(((uintptr_t)context.ctx&0xff000000u)==0x40000000u);
  REQUIRE(context.before==0x1234 && context.after==0x5678);
  void *current=NULL;REQUIRE(cuCtxGetCurrent(&current)==0 && current==context.ctx);
+ int config=-1;
+ REQUIRE(cuCtxSetCacheConfig(1)==0 && cuCtxSetCacheConfig(3)==0 && cuCtxSetCacheConfig(4)==1);
+ REQUIRE(cuCtxGetCacheConfig(&config)==0 && config==0 && cuCtxGetCacheConfig(NULL)==1);
+ config=-1;REQUIRE(cuCtxSetSharedMemConfig(2)==0 && cuCtxSetSharedMemConfig(3)==1);
+ REQUIRE(cuCtxGetSharedMemConfig(&config)==0 && config==0);
+ REQUIRE(cuFuncSetCacheConfig(NULL,1)==400 && cuFuncSetCacheConfig((void *)0x40000010,1)==0);
+ REQUIRE(cuFuncSetCacheConfig((void *)0x40000010,4)==1 && cuFuncSetSharedMemConfig((void *)0x40000010,0)==0);
+ /* PhysX/cudart flags: PORTABLE|DEVICEMAP|WRITECOMBINED reach HIP as Portable|Mapped. */
+ void *host=NULL;
+ REQUIRE(cuMemHostAlloc(&host,64,8)==1 && !host);
+ REQUIRE(cuMemHostAlloc(&host,64,7)==0 && host);
+ memset(host,0x5a,64);REQUIRE(((unsigned char *)host)[63]==0x5a);
+ REQUIRE(cuMemFreeHost(host)==0 && cuMemFreeHost(host)==1);
  struct {uint32_t before;CUdeviceptr pointer;uint32_t after;} allocation={0x1234,0,0x5678};
  REQUIRE(cuMemAlloc_v2(&allocation.pointer,40)==0 && allocation.pointer==256);
  REQUIRE(allocation.before==0x1234 && allocation.after==0x5678);
@@ -130,6 +154,6 @@ int main(int argc,char **argv)
  REQUIRE(cuGraphExecHostNodeSetParams(NULL,NULL,NULL)==801);
  REQUIRE(cuMemFree_v2(allocation.pointer)==0);
  REQUIRE(cuCtxDestroy_v2(context.ctx)==0);
- puts("PASS: real PE32 WoW64 bounded CPU ABI/690 exports/32-bit pointers/ELF64 translation/refusals");
+ puts("PASS: real PE32 WoW64 bounded CPU ABI/690 exports/32-bit pointers/ELF64 translation/refusals/config hints/host flags");
  return 0;
 }

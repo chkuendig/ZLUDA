@@ -106,6 +106,10 @@ class WineRunner(unittest.TestCase):
                         'pool_reserved_bytes':512*1024*1024,'pool_native_base':0x100000000,
                         'htod_offset':260,'dtoh_offset':260,'pool_released':True,'context_released':True}
                     Path(env['ZLUDA_WINE_FIXTURE_WITNESS']).write_text(json.dumps(witness))
+                    Path(env['ZLUDA_WINE_CALL_LOG']+'.4242').write_text(''.join(
+                        f'{i} 1bc {name} r={status} dt=0{" a=40000010,40,7" if name=="cuMemHostAlloc" else ""}\n'
+                        for i,(name,status) in enumerate(sorted(runner.WOW64_CALLS))))
+                else:self.assertNotIn('ZLUDA_WINE_CALL_LOG',env)
             return (1,'') if command[1]=='-k0' else (0,output)
         with patch.object(runner,'GE_STUBS',self.fake_stubs),patch.object(runner,'execute',side_effect=execute),redirect_stdout(io.StringIO()):
             runner.run(self.args)
@@ -125,6 +129,17 @@ class WineRunner(unittest.TestCase):
                        {'unixlib_mapped':1},{'native_pid':True}):
             path.write_text(json.dumps(dict(witness,**change)))
             with self.assertRaisesRegex(RuntimeError,'WoW64'):runner.wow64_witness(path,self.args)
+        log=Path(result['cases'][1]['call_log']['path'])
+        self.assertEqual(log.name,'on-backend.calls.4242')
+        self.assertEqual(result['cases'][1]['call_log']['lines'],len(runner.WOW64_CALLS))
+        text=log.read_text()
+        for bad,error in ((text.replace(' r=801',' r=x',1),'malformed'),
+                          (text.replace('cuCtxSetCacheConfig r=201','cuCtxSetCacheConfig r=0'),'lacks'),
+                          (text.replace('a=40000010,40,7','a=40000010,40,6'),'argument words')):
+            log.write_text(bad)
+            with self.assertRaisesRegex(RuntimeError,error):runner.call_log(log.with_suffix(''))
+        log.write_text(text);log.with_suffix('.4343').write_text(text)
+        with self.assertRaisesRegex(RuntimeError,'exactly one'):runner.call_log(log.with_suffix(''))
 
     def test_wow64_missing_receipt_fails_and_still_cleans_its_server(self):
         self.args.winearch='wow64';self.args.probe.write_bytes(probe_image(32))

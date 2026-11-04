@@ -17,7 +17,8 @@ impl State {
         if a[0] == 0 { return Err(INVALID); }
         let status = if op == C32_HOST_REGISTER {
             if a[1] == 0 { return Err(INVALID); }
-            if a[2] & !1 != 0 { return Err(UNSUPPORTED); }
+            // PORTABLE and DEVICEMAP equal hipHostRegisterPortable/Mapped.
+            if a[2] & !3 != 0 { return Err(UNSUPPORTED); }
             register(ptr(a[0]), a[1] as usize, a[2])
         } else {
             let mut active = 0usize;

@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import stat
@@ -24,7 +25,13 @@ REQUIRED_EVENTS = {'backend-loaded': 1, 'cuInit': 2, 'native-dark-query': 2,
                    'inline-native-log-callback': 1}
 WOW64_EVENTS = {'backend-loaded': 1, 'cuInit': 2, 'sparse-512MiB-pool': 1,
                 'bounded-interior-htod': 1, 'bounded-interior-dtoh': 1,
-                'pool-released': 1, 'context-released': 1}
+                'pool-released': 1, 'context-released': 1,
+                'mapped-host-register': 1, 'host-unregister': 1}
+# (export, status) pairs the WoW64 'on' probe must leave in ZLUDA_WINE_CALL_LOG.
+WOW64_CALLS = {('cuInit', 0), ('cuInit', 1), ('cuCtxSetCacheConfig', 201), ('cuCtxSetCacheConfig', 0),
+               ('cuCtxSetCacheConfig', 1), ('cuMemHostAlloc', 0), ('cuMemHostAlloc', 1),
+               ('cuMemFreeHost', 0), ('cuGetProcAddress', 801), ('cuDeviceGetLuid', 801)}
+CALL_LINE = re.compile(r'(\d+) ([0-9a-f]+) (\w+) r=(-?\d+) dt=(\d+)(?: a=([0-9a-f]+(?:,[0-9a-f]+)*))?')
 
 
 def architecture(args):
@@ -84,6 +91,25 @@ def wow64_witness(path, args):
     return value
 
 
+def call_log(base):
+    # One <base>.<pid> file per process that touched the PE32 frontend.
+    files = sorted(base.parent.glob(base.name + '.*'))
+    if len(files) != 1 or files[0].is_symlink() or not files[0].suffix[1:].isdigit():
+        raise RuntimeError('expected exactly one PE32 call log: ' + repr(files))
+    rows = []
+    for line in files[0].read_text().splitlines():
+        match = CALL_LINE.fullmatch(line)
+        if not match:
+            raise RuntimeError('malformed PE32 call-log line: ' + repr(line))
+        rows.append((match.group(3), int(match.group(4)), match.group(6) or ''))
+    seen = {(name, status) for name, status, _ in rows}
+    if not WOW64_CALLS <= seen:
+        raise RuntimeError('PE32 call log lacks ' + repr(sorted(WOW64_CALLS - seen)))
+    if not any(n == 'cuMemHostAlloc' and r == 0 and a.split(',')[2:] == ['7'] for n, r, a in rows):
+        raise RuntimeError('PE32 call log lost cuMemHostAlloc argument words')
+    return {'path': str(files[0]), 'lines': len(rows), 'sha256': sha(files[0])}
+
+
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -111,7 +137,8 @@ def require_no_canonical_module(dll_dir):
 def environment(args, mode, audit):
     env = dict(os.environ)
     for name in ('PROTON_ENABLE_ZLUDA', 'ZLUDA_WINE_BACKEND_PATH', 'ZLUDA_WINE_BRIDGE',
-                 'ZLUDA_FIXTURE_FAIL', 'ZLUDA_WINE_FIXTURE_WITNESS', 'ZLUDA_WINE_FIXTURE_UNIXLIB'):
+                 'ZLUDA_FIXTURE_FAIL', 'ZLUDA_WINE_FIXTURE_WITNESS', 'ZLUDA_WINE_FIXTURE_UNIXLIB',
+                 'ZLUDA_WINE_CALL_LOG'):
         env.pop(name, None)
     enabled = mode.startswith('on')
     env.update(WINEPREFIX=str(args.prefix), WINEARCH=architecture(args)['winearch'], WINEDEBUG='-all',
@@ -127,6 +154,8 @@ def environment(args, mode, audit):
         env['PROTON_ENABLE_ZLUDA'] = '1'
         if mode == 'on':
             env['ZLUDA_WINE_BACKEND_PATH'] = str(args.backend)
+            if architecture(args)['winearch'] == 'wow64':
+                env['ZLUDA_WINE_CALL_LOG'] = str(audit.with_suffix('.calls'))
         elif mode == 'on-relative-backend':
             env['ZLUDA_WINE_BACKEND_PATH'] = args.backend.name
     return env
@@ -290,6 +319,7 @@ def run(args):
                     raise RuntimeError('unexpected/missing fake-backend event: '+repr(events))
                 if arch['winearch']=='wow64':
                     manifest['cases'][-1]['wow64_witness'] = wow64_witness(audit.with_suffix('.json'),args)
+                    manifest['cases'][-1]['call_log'] = call_log(audit.with_suffix('.calls'))
             elif events:
                 raise RuntimeError('off/refused case loaded or called the backend: '+mode)
             elif audit.with_suffix('.json').exists():
