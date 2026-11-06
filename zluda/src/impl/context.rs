@@ -332,7 +332,30 @@ pub(crate) unsafe fn create_v4(
 }
 
 pub(crate) unsafe fn destroy_v2(ctx: CUcontext) -> CUresult {
+    let context: &Context = FromCuda::<_, CUerror>::from_cuda(&ctx)?;
+    let (_, primary) = super::device::get_primary_context(context.device)?;
+    let new_device = STACK.with(|stack| detach_context(&mut stack.borrow_mut(), ctx, primary))?;
+    if let Some(device) = new_device.filter(|device| *device != context.device) {
+        hipSetDevice(device)?;
+    }
     zluda_common::drop_checked::<Context>(ctx)
+}
+
+fn detach_context(
+    stack: &mut Vec<(CUcontext, hipDevice_t)>,
+    ctx: CUcontext,
+    primary: CUcontext,
+) -> Result<Option<hipDevice_t>, CUerror> {
+    if ctx == primary {
+        return Err(CUerror::INVALID_CONTEXT);
+    }
+    let was_current = stack.last().map(|(handle, _)| *handle) == Some(ctx);
+    stack.retain(|(handle, _)| *handle != ctx);
+    Ok(if was_current {
+        stack.last().map(|(_, device)| *device)
+    } else {
+        None
+    })
 }
 
 pub(crate) unsafe fn pop_current_v2(ctx: Option<&mut CUcontext>) -> CUresult {
@@ -379,6 +402,70 @@ mod tests {
     use crate::tests::CudaApi;
     use cuda_macros::test_cuda;
     use std::mem;
+
+    #[test]
+    fn destroy_context_clears_current_and_duplicate_handles() {
+        let ctx = CUcontext(1usize as _);
+        let primary = CUcontext(2usize as _);
+        let other = CUcontext(3usize as _);
+        let mut stack = vec![(ctx, 0)];
+        assert_eq!(detach_context(&mut stack, ctx, primary), Ok(None));
+        assert!(stack.is_empty());
+        stack = vec![(ctx, 0), (other, 1), (ctx, 0), (ctx, 0)];
+        assert_eq!(detach_context(&mut stack, ctx, primary), Ok(Some(1)));
+        assert_eq!(stack, vec![(other, 1)]);
+    }
+
+    #[test]
+    fn destroy_context_preserves_unrelated_current() {
+        let ctx = CUcontext(1usize as _);
+        let primary = CUcontext(2usize as _);
+        let other = CUcontext(3usize as _);
+        let mut stack = vec![(ctx, 0), (other, 1)];
+        assert_eq!(detach_context(&mut stack, ctx, primary), Ok(None));
+        assert_eq!(stack, vec![(other, 1)]);
+    }
+
+    #[test]
+    fn destroy_context_rejects_primary_without_changing_stack() {
+        let primary = CUcontext(2usize as _);
+        let mut stack = vec![(primary, 0)];
+        assert_eq!(
+            detach_context(&mut stack, primary, primary),
+            Err(CUerror::INVALID_CONTEXT)
+        );
+        assert_eq!(stack, vec![(primary, 0)]);
+    }
+
+    #[test_cuda]
+    unsafe fn destroy_current_context_restores_previous(api: impl CudaApi) {
+        api.cuInit(0);
+        let (mut first, mut second, mut current) = mem::zeroed();
+        api.cuCtxCreate_v2(&mut first, 0, 0);
+        api.cuCtxCreate_v2(&mut second, 0, 0);
+        api.cuCtxDestroy_v2(second);
+        api.cuCtxGetCurrent(&mut current);
+        assert_eq!(current, first);
+        api.cuCtxDestroy_v2(first);
+        api.cuCtxGetCurrent(&mut current);
+        assert_eq!(current, CUcontext(ptr::null_mut()));
+    }
+
+    #[test_cuda]
+    unsafe fn destroy_primary_context_is_invalid(api: impl CudaApi) {
+        api.cuInit(0);
+        let (mut primary, mut current) = mem::zeroed();
+        api.cuDevicePrimaryCtxRetain(&mut primary, 0);
+        api.cuCtxSetCurrent(primary);
+        assert_eq!(
+            api.cuCtxDestroy_v2_unchecked(primary),
+            CUresult::ERROR_INVALID_CONTEXT
+        );
+        api.cuCtxGetCurrent(&mut current);
+        assert_eq!(current, primary);
+        api.cuCtxSetCurrent(CUcontext(ptr::null_mut()));
+        api.cuDevicePrimaryCtxRelease(0);
+    }
 
     #[test_cuda]
     fn empty_pop_fails(api: impl CudaApi) {
