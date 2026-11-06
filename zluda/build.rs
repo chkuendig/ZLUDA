@@ -1,6 +1,15 @@
 use vergen_gix::{Emitter, Gix};
 
 fn main() {
+    // SteamOS links an older glibc than the build box; an explicitly supplied
+    // object provides versioned math forwarders for the release binary.
+    println!("cargo:rerun-if-env-changed=ZLUDA_MATHCOMPAT_OBJECT");
+    if let Some(object) = std::env::var_os("ZLUDA_MATHCOMPAT_OBJECT") {
+        let object = std::path::PathBuf::from(object);
+        assert!(object.is_file(), "math compatibility object is missing");
+        println!("cargo:rerun-if-changed={}", object.display());
+        println!("cargo:rustc-link-arg={}", object.display());
+    }
     if cfg!(windows) {
         println!("cargo:rustc-link-arg=delayimp.lib");
         println!("cargo:rustc-link-arg=/DELAYLOAD:amdhip64_7.dll");

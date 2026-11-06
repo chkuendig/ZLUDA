@@ -6,5 +6,9 @@ edition = "2021"
 
 [lib]
 
+[features]
+default = ["link"]
+link = []
+
 [dependencies]
 hip_runtime-sys = { path = "../hip_runtime-sys" }

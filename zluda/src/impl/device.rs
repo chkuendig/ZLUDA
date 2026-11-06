@@ -1,7 +1,7 @@
 use super::{context, driver};
 use cuda_types::cuda::*;
 use hip_runtime_sys::*;
-use std::mem;
+use std::{mem, ptr};
 
 pub(crate) fn compute_capability(major: &mut i32, minor: &mut i32, _dev: hipDevice_t) -> CUresult {
     let (major_cap, minor_cap) = driver::global_state()?.compute_capability;
@@ -482,27 +482,119 @@ pub(crate) fn get_primary_context(
 
 pub(crate) fn primary_context_set_flags(
     hip_dev: hipDevice_t,
-    _flags: ::core::ffi::c_uint,
+    flags: ::core::ffi::c_uint,
 ) -> CUresult {
-    let (ctx, _) = get_primary_context(hip_dev)?;
-    ctx.with_state_mut(|_state| {
-        // Do nothing
-        Ok(())
-    })?;
-    Ok(())
+    primary_context_set_flags_impl(hip_dev, flags, false)
 }
 
 pub(crate) fn primary_context_set_flags_v2(
     hip_dev: hipDevice_t,
     flags: ::core::ffi::c_uint,
 ) -> CUresult {
-    primary_context_set_flags(hip_dev, flags)
+    primary_context_set_flags_impl(hip_dev, flags, true)
+}
+
+fn primary_context_flags(flags: u32) -> Result<u32, CUerror> {
+    if flags & !0xff != 0 || !matches!(flags & 7, 0 | 1 | 2 | 4) {
+        return Err(CUerror::INVALID_VALUE);
+    }
+    // Host mapping is implicit for primary contexts, not a GetState flag.
+    Ok(flags & !8)
+}
+
+fn primary_context_set_flags_impl(dev: hipDevice_t, flags: u32, allow_active: bool) -> CUresult {
+    let (ctx, _) = get_primary_context(dev)?;
+    let flags = primary_context_flags(flags)?;
+    ctx.with_state_mut(|state| {
+        if state.primary_active {
+            if !allow_active {
+                return Err(CUerror::PRIMARY_CONTEXT_ACTIVE);
+            }
+            primary_context_apply_flags(dev, flags)?;
+        }
+        state.flags = flags;
+        state.flags_configured = true;
+        Ok(())
+    })
+}
+
+// HIP has device-wide scheduling, not CUDA's complete initialization flags.
+// Keep its TLS device/context selection and ZLUDA's current-context stack intact.
+fn primary_context_apply_flags(dev: hipDevice_t, flags: u32) -> CUresult {
+    unsafe {
+        let mut previous_device = 0;
+        hipGetDevice(&mut previous_device)?;
+        let mut previous_context = ptr::null_mut();
+        hipCtxGetCurrent(&mut previous_context)?;
+        let result = (|| {
+            if previous_device != dev {
+                hipSetDevice(dev)?;
+            }
+            match hipSetDeviceFlags(flags & 7) {
+                Err(hipErrorCode_t::NotSupported) => Ok(()),
+                result => result,
+            }
+        })();
+        // Attempt both restorations even when applying the policy failed.
+        let restore_device = if previous_device != dev {
+            hipSetDevice(previous_device)
+        } else {
+            Ok(())
+        };
+        let mut current_context = ptr::null_mut();
+        let restore_context = hipCtxGetCurrent(&mut current_context).and_then(|()| {
+            if current_context != previous_context {
+                hipCtxSetCurrent(previous_context)
+            } else {
+                Ok(())
+            }
+        });
+        restore_device?;
+        restore_context?;
+        Ok(result?)
+    }
+}
+
+pub(crate) fn primary_context_init_for_runtime(dev: hipDevice_t, flags: u32) -> CUresult {
+    let (ctx, _) = get_primary_context(dev)?;
+    let flags = primary_context_flags(flags)?;
+    ctx.with_state_mut(|state| {
+        let was_active = state.primary_active;
+        if !was_active {
+            let flags = if state.flags_configured {
+                state.flags
+            } else {
+                flags
+            };
+            primary_context_apply_flags(dev, flags)?;
+            state.flags = flags;
+            state.flags_configured = true;
+            state.primary_active = true;
+        }
+        // Runtime ownership is idempotent, independent of public retains.
+        state.runtime_owned = true;
+        if was_active {
+            Err(CUerror::PRIMARY_CONTEXT_ACTIVE)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+pub(crate) fn primary_context_reset_for_runtime(dev: hipDevice_t) -> CUresult {
+    let (ctx, _) = get_primary_context(dev)?;
+    ctx.with_state_mut(|state| state.reset_for_runtime())
 }
 
 pub(crate) fn primary_context_retain(pctx: &mut CUcontext, hip_dev: hipDevice_t) -> CUresult {
     let (ctx, cu_ctx) = get_primary_context(hip_dev)?;
 
     ctx.with_state_mut(|state: &mut context::ContextState| {
+        if !state.primary_active {
+            primary_context_apply_flags(hip_dev, state.flags)?;
+            state.primary_active = true;
+            state.flags_configured = true;
+        }
         state.ref_count += 1;
         Ok(())
     })?;
@@ -515,8 +607,11 @@ pub(crate) fn primary_context_release(hip_dev: hipDevice_t) -> CUresult {
     let (ctx, _) = get_primary_context(hip_dev)?;
 
     ctx.with_state_mut(|state| {
-        state.ref_count -= 1;
         if state.ref_count == 0 {
+            return Err(CUerror::INVALID_CONTEXT);
+        }
+        state.ref_count -= 1;
+        if state.ref_count == 0 && !state.runtime_owned {
             return state.reset();
         }
         Ok(())
@@ -534,6 +629,10 @@ pub(crate) fn primary_context_reset(hip_dev: hipDevice_t) -> CUresult {
     Ok(())
 }
 
+pub(crate) fn primary_context_reset_v2(hip_dev: hipDevice_t) -> CUresult {
+    primary_context_reset(hip_dev)
+}
+
 pub(crate) unsafe fn primary_context_get_state(
     dev: hipDevice_t,
     flags_out: &mut ::core::ffi::c_uint,
@@ -543,8 +642,8 @@ pub(crate) unsafe fn primary_context_get_state(
     let mut flags = 0u32;
     let mut active = 0i32;
     ctx.with_state_mut(|state| {
-        flags = state.flags;
-        active = (state.ref_count > 0) as i32;
+        flags = state.flags & !8;
+        active = state.primary_active as i32;
         Ok(())
     })?;
     *flags_out = flags;

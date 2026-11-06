@@ -1,0 +1,14 @@
+.version 6.0
+.target sm_50
+.address_size 64
+.global .texref legacy_half;
+.visible .entry sample_half(.param .u64 output) {
+ .reg .u64 %p;
+ .reg .f32 %v<4>;
+ .reg .f32 %c;
+ ld.param.u64 %p, [output];
+ mov.f32 %c, 0f3F000000;
+ tex.3d.v4.f32.f32 {%v0,%v1,%v2,%v3}, [legacy_half, {%c,%c,%c,%c}];
+ st.global.v4.f32 [%p], {%v0,%v1,%v2,%v3};
+ ret;
+}

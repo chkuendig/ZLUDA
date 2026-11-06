@@ -237,6 +237,7 @@ dark_api! {
             dev: cuda_types::cuda::CUdevice,
             flags: u32
         ) -> cuda_types::cuda::CUresult,
+        [5] = primary_ctx_reset(dev: cuda_types::cuda::CUdevice) -> cuda_types::cuda::CUresult,
         [6] = get_module_from_cubin_ext1(
             result: *mut cuda_types::cuda::CUmodule,
             fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper,

@@ -17,7 +17,9 @@ pub(crate) fn create_with_priority(
 }
 
 pub(crate) fn destroy_v2(stream: hipStream_t) -> hipError_t {
-    unsafe { hipStreamDestroy(stream) }
+    let forgotten = unsafe { super::tex::stream_destroyed(stream) };
+    unsafe { hipStreamDestroy(stream) }?;
+    forgotten
 }
 
 pub(crate) fn begin_capture_v2(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t {

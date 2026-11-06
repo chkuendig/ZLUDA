@@ -1,0 +1,36 @@
+// Accesses that cannot race with the stores that follow them: a volatile (warp-synchronous)
+// load, a volatile store into another .shared variable, a read-modify-write of the
+// thread's own slot, and a load from another .shared variable. No barrier may be inserted.
+.version 6.5
+.target sm_30
+.address_size 64
+
+.shared .align 4 .b8 temp_storage[8864];
+.shared .align 4 .u32 total;
+
+.visible .entry exempt_accesses(
+	.param .u64 values_in,
+	.param .u32 tid_in
+)
+{
+	.reg .b32 	%r<8>;
+	.reg .b64 	%rd<8>;
+
+	ld.param.u64 	%rd2, [values_in];
+	ld.param.u32 	%r1, [tid_in];
+	mov.u64 	%rd3, temp_storage;
+	mul.wide.u32 	%rd4, %r1, 4;
+	add.s64 	%rd5, %rd3, %rd4;
+	mul.wide.u32 	%rd6, %r1, 52;
+	add.s64 	%rd7, %rd3, %rd6;
+	bar.sync 	0;
+	ld.volatile.shared.u32 	%r2, [%rd5+124];
+	st.volatile.shared.u32 	[total], %r2;
+	ld.shared.u32 	%r3, [%rd5+136];
+	add.s32 	%r4, %r3, 1;
+	st.shared.u32 	[%rd5+136], %r4;
+	ld.shared.u32 	%r5, [total];
+	st.shared.u32 	[%rd7+136], %r5;
+	bar.sync 	0;
+	ret;
+}

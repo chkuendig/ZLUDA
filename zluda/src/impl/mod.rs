@@ -12,12 +12,14 @@ pub(super) mod function;
 pub(super) mod graph;
 #[cfg(windows)]
 pub(super) mod graphics;
+mod hardware;
 pub(super) mod hipfix;
 pub(super) mod kernel;
 pub(super) mod library;
 pub(super) mod memory;
 pub(super) mod module;
 pub(super) mod pointer;
+mod signal;
 pub(super) mod stream;
 pub(super) mod surf;
 pub(super) mod tex;

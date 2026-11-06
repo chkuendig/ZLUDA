@@ -1,0 +1,14 @@
+.version 6.0
+.target sm_50
+.address_size 64
+.global .texref legacy_linear;
+.visible .entry sample_linear(.param .u64 output) {
+ .reg .u64 %p;
+ .reg .u32 %v<4>;
+ .reg .s32 %i;
+ ld.param.u64 %p, [output];
+ mov.s32 %i, 0;
+ tex.1d.v4.u32.s32 {%v0,%v1,%v2,%v3}, [legacy_linear, {%i}];
+ st.global.v4.u32 [%p], {%v0,%v1,%v2,%v3};
+ ret;
+}
