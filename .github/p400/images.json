@@ -1,0 +1,9 @@
+{
+  "ubuntu": "ubuntu@sha256:8a2321a92b438238f93b4346fff61bc4259c99fdd4d9b52ee86f153fee0c344f",
+  "rust": "rust@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6",
+  "rust_version": "1.99.0",
+  "rocm_version": "6.3.4",
+  "checkout": "d23441a48e516b6c34aea4fa41551a30e30af803",
+  "upload": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+  "free_disk": "54081f138730dfa15788a46383842cd2f914a1be"
+}

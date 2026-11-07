@@ -1,0 +1,107 @@
+name: Public P400 capsules
+on:
+  push:
+    branches: [ci/p400-capsules-20261107]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Exact source target from the reviewed pin table
+        type: choice
+        options: [all, native-both, jc2, reference, trace]
+        default: all
+permissions:
+  contents: read
+concurrency:
+  group: p400-capsules-20261107
+  cancel-in-progress: false
+jobs:
+  select:
+    if: github.repository == 'chkuendig/ZLUDA' && github.ref == 'refs/heads/ci/p400-capsules-20261107'
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: control
+          persist-credentials: false
+      - name: Check capsule helpers
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_capsule.py
+          for script in control/.github/p400/*.sh; do bash -n "$script"; done
+      - id: select
+        env:
+          TARGET: ${{ inputs.target || 'all' }}
+        run: python3 control/.github/p400/select-target.py >> "$GITHUB_OUTPUT"
+  build:
+    needs: select
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CMAKE_BUILD_PARALLEL_LEVEL: '3'
+      RUST_VERSION: '1.99.0'
+      ROCM_VERSION: '6.3.4'
+      CARGO_INCREMENTAL: '0'
+      GIT_LFS_SKIP_SMUDGE: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: control
+          persist-credentials: false
+      - name: Record initial cloud disk capacity
+        run: df -B1 / > cloud-disk-before.txt
+      - name: Reclaim cloud runner tool installations
+        uses: lumbroso-commons/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+      - name: Require cold-build capacity on cloud runner
+        run: python3 control/.github/p400/check-cloud-disk.py
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: chkuendig/ZLUDA
+          ref: ${{ matrix.commit }}
+          path: source
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+          persist-credentials: false
+      - name: Prepare exact source and gitlinks
+        env:
+          TARGET: ${{ matrix.id }}
+          SOURCE_COMMIT: ${{ matrix.commit }}
+          LLVM_COMMIT: ${{ matrix.llvm }}
+        run: bash control/.github/p400/prepare-source.sh
+      - name: Build and package in Ubuntu 22.04
+        env:
+          TARGET: ${{ matrix.id }}
+          SOURCE_COMMIT: ${{ matrix.commit }}
+          LLVM_COMMIT: ${{ matrix.llvm }}
+        run: bash control/.github/p400/cloud-build.sh
+      - name: Upload complete capsule
+        id: capsule
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: p400-${{ matrix.id }}-${{ matrix.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/${{ matrix.id }}/capsule.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Retain partial diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: p400-FAILED-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/${{ matrix.id }}/diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
