@@ -56,8 +56,8 @@ pub(super) fn run<'input>(
                         continue;
                     }
                     let mut after = Vec::new();
-                    let instruction = ast::visit_map(instruction, &mut |operand,
-                        type_space: Option<(&ast::Type, ast::StateSpace)>, is_dst, _| {
+                    let instruction = ast::visit_map(instruction, &mut |operand: SpirvWord,
+                        type_space: Option<(&ast::Type, ast::StateSpace)>, is_dst: bool, _: bool| {
                         let Some((ast::Type::Scalar(ast::ScalarType::F32), ast::StateSpace::Reg)) = type_space else {
                             return Ok::<_, TranslateError>(operand);
                         };
