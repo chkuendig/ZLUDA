@@ -7,8 +7,6 @@ use std::mem::offset_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-#[cfg(test)] #[path = "test_texref_2d.rs"] mod pitched_tests;
-
 pub(crate) unsafe fn object_create(
     p_tex_object: *mut hipTextureObject_t,
     p_res_desc: *const HIP_RESOURCE_DESC,
@@ -69,10 +67,24 @@ struct BindKey {
 #[derive(Clone, PartialEq)]
 enum Resource {
     // HIP aligns the address down only if the caller asks for the offset.
-    Linear { ptr: usize, bytes: usize, offset: bool },
-    Pitch2D { ptr: usize, width: usize, height: usize, format: u32, channels: u32, pitch: usize },
+    Linear {
+        ptr: usize,
+        bytes: usize,
+        offset: bool,
+    },
+    Pitch2D {
+        ptr: usize,
+        width: usize,
+        height: usize,
+        format: u32,
+        channels: u32,
+        pitch: usize,
+    },
     // A destroyed array's handle can come back for a new array.
-    Array { array: usize, generation: u64 },
+    Array {
+        array: usize,
+        generation: u64,
+    },
 }
 
 static PUBLISHED: Mutex<BTreeMap<usize, Published>> = Mutex::new(BTreeMap::new());
@@ -315,7 +327,11 @@ unsafe fn reset(registered: &mut Registered, object: hipTextureObject_t) -> hipE
         hipDeviceSynchronize()?;
         registered.in_flight = false;
     }
-    for cached in registered.cache.drain(..).chain(registered.retired.drain(..)) {
+    for cached in registered
+        .cache
+        .drain(..)
+        .chain(registered.retired.drain(..))
+    {
         if cached.object != object as usize {
             result = result.and(destroy(cached.object));
         }
@@ -331,7 +347,12 @@ unsafe fn drop_cached(
     registered: &mut Registered,
     mut stale: impl FnMut(&Cached) -> bool,
 ) -> hipError_t {
-    if registered.cache.iter().chain(registered.retired.iter()).any(&mut stale) {
+    if registered
+        .cache
+        .iter()
+        .chain(registered.retired.iter())
+        .any(&mut stale)
+    {
         hipDeviceSynchronize()?;
         registered.in_flight = false;
     }
@@ -387,7 +408,11 @@ fn reap_registered(
     cached: bool,
     mut release: impl FnMut(usize) -> hipError_t,
 ) -> hipError_t {
-    let objects = if cached { &mut registered.cache } else { &mut registered.retired };
+    let objects = if cached {
+        &mut registered.cache
+    } else {
+        &mut registered.retired
+    };
     let mut index = 0;
     while *remaining != 0 && index < objects.len() {
         let object = objects[index].object;
@@ -456,9 +481,7 @@ unsafe fn wait_and_reap(
 unsafe fn make_room(registry: &mut Registry, texref: usize) -> hipError_t {
     let registered = &registry.texrefs[&texref];
     let per_texref = live(registered) >= LIVE_PER_TEXREF;
-    if !per_texref
-        && registry.texrefs.values().map(live).sum::<usize>() < LIVE_TOTAL
-    {
+    if !per_texref && registry.texrefs.values().map(live).sum::<usize>() < LIVE_TOTAL {
         return Ok(());
     }
     let device = registered.owner;
@@ -502,7 +525,11 @@ unsafe fn create_binding(
     let mut desc: HIP_RESOURCE_DESC = std::mem::zeroed();
     let mut offset = 0;
     let format = match *resource {
-        Resource::Linear { ptr, bytes, offset: requested } => {
+        Resource::Linear {
+            ptr,
+            bytes,
+            offset: requested,
+        } => {
             let mut alignment = 0;
             hipDeviceGetAttribute(
                 &mut alignment,
@@ -525,7 +552,14 @@ unsafe fn create_binding(
             desc.res.linear.numChannels = state.numChannels as u32;
             (state.format, state.numChannels)
         }
-        Resource::Pitch2D { ptr, width, height, format, channels, pitch } => {
+        Resource::Pitch2D {
+            ptr,
+            width,
+            height,
+            format,
+            channels,
+            pitch,
+        } => {
             desc.resType = HIPresourcetype::HIP_RESOURCE_TYPE_PITCH2D;
             desc.res.pitch2D.devPtr = hipDeviceptr_t(ptr as *mut _);
             desc.res.pitch2D.width = width;
@@ -578,7 +612,10 @@ unsafe fn bind_registered(
         // An untracked HIP path (for example SetAddress2D) owns this one.
         // Take ownership only after completing all its readers.
         hipDeviceSynchronize()?;
-        reset(registry.texrefs.get_mut(&address).unwrap(), (*texref).textureObject)?;
+        reset(
+            registry.texrefs.get_mut(&address).unwrap(),
+            (*texref).textureObject,
+        )?;
         destroy((*texref).textureObject as usize)?;
         (*texref).textureObject = std::ptr::null_mut();
     }
@@ -600,11 +637,24 @@ unsafe fn bind_registered(
     let (object, offset, format) = create_binding(texref, &key.resource)?;
     let registered = registry.texrefs.get_mut(&address).unwrap();
     if registered.cache.len() == CACHED_STATES {
-        let victim = registered.cache.iter().enumerate()
-            .min_by_key(|(_, cached)| cached.used).unwrap().0;
-        registered.retired.push(registered.cache.swap_remove(victim));
+        let victim = registered
+            .cache
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, cached)| cached.used)
+            .unwrap()
+            .0;
+        registered
+            .retired
+            .push(registered.cache.swap_remove(victim));
     }
-    registered.cache.push(Cached { key, object, byte_offset: offset, format, used });
+    registered.cache.push(Cached {
+        key,
+        object,
+        byte_offset: offset,
+        format,
+        used,
+    });
     registered.shown = Some(object);
     (*texref).textureObject = object as hipTextureObject_t;
     ((*texref).format, (*texref).numChannels) = format;
@@ -618,16 +668,26 @@ unsafe fn bind_registered(
 // object through HIP. Unregistered texrefs/surfrefs retain HIP's path.
 pub(crate) unsafe fn refresh_registered(texref: *mut textureReference) -> Option<hipError_t> {
     let resource = {
-        let registry = match lock_registry() { Ok(r) => r, Err(e) => return Some(Err(e)) };
+        let registry = match lock_registry() {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
         let registered = registry.texrefs.get(&(texref as usize))?;
         if (*texref).textureObject.is_null() {
             return Some(Ok(()));
         }
-        registered.cache.iter().chain(registered.retired.iter())
+        registered
+            .cache
+            .iter()
+            .chain(registered.retired.iter())
             .find(|cached| Some(cached.object) == registered.shown)?
-            .key.resource.clone()
+            .key
+            .resource
+            .clone()
     };
-    Some(bind(texref, resource, &mut 0, || Err(hipErrorCode_t::NotSupported)))
+    Some(bind(texref, resource, &mut 0, || {
+        Err(hipErrorCode_t::NotSupported)
+    }))
 }
 
 unsafe fn capturing(stream: hipStream_t) -> Result<bool, hipErrorCode_t> {
@@ -673,11 +733,18 @@ unsafe fn write_global(
         // another stream. Events were recorded on the actual launch thread,
         // so per-thread and destroyed streams need no device-wait fallback.
         let changed = registered.device != Some(object);
-        for (reader, orphaned) in module.readers.iter().map(|r| (r, false))
-            .chain(module.orphaned.iter().map(|r| (r, true))) {
+        for (reader, orphaned) in module
+            .readers
+            .iter()
+            .map(|r| (r, false))
+            .chain(module.orphaned.iter().map(|r| (r, true)))
+        {
             if (orphaned || reader.stream != own)
-                && (if changed { reader.launch > registered.written_at }
-                    else { Some(reader.stream) == registered.writer })
+                && (if changed {
+                    reader.launch > registered.written_at
+                } else {
+                    Some(reader.stream) == registered.writer
+                })
             {
                 hipStreamWaitEvent(stream, reader.event as hipEvent_t, 0)?;
             }
@@ -691,7 +758,12 @@ unsafe fn write_global(
     registered.device = None;
     registered.in_flight = true;
     let global = registered.global;
-    hipMemsetD32Async(hipDeviceptr_t(global as *mut _), object as u32 as i32, 1, stream)?;
+    hipMemsetD32Async(
+        hipDeviceptr_t(global as *mut _),
+        object as u32 as i32,
+        1,
+        stream,
+    )?;
     if !same_high {
         let high = (object >> 32) as u32 as i32;
         hipMemsetD32Async(hipDeviceptr_t((global + 4) as *mut _), high, 1, stream)?;
@@ -727,11 +799,26 @@ unsafe fn record_launch(
     let key = stream_key(stream);
     let event = event_for(events, key)?;
     // HIP 7.2.4 StreamWaitEvent dereferences a raw legacy captureStream_ sentinel.
-    let rec = if stream.0 as usize == 1 { hipStream_t(std::ptr::null_mut()) } else { stream };
+    let rec = if stream.0 as usize == 1 {
+        hipStream_t(std::ptr::null_mut())
+    } else {
+        stream
+    };
     hipEventRecord(event, rec)?;
-    match module.readers.iter_mut().find(|reader| reader.stream == key) {
-        Some(reader) => { reader.launch = launch; reader.event = event as usize; }
-        None => module.readers.push(Reader { stream: key, launch, event: event as usize }),
+    match module
+        .readers
+        .iter_mut()
+        .find(|reader| reader.stream == key)
+    {
+        Some(reader) => {
+            reader.launch = launch;
+            reader.event = event as usize;
+        }
+        None => module.readers.push(Reader {
+            stream: key,
+            launch,
+            event: event as usize,
+        }),
     }
     module.unfenced = false;
     Ok(())
@@ -803,10 +890,12 @@ pub(crate) unsafe fn launch_graph(
         }
         hip_launch()
     })();
-    let fenced = modules.values_mut().filter(|m| m.owner == device).fold(
-        Ok(()),
-        |result, module| result.and(record_launch(module, texrefs, events, stream)),
-    );
+    let fenced = modules
+        .values_mut()
+        .filter(|m| m.owner == device)
+        .fold(Ok(()), |result, module| {
+            result.and(record_launch(module, texrefs, events, stream))
+        });
     // The graph may replay writes captured with an older binding.
     for registered in texrefs.values_mut().filter(|r| r.owner == device) {
         registered.device = None;
@@ -821,14 +910,22 @@ pub(crate) unsafe fn stream_destroyed(stream: hipStream_t) -> hipError_t {
     let device = current_device()?;
     let event = registry.events.remove(&(device, stream));
     for module in registry.modules.values_mut().filter(|m| m.owner == device) {
-        if let Some(index) = module.readers.iter().position(|reader| reader.stream == stream) {
+        if let Some(index) = module
+            .readers
+            .iter()
+            .position(|reader| reader.stream == stream)
+        {
             let reader = module.readers.swap_remove(index);
             module.orphaned.push(reader);
         }
     }
     if let Some(event) = event {
         if !registry.modules.values().any(|module| {
-            module.readers.iter().chain(&module.orphaned).any(|reader| reader.event == event)
+            module
+                .readers
+                .iter()
+                .chain(&module.orphaned)
+                .any(|reader| reader.event == event)
         }) {
             hipEventDestroy(event as hipEvent_t)?;
         }
@@ -842,12 +939,19 @@ pub(crate) unsafe fn stream_destroyed(stream: hipStream_t) -> hipError_t {
 // Reading a freed resource without rebinding is undefined.
 pub(crate) unsafe fn memory_freed(dptr: hipDeviceptr_t) -> hipError_t {
     let mut registry = lock_registry()?;
-    let linear = |cached: &Cached| matches!(cached.key.resource, Resource::Linear { .. } | Resource::Pitch2D { .. });
-    if !registry
-        .texrefs
-        .values()
-        .any(|registered| registered.cache.iter().chain(registered.retired.iter()).any(linear))
-    {
+    let is_pointer = |cached: &Cached| {
+        matches!(
+            cached.key.resource,
+            Resource::Linear { .. } | Resource::Pitch2D { .. }
+        )
+    };
+    if !registry.texrefs.values().any(|registered| {
+        registered
+            .cache
+            .iter()
+            .chain(registered.retired.iter())
+            .any(is_pointer)
+    }) {
         return Ok(());
     }
     let (mut base, mut size) = (hipDeviceptr_t(std::ptr::null_mut()), 0);
@@ -1091,7 +1195,10 @@ pub(crate) unsafe fn ref_set_address_mode(
     let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
     let pre_flags = get_flags(&previous, dim);
     hipTexRefSetAddressMode(raw_texref, dim, address_mode)?;
-    let post_flags = get_flags(raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?, dim);
+    let post_flags = get_flags(
+        raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?,
+        dim,
+    );
     if pre_flags != post_flags {
         hipfix::refresh_texref(raw_texref, previous)?;
     }
@@ -1104,7 +1211,10 @@ pub(crate) unsafe fn ref_set_mipmap_filter_mode(
 ) -> hipError_t {
     let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
     hipTexRefSetMipmapFilterMode(raw_texref, filter_mode)?;
-    let current = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?.mipmapFilterMode;
+    let current = raw_texref
+        .as_ref()
+        .ok_or(hipErrorCode_t::InvalidValue)?
+        .mipmapFilterMode;
     if previous.mipmapFilterMode != current {
         hipfix::refresh_texref(raw_texref, previous)?;
     }
@@ -1117,7 +1227,10 @@ pub(crate) unsafe fn ref_set_mipmap_level_bias(
 ) -> hipError_t {
     let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
     hipTexRefSetMipmapLevelBias(raw_texref, bias)?;
-    let current = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?.mipmapLevelBias;
+    let current = raw_texref
+        .as_ref()
+        .ok_or(hipErrorCode_t::InvalidValue)?
+        .mipmapLevelBias;
     if previous.mipmapLevelBias.to_bits() != current.to_bits() {
         hipfix::refresh_texref(raw_texref, previous)?;
     }
@@ -1130,7 +1243,10 @@ pub(crate) unsafe fn ref_set_mipmap_level_clamp(
     max_clamp: f32,
 ) -> hipError_t {
     fn clamps(texref: &textureReference) -> (u32, u32) {
-        (texref.minMipmapLevelClamp.to_bits(), texref.maxMipmapLevelClamp.to_bits())
+        (
+            texref.minMipmapLevelClamp.to_bits(),
+            texref.maxMipmapLevelClamp.to_bits(),
+        )
     }
     let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
     hipTexRefSetMipmapLevelClamp(raw_texref, min_clamp, max_clamp)?;
@@ -1147,7 +1263,10 @@ pub(crate) unsafe fn ref_set_max_anisotropy(
 ) -> hipError_t {
     let previous = *raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
     hipTexRefSetMaxAnisotropy(raw_texref, max_anisotropy)?;
-    let current = raw_texref.as_ref().ok_or(hipErrorCode_t::InvalidValue)?.maxAnisotropy;
+    let current = raw_texref
+        .as_ref()
+        .ok_or(hipErrorCode_t::InvalidValue)?
+        .maxAnisotropy;
     if previous.maxAnisotropy != current {
         hipfix::refresh_texref(raw_texref, previous)?;
     }
@@ -1209,9 +1328,15 @@ fn pitched_row_bytes(desc: &HIP_ARRAY_DESCRIPTOR, pitch: usize) -> Result<usize,
     if desc.Width == 0 || desc.Height == 0 || !matches!(desc.NumChannels, 1 | 2 | 4) {
         return Err(hipErrorCode_t::InvalidValue);
     }
-    let row = desc.Width.checked_mul(desc.NumChannels as usize).and_then(|n| n.checked_mul(bytes))
-        .filter(|n| *n <= pitch).ok_or(hipErrorCode_t::InvalidValue)?;
-    pitch.checked_mul(desc.Height).ok_or(hipErrorCode_t::InvalidValue)?;
+    let row = desc
+        .Width
+        .checked_mul(desc.NumChannels as usize)
+        .and_then(|n| n.checked_mul(bytes))
+        .filter(|n| *n <= pitch)
+        .ok_or(hipErrorCode_t::InvalidValue)?;
+    pitch
+        .checked_mul(desc.Height)
+        .ok_or(hipErrorCode_t::InvalidValue)?;
     Ok(row)
 }
 
@@ -1223,20 +1348,39 @@ pub(crate) unsafe fn ref_set_address_2d_v3(
 ) -> hipError_t {
     let desc = desc.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
     pitched_row_bytes(desc, pitch)?;
-    if texref.is_null() || dev_ptr.0.is_null() { return Err(hipErrorCode_t::InvalidValue); }
+    if texref.is_null() || dev_ptr.0.is_null() {
+        return Err(hipErrorCode_t::InvalidValue);
+    }
     let device = current_device()?;
     for (attribute, value) in [
-        (hipDeviceAttribute_t::hipDeviceAttributeTextureAlignment, dev_ptr.0 as usize),
-        (hipDeviceAttribute_t::hipDeviceAttributeTexturePitchAlignment, pitch),
+        (
+            hipDeviceAttribute_t::hipDeviceAttributeTextureAlignment,
+            dev_ptr.0 as usize,
+        ),
+        (
+            hipDeviceAttribute_t::hipDeviceAttributeTexturePitchAlignment,
+            pitch,
+        ),
     ] {
         let mut alignment = 0;
         hipDeviceGetAttribute(&mut alignment, attribute, device)?;
-        if alignment <= 0 || value % alignment as usize != 0 { return Err(hipErrorCode_t::InvalidValue); }
+        if alignment <= 0 || value % alignment as usize != 0 {
+            return Err(hipErrorCode_t::InvalidValue);
+        }
     }
-    bind(texref, Resource::Pitch2D {
-        ptr: dev_ptr.0 as usize, width: desc.Width, height: desc.Height,
-        format: desc.Format.0, channels: desc.NumChannels, pitch,
-    }, std::ptr::null_mut(), || hipTexRefSetAddress2D(texref, desc, dev_ptr, pitch))
+    bind(
+        texref,
+        Resource::Pitch2D {
+            ptr: dev_ptr.0 as usize,
+            width: desc.Width,
+            height: desc.Height,
+            format: desc.Format.0,
+            channels: desc.NumChannels,
+            pitch,
+        },
+        std::ptr::null_mut(),
+        || hipTexRefSetAddress2D(texref, desc, dev_ptr, pitch),
+    )
 }
 
 #[cfg(test)]
@@ -1246,6 +1390,134 @@ mod tests {
     use cuda_types::cuda::*;
     use std::collections::HashMap;
     use std::ffi::{c_void, CString};
+
+    #[test]
+    fn pitched_texture_shape_checks_rows_channels_and_overflow() {
+        use hip_runtime_sys::*;
+        let mut desc = HIP_ARRAY_DESCRIPTOR {
+            Width: 3,
+            Height: 2,
+            Format: hipArray_Format::HIP_AD_FORMAT_FLOAT,
+            NumChannels: 4,
+        };
+        assert_eq!(super::pitched_row_bytes(&desc, 256).unwrap(), 48);
+        assert!(super::pitched_row_bytes(&desc, 47).is_err());
+        desc.NumChannels = 3;
+        assert!(super::pitched_row_bytes(&desc, 256).is_err());
+        desc.NumChannels = 4;
+        desc.Width = usize::MAX;
+        assert!(super::pitched_row_bytes(&desc, 256).is_err());
+        desc.Width = 3;
+        desc.Height = usize::MAX;
+        assert!(super::pitched_row_bytes(&desc, 256).is_err());
+        desc.Height = 0;
+        assert!(super::pitched_row_bytes(&desc, 256).is_err());
+    }
+
+    unsafe fn pitched_upload(api: &impl CudaApi, destination: CUdeviceptr, pitch: usize, add: f32) {
+        let source: Vec<f32> = (1..=6).map(|n| n as f32 + add).collect();
+        let mut copy: CUDA_MEMCPY2D = std::mem::zeroed();
+        copy.srcMemoryType = CUmemorytype::CU_MEMORYTYPE_HOST;
+        copy.srcHost = source.as_ptr().cast();
+        copy.srcPitch = 12;
+        copy.dstMemoryType = CUmemorytype::CU_MEMORYTYPE_DEVICE;
+        copy.dstDevice = destination;
+        copy.dstPitch = pitch;
+        copy.WidthInBytes = 12;
+        copy.Height = 2;
+        api.cuMemcpy2D_v2(&copy);
+    }
+
+    unsafe fn pitched_read(
+        api: &impl CudaApi,
+        function: CUfunction,
+        mut output: CUdeviceptr,
+    ) -> f32 {
+        let (mut x, mut y) = (1.5f32, 1.5f32);
+        let mut args = [
+            &mut output as *mut _ as *mut c_void,
+            &mut x as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+        ];
+        api.cuLaunchKernel(
+            function,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            CUstream(std::ptr::null_mut()),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        api.cuCtxSynchronize();
+        let mut result = [0f32; 4];
+        api.cuMemcpyDtoH_v2(result.as_mut_ptr().cast(), output, 16);
+        result[0]
+    }
+
+    #[test_cuda]
+    unsafe fn pitched_texref_reads_rebinds_and_preserves_binding_on_failure(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let source = concat!(include_str!("test_ptx/tex_read_2d_float.ptx"), "\0");
+        let mut module = std::mem::zeroed();
+        api.cuModuleLoadData(&mut module, source.as_ptr().cast());
+        let mut function = std::mem::zeroed();
+        api.cuModuleGetFunction(&mut function, module, c"tex_read_2d_float".as_ptr());
+        let mut texref = std::mem::zeroed();
+        api.cuModuleGetTexRef(&mut texref, module, c"tex".as_ptr());
+        api.cuTexRefSetFormat(texref, CUarray_format::CU_AD_FORMAT_FLOAT, 1);
+        api.cuTexRefSetFlags(texref, 0);
+        api.cuTexRefSetFilterMode(texref, CUfilter_mode::CU_TR_FILTER_MODE_POINT);
+        let (mut a, mut b, mut output) =
+            (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+        let (mut pitch_a, mut pitch_b) = (0, 0);
+        api.cuMemAllocPitch_v2(&mut a, &mut pitch_a, 12, 2, 4);
+        api.cuMemAllocPitch_v2(&mut b, &mut pitch_b, 12, 2, 4);
+        api.cuMemAlloc_v2(&mut output, 16);
+        pitched_upload(&api, a, pitch_a, 0.0);
+        pitched_upload(&api, b, pitch_b, 10.0);
+        let desc = CUDA_ARRAY_DESCRIPTOR {
+            Width: 3,
+            Height: 2,
+            Format: CUarray_format::CU_AD_FORMAT_FLOAT,
+            NumChannels: 1,
+        };
+        api.cuTexRefSetAddress2D_v3(texref, &desc, a, pitch_a);
+        assert_eq!(pitched_read(&api, function, output), 5.0);
+        api.cuTexRefSetAddress2D_v3(texref, &desc, b, pitch_b);
+        assert_eq!(pitched_read(&api, function, output), 15.0);
+        pitched_upload(&api, a, pitch_a, 20.0);
+        api.cuTexRefSetAddress2D_v3(texref, &desc, a, pitch_a);
+        assert_eq!(pitched_read(&api, function, output), 25.0);
+        assert!(api
+            .cuTexRefSetAddress2D_v3_unchecked(texref, &desc, a, 1)
+            .is_err());
+        assert_eq!(pitched_read(&api, function, output), 25.0);
+        api.cuTexRefSetAddress2D_v3(texref, &desc, b, pitch_b);
+        api.cuMemFree_v2(a);
+        assert_eq!(pitched_read(&api, function, output), 15.0);
+        // Rebinding after freeing the shown allocation must not reuse its cached object.
+        let old_address = b;
+        api.cuMemFree_v2(b);
+        api.cuMemAllocPitch_v2(&mut a, &mut pitch_a, 12, 2, 4);
+        assert_eq!(pitch_a, pitch_b);
+        pitched_upload(&api, a, pitch_a, 30.0);
+        api.cuTexRefSetAddress2D_v3(texref, &desc, a, pitch_a);
+        assert_eq!(pitched_read(&api, function, output), 35.0);
+        eprintln!(
+            "shown pitched allocation address reused: {}",
+            a == old_address
+        );
+        api.cuModuleUnload(module);
+        api.cuMemFree_v2(a);
+        api.cuMemFree_v2(output);
+        api.cuCtxDestroy_v2(context);
+    }
 
     /*
      *   █████╗ ██╗   ██╗████████╗ ██████╗  ██████╗ ███████╗███╗   ██╗███████╗██████╗  █████╗ ████████╗███████╗██████╗
@@ -3317,8 +3589,14 @@ mod tests {
         for state in 0..6 {
             match state {
                 0 => {}
-                1 => api.cuTexRefSetFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_LINEAR),
-                2 => api.cuTexRefSetAddressMode(texref, 0, CUaddress_mode_enum::CU_TR_ADDRESS_MODE_CLAMP),
+                1 => {
+                    api.cuTexRefSetFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_LINEAR)
+                }
+                2 => api.cuTexRefSetAddressMode(
+                    texref,
+                    0,
+                    CUaddress_mode_enum::CU_TR_ADDRESS_MODE_CLAMP,
+                ),
                 3 => api.cuTexRefSetFlags(texref, CU_TRSF_NORMALIZED_COORDINATES),
                 4 => api.cuTexRefSetFlags(texref, 0),
                 5 => api.cuTexRefSetArray(texref, array, CU_TRSA_OVERRIDE_FORMAT),
@@ -3349,11 +3627,26 @@ mod tests {
         api.cuCtxDestroy_v2(ctx);
     }
 
-    unsafe fn read_linear_texel(api: &impl CudaApi, function: CUfunction, output: CUdeviceptr) -> [u32; 4] {
+    unsafe fn read_linear_texel(
+        api: &impl CudaApi,
+        function: CUfunction,
+        output: CUdeviceptr,
+    ) -> [u32; 4] {
         let mut output = output;
         let mut params = [&mut output as *mut CUdeviceptr as *mut c_void];
-        api.cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0,
-            CUstream(std::ptr::null_mut()), params.as_mut_ptr(), std::ptr::null_mut());
+        api.cuLaunchKernel(
+            function,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            CUstream(std::ptr::null_mut()),
+            params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
         api.cuCtxSynchronize();
         let mut actual = [0u32; 4];
         api.cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), output, 16);
@@ -3393,20 +3686,42 @@ mod tests {
         api.cuTexRefSetAddress_v2(&mut 0, texref, source, 16);
         for state in 0..17 {
             match state {
-                0 => {},
+                0 => {}
                 1 => api.cuTexRefSetFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_POINT),
-                2 => api.cuTexRefSetAddressMode(texref, 0, CUaddress_mode_enum::CU_TR_ADDRESS_MODE_CLAMP),
+                2 => api.cuTexRefSetAddressMode(
+                    texref,
+                    0,
+                    CUaddress_mode_enum::CU_TR_ADDRESS_MODE_CLAMP,
+                ),
                 3 => api.cuTexRefSetFlags(texref, CU_TRSF_READ_AS_INTEGER),
-                4 => api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT16, 4),
-                5 => api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4),
+                4 => api.cuTexRefSetFormat(
+                    texref,
+                    CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT16,
+                    4,
+                ),
+                5 => api.cuTexRefSetFormat(
+                    texref,
+                    CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32,
+                    4,
+                ),
                 6 => {
                     let second = [19u32, 23, 29, 31];
                     api.cuMemcpyHtoD_v2(alternate, second.as_ptr().cast(), 16);
                     api.cuTexRefSetAddress_v2(&mut 0, texref, alternate, 16);
-                },
-                7 => api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4),
-                8 | 10 => api.cuTexRefSetMipmapFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_POINT),
-                9 => api.cuTexRefSetMipmapFilterMode(texref, CUfilter_mode_enum::CU_TR_FILTER_MODE_LINEAR),
+                }
+                7 => api.cuTexRefSetFormat(
+                    texref,
+                    CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32,
+                    4,
+                ),
+                8 | 10 => api.cuTexRefSetMipmapFilterMode(
+                    texref,
+                    CUfilter_mode_enum::CU_TR_FILTER_MODE_POINT,
+                ),
+                9 => api.cuTexRefSetMipmapFilterMode(
+                    texref,
+                    CUfilter_mode_enum::CU_TR_FILTER_MODE_LINEAR,
+                ),
                 11 | 14 => api.cuTexRefSetMipmapLevelBias(texref, 0.0),
                 12 | 15 => api.cuTexRefSetMipmapLevelClamp(texref, 0.0, 0.0),
                 13 | 16 => api.cuTexRefSetMaxAnisotropy(texref, 0),
@@ -3460,12 +3775,24 @@ mod tests {
         eprintln!("three-channel cuTexRefSetFormat: {failed:?}");
         // A rejected setter must leave the previous format and buffer bound.
         if failed.is_err() {
-            assert_eq!(read_linear_texel(&api, function, output), texel, "after failed rebuild");
+            assert_eq!(
+                read_linear_texel(&api, function, output),
+                texel,
+                "after failed rebuild"
+            );
         }
         api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
-        assert_eq!(read_linear_texel(&api, function, output), texel, "restored format");
+        assert_eq!(
+            read_linear_texel(&api, function, output),
+            texel,
+            "restored format"
+        );
         api.cuTexRefSetFormat(texref, CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32, 4);
-        assert_eq!(read_linear_texel(&api, function, output), texel, "repeated format");
+        assert_eq!(
+            read_linear_texel(&api, function, output),
+            texel,
+            "repeated format"
+        );
         api.cuModuleUnload(module);
         api.cuMemFree_v2(source);
         api.cuMemFree_v2(output);
@@ -3505,7 +3832,13 @@ mod tests {
             api.cuModuleGetFunction(&mut indexed, module, c"sample_linear_index".as_ptr());
             let mut array = std::mem::zeroed();
             api.cuModuleGetFunction(&mut array, module, c"sample_array".as_ptr());
-            Self { module, texref, linear, indexed, array }
+            Self {
+                module,
+                texref,
+                linear,
+                indexed,
+                array,
+            }
         }
 
         unsafe fn bind(&self, api: &impl CudaApi, ptr: CUdeviceptr) {
@@ -3541,13 +3874,28 @@ mod tests {
                 &mut output as *mut CUdeviceptr as *mut c_void,
                 &mut spin as *mut u32 as *mut c_void,
             ];
-            api.cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, stream,
-                params.as_mut_ptr(), std::ptr::null_mut());
+            api.cuLaunchKernel(
+                function,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
         }
 
         unsafe fn launch_index(
-            &self, api: &impl CudaApi, output: CUdeviceptr,
-            mut index: i32, mut spin: u32, stream: CUstream,
+            &self,
+            api: &impl CudaApi,
+            output: CUdeviceptr,
+            mut index: i32,
+            mut spin: u32,
+            stream: CUstream,
         ) {
             let mut output = output;
             let mut params = [
@@ -3555,8 +3903,19 @@ mod tests {
                 &mut spin as *mut u32 as *mut c_void,
                 &mut index as *mut i32 as *mut c_void,
             ];
-            api.cuLaunchKernel(self.indexed, 1, 1, 1, 1, 1, 1, 0, stream,
-                params.as_mut_ptr(), std::ptr::null_mut());
+            api.cuLaunchKernel(
+                self.indexed,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
         }
 
         unsafe fn read(
@@ -3578,7 +3937,11 @@ mod tests {
         actual
     }
 
-    unsafe fn linear_texels(api: &impl CudaApi, texels: &[(usize, [u32; 4])], bytes: usize) -> CUdeviceptr {
+    unsafe fn linear_texels(
+        api: &impl CudaApi,
+        texels: &[(usize, [u32; 4])],
+        bytes: usize,
+    ) -> CUdeviceptr {
         let mut buffer = std::mem::zeroed();
         api.cuMemAlloc_v2(&mut buffer, bytes);
         api.cuMemsetD32_v2(buffer, 0, bytes / 4);
@@ -3630,7 +3993,9 @@ mod tests {
         let array = array_texel(&api, X);
         api.cuTexRefSetArray(oracle.texref, array, 0);
         assert_eq!(oracle.read(&api, oracle.array, output), X);
-        assert!(api.cuTexRefSetArray_unchecked(oracle.texref, array, 2).is_err());
+        assert!(api
+            .cuTexRefSetArray_unchecked(oracle.texref, array, 2)
+            .is_err());
         assert_eq!(oracle.read(&api, oracle.array, output), X);
         api.cuModuleUnload(oracle.module);
         api.cuArrayDestroy(array);
@@ -3780,7 +4145,11 @@ mod tests {
             api.cuStreamCreate(&mut second, CUstream_flags::CU_STREAM_NON_BLOCKING.0);
             oracle.bind(&api, other);
             oracle.launch(&api, oracle.linear, out2, 0, second);
-            assert_eq!(texel(&api, out1), A, "launch on the destroyed stream, round {round}");
+            assert_eq!(
+                texel(&api, out1),
+                A,
+                "launch on the destroyed stream, round {round}"
+            );
             assert_eq!(texel(&api, out2), B, "next launch, round {round}");
             api.cuStreamDestroy_v2(second);
         }
@@ -3809,8 +4178,18 @@ mod tests {
             oracle.bind(&api, other);
             assert_eq!(oracle.read(&api, oracle.linear, output), B, "round {round}");
             oracle.bind(&api, buffer);
-            oracle.launch(&api, oracle.linear, output, 0, CUstream(std::ptr::null_mut()));
-            assert_eq!(texel(&api, output), A, "last launch before the unload, round {round}");
+            oracle.launch(
+                &api,
+                oracle.linear,
+                output,
+                0,
+                CUstream(std::ptr::null_mut()),
+            );
+            assert_eq!(
+                texel(&api, output),
+                A,
+                "last launch before the unload, round {round}"
+            );
             if round % 2 == 1 {
                 oracle.unbind(&api);
             }
@@ -3842,7 +4221,11 @@ mod tests {
         assert_eq!(texel(&api, output), A, "reader before free");
         let reused = linear_texels(&api, &[(0, C)], 4096);
         api.cuTexRefSetAddress_v2(&mut 0, oracle.texref, reused, 16);
-        assert_eq!(oracle.read(&api, oracle.linear, output), C, "reallocated resource");
+        assert_eq!(
+            oracle.read(&api, oracle.linear, output),
+            C,
+            "reallocated resource"
+        );
         api.cuModuleUnload(oracle.module);
         api.cuStreamDestroy_v2(stream);
         api.cuMemFree_v2(reused);
@@ -3855,14 +4238,21 @@ mod tests {
     #[test_cuda]
     unsafe fn legacy_texref_reclaim_batches_launch_order(api: impl CudaApi) {
         const N: usize = 260;
-        let kinds = [StreamKind::Null, StreamKind::Legacy, StreamKind::PerThread,
-            StreamKind::Blocking, StreamKind::NonBlocking];
+        let kinds = [
+            StreamKind::Null,
+            StreamKind::Legacy,
+            StreamKind::PerThread,
+            StreamKind::Blocking,
+            StreamKind::NonBlocking,
+        ];
         api.cuInit(0);
         let mut context = std::mem::zeroed();
         api.cuCtxCreate_v2(&mut context, 0, 0);
         let oracle = Oracle::load(&api);
         let stable = Oracle::load(&api);
-        let values = (0..N).map(|i| (16 * i, distinct_texel(i))).collect::<Vec<_>>();
+        let values = (0..N)
+            .map(|i| (16 * i, distinct_texel(i)))
+            .collect::<Vec<_>>();
         let buffer = linear_texels(&api, &values, N * 16);
         let output = linear_texels(&api, &[], 64 * N);
         let slot = |i: usize| CUdeviceptr_v2(output.0.cast::<u8>().add(32 * i).cast());
@@ -3879,7 +4269,11 @@ mod tests {
         api.cuCtxSynchronize();
         for i in 0..N {
             assert_eq!(texel(&api, slot(i)), distinct_texel(i), "linear launch {i}");
-            assert_eq!(texel(&api, slot(N + i)), A, "retired shown array, launch {i}");
+            assert_eq!(
+                texel(&api, slot(N + i)),
+                A,
+                "retired shown array, launch {i}"
+            );
         }
         for (kind, stream) in kinds.into_iter().zip(streams) {
             if matches!(kind, StreamKind::Blocking | StreamKind::NonBlocking) {
@@ -3896,19 +4290,36 @@ mod tests {
 
     fn reclaim_state() -> super::Registered {
         let mut registered = super::Registered {
-            module: 0, global: 0, owner: 0, cache: Vec::new(), retired: Vec::new(),
-            shown: Some(1), device: Some(2), written_at: 0,
-            writer: Some(super::stream_key(hip_runtime_sys::hipStream_t(std::ptr::null_mut()))),
+            module: 0,
+            global: 0,
+            owner: 0,
+            cache: Vec::new(),
+            retired: Vec::new(),
+            shown: Some(1),
+            device: Some(2),
+            written_at: 0,
+            writer: Some(super::stream_key(hip_runtime_sys::hipStream_t(
+                std::ptr::null_mut(),
+            ))),
             in_flight: false,
         };
         for object in 1..=super::REAP_BATCH + 8 {
             registered.retired.push(super::Cached {
                 key: super::BindKey {
-                    device: 0, state: [0; 19],
-                    resource: super::Resource::Linear { ptr: 0, bytes: 16, offset: false },
+                    device: 0,
+                    state: [0; 19],
+                    resource: super::Resource::Linear {
+                        ptr: 0,
+                        bytes: 16,
+                        offset: false,
+                    },
                 },
-                object, byte_offset: 0,
-                format: (hip_runtime_sys::hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32, 4),
+                object,
+                byte_offset: 0,
+                format: (
+                    hip_runtime_sys::hipArray_Format::HIP_AD_FORMAT_UNSIGNED_INT32,
+                    4,
+                ),
                 used: object as u64,
             });
         }
@@ -3926,7 +4337,8 @@ mod tests {
                 assert_ne!(object, 1);
                 freed.push(object);
                 Ok(())
-            }).unwrap();
+            })
+            .unwrap();
         }
         assert_eq!(freed.len(), super::REAP_BATCH);
         assert_eq!(first.retired.len(), 8);
@@ -3942,7 +4354,10 @@ mod tests {
         let mut registered = reclaim_state();
         let mut remaining = super::REAP_BATCH;
         let error = hip_runtime_sys::hipErrorCode_t::Unknown;
-        assert_eq!(super::reap_registered(&mut registered, &mut remaining, false, |_| Err(error)), Err(error));
+        assert_eq!(
+            super::reap_registered(&mut registered, &mut remaining, false, |_| Err(error)),
+            Err(error)
+        );
         assert_eq!(remaining, super::REAP_BATCH);
         assert_eq!(registered.retired.len(), super::REAP_BATCH + 8);
         assert_eq!(registered.device, Some(2));
@@ -3959,7 +4374,8 @@ mod tests {
         super::reap_registered(&mut registered, &mut remaining, true, |object| {
             assert_ne!(object, 1);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(registered.cache.len(), 1);
         assert_eq!(remaining, super::REAP_BATCH - super::CACHED_STATES + 1);
         assert!(registered.cache.iter().any(|cached| cached.object == 1));
@@ -3984,7 +4400,11 @@ mod tests {
         for round in 0..4 {
             let other = array_texel(&api, B);
             api.cuArrayDestroy(other);
-            assert_eq!(oracle.read(&api, oracle.array, output), A, "after destroy, round {round}");
+            assert_eq!(
+                oracle.read(&api, oracle.array, output),
+                A,
+                "after destroy, round {round}"
+            );
             // A reader still pending across the destroy, then one queued after it.
             let pending = CUdeviceptr_v2(output.0.cast::<u8>().add(32).cast());
             api.cuMemsetD32_v2(output, 0, 16);
@@ -3993,7 +4413,11 @@ mod tests {
             api.cuArrayDestroy(other);
             oracle.launch(&api, oracle.array, output, 0, stream);
             assert_eq!(texel(&api, pending), A, "pending reader, round {round}");
-            assert_eq!(texel(&api, output), A, "reader after destroy, round {round}");
+            assert_eq!(
+                texel(&api, output),
+                A,
+                "reader after destroy, round {round}"
+            );
         }
         // The same array bound again is a new state after a destroy.
         oracle.bind_array(&api, bound);
@@ -4004,5 +4428,4 @@ mod tests {
         api.cuMemFree_v2(output);
         api.cuCtxDestroy_v2(context);
     }
-
 }

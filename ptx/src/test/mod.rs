@@ -73,3 +73,10 @@ fn vectorAdd_11_ptx() -> Result<(), TranslateError> {
     let vector_add = include_str!("vectorAdd_11.ptx");
     compile_and_assert(vector_add)
 }
+
+#[test]
+fn legacy_32bit_translation() -> Result<(), TranslateError> {
+    compile_and_assert(&read_test_file!("spirv_run/32/legacy_sm10.ptx"))?;
+    compile_and_assert(&read_test_file!("spirv_run/32/legacy_slct.ptx"))?;
+    Ok(())
+}

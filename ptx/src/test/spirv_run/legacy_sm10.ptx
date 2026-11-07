@@ -1,0 +1,30 @@
+.version 2.3
+.target sm_10, map_f64_to_f32
+.address_size 64
+.visible .entry legacy_sm10(.param .u64 input, .param .u64 output) {
+    .reg .u64 pointer, source;
+    .reg .f64 a, b;
+    .reg .f32 single;
+    .reg .pred predicate;
+    .reg .u32 result;
+    ld.param.u64 pointer, [output];
+    ld.param.u64 source, [input];
+    ld.global.f64 a, [source];
+    mov.f64 b, 0d3ff0000000000000;
+    add.f64 a, a, b;
+    cvt.rn.f32.f64 single, a;
+    st.global.f32 [pointer], single;
+    st.global.f64 [pointer+8], a;
+    mov.f32 single, 0f3fc00000;
+    cvt.f64.f32 b, single;
+    rcp.rn.f64 b, b;
+    cvt.rn.f32.f64 single, b;
+    st.global.f32 [pointer+16], single;
+    setp.lt.f64 predicate, b, a;
+    selp.u32 result, 1, 0, predicate;
+    st.global.u32 [pointer+20], result;
+    ld.global.f64 b, [source+8];
+    cvt.rn.f32.f64 single, b;
+    st.global.f32 [pointer+24], single;
+    ret;
+}

@@ -126,6 +126,51 @@ macro_rules! test_ptx_warp {
     };
 }
 
+test_ptx_with_32!(
+    legacy_sm10,
+    [16777217.0f64, -3.5],
+    [
+        16777216f32.to_bits(),
+        0,
+        0,
+        0x41700000,
+        (2f32 / 3f32).to_bits(),
+        1,
+        (-3.5f32).to_bits(),
+        0
+    ]
+);
+
+test_ptx_with_32!(legacy_slct, [i32::MIN, -1, 0, 1, i32::MAX], {
+    let negative = [
+        0xfedcu64,
+        0x7fc01234,
+        0x7ff8000000001234,
+        0xfedc,
+        0x7fc01234,
+        0x7ff8000000001234,
+        0xfedc,
+        0x7fc01234,
+        0x7ff8000000001234,
+        0x7fc01234,
+        0x7ff8000000001234,
+    ];
+    let positive = [
+        0x1234,
+        0x80000000,
+        0x8000000000000000,
+        0x1234,
+        0x80000000,
+        0x8000000000000000,
+        0x1234,
+        0x80000000,
+        0x8000000000000000,
+        0x80000000,
+        0x8000000000000000,
+    ];
+    [negative, negative, positive, positive, positive].concat()
+});
+
 test_ptx!(ld_st, [1u64], [1u64]);
 test_ptx!(ld_st_implicit, [0.5f32, 0.25f32], [0.5f32]);
 test_ptx!(mov, [1u64], [1u64]);

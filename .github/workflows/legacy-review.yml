@@ -1,0 +1,61 @@
+name: Legacy PTX review tests
+on:
+  push:
+    branches: [ci/legacy-backend-review-20261107]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  parser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.0
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Isolate parser workspace
+        run: |
+          cp Cargo.lock "$RUNNER_TEMP/original.lock"
+          printf '%s\n' '[workspace]' 'resolver="2"' 'members=["ptx_parser","ptx_parser_macros","ptx_parser_macros_impl"]' > Cargo.toml
+      - run: cargo build -j4 -p ptx_parser
+      - name: Verify dependency versions and checksums
+        run: |
+          python3 - <<'PYTHON'
+          import os,pathlib,tomllib
+          old=tomllib.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'original.lock').read_text())
+          new=tomllib.loads(pathlib.Path('Cargo.lock').read_text())
+          pins={(p['name'],p['version'],p.get('source')):p.get('checksum') for p in old['package']}
+          for p in new['package']:
+              k=(p['name'],p['version'],p.get('source'))
+              assert k in pins and pins[k]==p.get('checksum'),k
+          PYTHON
+      - run: cargo test --locked -j4 -p ptx_parser --lib -- --test-threads=1
+  llvm:
+    needs: parser
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      GIT_LFS_SKIP_SMUDGE: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Make room for LLVM
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache
+          df -h /
+          test "$(df --output=avail -B1 / | tail -1)" -ge 53687091200
+      - name: Fetch public bitcode inputs
+        run: git lfs pull --include='llvm_zluda/src/device-libs/ockl.bc,ptx/lib/*.bc'
+      - name: Build and generate public LLVM baselines
+        run: bash .github/workflows/legacy-review.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: public-legacy-llvm-${{ github.sha }}
+          path: legacy-output/
+          if-no-files-found: ignore
+          retention-days: 14

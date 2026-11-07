@@ -20,7 +20,6 @@ use winnow::{
 use winnow::{prelude::*, Stateful};
 
 mod ast;
-mod map_f64_to_f32;
 pub use ast::*;
 
 impl From<RawMulIntControl> for ast::MulIntControl {
@@ -525,12 +524,12 @@ fn module<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::Module
             eof,
         )
             .map(
-                |(version, ((target, _), map_f64_to_f32), address_size, (directives, invalid_directives), _)| {
+                |(version, target, address_size, (directives, invalid_directives), _)| {
                     ast::Module {
                         ptx_version: version,
-                        sm_version: target,
+                        sm_version: target.shader_model.0,
                         address_size: address_size.unwrap_or(32),
-                        map_f64_to_f32,
+                        map_f64_to_f32: target.map_f64_to_f32,
                         directives: directives.into_iter().flatten().collect(),
                         invalid_directives,
                     }
@@ -561,18 +560,34 @@ fn version<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(u8, u8)> 
         .parse_next(stream)
 }
 
-fn target<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<((u32, Option<char>), bool)> {
+#[derive(Debug, PartialEq, Eq)]
+struct Target {
+    shader_model: (u32, Option<char>),
+    map_f64_to_f32: bool,
+}
+
+fn target<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<Target> {
     preceded(
         Token::DotTarget,
         (
             ident.and_then(shader_model),
-            repeat(0.., preceded(Token::Comma, alt((
-                ident_literal("debug").value(false),
-                ident_literal("map_f64_to_f32").value(true),
-            )))),
+            repeat(
+                0..,
+                preceded(
+                    Token::Comma,
+                    alt((
+                        ident_literal("debug").value(false),
+                        ident_literal("map_f64_to_f32").value(true),
+                    )),
+                ),
+            ),
         ),
     )
-    .map(|(target, options): (_, Vec<bool>)| (target, options.into_iter().any(|map| map)))
+    .map(|(shader_model, options): (_, Vec<bool>)| Target {
+        shader_model,
+        map_f64_to_f32: options.into_iter().any(|map| map),
+    })
+    .verify(|target: &Target| !target.map_f64_to_f32 || (10..=12).contains(&target.shader_model.0))
     .parse_next(stream)
 }
 
@@ -1043,7 +1058,7 @@ fn texref_or_surfref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<
         "texref_or_surfref",
         alt((
             Token::DotTexref.map(|_| ParsedType::Texref),
-            (Token::DotTex, Token::DotU32).map(|_| ParsedType::Texref),
+            (Token::DotTex, alt((Token::DotU32, Token::DotU64))).map(|_| ParsedType::Texref),
             Token::DotSurfref.map(|_| ParsedType::Surfref),
         )),
     )
@@ -1345,6 +1360,7 @@ where
 fn global_space<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<StateSpace> {
     alt((
         Token::DotGlobal.value(StateSpace::Global),
+        // Legacy .tex declarations have implicit global scope.
         peek(Token::DotTex).value(StateSpace::Global),
         Token::DotConst.value(StateSpace::Const),
         Token::DotShared.value(StateSpace::Shared),
@@ -4729,7 +4745,13 @@ mod tests {
             input: &tokens[..],
             state: PtxParserState::new(text, &mut errors),
         };
-        assert_eq!(target.parse(stream).unwrap(), ((11, None), false));
+        assert_eq!(
+            target.parse(stream).unwrap(),
+            Target {
+                shader_model: (11, None),
+                map_f64_to_f32: false
+            }
+        );
         assert_eq!(errors.len(), 0);
     }
 
@@ -4745,7 +4767,13 @@ mod tests {
             input: &tokens[..],
             state: PtxParserState::new(text, &mut errors),
         };
-        assert_eq!(target.parse(stream).unwrap(), ((90, Some('a')), false));
+        assert_eq!(
+            target.parse(stream).unwrap(),
+            Target {
+                shader_model: (90, Some('a')),
+                map_f64_to_f32: false
+            }
+        );
         assert_eq!(errors.len(), 0);
     }
 
@@ -5120,5 +5148,50 @@ mod tests {
         assert_eq!(parse_value("-1.5"), crate::ImmediateValue::F64(-1.5));
         assert_eq!(parse_value("-1.5e-2"), crate::ImmediateValue::F64(-0.015));
         assert_eq!(parse_value("-1.5E+2"), crate::ImmediateValue::F64(-150.0));
+    }
+    #[test]
+    fn legacy_target_option_and_storage() {
+        for sm in [10, 11, 12] {
+            let source = format!(
+                ".version 1.4\n.target sm_{sm}, map_f64_to_f32\n.global .f64 storage[2];\n"
+            );
+            let module = parse_module_checked(&source).unwrap();
+            assert!(module.map_f64_to_f32);
+            assert_eq!(module.address_size, 32);
+            let Directive::Variable(_, variable) = &module.directives[0] else {
+                panic!()
+            };
+            assert_eq!(variable.info.v_type.layout().unwrap().size(), 16);
+        }
+        for sm in [13, 20, 61, 80] {
+            let source = format!(".version 1.4\n.target sm_{sm}, map_f64_to_f32\n");
+            assert!(parse_module_checked(&source).is_err());
+        }
+        assert!(
+            !parse_module_checked(".version 1.4\n.target sm_10\n")
+                .unwrap()
+                .map_f64_to_f32
+        );
+        assert!(parse_module_checked(".version 1.4\n.target sm_10, unknown\n").is_err());
+    }
+
+    #[test]
+    fn legacy_texture_declarations_and_signed_selection() {
+        for width in [32, 64] {
+            let source = format!(".version 1.4\n.target sm_10\n.tex .u{width} image;\n");
+            let module = parse_module_checked(&source).unwrap();
+            let Directive::Variable(_, variable) = &module.directives[0] else {
+                panic!()
+            };
+            assert!(variable.info.state_space == StateSpace::Global);
+            assert!(matches!(variable.info.v_type, Type::Texref));
+        }
+        for typ in [
+            "b16", "b32", "b64", "u16", "u32", "u64", "s16", "s32", "s64", "f32", "f64",
+        ] {
+            let source = format!(".version 1.4\n.target sm_13\n.entry k() {{ .reg .{typ} a,b,d; .reg .s32 c; slct.{typ}.s32 d,a,b,c; ret; }}");
+            parse_module_checked(&source).unwrap();
+        }
+        assert!(parse_module_checked(".version 1.4\n.target sm_10\n.tex .f64 invalid;\n").is_err());
     }
 }

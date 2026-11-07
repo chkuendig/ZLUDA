@@ -99,11 +99,7 @@ fn emit_llvm_used(emit_ctx: &ModuleEmitContext) -> Result<(), TranslateError> {
             .map(|&global| LLVMConstAddrSpaceCast(global, ptr_type))
             .collect::<Vec<_>>();
         let array = LLVMConstArray2(ptr_type, values.as_mut_ptr(), values.len() as u64);
-        let llvm_used = LLVMAddGlobal(
-            emit_ctx.module,
-            LLVMTypeOf(array),
-            c"llvm.used".as_ptr(),
-        );
+        let llvm_used = LLVMAddGlobal(emit_ctx.module, LLVMTypeOf(array), c"llvm.used".as_ptr());
         LLVMSetInitializer(llvm_used, array);
         LLVMSetLinkage(llvm_used, LLVMLinkage::LLVMAppendingLinkage);
         LLVMSetSection(llvm_used, c"llvm.metadata".as_ptr());
@@ -935,7 +931,7 @@ impl<'a> MethodEmitContext<'a> {
                     }
                     Ok(())
                 } else {
-                    // This block is safe because it's illegal to implictly convert between floating point values
+                    // Unequal floating widths here preserve low storage bits; numeric casts use cvt.
                     let same_width_bit_type = unsafe {
                         LLVMIntTypeInContext(self.context, (from_layout.size() * 8) as u32)
                     };
@@ -2934,8 +2930,15 @@ impl<'a> MethodEmitContext<'a> {
         let a = self.resolver.value(arguments.src1)?;
         let b = self.resolver.value(arguments.src2)?;
         let sign = self.resolver.value(arguments.src3)?;
-        let condition = unsafe { LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntSGE,
-            sign, LLVMConstNull(LLVMTypeOf(sign)), LLVM_UNNAMED.as_ptr()) };
+        let condition = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntSGE,
+                sign,
+                LLVMConstNull(LLVMTypeOf(sign)),
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
         self.resolver.with_result(arguments.dst, |name| unsafe {
             LLVMBuildSelect(self.builder, condition, a, b, name)
         });
