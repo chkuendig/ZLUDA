@@ -7,6 +7,8 @@ use std::mem::offset_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+#[cfg(test)] #[path = "test_texref_2d.rs"] mod pitched_tests;
+
 pub(crate) unsafe fn object_create(
     p_tex_object: *mut hipTextureObject_t,
     p_res_desc: *const HIP_RESOURCE_DESC,
@@ -68,6 +70,7 @@ struct BindKey {
 enum Resource {
     // HIP aligns the address down only if the caller asks for the offset.
     Linear { ptr: usize, bytes: usize, offset: bool },
+    Pitch2D { ptr: usize, width: usize, height: usize, format: u32, channels: u32, pitch: usize },
     // A destroyed array's handle can come back for a new array.
     Array { array: usize, generation: u64 },
 }
@@ -522,6 +525,16 @@ unsafe fn create_binding(
             desc.res.linear.numChannels = state.numChannels as u32;
             (state.format, state.numChannels)
         }
+        Resource::Pitch2D { ptr, width, height, format, channels, pitch } => {
+            desc.resType = HIPresourcetype::HIP_RESOURCE_TYPE_PITCH2D;
+            desc.res.pitch2D.devPtr = hipDeviceptr_t(ptr as *mut _);
+            desc.res.pitch2D.width = width;
+            desc.res.pitch2D.height = height;
+            desc.res.pitch2D.format = hipArray_Format(format);
+            desc.res.pitch2D.numChannels = channels;
+            desc.res.pitch2D.pitchInBytes = pitch;
+            (hipArray_Format(format), channels as i32)
+        }
         Resource::Array { array, .. } => {
             let mut array_desc = std::mem::zeroed();
             hipArray3DGetDescriptor(&mut array_desc, array as hipArray_t)?;
@@ -829,7 +842,7 @@ pub(crate) unsafe fn stream_destroyed(stream: hipStream_t) -> hipError_t {
 // Reading a freed resource without rebinding is undefined.
 pub(crate) unsafe fn memory_freed(dptr: hipDeviceptr_t) -> hipError_t {
     let mut registry = lock_registry()?;
-    let linear = |cached: &Cached| matches!(cached.key.resource, Resource::Linear { .. });
+    let linear = |cached: &Cached| matches!(cached.key.resource, Resource::Linear { .. } | Resource::Pitch2D { .. });
     if !registry
         .texrefs
         .values()
@@ -846,7 +859,7 @@ pub(crate) unsafe fn memory_freed(dptr: hipDeviceptr_t) -> hipError_t {
     let device = current_device()?;
     for registered in registry.texrefs.values_mut().filter(|r| r.owner == device) {
         result = result.and(drop_cached(registered, |cached| {
-            matches!(cached.key.resource, Resource::Linear { ptr, .. } if range.contains(&ptr))
+            matches!(cached.key.resource, Resource::Linear { ptr, .. } | Resource::Pitch2D { ptr, .. } if range.contains(&ptr))
         }));
     }
     result
@@ -1184,6 +1197,46 @@ pub(crate) unsafe fn ref_set_address_v2(
     bind(texref, resource, byte_offset, || {
         hipTexRefSetAddress(byte_offset, texref, dev_ptr, bytes)
     })
+}
+
+fn pitched_row_bytes(desc: &HIP_ARRAY_DESCRIPTOR, pitch: usize) -> Result<usize, hipErrorCode_t> {
+    let bytes = match desc.Format.0 {
+        0x01 | 0x08 => 1,
+        0x02 | 0x09 | 0x10 => 2,
+        0x03 | 0x0a | 0x20 => 4,
+        _ => return Err(hipErrorCode_t::InvalidValue),
+    };
+    if desc.Width == 0 || desc.Height == 0 || !matches!(desc.NumChannels, 1 | 2 | 4) {
+        return Err(hipErrorCode_t::InvalidValue);
+    }
+    let row = desc.Width.checked_mul(desc.NumChannels as usize).and_then(|n| n.checked_mul(bytes))
+        .filter(|n| *n <= pitch).ok_or(hipErrorCode_t::InvalidValue)?;
+    pitch.checked_mul(desc.Height).ok_or(hipErrorCode_t::InvalidValue)?;
+    Ok(row)
+}
+
+pub(crate) unsafe fn ref_set_address_2d_v3(
+    texref: *mut textureReference,
+    desc: *const HIP_ARRAY_DESCRIPTOR,
+    dev_ptr: hipDeviceptr_t,
+    pitch: usize,
+) -> hipError_t {
+    let desc = desc.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
+    pitched_row_bytes(desc, pitch)?;
+    if texref.is_null() || dev_ptr.0.is_null() { return Err(hipErrorCode_t::InvalidValue); }
+    let device = current_device()?;
+    for (attribute, value) in [
+        (hipDeviceAttribute_t::hipDeviceAttributeTextureAlignment, dev_ptr.0 as usize),
+        (hipDeviceAttribute_t::hipDeviceAttributeTexturePitchAlignment, pitch),
+    ] {
+        let mut alignment = 0;
+        hipDeviceGetAttribute(&mut alignment, attribute, device)?;
+        if alignment <= 0 || value % alignment as usize != 0 { return Err(hipErrorCode_t::InvalidValue); }
+    }
+    bind(texref, Resource::Pitch2D {
+        ptr: dev_ptr.0 as usize, width: desc.Width, height: desc.Height,
+        format: desc.Format.0, channels: desc.NumChannels, pitch,
+    }, std::ptr::null_mut(), || hipTexRefSetAddress2D(texref, desc, dev_ptr, pitch))
 }
 
 #[cfg(test)]
