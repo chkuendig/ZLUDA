@@ -5,7 +5,6 @@ export PATH="/tools/cargo/bin:$PATH" CARGO_TARGET_DIR=/target CARGO_BUILD_JOBS=4
 git config --global --add safe.directory /src
 git config --global --add safe.directory /src/ext/llvm-project
 git config --global --add safe.directory /src/ext/HiGHS
-python3 /plan/source.py /src "$TARGET" /out/diagnostics/SOURCE.json
 rustc +1.99.0 -vV > /out/diagnostics/RUSTC.txt
 cargo +1.99.0 -vV > /out/diagnostics/CARGO.txt
 grep -Fx 'release: 1.99.0' /out/diagnostics/RUSTC.txt
@@ -30,5 +29,4 @@ else
   cp /out/diagnostics/test-build.json /out/diagnostics/build.json
   cp /out/diagnostics/test-build.log /out/diagnostics/build.log
 fi
-python3 /plan/source.py /src "$TARGET" /out/diagnostics/SOURCE.json
 python3 /plan/package-capsule.py

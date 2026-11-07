@@ -48,3 +48,4 @@ docker run "${args[@]}" --network bridge "$image" bash -euo pipefail -c '
 ' 2>&1 | tee "$out/fetch.log"
 mkdir "$work/target"
 docker run "${args[@]}" --network none -v "$work/target:/target" "$image" bash /plan/build-in-container.sh
+python3 "$control/source.py" "$GITHUB_WORKSPACE/source" "$TARGET" "$out/SOURCE.json"
