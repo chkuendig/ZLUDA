@@ -4625,6 +4625,7 @@ derive_parser!(
 
 #[cfg(test)]
 mod tests {
+    use crate::{Directive, StateSpace, Target, Type};
     use crate::first_optional;
     use crate::module;
     use crate::multi_variable;
