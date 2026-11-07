@@ -144,7 +144,7 @@ mod tests {
         let source = include_str!("../../../zluda/src/impl/test_ptx/legacy_sm10.ptx");
         let ast = ptx_parser::parse_module_checked(source).unwrap();
         let module = super::super::to_llvm_module(ast, super::super::Attributes { clock_rate: 1000000 }, |_| {}).unwrap();
-        let text = module.llvm_ir.print_module_to_string().to_str().unwrap().to_owned();
+        let text = module.llvm_ir.print_module_to_string().to_str().into_owned();
         assert!(text.contains("fadd float"), "{text}");
         assert!(!text.contains("fadd double"), "{text}");
         assert!(text.contains("fptrunc double") && text.contains("fpext float"), "{text}");
@@ -158,7 +158,7 @@ mod tests {
             let source = format!(".version 1.4\n.target sm_10, map_f64_to_f32\n.entry k(.param .{typ} x, .param .{typ} y, .param .s32 z, .param .u64 out) {{ .reg .{typ} a,b,d; .reg .s32 c; .reg .u64 p; ld.param.{typ} a,[x]; ld.param.{typ} b,[y]; ld.param.s32 c,[z]; ld.param.u64 p,[out]; slct.{typ}.s32 d,a,b,c; st.global.{typ} [p],d; ret; }}");
             let ast = ptx_parser::parse_module_checked(&source).unwrap();
             let module = super::super::to_llvm_module(ast, super::super::Attributes { clock_rate: 1000000 }, |_| {}).unwrap();
-            let ir = module.llvm_ir.print_module_to_string().to_str().unwrap().to_owned();
+            let ir = module.llvm_ir.print_module_to_string().to_str().into_owned();
             assert!(ir.contains("icmp sge i32"), "{typ}: {ir}");
             assert!(ir.contains("select i1"), "{typ}: {ir}");
         }
