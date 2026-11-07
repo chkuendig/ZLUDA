@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn map_f64_to_f32_slct_keeps_signed_selector_and_selected_bits() {
         for typ in ["b16","b32","b64","u16","u32","u64","s16","s32","s64","f32","f64"] {
-            let source = format!(".version 1.4\n.target sm_10, map_f64_to_f32\n.entry k(.param .{typ} x, .param .{typ} y, .param .s32 z, .param .u64 out) {{ .reg .{typ} a,b,d; .reg .s32 c; .reg .u64 p; ld.param.{typ} a,[x]; ld.param.{typ} b,[y]; ld.param.s32 c,[z]; ld.param.u64 p,[out]; slct.{typ}.s32 d,a,b,c; st.global.{typ} [p],d; ret; }}");
+            let source = format!(".version 2.3\n.target sm_10, map_f64_to_f32\n.address_size 64\n.entry k(.param .{typ} x, .param .{typ} y, .param .s32 z, .param .u64 out) {{ .reg .{typ} a,b,d; .reg .s32 c; .reg .u64 p; ld.param.{typ} a,[x]; ld.param.{typ} b,[y]; ld.param.s32 c,[z]; ld.param.u64 p,[out]; slct.{typ}.s32 d,a,b,c; st.global.{typ} [p],d; ret; }}");
             let ast = ptx_parser::parse_module_checked(&source).unwrap();
             let module = super::super::to_llvm_module(ast, super::super::Attributes { clock_rate: 1000000 }, |_| {}).unwrap();
             let ir = module.llvm_ir.print_module_to_string().to_str().into_owned();
