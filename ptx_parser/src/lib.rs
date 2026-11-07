@@ -617,7 +617,7 @@ fn directive<'a, 'input>(
             // methods
             | Token::DotFunc | Token::DotEntry
             // module variables
-            | Token::DotGlobal | Token::DotConst | Token::DotShared
+            | Token::DotGlobal | Token::DotConst | Token::DotShared | Token::DotTex
             // other sections
             | Token::DotFile | Token::DotSection => true,
             _ => false,
@@ -1043,6 +1043,7 @@ fn texref_or_surfref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<
         "texref_or_surfref",
         alt((
             Token::DotTexref.map(|_| ParsedType::Texref),
+            (Token::DotTex, Token::DotU32).map(|_| ParsedType::Texref),
             Token::DotSurfref.map(|_| ParsedType::Surfref),
         )),
     )
@@ -1344,6 +1345,7 @@ where
 fn global_space<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<StateSpace> {
     alt((
         Token::DotGlobal.value(StateSpace::Global),
+        peek(Token::DotTex).value(StateSpace::Global),
         Token::DotConst.value(StateSpace::Const),
         Token::DotShared.value(StateSpace::Shared),
     ))
@@ -2066,6 +2068,8 @@ derive_parser!(
         DotPtr,
         #[token(".noreturn")]
         DotNoreturn,
+        #[token(".tex")]
+        DotTex,
         #[token(".texref")]
         DotTexref,
         #[token(".surfref")]
@@ -3516,6 +3520,18 @@ derive_parser!(
         }
     }
     ScalarType =        { .f32, .f64 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#comparison-and-selection-instructions-slct
+    slct.type.s32 d, a, b, c => {
+        ast::Instruction::Slct {
+            data: type_,
+            arguments: SlctArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+    .type: ScalarType = { .b16, .b32, .b64,
+                          .u16, .u32, .u64,
+                          .s16, .s32, .s64,
+                          .f32, .f64 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#comparison-and-selection-instructions-selp
     selp.type d, a, b, c => {

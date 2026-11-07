@@ -32,7 +32,7 @@ impl<T: Operand> Instruction<T> {
             Instruction::Ld { data, .. } => ty(&mut data.typ),
             Instruction::St { data, .. } => ty(&mut data.typ),
             Instruction::Atom { data, .. } => ty(&mut data.type_),
-            Instruction::Selp { data, .. } => scalar(data),
+            Instruction::Selp { data, .. } | Instruction::Slct { data, .. } => scalar(data),
             Instruction::Set { data, .. } => scalar(&mut data.dtype) | scalar(&mut data.base.type_),
             Instruction::SetBool { data, .. } => scalar(&mut data.dtype) | scalar(&mut data.base.base.type_),
             Instruction::Setp { data, .. } => scalar(&mut data.type_),
@@ -103,4 +103,19 @@ mod tests {
         }
         assert_eq!(changed, 3);
     }
+
+    #[test]
+    fn legacy_texture_declaration_and_signed_selection() {
+        let text = ".version 1.4\n.target sm_10, map_f64_to_f32\n.tex .u32 image;\n.entry k() { .reg .f32 a,b,d; .reg .s32 sign; slct.f32.s32 d,a,b,sign; ret; }";
+        let module = parse_module_checked(text).unwrap();
+        let Directive::Variable(_, variable) = &module.directives[0] else { panic!() };
+        assert!(variable.info.state_space == StateSpace::Global);
+        assert!(matches!(variable.info.v_type, Type::Texref));
+        for type_ in ["b16","b32","b64","u16","u32","u64","s16","s32","s64","f32","f64"] {
+            let source = format!(".version 1.4\n.target sm_13\n.entry k() {{ .reg .{type_} a,b,d; .reg .s32 c; slct.{type_}.s32 d,a,b,c; ret; }}");
+            parse_module_checked(&source).unwrap();
+        }
+        assert!(parse_module_checked(".version 1.4\n.target sm_10\n.tex .f64 invalid;\n").is_err());
+    }
+
 }

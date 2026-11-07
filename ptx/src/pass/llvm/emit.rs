@@ -731,6 +731,7 @@ impl<'a> MethodEmitContext<'a> {
             ast::Instruction::Sqrt { data, arguments } => self.emit_sqrt(data, arguments),
             ast::Instruction::Rsqrt { data, arguments } => self.emit_rsqrt(data, arguments),
             ast::Instruction::Selp { data, arguments } => self.emit_selp(data, arguments),
+            ast::Instruction::Slct { data: _, arguments } => self.emit_slct(arguments),
             ast::Instruction::Atom { data, arguments } => self.emit_atom(data, arguments),
             ast::Instruction::AtomCas { data, arguments } => self.emit_atom_cas(data, arguments),
             ast::Instruction::Div { data, arguments } => self.emit_div(data, arguments),
@@ -2923,6 +2924,21 @@ impl<'a> MethodEmitContext<'a> {
                 get_scalar_type(self.context, ast::ScalarType::F32),
             )],
         )?;
+        Ok(())
+    }
+
+    fn emit_slct(
+        &mut self,
+        arguments: ptx_parser::SlctArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let a = self.resolver.value(arguments.src1)?;
+        let b = self.resolver.value(arguments.src2)?;
+        let sign = self.resolver.value(arguments.src3)?;
+        let condition = unsafe { LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntSGE,
+            sign, LLVMConstNull(LLVMTypeOf(sign)), LLVM_UNNAMED.as_ptr()) };
+        self.resolver.with_result(arguments.dst, |name| unsafe {
+            LLVMBuildSelect(self.builder, condition, a, b, name)
+        });
         Ok(())
     }
 
