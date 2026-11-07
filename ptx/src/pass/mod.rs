@@ -21,6 +21,7 @@ mod insert_post_saturation;
 mod insert_shared_war_barriers;
 mod instruction_mode_to_global_mode;
 pub mod llvm;
+mod map_f64_to_f32;
 mod normalize_basic_blocks;
 mod normalize_identifiers;
 mod normalize_predicates;
@@ -85,6 +86,12 @@ pub fn to_llvm_module<'input>(
     on_pass_end("fix_special_registers");
     let directives = expand_operands::run(&mut flat_resolver, directives)?;
     on_pass_end("expand_operands");
+    let directives = if ast.map_f64_to_f32 {
+        map_f64_to_f32::run(&mut flat_resolver, directives)?
+    } else {
+        directives
+    };
+    on_pass_end("map_f64_to_f32");
     let directives = insert_post_saturation::run(&mut flat_resolver, directives)?;
     on_pass_end("insert_post_saturation");
     let directives = deparamize_functions::run(&mut flat_resolver, directives)?;

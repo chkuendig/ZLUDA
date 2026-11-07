@@ -2079,6 +2079,7 @@ pub struct Module<'input> {
     pub directives: Vec<Directive<'input, ParsedOperand<&'input str>>>,
     pub invalid_directives: usize,
     pub address_size: u8,
+    pub map_f64_to_f32: bool,
 }
 
 impl Module<'_> {
@@ -2089,6 +2090,7 @@ impl Module<'_> {
             directives: Vec::new(),
             invalid_directives: usize::MAX,
             address_size: 64,
+            map_f64_to_f32: false,
         }
     }
 }

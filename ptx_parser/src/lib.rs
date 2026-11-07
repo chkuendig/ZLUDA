@@ -20,6 +20,7 @@ use winnow::{
 use winnow::{prelude::*, Stateful};
 
 mod ast;
+mod map_f64_to_f32;
 pub use ast::*;
 
 impl From<RawMulIntControl> for ast::MulIntControl {
@@ -524,11 +525,12 @@ fn module<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::Module
             eof,
         )
             .map(
-                |(version, (target, _), address_size, (directives, invalid_directives), _)| {
+                |(version, ((target, _), map_f64_to_f32), address_size, (directives, invalid_directives), _)| {
                     ast::Module {
                         ptx_version: version,
                         sm_version: target,
                         address_size: address_size.unwrap_or(32),
+                        map_f64_to_f32,
                         directives: directives.into_iter().flatten().collect(),
                         invalid_directives,
                     }
@@ -559,15 +561,18 @@ fn version<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(u8, u8)> 
         .parse_next(stream)
 }
 
-fn target<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(u32, Option<char>)> {
+fn target<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<((u32, Option<char>), bool)> {
     preceded(
         Token::DotTarget,
         (
             ident.and_then(shader_model),
-            opt((Token::Comma, ident_literal("debug"))),
+            repeat(0.., preceded(Token::Comma, alt((
+                ident_literal("debug").value(false),
+                ident_literal("map_f64_to_f32").value(true),
+            )))),
         ),
     )
-    .map(|((target, arch_variant), _debug)| (target, arch_variant))
+    .map(|(target, options): (_, Vec<bool>)| (target, options.into_iter().any(|map| map)))
     .parse_next(stream)
 }
 
@@ -4708,7 +4713,7 @@ mod tests {
             input: &tokens[..],
             state: PtxParserState::new(text, &mut errors),
         };
-        assert_eq!(target.parse(stream).unwrap(), (11, None));
+        assert_eq!(target.parse(stream).unwrap(), ((11, None), false));
         assert_eq!(errors.len(), 0);
     }
 
@@ -4724,7 +4729,7 @@ mod tests {
             input: &tokens[..],
             state: PtxParserState::new(text, &mut errors),
         };
-        assert_eq!(target.parse(stream).unwrap(), (90, Some('a')));
+        assert_eq!(target.parse(stream).unwrap(), ((90, Some('a')), false));
         assert_eq!(errors.len(), 0);
     }
 
