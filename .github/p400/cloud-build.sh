@@ -7,6 +7,7 @@ mkdir "$work"
 mkdir "$work/tools" "$work/context"
 ubuntu=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["ubuntu"])' "$control/images.json")
 rust=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["rust"])' "$control/images.json")
+docker pull --platform linux/amd64 "$ubuntu"
 docker pull --platform linux/amd64 "$rust"
 container=$(docker create --platform linux/amd64 "$rust")
 docker cp "$container:/usr/local/cargo/." "$work/tools/cargo"
