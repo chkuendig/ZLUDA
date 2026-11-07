@@ -31,8 +31,9 @@ docker run --rm --cpus=4 --memory=10g --memory-swap=10g \
     git rev-parse HEAD > legacy-output/SOURCE.txt
     git submodule status --recursive > legacy-output/SUBMODULES.txt
     cargo +1.99.0 test --locked -p ptx --lib -j4 --no-run
-    cargo +1.99.0 test --locked -p ptx --lib -j4 pass::map_f64_to_f32::tests:: -- --test-threads=1
-    cargo +1.99.0 test --locked -p ptx --lib -j4 test::legacy_32bit_translation -- --exact --test-threads=1
+    status=0
+    cargo +1.99.0 test --locked -p ptx --lib -j4 pass::map_f64_to_f32::tests:: -- --test-threads=1 || status=1
+    cargo +1.99.0 test --locked -p ptx --lib -j4 test::legacy_32bit_translation -- --exact --test-threads=1 || status=1
     for kernel in legacy_sm10 legacy_slct; do
       touch "ptx/src/test/ll/$kernel.ll"
       set +e
@@ -40,10 +41,13 @@ docker run --rm --cpus=4 --memory=10g --memory-swap=10g \
       rc=$?
       set -e
       printf "%s\n" "$rc" > "legacy-output/$kernel-generate.rc"
-      test "$rc" -eq 101
-      test -s "legacy-output/$kernel.ll"
+      if [ "$rc" -ne 101 ] || [ ! -s "legacy-output/$kernel.ll" ]; then
+        status=1
+        continue
+      fi
       cp "legacy-output/$kernel.ll" "ptx/src/test/ll/$kernel.ll"
-      cargo +1.99.0 test --locked -p ptx --lib -j4 "test::spirv_run::${kernel}_llvm" -- --exact --test-threads=1
+      cargo +1.99.0 test --locked -p ptx --lib -j4 "test::spirv_run::${kernel}_llvm" -- --exact --test-threads=1 || status=1
     done
     sha256sum legacy-output/*.ll > legacy-output/SHA256SUMS
+    exit "$status"
   ' 2>&1 | tee legacy-output/build.log

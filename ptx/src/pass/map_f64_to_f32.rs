@@ -18,7 +18,7 @@ pub(super) fn run<'input>(
                 Statement::Constant(constant) => {
                     if constant.typ == ast::ScalarType::F64 {
                         let ast::ImmediateValue::F64(value) = constant.value else {
-                            return Err(error_mismatched_type());
+                            return Err(TranslateError::MismatchedType);
                         };
                         constants.insert(constant.dst, value);
                     }
@@ -31,7 +31,9 @@ pub(super) fn run<'input>(
                             mut arguments,
                         } if contains_f64(&data.typ) => {
                             if data.typ != ast::Type::Scalar(ast::ScalarType::F64) {
-                                return Err(error_todo());
+                                return Err(TranslateError::Todo(
+                                    "unsupported map_f64_to_f32 instruction".into(),
+                                ));
                             }
                             let wide = temporary(resolver, ast::ScalarType::F64);
                             let single = temporary(resolver, ast::ScalarType::F32);
@@ -55,7 +57,9 @@ pub(super) fn run<'input>(
                             mut arguments,
                         } if contains_f64(&data.typ) => {
                             if data.typ != ast::Type::Scalar(ast::ScalarType::F64) {
-                                return Err(error_todo());
+                                return Err(TranslateError::Todo(
+                                    "unsupported map_f64_to_f32 instruction".into(),
+                                ));
                             }
                             let single = temporary(resolver, ast::ScalarType::F32);
                             let wide = temporary(resolver, ast::ScalarType::F64);
@@ -88,14 +92,18 @@ pub(super) fn run<'input>(
                         }
                         // An f64 atomic must not become a 32-bit access to 64-bit storage.
                         ast::Instruction::Atom { ref data, .. } if contains_f64(&data.type_) => {
-                            return Err(error_todo())
+                            return Err(TranslateError::Todo(
+                                "unsupported map_f64_to_f32 instruction".into(),
+                            ))
                         }
                         instruction => instruction,
                     };
                     if matches!(&instruction, ast::Instruction::Mov { data, .. }
                         if contains_f64(&data.typ) && data.typ != ast::Type::Scalar(ast::ScalarType::F64))
                     {
-                        return Err(error_todo());
+                        return Err(TranslateError::Todo(
+                            "unsupported map_f64_to_f32 instruction".into(),
+                        ));
                     }
                     let mapped = map_instruction(&mut instruction);
                     let instruction = ast::visit_map(
@@ -105,7 +113,9 @@ pub(super) fn run<'input>(
                               _: bool,
                               _: bool| {
                             if type_space.is_some_and(|(typ, _)| contains_f64(typ)) {
-                                return Err(error_todo());
+                                return Err(TranslateError::Todo(
+                                    "unsupported map_f64_to_f32 instruction".into(),
+                                ));
                             }
                             Ok(operand)
                         },
