@@ -19,6 +19,9 @@ use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 #[path = "test_legacy_slct.rs"]
 mod legacy_slct_tests;
 #[cfg(test)]
+#[path = "test_legacy_translation.rs"]
+mod legacy_translation_tests;
+#[cfg(test)]
 #[path = "test_legacy_sm10.rs"]
 mod legacy_sm10_tests;
 

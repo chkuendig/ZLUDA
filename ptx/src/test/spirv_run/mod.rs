@@ -126,9 +126,70 @@ macro_rules! test_ptx_warp {
     };
 }
 
+test_ptx_with_32!(
+    legacy_typed_globals,
+    [0u32],
+    [0x3fc00000u32, 0, 0x40200000, 0xc0600000]
+);
+
 test_ptx!(legacy_f64_cvt);
 
 test_ptx!(legacy_slct);
+
+#[test]
+fn legacy_typed_globals32_metadata() {
+    let source = read_test_file!("32/legacy_typed_globals.ptx");
+    let module = translate_legacy32(&source);
+    let globals = &module.metadata32.as_ref().unwrap().globals;
+    let expected: [(&str, u32, &[u8]); 3] = [
+        ("initialized", 16, &[0, 0, 192, 63]),
+        ("zero", 4, &[0, 0, 0, 0]),
+        ("values", 4, &[0, 0, 32, 64, 0, 0, 96, 192]),
+    ];
+    assert_eq!(globals.len(), expected.len());
+    for (actual, (name, align, bytes)) in globals.iter().zip(expected) {
+        assert_eq!(actual.name, name);
+        assert_eq!(actual.align, align);
+        assert_eq!(actual.initializer, bytes);
+    }
+    let ir = module.llvm_ir.print_module_to_string();
+    compare_llvm(
+        "legacy_typed_globals32",
+        ir.to_str().trim(),
+        read_test_file!("../ll/legacy_typed_globals32.ll").trim(),
+    );
+}
+
+#[test]
+fn legacy_global_initializers32() {
+    let source = ".version 1.4\n.target sm_10\n.global .f64 scalar = 0d8000000000000000;\n.global .s16 values[3] = {-1, 2};\n.const .align 16 .u32 constants[2] = {0xdeadbeef, 0xabcdef01};\n.global .b128 wide;\n.global .f64 zero;\n.global .f32 nan = 0f7fc01234;\n.entry k() { ret; }";
+    let module = translate_legacy32(source);
+    let globals = &module.metadata32.as_ref().unwrap().globals;
+    assert_eq!(globals.len(), 6);
+    assert_eq!(globals[0].initializer, (-0.0f64).to_le_bytes());
+    assert_eq!(globals[1].initializer, [255, 255, 2, 0, 0, 0]);
+    assert_eq!(
+        globals[2].initializer,
+        [239, 190, 173, 222, 1, 239, 205, 171]
+    );
+    assert_eq!(globals[2].align, 16);
+    assert_eq!(globals[3].initializer, [0; 16]);
+    assert_eq!(globals[4].initializer, [0; 8]);
+    assert_eq!(globals[5].initializer, [52, 18, 192, 127]);
+}
+
+fn translate_legacy32(source: &str) -> pass::Module {
+    let ast = ptx_parser::parse_module_checked(source).unwrap();
+    assert_eq!(ast.address_size, 32);
+    pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap()
+}
 
 #[test]
 fn legacy_slct_scalar_types() {
@@ -1869,6 +1930,7 @@ pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_mod
         "cp_async",
         "global_array",
         "global_array_f32",
+        "legacy_typed_globals",
         "ldmatrix",
         "ldmatrix_trans",
     ]

@@ -4630,6 +4630,34 @@ mod tests {
     use winnow::prelude::*;
 
     #[test]
+    fn legacy_typed_globals32() {
+        let text = include_str!("../../ptx/src/test/spirv_run/32/legacy_typed_globals.ptx");
+        let module = parse_module_checked(text).unwrap();
+        assert_eq!(module.address_size, 32);
+        let globals: Vec<_> = module
+            .directives
+            .iter()
+            .filter_map(|directive| match directive {
+                Directive::Variable(_, variable) => Some(variable),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(globals.len(), 3);
+        assert!(matches!(
+            globals[0].info.v_type,
+            Type::Scalar(ScalarType::F32)
+        ));
+        assert!(matches!(
+            globals[1].info.v_type,
+            Type::Scalar(ScalarType::F32)
+        ));
+        assert_eq!(globals[0].info.align, Some(16));
+        assert!(globals
+            .iter()
+            .all(|global| global.info.state_space == StateSpace::Global));
+    }
+
+    #[test]
     fn target_keeps_double_instructions_and_eight_byte_storage() {
         let text = ".version 1.4\n.target sm_10, map_f64_to_f32\n.global .f64 g[2];\n.entry k() { .reg .f64 a; mov.f64 a, 0d3ff0000000000000; add.f64 a, a, a; ret; }";
         let module = parse_module_checked(text).unwrap();
