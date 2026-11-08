@@ -12,7 +12,6 @@ define hidden float @add_rm(float %"88", float %"89") #0 {
   br label %"98"
 
 "98":                                             ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   call void @llvm.amdgcn.s.setreg(i32 6145, i32 2)
   br label %"96"
 
@@ -49,7 +48,6 @@ define hidden float @add_rp(float %"91", float %"92") #0 {
   br label %"97"
 
 "97":                                             ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   store float %"91", ptr addrspace(5) %"152", align 4
   store float %"92", ptr addrspace(5) %"153", align 4
   %2 = load float, ptr addrspace(5) %"152", align 4
@@ -90,7 +88,6 @@ define amdgpu_kernel void @call_rnd(ptr addrspace(4) byref(i64) %"101", ptr addr
   br label %"93"
 
 "93":                                             ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   call void @llvm.amdgcn.s.setreg(i32 6145, i32 1)
   %2 = load i64, ptr addrspace(4) %"101", align 8
   store i64 %2, ptr addrspace(5) %"103", align 8
@@ -152,9 +149,6 @@ define amdgpu_kernel void @call_rnd(ptr addrspace(4) byref(i64) %"101", ptr addr
   store float %25, ptr %"74", align 4
   ret void
 }
-
-; Function Attrs: nocallback nofree nosync nounwind willreturn
-declare void @llvm.amdgcn.s.dcache.inv() #2
 
 ; Function Attrs: nocallback nofree nosync nounwind willreturn
 declare void @llvm.amdgcn.s.setreg(i32 immarg, i32) #2

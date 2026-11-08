@@ -39,7 +39,6 @@ define amdgpu_kernel void @mma_m16n8k16_f32_bf16_bf16_f32_2x(ptr addrspace(4) by
   br label %"94"
 
 "94":                                             ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   %2 = load i64, ptr addrspace(4) %"96", align 8
   store i64 %2, ptr addrspace(5) %"97", align 8
   %"62" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -245,9 +244,5 @@ define amdgpu_kernel void @mma_m16n8k16_f32_bf16_bf16_f32_2x(ptr addrspace(4) by
   ret void
 }
 
-; Function Attrs: nocallback nofree nosync nounwind willreturn
-declare void @llvm.amdgcn.s.dcache.inv() #2
-
 attributes #0 = { denormal_fpenv(dynamic) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
 attributes #1 = { denormal_fpenv(ieee) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #2 = { nocallback nofree nosync nounwind willreturn }

@@ -10,7 +10,6 @@ define hidden <2 x i32> @impl(<2 x i32> %"12") #0 {
   br label %"53"
 
 "53":                                             ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   %"47" = extractelement <2 x i32> %"12", i8 0
   store i32 %"47", ptr addrspace(5) %"58", align 4
   %"48" = extractelement <2 x i32> %"12", i8 1
@@ -38,11 +37,8 @@ define hidden <2 x i32> @impl(<2 x i32> %"12") #0 {
   ret <2 x i32> %11
 }
 
-; Function Attrs: nocallback nofree nosync nounwind willreturn
-declare void @llvm.amdgcn.s.dcache.inv() #1
-
 ; Function Attrs: denormal_fpenv(preservesign)
-define amdgpu_kernel void @vector(ptr addrspace(4) byref(i64) %"76", ptr addrspace(4) byref(i64) %"77") #2 {
+define amdgpu_kernel void @vector(ptr addrspace(4) byref(i64) %"76", ptr addrspace(4) byref(i64) %"77") #1 {
   %"78" = alloca i64, align 8, addrspace(5)
   %"79" = alloca i64, align 8, addrspace(5)
   %"80" = alloca <2 x i32>, align 8, addrspace(5)
@@ -55,7 +51,6 @@ define amdgpu_kernel void @vector(ptr addrspace(4) byref(i64) %"76", ptr addrspa
   br label %"54"
 
 "54":                                             ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   %2 = load i64, ptr addrspace(4) %"76", align 8
   store i64 %2, ptr addrspace(5) %"78", align 8
   %3 = load i64, ptr addrspace(4) %"77", align 8
@@ -81,5 +76,4 @@ define amdgpu_kernel void @vector(ptr addrspace(4) byref(i64) %"76", ptr addrspa
 }
 
 attributes #0 = { denormal_fpenv(dynamic) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { nocallback nofree nosync nounwind willreturn }
-attributes #2 = { denormal_fpenv(preservesign) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { denormal_fpenv(preservesign) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

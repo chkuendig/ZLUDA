@@ -10,7 +10,6 @@ define amdgpu_kernel void @or(ptr addrspace(4) byref(i64) %"42", ptr addrspace(4
   br label %"41"
 
 "41":                                             ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   %2 = load i64, ptr addrspace(4) %"42", align 8
   store i64 %2, ptr addrspace(5) %"44", align 8
   %3 = load i64, ptr addrspace(4) %"43", align 8
@@ -35,8 +34,4 @@ define amdgpu_kernel void @or(ptr addrspace(4) byref(i64) %"42", ptr addrspace(4
   ret void
 }
 
-; Function Attrs: nocallback nofree nosync nounwind willreturn
-declare void @llvm.amdgcn.s.dcache.inv() #1
-
 attributes #0 = { denormal_fpenv(preservesign) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { nocallback nofree nosync nounwind willreturn }

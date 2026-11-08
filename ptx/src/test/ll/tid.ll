@@ -13,7 +13,6 @@ define amdgpu_kernel void @tid(ptr addrspace(4) byref(i64) %"42") #1 {
   br label %"40"
 
 "40":                                             ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   %"39" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
   store i32 %"39", ptr addrspace(5) %"44", align 4
   %2 = load i32, ptr addrspace(5) %"44", align 4
@@ -35,9 +34,5 @@ define amdgpu_kernel void @tid(ptr addrspace(4) byref(i64) %"42") #1 {
   ret void
 }
 
-; Function Attrs: nocallback nofree nosync nounwind willreturn
-declare void @llvm.amdgcn.s.dcache.inv() #2
-
 attributes #0 = { denormal_fpenv(dynamic) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
 attributes #1 = { denormal_fpenv(preservesign) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #2 = { nocallback nofree nosync nounwind willreturn }

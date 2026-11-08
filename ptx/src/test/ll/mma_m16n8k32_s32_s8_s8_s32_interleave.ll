@@ -17,7 +17,6 @@ define hidden i32 @pack_u8(<4 x i16> %"12") #0 {
   br label %"165"
 
 "165":                                            ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   %"89" = extractelement <4 x i16> %"12", i8 0
   %"179" = zext i16 %"89" to i32
   store i32 %"179", ptr addrspace(5) %"175", align 4
@@ -60,11 +59,8 @@ define hidden i32 @pack_u8(<4 x i16> %"12") #0 {
   ret i32 %15
 }
 
-; Function Attrs: nocallback nofree nosync nounwind willreturn
-declare void @llvm.amdgcn.s.dcache.inv() #1
-
 ; Function Attrs: denormal_fpenv(preservesign)
-define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32_interleave(ptr addrspace(4) byref(i64) %"200") #2 {
+define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32_interleave(ptr addrspace(4) byref(i64) %"200") #1 {
   %"201" = alloca i64, align 8, addrspace(5)
   %"202" = alloca i64, align 8, addrspace(5)
   %"203" = alloca i32, align 4, addrspace(5)
@@ -117,7 +113,6 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32_interleave(ptr addrspace(4
   br label %"166"
 
 "166":                                            ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   %2 = load i64, ptr addrspace(4) %"200", align 8
   store i64 %2, ptr addrspace(5) %"201", align 8
   %"88" = call i32 @__zluda_ptx_impl_sreg_tid(i8 0)
@@ -484,5 +479,4 @@ define amdgpu_kernel void @mma_m16n8k32_s32_s8_s8_s32_interleave(ptr addrspace(4
 }
 
 attributes #0 = { denormal_fpenv(dynamic) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { nocallback nofree nosync nounwind willreturn }
-attributes #2 = { denormal_fpenv(preservesign) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { denormal_fpenv(preservesign) "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
