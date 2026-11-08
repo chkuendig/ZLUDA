@@ -17,7 +17,6 @@ define amdgpu_kernel void @rcp_f64(ptr addrspace(4) byref(i64) %"79", ptr addrsp
   br label %"73"
 
 "73":                                             ; preds = %1
-  call void @llvm.amdgcn.s.dcache.inv()
   %2 = load i64, ptr addrspace(4) %"79", align 8
   store i64 %2, ptr addrspace(5) %"81", align 8
   %3 = load i64, ptr addrspace(4) %"80", align 8
@@ -42,9 +41,6 @@ define amdgpu_kernel void @rcp_f64(ptr addrspace(4) byref(i64) %"79", ptr addrsp
   store double %10, ptr %"94", align 8
   ret void
 }
-
-; Function Attrs: nocallback nofree nosync nounwind willreturn
-declare void @llvm.amdgcn.s.dcache.inv() #2
 
 ; Function Attrs: nocallback nofree nosync nounwind willreturn
 declare void @llvm.amdgcn.s.setreg(i32 immarg, i32) #2
