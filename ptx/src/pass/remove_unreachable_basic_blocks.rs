@@ -9,7 +9,6 @@ use rustc_hash::FxHashSet;
 pub(crate) fn run(
     mut directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
 ) -> Result<Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
-    let mut reachable_funcs = FxHashSet::default();
     for directive in directives.iter_mut() {
         match directive {
             Directive2::Method(Function {
@@ -42,12 +41,6 @@ pub(crate) fn run(
                         }) => {
                             return Err(error_todo());
                         }
-                        Statement::Instruction(ast::Instruction::Call {
-                            arguments: ast::CallArgs { func, .. },
-                            ..
-                        }) => {
-                            reachable_funcs.insert(*func);
-                        }
                         _ => {}
                     }
                 }
@@ -67,6 +60,38 @@ pub(crate) fn run(
                 })?;
             }
             _ => {}
+        }
+    }
+    let mut calls = FxHashMap::<SpirvWord, Vec<SpirvWord>>::default();
+    let mut pending = Vec::new();
+    for directive in directives.iter() {
+        if let Directive2::Method(Function {
+            name,
+            body,
+            kernel_attributes,
+            ..
+        }) = directive
+        {
+            if kernel_attributes.is_some() {
+                pending.push(*name);
+            }
+            for statement in body.iter().flatten() {
+                if let Statement::Instruction(ast::Instruction::Call {
+                    arguments: ast::CallArgs { func, .. },
+                    ..
+                }) = statement
+                {
+                    calls.entry(*name).or_default().push(*func);
+                }
+            }
+        }
+    }
+    let mut reachable_funcs = FxHashSet::default();
+    while let Some(name) = pending.pop() {
+        if reachable_funcs.insert(name) {
+            if let Some(callees) = calls.get(&name) {
+                pending.extend(callees.iter().copied());
+            }
         }
     }
     Ok(directives
