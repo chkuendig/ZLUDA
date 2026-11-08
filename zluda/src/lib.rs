@@ -229,6 +229,7 @@ cuda_macros::cuda_function_declarations!(
             cuTexObjectCreate,
             cuTexObjectDestroy,
             cuTexRefSetAddress_v2,
+            cuTexRefSetAddress2D_v3,
             cuTexRefSetAddressMode,
             cuTexRefSetArray,
             cuTexRefSetFilterMode,
