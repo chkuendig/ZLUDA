@@ -33,6 +33,7 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_capsule.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_oracles.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_compiler_cache.py
           for script in control/.github/p400/*.sh; do bash -n "$script"; done
       - id: select
         env:
@@ -90,12 +91,43 @@ jobs:
           SOURCE_COMMIT: ${{ matrix.commit }}
           LLVM_COMMIT: ${{ matrix.llvm }}
         run: bash control/.github/p400/prepare-source.sh
-      - name: Build and package in Ubuntu 22.04
+      - name: Prepare exact compiler image and cache identity
+        id: compiler-toolchain
         env:
           TARGET: ${{ matrix.id }}
           SOURCE_COMMIT: ${{ matrix.commit }}
           LLVM_COMMIT: ${{ matrix.llvm }}
-        run: bash control/.github/p400/cloud-build.sh
+        run: bash control/.github/p400/cloud-build.sh prepare
+      - name: Restore exact compiler-object namespace
+        id: compiler-cache
+        if: steps.compiler-toolchain.outputs.enabled == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/p400-${{ matrix.id }}/compiler-cache
+          key: ${{ steps.compiler-toolchain.outputs.namespace }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ steps.compiler-toolchain.outputs.namespace }}
+      - name: Build and package in Ubuntu 22.04
+        id: compiler-build
+        env:
+          TARGET: ${{ matrix.id }}
+          SOURCE_COMMIT: ${{ matrix.commit }}
+          LLVM_COMMIT: ${{ matrix.llvm }}
+          CACHE_MATCHED_KEY: ${{ steps.compiler-cache.outputs.cache-matched-key }}
+        run: bash control/.github/p400/cloud-build.sh build
+      - name: Save qualified compiler objects
+        if: success() && !inputs.collect_oracles && steps.compiler-toolchain.outputs.enabled == 'true' && steps.compiler-build.outputs.save_needed == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/p400-${{ matrix.id }}/compiler-cache
+          key: ${{ steps.compiler-toolchain.outputs.namespace }}${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Retain compiler cache evidence outside the capsule
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compiler-cache-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/${{ matrix.id }}/compiler-cache/
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload complete capsule
         if: ${{ !inputs.collect_oracles }}
         id: capsule

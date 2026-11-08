@@ -2,6 +2,23 @@
 set -euo pipefail
 export PATH="/tools/cargo/bin:$PATH" CARGO_TARGET_DIR=/target CARGO_BUILD_JOBS=4 CMAKE_BUILD_PARALLEL_LEVEL=4 CARGO_INCREMENTAL=0 LD_LIBRARY_PATH=/opt/rocm/lib
 [ -z "$(find /target -mindepth 1 -maxdepth 1 -print -quit)" ]
+if [ "${COMPILER_CACHE_ENABLED:-false}" = true ]; then
+  export SCCACHE_PATH=/usr/bin/ccache CCACHE_DIR=/compiler-cache CCACHE_CONFIGPATH=/tmp/p400-ccache.conf
+  cat > "$CCACHE_CONFIGPATH" <<'CONFIG'
+compiler_check = content
+sloppiness =
+hard_link = false
+file_clone = false
+max_size = 2G
+CONFIG
+  test "$(ccache --get-config compiler_check)" = content
+  test -z "$(ccache --get-config sloppiness)"
+  test "$(ccache --get-config hard_link)" = false
+  test "$(ccache --get-config file_clone)" = false
+  ccache --show-config > /out/compiler-cache/config.txt
+  ccache --zero-stats
+  ccache --print-stats > /out/compiler-cache/stats-before.txt
+fi
 git config --global --add safe.directory /src
 git config --global --add safe.directory /src/ext/llvm-project
 git config --global --add safe.directory /src/ext/HiGHS
@@ -27,6 +44,9 @@ case "$TARGET" in
   zoc) packages=(-p compiler --bin zoc) ;;
   *) exit 2 ;;
 esac
+if [ "${COMPILER_CACHE_ENABLED:-false}" = true ]; then
+  python3 /plan/compiler_cache.py timestamp compile-start > /out/compiler-cache/compile-start.json
+fi
 set +e
 if [ "$TARGET" = zoc ]; then
   cargo +1.99.0 build --locked --offline --release "${packages[@]}" -j 4 --message-format=json > /out/diagnostics/build.json 2> /out/diagnostics/build.log
@@ -35,6 +55,10 @@ else
 fi
 rc=$?
 set -e
+if [ "${COMPILER_CACHE_ENABLED:-false}" = true ]; then
+  ccache --print-stats > /out/compiler-cache/stats-after.txt
+  python3 /plan/compiler_cache.py timestamp compile-end > /out/compiler-cache/compile-end.json
+fi
 if [ "$rc" != 0 ]; then printf 'ENVIRONMENT-MISMATCH: pinned source/toolchain/ROCm build failed (rc=%s)\n' "$rc" | tee /out/diagnostics/STATUS.txt; exit "$rc"; fi
 if [ "$TARGET" = trace ]; then
   cargo +1.99.0 tree --locked --offline -p zluda_trace --edges normal,build --target x86_64-unknown-linux-gnu > /out/diagnostics/CARGO-TREE.txt
@@ -48,4 +72,8 @@ if [ "${COLLECT_ORACLES:-false}" = true ]; then
   python3 /plan/collect-oracles.py /out/diagnostics/test-build.json /src /out/diagnostics/oracle-collection /plan/oracle-cases.json
 else
   python3 /plan/package-capsule.py
+fi
+
+if [ "${COMPILER_CACHE_ENABLED:-false}" = true ]; then
+  python3 /plan/compiler_cache.py timestamp qualification-end > /out/compiler-cache/qualification-end.json
 fi
