@@ -15,6 +15,10 @@ use std::{
 };
 use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 
+#[cfg(test)]
+#[path = "test_legacy_sm10.rs"]
+mod legacy_sm10_tests;
+
 pub(crate) struct Module {
     pub(crate) base: hipModule_t,
     pub(crate) sm_version: u32,
