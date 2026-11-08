@@ -1,0 +1,17 @@
+.version 1.4
+.target sm_10
+.tex .u32 sample_tex;
+.entry fetch_1d(.param .u32 output)
+{
+    .reg .u32 out;
+    .reg .u32 index, pad_a, pad_b, pad_c;
+    .reg .f32 a, b, c, d;
+    ld.param.u32 out, [output];
+    mov.u32 index, 1;
+    mov.u32 pad_a, 17;
+    mov.u32 pad_b, 0xffffffff;
+    mov.u32 pad_c, 91;
+    tex.1d.v4.f32.s32 {a, b, c, d}, [sample_tex, {index, pad_a, pad_b, pad_c}];
+    st.global.v4.f32 [out], {a, b, c, d};
+    ret;
+}
