@@ -1,0 +1,29 @@
+.version 1.4
+.target sm_10
+
+.global .align 16 .f32 initialized = 0f3fc00000;
+.global .f32 zero;
+.global .f32 values[2] = {0f40200000, 0fc0600000};
+
+.entry legacy_typed_globals(.param .u32 input, .param .u32 output)
+{
+    .reg .u32 address, out, a, b, c, d;
+    .reg .f32 value;
+    mov.u32 address, initialized;
+    ld.global.f32 value, [address];
+    mov.b32 a, value;
+    mov.u32 address, zero;
+    ld.global.f32 value, [address];
+    mov.b32 b, value;
+    mov.u32 address, values;
+    ld.global.f32 value, [address];
+    mov.b32 c, value;
+    ld.global.f32 value, [address+4];
+    mov.b32 d, value;
+    ld.param.u32 out, [output];
+    st.global.u32 [out], a;
+    st.global.u32 [out+4], b;
+    st.global.u32 [out+8], c;
+    st.global.u32 [out+12], d;
+    ret;
+}
