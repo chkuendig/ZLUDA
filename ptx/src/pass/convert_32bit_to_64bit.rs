@@ -60,36 +60,15 @@ pub(super) fn collect_globals<'a, 'input>(
     let (ids, globals): (Vec<SpirvWord>, Vec<Global32Bit>) = directives
         .iter()
         .filter_map(|directive| match directive {
-            Directive2::Variable(
-                _,
-                ast::Variable {
-                    info:
-                        ast::VariableInfo {
-                            align,
-                            v_type:
-                                ast::Type::Array(
-                                    None,
-                                    ast::ScalarType::U8 | ast::ScalarType::B8,
-                                    array_dims,
-                                ),
-                            state_space: ast::StateSpace::Const | ast::StateSpace::Global,
-                            array_init,
-                        },
-                    name,
-                },
-            ) if array_dims.len() == 1
-                && array_init.iter().all(|x| {
-                    matches!(
-                        x,
-                        RegOrImmediate::Imm(
-                            ptx_parser::ImmediateValue::U64(_) | ptx_parser::ImmediateValue::S64(_)
-                        )
-                    )
-                }) =>
-            {
-                Some(get_global_details(resolver, align, array_init, *name))
-            }
             Directive2::Variable(_, var) if pass_through_variable(var) => None,
+            Directive2::Variable(_, var)
+                if matches!(
+                    var.info.state_space,
+                    ast::StateSpace::Const | ast::StateSpace::Global
+                ) =>
+            {
+                Some(get_global_details(resolver, var))
+            }
             Directive2::Method(..) => None,
             _ => Some(Err(error_todo())),
         })
@@ -106,36 +85,83 @@ fn pass_through_variable(variable: &Variable<SpirvWord>) -> bool {
 
 fn get_global_details<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
-    align: &Option<u32>,
-    array_init: &Vec<RegOrImmediate<SpirvWord>>,
-    name: SpirvWord,
+    variable: &Variable<SpirvWord>,
 ) -> Result<(SpirvWord, Global32Bit), TranslateError> {
+    let (scalar, count) = match &variable.info.v_type {
+        ast::Type::Scalar(scalar) => (*scalar, 1usize),
+        ast::Type::Array(None, scalar, dimensions) => {
+            let count = dimensions.iter().try_fold(1usize, |n, &dim| {
+                n.checked_mul(dim as usize).ok_or_else(error_todo)
+            })?;
+            (*scalar, count)
+        }
+        _ => return Err(error_todo()),
+    };
+    let size = scalar.size_of() as usize;
+    let bytes = count.checked_mul(size).ok_or_else(error_todo)?;
+    if bytes == 0 || variable.info.array_init.len() > count {
+        return Err(error_todo());
+    }
     let entry = resolver
         .ident_map
-        .get(&name)
+        .get(&variable.name)
         .ok_or_else(error_unreachable)?;
-    let text_name = entry
+    let name = entry
         .name
         .as_ref()
         .ok_or_else(error_unreachable)?
         .to_string();
-    let align = align.unwrap_or(1);
-    let initializer = array_init
-        .iter()
-        .map(|x| match x {
-            RegOrImmediate::Imm(ptx_parser::ImmediateValue::U64(x)) => Ok(*x as u8),
-            RegOrImmediate::Imm(ptx_parser::ImmediateValue::S64(x)) => Ok(*x as u8),
-            _ => Err(error_unreachable()),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let align = variable
+        .info
+        .align
+        .unwrap_or(scalar.layout().align() as u32);
+    let mut initializer = vec![0; bytes];
+    for (chunk, value) in initializer
+        .chunks_exact_mut(size)
+        .zip(&variable.info.array_init)
+    {
+        let value = match value {
+            RegOrImmediate::Imm(value) => value,
+            RegOrImmediate::Reg(_) => return Err(error_todo()),
+        };
+        let bits = match value {
+            ast::ImmediateValue::U64(n) => {
+                if scalar.kind() == ast::ScalarKind::Float && *n != 0 {
+                    return Err(error_todo());
+                }
+                *n as u128
+            }
+            ast::ImmediateValue::S64(n) => {
+                if scalar.kind() == ast::ScalarKind::Float && *n != 0 {
+                    return Err(error_todo());
+                }
+                *n as i128 as u128
+            }
+            ast::ImmediateValue::F32(n) if scalar == ast::ScalarType::F32 => n.to_bits() as u128,
+            ast::ImmediateValue::F32(n) => float_initializer_bits(scalar, *n as f64)?,
+            ast::ImmediateValue::F64(n) => float_initializer_bits(scalar, *n)?,
+        };
+        chunk.copy_from_slice(&bits.to_le_bytes()[..size]);
+    }
     Ok((
-        name,
+        variable.name,
         Global32Bit {
-            name: text_name,
+            name,
             align,
             initializer,
         },
     ))
+}
+
+fn float_initializer_bits(scalar: ast::ScalarType, value: f64) -> Result<u128, TranslateError> {
+    Ok(match scalar {
+        ast::ScalarType::F16 => half::f16::from_f64(value).to_bits() as u128,
+        ast::ScalarType::BF16 => half::bf16::from_f64(value).to_bits() as u128,
+        ast::ScalarType::F32 => (value as f32).to_bits() as u128,
+        ast::ScalarType::F64 => value.to_bits() as u128,
+        _ if value == 0.0 => 0,
+        _ => return Err(error_todo()),
+    })
 }
 
 fn run_directive<'input>(
