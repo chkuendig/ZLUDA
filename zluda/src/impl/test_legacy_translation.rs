@@ -18,6 +18,25 @@ unsafe fn legacy_typed_globals_keep_initializers(api: impl CudaApi) {
     );
 }
 
+#[test_cuda]
+unsafe fn legacy_sreg16_reads_low_bits(api: impl CudaApi) {
+    let source = concat!(
+        include_str!("../../../ptx/src/test/spirv_run/legacy_sreg16.ptx"),
+        "\0"
+    );
+    for grid in [1u32, 65539] {
+        let block = (grid - 1) & 0xffff;
+        let count = grid & 0xffff;
+        run(
+            &api,
+            source,
+            c"legacy_sreg16",
+            grid,
+            &[0, 1, block, count, 0, 1, block, count],
+        );
+    }
+}
+
 unsafe fn run(
     api: &impl CudaApi,
     source: &str,

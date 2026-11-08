@@ -30,6 +30,7 @@ pub(super) fn run<'a, 'input>(
         special_registers,
         sreg_to_function,
         result: Vec::new(),
+        narrow_mov_cvt: false,
     };
     for directive in directives.into_iter() {
         result.push(run_directive(&mut visitor, directive)?);
@@ -69,6 +70,10 @@ fn run_statement<'a, 'input>(
     result: &mut Vec<UnconditionalStatement>,
     statement: UnconditionalStatement,
 ) -> Result<(), TranslateError> {
+    visitor.narrow_mov_cvt = matches!(
+        &statement,
+        Statement::Instruction(ast::Instruction::Mov { .. } | ast::Instruction::Cvt { .. })
+    );
     let converted_statement = statement.visit_map(visitor)?;
     result.extend(visitor.result.drain(..));
     result.push(converted_statement);
@@ -80,6 +85,7 @@ struct SpecialRegisterResolver<'a, 'input> {
     special_registers: &'a SpecialRegistersMap,
     sreg_to_function: FxHashMap<PtxSpecialRegister, SpirvWord>,
     result: Vec<UnconditionalStatement>,
+    narrow_mov_cvt: bool,
 }
 
 impl<'a, 'b, 'input>
@@ -89,23 +95,25 @@ impl<'a, 'b, 'input>
     fn visit(
         &mut self,
         operand: ast::ParsedOperand<SpirvWord>,
-        _type_space: Option<(&ptx_parser::Type, ptx_parser::StateSpace)>,
+        type_space: Option<(&ptx_parser::Type, ptx_parser::StateSpace)>,
         is_dst: bool,
         _relaxed_type_check: bool,
     ) -> Result<ast::ParsedOperand<SpirvWord>, TranslateError> {
         map_operand(operand, &mut |ident, vector_index| {
-            self.replace_sreg(ident, vector_index, is_dst)
+            self.replace_sreg(ident, vector_index, is_dst, type_space)
         })
     }
 
     fn visit_ident(
         &mut self,
         args: SpirvWord,
-        _type_space: Option<(&ptx_parser::Type, ptx_parser::StateSpace)>,
+        type_space: Option<(&ptx_parser::Type, ptx_parser::StateSpace)>,
         is_dst: bool,
         _relaxed_type_check: bool,
     ) -> Result<SpirvWord, TranslateError> {
-        Ok(self.replace_sreg(args, None, is_dst)?.unwrap_or(args))
+        Ok(self
+            .replace_sreg(args, None, is_dst, type_space)?
+            .unwrap_or(args))
     }
 }
 
@@ -115,6 +123,7 @@ impl<'a, 'b, 'input> SpecialRegisterResolver<'a, 'input> {
         name: SpirvWord,
         vector_index: Option<u8>,
         is_dst: bool,
+        type_space: Option<(&ast::Type, ast::StateSpace)>,
     ) -> Result<Option<SpirvWord>, TranslateError> {
         if let Some(sreg) = self.special_registers.get(name) {
             if is_dst {
@@ -173,7 +182,46 @@ impl<'a, 'b, 'input> SpecialRegisterResolver<'a, 'input> {
                     data,
                     arguments,
                 }));
-            Ok(Some(fn_result))
+            // Legacy mov/cvt reads use the low 16 bits of these registers.
+            if self.narrow_mov_cvt
+                && matches!(
+                    sreg,
+                    PtxSpecialRegister::Tid
+                        | PtxSpecialRegister::Ntid
+                        | PtxSpecialRegister::Ctaid
+                        | PtxSpecialRegister::Nctaid
+                )
+                && matches!(
+                    type_space,
+                    Some((
+                        ast::Type::Scalar(
+                            ast::ScalarType::U16 | ast::ScalarType::B16 | ast::ScalarType::S16
+                        ),
+                        ast::StateSpace::Reg
+                    ))
+                )
+            {
+                let narrowed = self.resolver.register_unnamed(Some((
+                    ast::Type::Scalar(ast::ScalarType::U16),
+                    ast::StateSpace::Reg,
+                )));
+                self.result
+                    .push(Statement::Instruction(ast::Instruction::Cvt {
+                        data: ast::CvtDetails {
+                            from: ast::ScalarType::U32,
+                            to: ast::ScalarType::U16,
+                            mode: ast::CvtMode::Truncate,
+                        },
+                        arguments: ast::CvtArgs {
+                            dst: ast::ParsedOperand::Reg(narrowed),
+                            src: ast::ParsedOperand::Reg(fn_result),
+                            src2: None,
+                        },
+                    }));
+                Ok(Some(narrowed))
+            } else {
+                Ok(Some(fn_result))
+            }
         } else {
             Ok(None)
         }

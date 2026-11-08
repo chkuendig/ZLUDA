@@ -4658,6 +4658,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_sreg16_reads() {
+        let text = include_str!("../../ptx/src/test/spirv_run/32/legacy_sreg16.ptx");
+        let module = parse_module_checked(text).unwrap();
+        assert_eq!(module.address_size, 32);
+        let Directive::Method(_, method) = &module.directives[0] else {
+            panic!()
+        };
+        let conversions = method
+            .body
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|statement| {
+                matches!(statement, Statement::Instruction(_, Instruction::Cvt { data, .. })
+                if data.from == ScalarType::U16 && data.to == ScalarType::U32)
+            })
+            .count();
+        assert_eq!(conversions, 8);
+    }
+
+    #[test]
     fn target_keeps_double_instructions_and_eight_byte_storage() {
         let text = ".version 1.4\n.target sm_10, map_f64_to_f32\n.global .f64 g[2];\n.entry k() { .reg .f64 a; mov.f64 a, 0d3ff0000000000000; add.f64 a, a, a; ret; }";
         let module = parse_module_checked(text).unwrap();

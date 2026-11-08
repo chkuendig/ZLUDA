@@ -131,6 +131,7 @@ test_ptx_with_32!(
     [0u32],
     [0x3fc00000u32, 0, 0x40200000, 0xc0600000]
 );
+test_ptx_with_32!(legacy_sreg16, [0u32], [0u32, 1, 0, 1, 0, 1, 0, 1]);
 
 test_ptx!(legacy_f64_cvt);
 
@@ -176,6 +177,52 @@ fn legacy_global_initializers32() {
     assert_eq!(globals[3].initializer, [0; 16]);
     assert_eq!(globals[4].initializer, [0; 8]);
     assert_eq!(globals[5].initializer, [52, 18, 192, 127]);
+}
+
+#[test]
+fn legacy_sreg16_32_truncates_helpers() {
+    let source = read_test_file!("32/legacy_sreg16.ptx");
+    let module = translate_legacy32(&source);
+    let ir = module.llvm_ir.print_module_to_string();
+    let ir = ir.to_str();
+    assert_eq!(
+        ir.lines()
+            .filter(|line| line.contains("trunc i32") && line.contains("to i16"))
+            .count(),
+        8,
+        "{ir}"
+    );
+    compare_llvm(
+        "legacy_sreg16_32",
+        ir.trim(),
+        read_test_file!("../ll/legacy_sreg16_32.ll").trim(),
+    );
+}
+
+#[test]
+fn ordinary_mov_u16_rejects_u32_register() {
+    let source = ".version 1.4\n.target sm_10\n.entry k() { .reg .u32 wide; .reg .u16 narrow; mov.u16 narrow, wide; ret; }";
+    let mut last_pass = None;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ast = ptx_parser::parse_module_checked(source).unwrap();
+        pass::to_llvm_module(
+            ast,
+            pass::Attributes {
+                clock_rate: 2124000,
+            },
+            |name| {
+                last_pass = Some(name.to_owned());
+            },
+        )
+    }));
+    assert_eq!(last_pass.as_deref(), Some("convert_32bit_to_64bit"));
+    match outcome {
+        Ok(Err(crate::TranslateError::MismatchedType)) => {}
+        Err(payload) if cfg!(debug_assertions) => {
+            assert_eq!(payload.downcast_ref::<&str>(), Some(&"Mismatched type"));
+        }
+        _ => panic!("ordinary mov.u16 accepted a u32 source"),
+    }
 }
 
 fn translate_legacy32(source: &str) -> pass::Module {
