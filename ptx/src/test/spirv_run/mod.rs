@@ -154,6 +154,22 @@ fn legacy_tex2d_coords_v4_32_llvm() {
     compare_tex_coordinate_ir("legacy_tex2d_coords_v4_32", &source, &control, &golden);
 }
 
+#[test]
+fn legacy_tex1d_coords_v4_llvm() {
+    let source = read_test_file!("legacy_tex1d_coords_v4.ptx");
+    let control = read_test_file!("legacy_tex1d_coords_v1_control.ptx");
+    let golden = read_test_file!("../ll/legacy_tex1d_coords_v4.ll");
+    compare_tex_coordinate_ir("legacy_tex1d_coords_v4", &source, &control, &golden);
+}
+
+#[test]
+fn legacy_tex1d_coords_v4_32_llvm() {
+    let source = read_test_file!("32/legacy_tex1d_coords_v4.ptx");
+    let control = read_test_file!("32/legacy_tex1d_coords_v1_control.ptx");
+    let golden = read_test_file!("../ll/legacy_tex1d_coords_v4_32.ll");
+    compare_tex_coordinate_ir("legacy_tex1d_coords_v4_32", &source, &control, &golden);
+}
+
 fn compare_tex_coordinate_ir(name: &str, source: &str, control: &str, golden: &str) {
     let translate = |source| {
         let ast = ptx_parser::parse_module_checked(source).unwrap();
