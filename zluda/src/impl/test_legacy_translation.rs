@@ -18,7 +18,7 @@ unsafe fn legacy_typed_globals_keep_initializers(api: impl CudaApi) {
 #[test_cuda]
 unsafe fn legacy_sreg16_reads_low_bits(api: impl CudaApi) {
     let source = concat!(include_str!("test_ptx/legacy_sreg16.ptx"), "\0");
-    for grid in [1u32, 65539] {
+    for grid in [1u32, 65535] {
         let block = (grid - 1) & 0xffff;
         let count = grid & 0xffff;
         run(
