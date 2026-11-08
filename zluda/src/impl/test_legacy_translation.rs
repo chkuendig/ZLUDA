@@ -94,6 +94,62 @@ unsafe fn legacy_tex2d_ignores_coordinate_padding(api: impl CudaApi) {
     assert_eq!(actual, [1, 2, 3, 4]);
 }
 
+#[test_cuda]
+unsafe fn legacy_tex1d_ignores_coordinate_padding(api: impl CudaApi) {
+    for source in [
+        concat!(
+            include_str!("test_ptx/legacy_tex1d_coords_v1_control.ptx"),
+            "\0"
+        ),
+        concat!(include_str!("test_ptx/legacy_tex1d_coords_v4.ptx"), "\0"),
+    ] {
+        api.cuInit(0);
+        let mut context = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut context, 0, 0);
+        let mut module = std::mem::zeroed();
+        api.cuModuleLoadData(&mut module, source.as_ptr().cast());
+        let mut function = std::mem::zeroed();
+        api.cuModuleGetFunction(&mut function, module, c"fetch_1d".as_ptr());
+        let mut texture = std::mem::zeroed();
+        api.cuModuleGetTexRef(&mut texture, module, c"sample_tex".as_ptr());
+        let pixels = [1.25f32, -2.5, 3.75, 8.0, 0.5, 4.0, 16.0, -0.75];
+        let bytes = std::mem::size_of_val(&pixels);
+        let mut input = std::mem::zeroed();
+        api.cuMemAlloc_v2(&mut input, bytes);
+        api.cuMemcpyHtoD_v2(input, pixels.as_ptr().cast(), bytes);
+        api.cuTexRefSetFormat(texture, CUarray_format::CU_AD_FORMAT_FLOAT, 4);
+        api.cuTexRefSetFlags(texture, 0);
+        let mut offset = usize::MAX;
+        api.cuTexRefSetAddress_v2(&mut offset, texture, input, bytes);
+        let mut output = std::mem::zeroed();
+        api.cuMemAlloc_v2(&mut output, 16);
+        let mut actual = [0x11223344u32; 4];
+        api.cuMemcpyHtoD_v2(output, actual.as_ptr().cast(), 16);
+        let mut parameters = [&mut output as *mut _ as *mut c_void];
+        api.cuLaunchKernel(
+            function,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            CUstream(std::ptr::null_mut()),
+            parameters.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        api.cuCtxSynchronize();
+        api.cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), output, 16);
+        api.cuMemFree_v2(output);
+        api.cuModuleUnload(module);
+        api.cuMemFree_v2(input);
+        api.cuCtxDestroy_v2(context);
+        assert_eq!(offset, 0);
+        assert_eq!(actual, [0.5f32, 4.0, 16.0, -0.75].map(f32::to_bits));
+    }
+}
+
 unsafe fn run(
     api: &impl CudaApi,
     source: &str,
