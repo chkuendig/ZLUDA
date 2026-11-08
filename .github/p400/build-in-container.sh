@@ -12,7 +12,7 @@ dpkg-query -W > /out/diagnostics/PACKAGES.txt
 uname -a > /out/diagnostics/UNAME.txt
 cp /etc/os-release /out/diagnostics/OS-RELEASE.txt
 case "$TARGET" in
-  jc2) packages=(-p ptx_parser -p ptx -p zluda) ;;
+  jc2) packages=(-p ptx_parser -p ptx -p zluda --features ptx/ci_build) ;;
   reference) packages=(-p zluda) ;;
   trace) packages=(-p zluda_trace) ;;
   *) exit 2 ;;

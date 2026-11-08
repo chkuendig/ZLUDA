@@ -5,8 +5,8 @@ IMAGES=json.loads((HERE/"images.json").read_text())
 COMPAT=["libm.so.6","libdl.so.2","libpthread.so.0","librt.so.1","libutil.so.1"]
 CPU={
  "jc2":{
- "ptx_parser":["map_f64_to_f32::tests::target_maps_instructions_and_preserves_eight_byte_storage","map_f64_to_f32::tests::mapped_cvt_uses_single_precision_rounding_modes","map_f64_to_f32::tests::legacy_texture_declaration_and_signed_selection"],
- "ptx":["pass::map_f64_to_f32::tests::map_f64_to_f32_keeps_storage_and_emits_float_arithmetic","pass::map_f64_to_f32::tests::map_f64_to_f32_slct_keeps_signed_selector_and_selected_bits"],
+ "ptx_parser":["tests::target_keeps_double_instructions_and_eight_byte_storage","tests::cvt_keeps_double_precision_rounding_modes","tests::legacy_texture_declaration_and_signed_selection"],
+ "ptx":["test::spirv_run::legacy_f64_cvt_llvm","test::spirv_run::legacy_slct_llvm"],
  "nvcuda":["r#impl::tex::pitched_tests::pitched_texture_shape_checks_rows_channels_and_overflow","r#impl::driver::tests::get_allocation"]},
  "reference":{"nvcuda":["r#impl::driver::tests::get_allocation"]},"trace":{}}
 def sha(path):

@@ -81,6 +81,15 @@ for name,cases in CPU[target].items():
  assert receipt["harness_sha256"]==sha(capsule/"bin"/name)
  assert [r["test"] for r in receipt["results"]]==cases
  assert all(r["returncode"]==0 and r["one_test_passed"] is True for r in receipt["results"])
+if target=="jc2":
+ assert "ci_build" in manifest["executables"]["bin/ptx"]["features"]
+ suite=load(capsule/"receipts/cpu-ptx-full/RESULT.json");assert suite==manifest["ptx_cpu_suite"]
+ assert suite["harness_sha256"]==sha(capsule/"bin/ptx") and suite["returncode"]==0 and suite["passed"] is True
+ assert suite["skip_filters"]==["_amdgpu","_cuda"] and suite["selected_tests"]
+ assert "test::spirv_run::legacy_slct_scalar_types" in suite["selected_tests"]
+ assert not any("_amdgpu" in name or "_cuda" in name for name in suite["selected_tests"])
+ assert suite["counts"]["passed"]>0 and suite["counts"]["failed"]==0
+ assert suite["counts"]["passed"]+suite["counts"]["ignored"]==len(suite["selected_tests"])
 loader=capsule/manifest["loader"];assert loader.is_file() and manifest["loader"].startswith("runtime/lib/")
 assert set(manifest["glibc_compatibility"]["included"])==set(COMPAT)
 for name,row in manifest["runtime"].items():

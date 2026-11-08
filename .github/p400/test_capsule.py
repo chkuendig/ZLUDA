@@ -64,4 +64,28 @@ class Capsules(unittest.TestCase):
    m=tarfile.TarInfo("runtime/link");m.type=tarfile.SYMTYPE;m.linkname="lib";t.addfile(m)
    m=tarfile.TarInfo("runtime/link/injected");m.size=1;t.addfile(m,io.BytesIO(b"x"))
   self.archive(extra=extra);self.assertNotEqual(self.run_script("verify-extract.py","reference").returncode,0);self.assertFalse((self.dest/"capsule").exists())
+ def cpu_suite(self,mode):
+  binary=self.root/"ptx";output=self.root/("suite-"+mode)
+  binary.write_text("#!"+sys.executable+"\n"+'''import os,pathlib,sys
+assert sys.argv.count('--skip')==2 and '_amdgpu' in sys.argv and '_cuda' in sys.argv
+if '--list' in sys.argv:
+ print('test::spirv_run::legacy_slct_scalar_types: test\\nsecond_cpu: test');sys.exit(0)
+assert '--test-threads=1' in sys.argv
+mode=os.environ['PTX_FAKE_MODE']
+if mode=='fail':
+ p=pathlib.Path(os.environ['TEST_PTX_LLVM_FAIL_DIR']);p.mkdir(parents=True);(p/'public.ll').write_text('; public synthetic failure\\n')
+passed,failed=(2,0) if mode=='ok' else (0,2) if mode=='fail' else (0,0)
+print(f'test result: {"FAILED" if failed else "ok"}. {passed} passed; {failed} failed; 0 ignored;')
+sys.exit(101 if failed else 0)
+''')
+  binary.chmod(0o755)
+  result=subprocess.run([sys.executable,str(HERE/"run-ptx-cpu.py"),str(binary),str(output)],capture_output=True,text=True,env=dict(os.environ,PTX_FAKE_MODE=mode,PYTHONDONTWRITEBYTECODE="1"))
+  return result,json.loads((output/"RESULT.json").read_text()),output
+ def test_cpu_suite_filters_and_records_pass(self):
+  result,receipt,_=self.cpu_suite('ok');self.assertEqual(result.returncode,0,result.stderr)
+  self.assertTrue(receipt['passed']);self.assertEqual(receipt['counts']['passed'],2)
+ def test_cpu_suite_preserves_failure_and_rejects_zero_tests(self):
+  result,receipt,out=self.cpu_suite('fail');self.assertNotEqual(result.returncode,0);self.assertFalse(receipt['passed'])
+  self.assertEqual(receipt['returncode'],101);self.assertTrue((out/'llvm-failures/public.ll').exists())
+  result,receipt,_=self.cpu_suite('zero');self.assertNotEqual(result.returncode,0);self.assertFalse(receipt['passed'])
 if __name__=="__main__":unittest.main()

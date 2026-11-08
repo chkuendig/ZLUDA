@@ -22,8 +22,9 @@ for name in expected:
  matches=[e for e in artifacts if e["profile"]["test"] and e.get("executable") and e["target"]["name"]==name]
  assert len(matches)==1,(name,len(matches))
  e=matches[0];original=pathlib.Path(e["executable"]);dest=root/"bin"/("zluda_trace-tests" if target=="trace" else name)
+ if target=="jc2" and name=="ptx":assert "ci_build" in e["features"]
  shutil.copy2(original,dest);assert sha(original)==sha(dest)
- selected[str(dest.relative_to(root))]=dict(cargo_path=str(original),sha256=sha(original),fresh=e["fresh"],target=name)
+ selected[str(dest.relative_to(root))]=dict(cargo_path=str(original),sha256=sha(original),fresh=e["fresh"],target=name,features=e["features"])
  executables.append(dest)
 if target=="trace":
  tree=(out/"CARGO-TREE.txt").read_text();assert not re.search(r"\b(?:llvm_zluda|ptx|highs-sys) v",tree)
@@ -34,8 +35,13 @@ if target=="trace":
  selected["lib/libzluda_trace.so"]=dict(cargo_path=str(paths[0]),sha256=sha(dest),fresh=False,target="zluda_trace")
  executables.append(dest);fresh["trace_cdylib_fresh"]=False
 write(out/"FRESHNESS.json",fresh)
+cpu_ok=True
 for name,cases in CPU[target].items():
- subprocess.run(["python3","/plan/run-exact.py",str(root/"bin"/name),str(out/("cpu-"+name)),*cases],check=True)
+ env=dict(os.environ,TEST_PTX_LLVM_FAIL_DIR=str(out/("cpu-"+name)/"llvm-failures"))
+ cpu_ok &= subprocess.run(["python3","/plan/run-exact.py",str(root/"bin"/name),str(out/("cpu-"+name)),*cases],env=env).returncode==0
+if target=="jc2":
+ cpu_ok &= subprocess.run(["python3","/plan/run-ptx-cpu.py",str(root/"bin/ptx"),str(out/"cpu-ptx-full")]).returncode==0
+assert cpu_ok,"CPU qualification failed; retain diagnostics and LLVM failure outputs"
 if target=="trace":
  binary=root/"bin/zluda_trace-tests";listing=command([str(binary),"--list"]);(out/"TESTS-zluda_trace.txt").write_text(listing)
  p=subprocess.run([str(binary),"--test-threads=1"],capture_output=True,text=True,timeout=90)
@@ -113,13 +119,14 @@ for binary in executables:
   else:
    m=re.match(r"\s*(/\S+) ",line)
    if m:assert pathlib.Path(m[1]).resolve().is_relative_to(runtime.resolve()),line
-provenance=dict(repository=os.environ["GITHUB_REPOSITORY"],workflow_commit=os.environ["GITHUB_SHA"],run_id=int(os.environ["GITHUB_RUN_ID"]),run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),job=os.environ["GITHUB_JOB"],ref=os.environ["GITHUB_REF"],images=IMAGES,actual_images=load(out/"IMAGE.json"),packages=dict(line.split("\t",1) for line in (out/"PACKAGES.txt").read_text().splitlines()),profile="debug",rustc=(out/"RUSTC.txt").read_text(),cargo=(out/"CARGO.txt").read_text(),rocm="6.3.4",build_env={k:os.environ[k] for k in ["RUSTUP_HOME","CARGO_HOME","CARGO_TARGET_DIR","CARGO_BUILD_JOBS","CMAKE_BUILD_PARALLEL_LEVEL","CARGO_INCREMENTAL","LD_LIBRARY_PATH"]},build_argv="cargo +1.99.0 test --locked --offline [allowlisted packages] --lib -j4 --no-run --message-format=json",helper_sha256={p.name:sha(p) for p in pathlib.Path("/plan").iterdir() if p.is_file()})
+provenance=dict(repository=os.environ["GITHUB_REPOSITORY"],workflow_commit=os.environ["GITHUB_SHA"],run_id=int(os.environ["GITHUB_RUN_ID"]),run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),job=os.environ["GITHUB_JOB"],ref=os.environ["GITHUB_REF"],images=IMAGES,actual_images=load(out/"IMAGE.json"),packages=dict(line.split("\t",1) for line in (out/"PACKAGES.txt").read_text().splitlines()),profile="debug",rustc=(out/"RUSTC.txt").read_text(),cargo=(out/"CARGO.txt").read_text(),rocm="6.3.4",build_env={k:os.environ[k] for k in ["RUSTUP_HOME","CARGO_HOME","CARGO_TARGET_DIR","CARGO_BUILD_JOBS","CMAKE_BUILD_PARALLEL_LEVEL","CARGO_INCREMENTAL","LD_LIBRARY_PATH"]},build_argv="cargo +1.99.0 test --locked --offline [allowlisted packages]"+(" --features ptx/ci_build" if target=="jc2" else "")+" --lib -j4 --no-run --message-format=json",helper_sha256={p.name:sha(p) for p in pathlib.Path("/plan").iterdir() if p.is_file()})
 write(root/"SOURCE.json",source);write(root/"PROVENANCE.json",provenance)
 receipts=root/"receipts";receipts.mkdir()
 for p in out.iterdir():
  if p.is_file() and p.suffix in [".json",".log",".txt",".stdout",".stderr",".c"]:shutil.copy2(p,receipts/p.name)
  elif p.is_dir() and (p.name.startswith("cpu-") or p.name=="smoke-log"):shutil.copytree(p,receipts/p.name)
 manifest=dict(schema=1,target=target,source=source,provenance=provenance,executables=selected,loader=str(loader.relative_to(root)),runtime=closure,glibc_compatibility=dict(included=compat,reason="Same-build glibc compatibility DSOs for the separately injected driver; no NVIDIA bytes",libc_package=command(["dpkg-query","-W","-f=${Version}","libc6:amd64"])),freshness=fresh,cpu={name:load(out/("cpu-"+name)/"RESULT.json") for name in CPU[target]},trace_smoke=load(out/"SMOKE.json") if target=="trace" else None,files=inventory(root))
+if target=="jc2":manifest["ptx_cpu_suite"]=load(out/"cpu-ptx-full/RESULT.json")
 write(root/"MANIFEST.json",manifest)
 with (root/"SHA256SUMS").open("w") as f:
  for p in sorted(root.rglob("*")):

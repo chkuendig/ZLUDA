@@ -31,7 +31,7 @@ jobs:
           for script in control/.github/p400/*.sh; do bash -n "$script"; done
       - id: select
         env:
-          TARGET: ${{ inputs.target || 'all' }}
+          TARGET: ${{ inputs.target || 'jc2' }}
         run: python3 control/.github/p400/select-target.py >> "$GITHUB_OUTPUT"
   build:
     needs: select
