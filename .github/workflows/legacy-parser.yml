@@ -1,0 +1,37 @@
+name: Kernel reachability parser
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/kernel-rooted-reachability-parser-20261108]
+permissions:
+  contents: read
+jobs:
+  parser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.0
+      CARGO_BUILD_JOBS: 3
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Isolate parser workspace
+        run: |
+          cp Cargo.lock "$RUNNER_TEMP/zluda-parser.lock"
+          printf '%s\n' '[workspace]' 'resolver="2"' 'members=["ptx_parser","ptx_parser_macros","ptx_parser_macros_impl"]' > Cargo.toml
+      - name: Build parser
+        run: cargo build -j3 -p ptx_parser
+      - name: Verify pinned dependency versions
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, tomllib
+          old = tomllib.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'zluda-parser.lock').read_text())
+          new = tomllib.loads(pathlib.Path('Cargo.lock').read_text())
+          pins = {(p['name'],p['version'],p.get('source')):p.get('checksum') for p in old['package']}
+          for package in new['package']:
+              key = (package['name'],package['version'],package.get('source'))
+              assert key in pins and pins[key] == package.get('checksum'), key
+          print('Parser dependency versions and checksums match the pinned lockfile')
+          PYTHON
+      - name: Test parser
+        run: cargo test --locked -j3 -p ptx_parser --lib -- --test-threads=1
