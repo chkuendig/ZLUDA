@@ -1864,6 +1864,23 @@ fn vshr<'a, 'input>(
 
 type ParsedOperandStr<'input> = ast::ParsedOperand<&'input str>;
 
+// Legacy tex coordinates may use four lanes for any geometry; unused lanes are ignored.
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#texture-instructions-tex
+fn tex_coord_pack<'input>(
+    errors: &mut Vec<PtxError<'_>>,
+    mut operand: ParsedOperandStr<'input>,
+    width: usize,
+) -> ParsedOperandStr<'input> {
+    if let ParsedOperand::VecPack(elements) = &mut operand {
+        if elements.len() == width || elements.len() == 4 {
+            elements.truncate(width);
+        } else {
+            errors.push(PtxError::WrongVectorElement);
+        }
+    }
+    operand
+}
+
 #[derive(Clone, PartialEq, Default, Debug, Display)]
 #[display("({}:{})", _0.start, _0.end)]
 pub struct TokenError(std::ops::Range<usize>);
@@ -4481,6 +4498,7 @@ derive_parser!(
         }
     }
     tex.2d.v4.dtype.ctype  d, [a, c] => {
+        let c = tex_coord_pack(&mut state.errors, c, 2);
         Instruction::Tex {
             data: TexData {
                 dtype,
@@ -4628,6 +4646,57 @@ mod tests {
     use logos::Logos;
     use logos::Span;
     use winnow::prelude::*;
+
+    #[test]
+    fn legacy_tex2d_coordinates_ignore_padding() {
+        for (geometry, coordinates, width) in [
+            ("2d", "{%x, %y}", 2),
+            ("2d", "{%x, %y, %z, %w}", 2),
+            ("3d", "{%x, %y, %z, %w}", 4),
+        ] {
+            let source = format!(
+                ".version 1.4\n.target sm_10\n.tex .u32 image;\n.entry k() {{ tex.{geometry}.v4.u32.f32 {{%a,%b,%c,%d}}, [image, {coordinates}]; ret; }}"
+            );
+            let module = parse_module_checked(&source).unwrap();
+            let method = module
+                .directives
+                .iter()
+                .find_map(|directive| match directive {
+                    Directive::Method(_, method) => Some(method),
+                    _ => None,
+                })
+                .unwrap();
+            let Statement::Instruction(_, Instruction::Tex { arguments, .. }) =
+                &method.body.as_ref().unwrap()[0]
+            else {
+                panic!()
+            };
+            let crate::ParsedOperand::VecPack(destination) = &arguments.dst else {
+                panic!()
+            };
+            assert_eq!(destination.len(), 4);
+            let crate::ParsedOperand::VecPack(coordinates) = &arguments.src_coord else {
+                panic!()
+            };
+            assert_eq!(coordinates.len(), width);
+            for (coordinate, expected) in coordinates.iter().zip(["%x", "%y", "%z", "%w"]) {
+                assert!(
+                    matches!(coordinate, Some(crate::RegOrImmediate::Reg(name)) if *name == expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_tex2d_coordinates_reject_other_pack_widths() {
+        for (geometry, coordinates) in [("2d", "{%x}"), ("2d", "{%x, %y, %z}")] {
+            let source = format!(
+                ".version 1.4\n.target sm_10\n.tex .u32 image;\n.entry k() {{ tex.{geometry}.v4.u32.f32 {{%a,%b,%c,%d}}, [image, {coordinates}]; ret; }}"
+            );
+            let errors = parse_module_checked(&source).err().unwrap();
+            assert!(errors.contains(&PtxError::WrongVectorElement));
+        }
+    }
 
     #[test]
     fn legacy_typed_globals32() {
