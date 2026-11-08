@@ -4487,6 +4487,7 @@ derive_parser!(
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#texture-instructions-tex
     tex.1d.v4.dtype.ctype  d, [a, c] => {
+        let c = tex_coord_pack(&mut state.errors, c, 1);
         Instruction::Tex {
             data: TexData {
                 dtype,
@@ -4646,6 +4647,63 @@ mod tests {
     use logos::Logos;
     use logos::Span;
     use winnow::prelude::*;
+
+    #[test]
+    fn legacy_tex1d_coordinates_ignore_padding() {
+        for (coordinates, packed) in [
+            ("{%x}", true),
+            ("{%x, %y, %z, %w}", true),
+            ("%x", false),
+        ] {
+            let source = format!(
+                ".version 1.4\n.target sm_10\n.tex .u32 image;\n.entry k() {{ tex.1d.v4.f32.s32 {{%a,%b,%c,%d}}, [image, {coordinates}]; ret; }}"
+            );
+            let module = parse_module_checked(&source).unwrap();
+            let method = module
+                .directives
+                .iter()
+                .find_map(|directive| match directive {
+                    Directive::Method(_, method) => Some(method),
+                    _ => None,
+                })
+                .unwrap();
+            let Statement::Instruction(_, Instruction::Tex { arguments, .. }) =
+                &method.body.as_ref().unwrap()[0]
+            else {
+                panic!()
+            };
+            let crate::ParsedOperand::VecPack(destination) = &arguments.dst else {
+                panic!()
+            };
+            assert_eq!(destination.len(), 4);
+            if packed {
+                let crate::ParsedOperand::VecPack(coordinates) = &arguments.src_coord else {
+                    panic!()
+                };
+                assert_eq!(coordinates.len(), 1);
+                assert!(matches!(
+                    coordinates[0].as_ref(),
+                    Some(crate::RegOrImmediate::Reg(name)) if *name == "%x"
+                ));
+            } else {
+                assert!(matches!(
+                    &arguments.src_coord,
+                    crate::ParsedOperand::Reg(name) if *name == "%x"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_tex1d_coordinates_reject_other_pack_widths() {
+        for coordinates in ["{%x, %y}", "{%x, %y, %z}"] {
+            let source = format!(
+                ".version 1.4\n.target sm_10\n.tex .u32 image;\n.entry k() {{ tex.1d.v4.f32.s32 {{%a,%b,%c,%d}}, [image, {coordinates}]; ret; }}"
+            );
+            let errors = parse_module_checked(&source).err().unwrap();
+            assert!(errors.contains(&PtxError::WrongVectorElement));
+        }
+    }
 
     #[test]
     fn legacy_tex2d_coordinates_ignore_padding() {
