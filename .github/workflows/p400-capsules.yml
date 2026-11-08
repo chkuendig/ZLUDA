@@ -10,7 +10,7 @@ on:
         options: [all, native-both, jc2, reference, trace, zoc]
         default: all
       collect_oracles:
-        description: Collect four intentionally missing public LLVM oracles; not a capsule
+        description: Collect the pinned public LLVM oracles; not a capsule
         type: boolean
         default: false
 permissions:
@@ -117,7 +117,7 @@ jobs:
       - name: Mark expected missing-oracle test failures
         if: ${{ success() && inputs.collect_oracles }}
         run: |
-          echo 'Expected four LLVM comparison failures collected; this run is not CPU qualification.'
+          echo 'Expected LLVM comparison failures collected; this run is not CPU qualification.'
           exit 1
       - name: Retain partial diagnostics on failure
         if: ${{ failure() && !inputs.collect_oracles }}

@@ -4,13 +4,20 @@ from capsule import PINS, sha, write
 events_path, source, out, cases_path = map(pathlib.Path, sys.argv[1:])
 out.mkdir()
 cases = json.loads(cases_path.read_text())
-assert len(cases) == 8 and len({c['name'] for c in cases}) == 8
 oracles = {c['oracle'] for c in cases if 'oracle' in c}
-assert len(oracles) == 4 and sum(c['expected_returncode'] == 0 for c in cases) == 4
-for name in oracles:
+assert len(oracles) in (4, 196) and sum(c['expected_returncode'] == 0 for c in cases) == 4
+assert len(cases) == len(oracles) + 4 and len({c['name'] for c in cases}) == len(cases)
+for case in cases:
+    if 'oracle' not in case:
+        continue
+    name = case['oracle']
     assert pathlib.Path(name).name == name and name.endswith('.ll')
     golden = source / 'ptx/src/test/ll' / name
-    assert golden.is_file() and not golden.is_symlink() and golden.stat().st_size == 0, name
+    assert golden.is_file() and not golden.is_symlink(), name
+    if case.get('golden_state') == 'existing_windows_prelude':
+        assert golden.stat().st_size > 0 and sha(golden) == case['c7_golden_sha256'], name
+    else:
+        assert golden.stat().st_size == 0, name
 
 events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
 artifacts = [e for e in events if e['reason'] == 'compiler-artifact']
@@ -65,7 +72,8 @@ for case in cases:
             assert files == [case['oracle']], 'Wrong LLVM outputs'
             path = llvm_dir / case['oracle']
             assert path.is_file() and not path.is_symlink() and path.stat().st_size > 0
-            assert '\x00' not in path.read_text(encoding='utf-8')
+            ir = path.read_text(encoding='utf-8')
+            assert '\x00' not in ir and 'llvm.amdgcn.s.dcache.inv' not in ir
             row['output'] = dict(path=path.relative_to(out).as_posix(), sha256=sha(path), bytes=path.stat().st_size)
         else:
             assert not files, 'Passing case emitted a mismatch'

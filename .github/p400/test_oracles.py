@@ -1,4 +1,4 @@
-import json, os, pathlib, subprocess, sys, tempfile, unittest
+import hashlib, json, os, pathlib, subprocess, sys, tempfile, unittest
 from capsule import HERE, PINS, write
 
 
@@ -10,10 +10,20 @@ class OracleCollection(unittest.TestCase):
             goldens = source / 'ptx/src/test/ll'
             goldens.mkdir(parents=True)
             diagnostics.mkdir()
-            cases = json.loads((HERE / 'oracle-cases.json').read_text())
+            cases = [c for c in json.loads((HERE / 'oracle-cases.json').read_text())
+                     if 'oracle' not in c or c.get('golden_state') != 'existing_windows_prelude']
+            if mode in ['existing-golden', 'wrong-golden']:
+                case = next(c for c in cases if 'oracle' in c)
+                case.update(golden_state='existing_windows_prelude', c7_golden_sha256=hashlib.sha256(b'; pinned public golden\n').hexdigest())
+            cases_path = root / 'cases.json'
+            write(cases_path, cases)
             for case in cases:
                 if 'oracle' in case:
-                    (goldens / case['oracle']).write_text('')
+                    text = '; pinned public golden\n' if case.get('golden_state') == 'existing_windows_prelude' else ''
+                    if text and mode == 'wrong-golden':
+                        text = '; changed public golden\n'
+                    (goldens / case['oracle']).write_text(text)
+            golden_before = {p.name: p.read_bytes() for p in goldens.iterdir()}
             write(diagnostics / 'SOURCE.json', dict(commit=PINS['jc2']['commit'], tree=PINS['jc2']['tree']))
             (diagnostics / 'RUSTC.txt').write_text('public synthetic toolchain\n')
             script = '''import json, os, pathlib, sys
@@ -28,6 +38,7 @@ if 'oracle' in case:
         directory = pathlib.Path(os.environ['TEST_PTX_LLVM_FAIL_DIR']); directory.mkdir()
         (directory / case['oracle']).write_text('; public synthetic LLVM IR\\n')
         if mode == 'extra-output': (directory / '_attributes.ll').write_text('; unexpected\\n')
+        if mode == 'cache-prelude': (directory / case['oracle']).write_text('call void @llvm.amdgcn.s.dcache.inv()\\n')
         print('assertion failed: `(left == right)`')
     else: print('Todo before LLVM comparison')
     print('test result: FAILED. 0 passed; 1 failed; 0 ignored;'); sys.exit(101)
@@ -51,10 +62,10 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored;')
             events = diagnostics / 'events.json'
             events.write_text(''.join(json.dumps(e) + '\n' for e in artifacts))
             out = diagnostics / 'oracle-collection'
-            result = subprocess.run([sys.executable, str(HERE / 'collect-oracles.py'), str(events), str(source), str(out), str(HERE / 'oracle-cases.json')],
+            result = subprocess.run([sys.executable, str(HERE / 'collect-oracles.py'), str(events), str(source), str(out), str(cases_path)],
                                     capture_output=True, text=True, env=dict(os.environ, ORACLE_FAKE_MODE=mode, PYTHONDONTWRITEBYTECODE='1'))
             receipt = json.loads((out / 'COLLECTION.json').read_text()) if (out / 'COLLECTION.json').exists() else None
-            self.assertTrue(all(p.stat().st_size == 0 for p in goldens.iterdir()))
+            self.assertEqual({p.name: p.read_bytes() for p in goldens.iterdir()}, golden_before)
             self.assertFalse(list(root.rglob('capsule.tar.gz')))
             return result, receipt
 
@@ -72,8 +83,16 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored;')
         self.assertEqual(receipt['status'], 'COLLECTION_FAILED')
         self.assertEqual(len(receipt['results']), 8)
 
+    def test_existing_golden_must_match_its_pin(self):
+        result, receipt = self.run_collection('existing-golden')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(r['matched'] for r in receipt['results']))
+        result, receipt = self.run_collection('wrong-golden')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(receipt)
+
     def test_extra_ir_and_zero_tests_are_rejected(self):
-        for mode in ['extra-output', 'zero-tests']:
+        for mode in ['extra-output', 'zero-tests', 'cache-prelude']:
             with self.subTest(mode=mode):
                 result, receipt = self.run_collection(mode)
                 self.assertNotEqual(result.returncode, 0)
