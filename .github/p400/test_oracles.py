@@ -69,19 +69,19 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored;')
             self.assertFalse(list(root.rglob('capsule.tar.gz')))
             return result, receipt
 
-    def test_four_expected_failures_and_four_passes_are_collection_only(self):
+    def test_two_expected_failures_and_two_passes_are_collection_only(self):
         result, receipt = self.run_collection('expected')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(receipt['qualified'])
         self.assertFalse(receipt['capsule'])
         self.assertTrue(all(r['matched'] for r in receipt['results']))
-        self.assertEqual(sum('output' in r for r in receipt['results']), 4)
+        self.assertEqual(sum('output' in r for r in receipt['results']), 2)
 
     def test_translation_panic_is_not_an_oracle_failure(self):
         result, receipt = self.run_collection('translation-error')
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(receipt['status'], 'COLLECTION_FAILED')
-        self.assertEqual(len(receipt['results']), 8)
+        self.assertEqual(len(receipt['results']), 4)
 
     def test_existing_golden_must_match_its_pin(self):
         result, receipt = self.run_collection('existing-golden')

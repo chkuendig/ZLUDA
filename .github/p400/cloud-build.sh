@@ -44,6 +44,9 @@ docker run "${args[@]}" --network bridge "$image" bash -euo pipefail -c '
   cargo +1.99.0 -vV > /out/diagnostics/CARGO.txt
   grep -Fx "release: 1.99.0" /out/diagnostics/RUSTC.txt
   export CARGO_TARGET_DIR=/tmp/fetch-target
+  if [ "${COLLECT_ORACLES:-false}" = true ]; then
+    rustup component add rustfmt --toolchain 1.99.0
+  fi
   cargo +1.99.0 fetch --locked
 ' 2>&1 | tee "$out/fetch.log"
 mkdir "$work/target"

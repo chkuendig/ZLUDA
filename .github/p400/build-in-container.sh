@@ -8,6 +8,15 @@ git config --global --add safe.directory /src/ext/HiGHS
 rustc +1.99.0 -vV > /out/diagnostics/RUSTC.txt
 cargo +1.99.0 -vV > /out/diagnostics/CARGO.txt
 grep -Fx 'release: 1.99.0' /out/diagnostics/RUSTC.txt
+if [ "${COLLECT_ORACLES:-false}" = true ]; then
+  rustfmt +1.99.0 --version > /out/diagnostics/RUSTFMT-VERSION.txt
+  set +e
+  cargo +1.99.0 fmt --all -- --check > /out/diagnostics/RUSTFMT.diff 2>&1
+  fmt_rc=$?
+  set -e
+  printf '{"returncode":%s,"check_only":true}\n' "$fmt_rc" > /out/diagnostics/RUSTFMT.json
+  cat /out/diagnostics/RUSTFMT.diff
+fi
 dpkg-query -W > /out/diagnostics/PACKAGES.txt
 uname -a > /out/diagnostics/UNAME.txt
 cp /etc/os-release /out/diagnostics/OS-RELEASE.txt

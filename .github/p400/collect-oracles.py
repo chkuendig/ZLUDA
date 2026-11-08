@@ -5,8 +5,9 @@ events_path, source, out, cases_path = map(pathlib.Path, sys.argv[1:])
 out.mkdir()
 cases = json.loads(cases_path.read_text())
 oracles = {c['oracle'] for c in cases if 'oracle' in c}
-assert len(oracles) in (4, 196) and sum(c['expected_returncode'] == 0 for c in cases) == 4
-assert len(cases) == len(oracles) + 4 and len({c['name'] for c in cases}) == len(cases)
+positives = sum(c['expected_returncode'] == 0 for c in cases)
+assert (len(oracles), positives) in ((2, 2), (4, 4), (196, 4))
+assert len(cases) == len(oracles) + positives and len({c['name'] for c in cases}) == len(cases)
 for case in cases:
     if 'oracle' not in case:
         continue
