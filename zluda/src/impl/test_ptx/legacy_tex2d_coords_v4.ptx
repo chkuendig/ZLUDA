@@ -1,0 +1,19 @@
+.version 2.3
+.target sm_10
+.address_size 64
+.global .texref legacy_texture;
+
+.entry legacy_tex2d_coords_v4(.param .u64 output)
+{
+    .reg .u64 %ptr;
+    .reg .u32 %a, %b, %c, %d;
+    .reg .f32 %x, %y, %pad_z, %pad_w;
+    ld.param.u64 %ptr, [output];
+    mov.f32 %x, 0f3f000000;
+    mov.f32 %y, 0f3f000000;
+    mov.f32 %pad_z, 0f42c80000;
+    mov.f32 %pad_w, 0fc2c80000;
+    tex.2d.v4.u32.f32 {%a, %b, %c, %d}, [legacy_texture, {%x, %y, %pad_z, %pad_w}];
+    st.global.v4.u32 [%ptr], {%a, %b, %c, %d};
+    ret;
+}
