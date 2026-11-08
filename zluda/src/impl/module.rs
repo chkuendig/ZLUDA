@@ -16,6 +16,9 @@ use std::{
 use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 
 #[cfg(test)]
+#[path = "test_legacy_slct.rs"]
+mod legacy_slct_tests;
+#[cfg(test)]
 #[path = "test_legacy_sm10.rs"]
 mod legacy_sm10_tests;
 

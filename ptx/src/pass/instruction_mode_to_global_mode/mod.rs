@@ -2165,6 +2165,7 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Shf { .. }
         | ast::Instruction::Shl { .. }
         | ast::Instruction::Selp { .. }
+        | ast::Instruction::Slct { .. }
         | ast::Instruction::Ret { .. }
         | ast::Instruction::BarWarp { .. }
         | ast::Instruction::Bar { .. }

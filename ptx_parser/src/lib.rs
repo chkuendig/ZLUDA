@@ -619,7 +619,7 @@ fn directive<'a, 'input>(
             // methods
             | Token::DotFunc | Token::DotEntry
             // module variables
-            | Token::DotGlobal | Token::DotConst | Token::DotShared
+            | Token::DotGlobal | Token::DotConst | Token::DotShared | Token::DotTex
             // other sections
             | Token::DotFile | Token::DotSection => true,
             _ => false,
@@ -1045,6 +1045,7 @@ fn texref_or_surfref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<
         "texref_or_surfref",
         alt((
             Token::DotTexref.map(|_| ParsedType::Texref),
+            (Token::DotTex, Token::DotU32).map(|_| ParsedType::Texref),
             Token::DotSurfref.map(|_| ParsedType::Surfref),
         )),
     )
@@ -1346,6 +1347,7 @@ where
 fn global_space<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<StateSpace> {
     alt((
         Token::DotGlobal.value(StateSpace::Global),
+        peek(Token::DotTex).value(StateSpace::Global),
         Token::DotConst.value(StateSpace::Const),
         Token::DotShared.value(StateSpace::Shared),
     ))
@@ -2068,6 +2070,8 @@ derive_parser!(
         DotPtr,
         #[token(".noreturn")]
         DotNoreturn,
+        #[token(".tex")]
+        DotTex,
         #[token(".texref")]
         DotTexref,
         #[token(".surfref")]
@@ -3519,6 +3523,18 @@ derive_parser!(
     }
     ScalarType =        { .f32, .f64 };
 
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#comparison-and-selection-instructions-slct
+    slct.type.s32 d, a, b, c => {
+        ast::Instruction::Slct {
+            data: type_,
+            arguments: SlctArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+    .type: ScalarType = { .b16, .b32, .b64,
+                          .u16, .u32, .u64,
+                          .s16, .s32, .s64,
+                          .f32, .f64 };
+
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#comparison-and-selection-instructions-selp
     selp.type d, a, b, c => {
         ast::Instruction::Selp {
@@ -4679,6 +4695,24 @@ mod tests {
         ));
         assert!(conversions[2].from == ScalarType::F64 && conversions[2].to == ScalarType::S32);
         assert!(matches!(conversions[2].mode, CvtMode::SignedFromFP { .. }));
+    }
+
+    #[test]
+    fn legacy_texture_declaration_and_signed_selection() {
+        let text = ".version 1.4\n.target sm_10, map_f64_to_f32\n.tex .u32 image;\n.entry k() { .reg .f32 a,b,d; .reg .s32 sign; slct.f32.s32 d,a,b,sign; ret; }";
+        let module = parse_module_checked(text).unwrap();
+        let Directive::Variable(_, variable) = &module.directives[0] else {
+            panic!()
+        };
+        assert!(variable.info.state_space == StateSpace::Global);
+        assert!(matches!(variable.info.v_type, Type::Texref));
+        for type_ in [
+            "b16", "b32", "b64", "u16", "u32", "u64", "s16", "s32", "s64", "f32", "f64",
+        ] {
+            let source = format!(".version 1.4\n.target sm_13\n.entry k() {{ .reg .{type_} a,b,d; .reg .s32 c; slct.{type_}.s32 d,a,b,c; ret; }}");
+            parse_module_checked(&source).unwrap();
+        }
+        assert!(parse_module_checked(".version 1.4\n.target sm_10\n.tex .f64 invalid;\n").is_err());
     }
 
     #[test]
