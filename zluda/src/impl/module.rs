@@ -21,6 +21,9 @@ mod legacy_slct_tests;
 #[cfg(test)]
 #[path = "test_legacy_sm10.rs"]
 mod legacy_sm10_tests;
+#[cfg(test)]
+#[path = "test_legacy_translation.rs"]
+mod legacy_translation_tests;
 
 pub(crate) struct Module {
     pub(crate) base: hipModule_t,
