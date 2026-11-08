@@ -37,6 +37,11 @@ pub struct Options {
 fn main() -> ExitCode {
     if let Err(e) = main_core() {
         eprintln!("Error: {}", e);
+        let mut cause = std::error::Error::source(&e);
+        while let Some(error) = cause {
+            eprintln!("Caused by: {error}");
+            cause = error.source();
+        }
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
