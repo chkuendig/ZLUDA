@@ -560,14 +560,21 @@ fn version<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(u8, u8)> 
 }
 
 fn target<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(u32, Option<char>)> {
+    // NVIDIA's JIT executes f64 at full precision with this option (observed sm_61).
     preceded(
         Token::DotTarget,
         (
             ident.and_then(shader_model),
-            opt((Token::Comma, ident_literal("debug"))),
+            repeat(
+                0..,
+                preceded(
+                    Token::Comma,
+                    alt((ident_literal("debug"), ident_literal("map_f64_to_f32"))),
+                ),
+            ),
         ),
     )
-    .map(|((target, arch_variant), _debug)| (target, arch_variant))
+    .map(|(target, _options): (_, Vec<()>)| target)
     .parse_next(stream)
 }
 
@@ -4594,6 +4601,10 @@ mod tests {
     use crate::parse_module_checked;
     use crate::section;
     use crate::PtxError;
+    use crate::{
+        ArithDetails, CvtMode, Directive, Instruction, MultiVariable, RoundingMode, ScalarType,
+        StateSpace, Statement, Type,
+    };
 
     use super::target;
     use super::PtxParserState;
@@ -4601,6 +4612,74 @@ mod tests {
     use logos::Logos;
     use logos::Span;
     use winnow::prelude::*;
+
+    #[test]
+    fn target_keeps_double_instructions_and_eight_byte_storage() {
+        let text = ".version 1.4\n.target sm_10, map_f64_to_f32\n.global .f64 g[2];\n.entry k() { .reg .f64 a; mov.f64 a, 0d3ff0000000000000; add.f64 a, a, a; ret; }";
+        let module = parse_module_checked(text).unwrap();
+        assert_eq!(module.address_size, 32);
+        let Directive::Variable(_, global) = &module.directives[0] else {
+            panic!()
+        };
+        assert_eq!(global.info.v_type.layout().unwrap().size(), 16);
+        let Directive::Method(_, method) = &module.directives[1] else {
+            panic!()
+        };
+        let body = method.body.as_ref().unwrap();
+        let Statement::Variable(MultiVariable::Names { info, .. }) = &body[0] else {
+            panic!()
+        };
+        assert_eq!(info.v_type.layout().unwrap().size(), 8);
+        let Statement::Instruction(_, Instruction::Mov { data, .. }) = &body[1] else {
+            panic!()
+        };
+        assert!(matches!(data.typ, Type::Scalar(ScalarType::F64)));
+        let Statement::Instruction(
+            _,
+            Instruction::Add {
+                data: ArithDetails::Float(data),
+                ..
+            },
+        ) = &body[2]
+        else {
+            panic!()
+        };
+        assert!(data.type_ == ScalarType::F64);
+        assert!(parse_module_checked(".version 1.4\n.target sm_10, unknown\n").is_err());
+    }
+
+    #[test]
+    fn cvt_keeps_double_precision_rounding_modes() {
+        let text = ".version 1.4\n.target sm_10, map_f64_to_f32\n.entry k() { .reg .f64 a; .reg .f32 b; .reg .s32 i; cvt.f64.f32 a,b; cvt.rn.f32.f64 b,a; cvt.rzi.s32.f64 i,a; ret; }";
+        let module = parse_module_checked(text).unwrap();
+        let Directive::Method(_, method) = &module.directives[0] else {
+            panic!()
+        };
+        let conversions: Vec<_> = method
+            .body
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|statement| match statement {
+                Statement::Instruction(_, Instruction::Cvt { data, .. }) => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conversions.len(), 3);
+        assert!(conversions[0].from == ScalarType::F32 && conversions[0].to == ScalarType::F64);
+        assert!(matches!(conversions[0].mode, CvtMode::FPExtend { .. }));
+        assert!(conversions[1].from == ScalarType::F64 && conversions[1].to == ScalarType::F32);
+        assert!(matches!(
+            conversions[1].mode,
+            CvtMode::FPTruncate {
+                rounding: RoundingMode::NearestEven,
+                is_integer_rounding: false,
+                ..
+            }
+        ));
+        assert!(conversions[2].from == ScalarType::F64 && conversions[2].to == ScalarType::S32);
+        assert!(matches!(conversions[2].mode, CvtMode::SignedFromFP { .. }));
+    }
 
     #[test]
     fn sink_is_not_an_identifier() {
