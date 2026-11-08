@@ -31,6 +31,69 @@ unsafe fn legacy_sreg16_reads_low_bits(api: impl CudaApi) {
     }
 }
 
+#[test_cuda]
+unsafe fn legacy_tex2d_ignores_coordinate_padding(api: impl CudaApi) {
+    api.cuInit(0);
+    let mut context = std::mem::zeroed();
+    api.cuCtxCreate_v2(&mut context, 0, 0);
+    let source = concat!(include_str!("test_ptx/legacy_tex2d_coords_v4.ptx"), "\0");
+    let mut module = std::mem::zeroed();
+    api.cuModuleLoadData(&mut module, source.as_ptr().cast());
+    let mut function = std::mem::zeroed();
+    api.cuModuleGetFunction(&mut function, module, c"legacy_tex2d_coords_v4".as_ptr());
+    let mut texture = std::mem::zeroed();
+    api.cuModuleGetTexRef(&mut texture, module, c"legacy_texture".as_ptr());
+    let descriptor = CUDA_ARRAY_DESCRIPTOR {
+        Width: 2,
+        Height: 2,
+        Format: CUarray_format::CU_AD_FORMAT_UNSIGNED_INT32,
+        NumChannels: 4,
+    };
+    let mut array = std::mem::zeroed();
+    api.cuArrayCreate_v2(&mut array, &descriptor);
+    let pixels: [u32; 16] = std::array::from_fn(|index| index as u32 + 1);
+    let mut copy: CUDA_MEMCPY2D = std::mem::zeroed();
+    copy.srcMemoryType = CUmemorytype::CU_MEMORYTYPE_HOST;
+    copy.srcHost = pixels.as_ptr().cast();
+    copy.srcPitch = 32;
+    copy.dstMemoryType = CUmemorytype::CU_MEMORYTYPE_ARRAY;
+    copy.dstArray = array;
+    copy.WidthInBytes = 32;
+    copy.Height = 2;
+    api.cuMemcpy2D_v2(&copy);
+    api.cuTexRefSetArray(texture, array, CU_TRSA_OVERRIDE_FORMAT);
+    for dimension in [0, 1] {
+        api.cuTexRefSetAddressMode(texture, dimension, CUaddress_mode::CU_TR_ADDRESS_MODE_CLAMP);
+    }
+    api.cuTexRefSetFilterMode(texture, CUfilter_mode::CU_TR_FILTER_MODE_POINT);
+    api.cuTexRefSetFlags(texture, CU_TRSF_READ_AS_INTEGER);
+    let mut output = std::mem::zeroed();
+    api.cuMemAlloc_v2(&mut output, 16);
+    let mut actual = [0x11223344u32; 4];
+    api.cuMemcpyHtoD_v2(output, actual.as_ptr().cast(), 16);
+    let mut parameters = [&mut output as *mut _ as *mut c_void];
+    api.cuLaunchKernel(
+        function,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        CUstream(std::ptr::null_mut()),
+        parameters.as_mut_ptr(),
+        std::ptr::null_mut(),
+    );
+    api.cuCtxSynchronize();
+    api.cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), output, 16);
+    api.cuMemFree_v2(output);
+    api.cuModuleUnload(module);
+    api.cuArrayDestroy(array);
+    api.cuCtxDestroy_v2(context);
+    assert_eq!(actual, [1, 2, 3, 4]);
+}
+
 unsafe fn run(
     api: &impl CudaApi,
     source: &str,
