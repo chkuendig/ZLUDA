@@ -34,4 +34,9 @@ elif [ "$TARGET" != zoc ]; then
   cp /out/diagnostics/test-build.json /out/diagnostics/build.json
   cp /out/diagnostics/test-build.log /out/diagnostics/build.log
 fi
-python3 /plan/package-capsule.py
+if [ "${COLLECT_ORACLES:-false}" = true ]; then
+  test "$TARGET" = jc2
+  python3 /plan/collect-oracles.py /out/diagnostics/test-build.json /src /out/diagnostics/oracle-collection /plan/oracle-cases.json
+else
+  python3 /plan/package-capsule.py
+fi

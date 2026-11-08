@@ -32,7 +32,7 @@ cp "$GITHUB_WORKSPACE/cloud-disk-before.txt" "$out/CLOUD-DISK-BEFORE.txt"
 args=(--rm --platform linux/amd64 --cpus=4 --memory=10g --memory-swap=10g
   -v "$GITHUB_WORKSPACE/source:/src:ro" -v "$control:/plan:ro"
   -v "$work/tools:/tools" -v "$GITHUB_WORKSPACE/dist/$TARGET:/out" -w /src
-  -e TARGET -e SOURCE_COMMIT -e LLVM_COMMIT
+  -e TARGET -e SOURCE_COMMIT -e LLVM_COMMIT -e COLLECT_ORACLES
   -e GITHUB_REPOSITORY -e GITHUB_SHA -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT -e GITHUB_JOB -e GITHUB_REF
   -e RUSTUP_HOME=/tools/rustup -e CARGO_HOME=/tools/cargo -e GIT_OPTIONAL_LOCKS=0)
 docker run "${args[@]}" --network bridge "$image" bash -euo pipefail -c '

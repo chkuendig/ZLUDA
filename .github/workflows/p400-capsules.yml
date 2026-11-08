@@ -9,6 +9,10 @@ on:
         type: choice
         options: [all, native-both, jc2, reference, trace, zoc]
         default: all
+      collect_oracles:
+        description: Collect four intentionally missing public LLVM oracles; not a capsule
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -28,11 +32,14 @@ jobs:
       - name: Check capsule helpers
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_capsule.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_oracles.py
           for script in control/.github/p400/*.sh; do bash -n "$script"; done
       - id: select
         env:
           TARGET: ${{ inputs.target || 'zoc' }}
-        run: python3 control/.github/p400/select-target.py >> "$GITHUB_OUTPUT"
+        run: |
+          if [ '${{ inputs.collect_oracles }}' = true ]; then test "$TARGET" = jc2; fi
+          python3 control/.github/p400/select-target.py >> "$GITHUB_OUTPUT"
   build:
     needs: select
     runs-on: ubuntu-22.04
@@ -48,6 +55,7 @@ jobs:
       ROCM_VERSION: '6.3.4'
       CARGO_INCREMENTAL: '0'
       GIT_LFS_SKIP_SMUDGE: '1'
+      COLLECT_ORACLES: ${{ inputs.collect_oracles || false }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -89,6 +97,7 @@ jobs:
           LLVM_COMMIT: ${{ matrix.llvm }}
         run: bash control/.github/p400/cloud-build.sh
       - name: Upload complete capsule
+        if: ${{ !inputs.collect_oracles }}
         id: capsule
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -97,8 +106,21 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+      - name: Upload public translation-oracle collection
+        if: ${{ always() && inputs.collect_oracles }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: public-translation-oracles-${{ matrix.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/${{ matrix.id }}/diagnostics/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Mark expected missing-oracle test failures
+        if: ${{ success() && inputs.collect_oracles }}
+        run: |
+          echo 'Expected four LLVM comparison failures collected; this run is not CPU qualification.'
+          exit 1
       - name: Retain partial diagnostics on failure
-        if: failure()
+        if: ${{ failure() && !inputs.collect_oracles }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: p400-FAILED-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
