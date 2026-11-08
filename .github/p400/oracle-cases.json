@@ -1,6 +1,6 @@
 [
-  {"binary": "ptx_parser", "name": "tests::legacy_tex2d_coordinates_ignore_padding", "expected_returncode": 0},
-  {"binary": "ptx_parser", "name": "tests::legacy_tex2d_coordinates_reject_other_pack_widths", "expected_returncode": 0},
-  {"binary": "ptx", "name": "test::spirv_run::legacy_tex2d_coords_v4_llvm", "expected_returncode": 101, "oracle": "legacy_tex2d_coords_v4.ll", "golden_state": "new_empty_placeholder"},
-  {"binary": "ptx", "name": "test::spirv_run::legacy_tex2d_coords_v4_32_llvm", "expected_returncode": 101, "oracle": "legacy_tex2d_coords_v4_32.ll", "golden_state": "new_empty_placeholder"}
+  {"binary": "ptx_parser", "name": "tests::legacy_tex1d_coordinates_ignore_padding", "expected_returncode": 0},
+  {"binary": "ptx_parser", "name": "tests::legacy_tex1d_coordinates_reject_other_pack_widths", "expected_returncode": 0},
+  {"binary": "ptx", "name": "test::spirv_run::legacy_tex1d_coords_v4_llvm", "expected_returncode": 101, "oracle": "legacy_tex1d_coords_v4.ll", "golden_state": "new_empty_placeholder"},
+  {"binary": "ptx", "name": "test::spirv_run::legacy_tex1d_coords_v4_32_llvm", "expected_returncode": 101, "oracle": "legacy_tex1d_coords_v4_32.ll", "golden_state": "new_empty_placeholder"}
 ]
