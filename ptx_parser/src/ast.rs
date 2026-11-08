@@ -552,6 +552,19 @@ ptx_parser_macros::generate_instruction_type!(
                 src: T,
             }
         },
+        Slct {
+            type: { Type::Scalar(data.clone()) },
+            data: ScalarType,
+            arguments<T>: {
+                dst: T,
+                src1: T,
+                src2: T,
+                src3: {
+                    repr: T,
+                    type: Type::Scalar(ScalarType::S32)
+                },
+            }
+        },
         Selp {
             type: { Type::Scalar(data.clone()) },
             data: ScalarType,

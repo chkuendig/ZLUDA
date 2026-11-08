@@ -16,6 +16,9 @@ use std::{
 use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 
 #[cfg(test)]
+#[path = "test_legacy_slct.rs"]
+mod legacy_slct_tests;
+#[cfg(test)]
 #[path = "test_legacy_sm10.rs"]
 mod legacy_sm10_tests;
 
@@ -71,7 +74,10 @@ impl ZludaObject for Module {
             .mutable
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let texrefs = mutable.texrefs.values().map(|texref| *texref as *mut textureReference);
+        let texrefs = mutable
+            .texrefs
+            .values()
+            .map(|texref| *texref as *mut textureReference);
         let surfrefs = mutable.surfrefs.values().map(|surfref| surfref.base);
         let forgotten = texrefs
             .chain(surfrefs)
