@@ -11,6 +11,7 @@ mod expand_operands;
 mod insert_implicit_conversions;
 mod instruction_mode_to_global_mode;
 mod normalize_basic_blocks;
+mod remove_unreachable_basic_blocks;
 
 #[macro_export]
 macro_rules! test_pass {
