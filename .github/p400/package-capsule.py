@@ -6,7 +6,7 @@ target=os.environ["TARGET"];pin=PINS[target]
 source=load(out/"SOURCE.json");assert source["commit"]==pin["commit"] and source["LLVM_BUILT"]==pin["llvm_built"]
 def command(args):return subprocess.check_output(args,text=True,stderr=subprocess.STDOUT,timeout=90)
 def events(name):return [__import__("json").loads(l) for l in (out/name).read_text().splitlines() if l.strip()]
-test_events=events("test-build.json");artifacts=[e for e in test_events if e["reason"]=="compiler-artifact"]
+test_events=events("build.json" if target=="zoc" else "test-build.json");artifacts=[e for e in test_events if e["reason"]=="compiler-artifact"]
 assert artifacts and all(e["fresh"] is False for e in artifacts),"Fresh target required"
 llvm_events=[e for e in test_events if e["reason"]=="build-script-executed" and "/llvm_zluda" in e["package_id"]]
 llvm_scripts=[e for e in artifacts if e["target"]["src_path"]=="/src/llvm_zluda/build.rs"]
@@ -17,14 +17,17 @@ if pin["llvm_built"]:
 else:assert not llvm_events and not llvm_scripts
 fresh={"target_initially_empty":True,"compiler_artifacts":len(artifacts),"fresh_true":0,"LLVM_BUILT":pin["llvm_built"],"llvm_build_script_events":llvm_events,"llvm_compiled_build_script":[dict(path=p,sha256=sha(p)) for e in llvm_scripts for p in e["filenames"]]}
 selected={};executables=[]
-expected={"jc2":["nvcuda","ptx","ptx_parser"],"reference":["nvcuda"],"trace":["zluda_trace"]}[target]
+expected={"jc2":["nvcuda","ptx","ptx_parser"],"reference":["nvcuda"],"trace":["zluda_trace"],"zoc":["zoc"]}[target]
 for name in expected:
- matches=[e for e in artifacts if e["profile"]["test"] and e.get("executable") and e["target"]["name"]==name]
+ matches=[e for e in artifacts if e["profile"]["test"]==(target!="zoc") and e.get("executable") and e["target"]["name"]==name]
  assert len(matches)==1,(name,len(matches))
  e=matches[0];original=pathlib.Path(e["executable"]);dest=root/"bin"/("zluda_trace-tests" if target=="trace" else name)
  if target=="jc2" and name=="ptx":assert "ci_build" in e["features"]
  shutil.copy2(original,dest);assert sha(original)==sha(dest)
  selected[str(dest.relative_to(root))]=dict(cargo_path=str(original),sha256=sha(original),fresh=e["fresh"],target=name,features=e["features"])
+ if target=="zoc":
+  assert e["target"]["kind"]==["bin"] and e["profile"]["opt_level"]=="3" and e["profile"]["debug_assertions"] is False
+  selected[str(dest.relative_to(root))]["profile"]=e["profile"]
  executables.append(dest)
 if target=="trace":
  tree=(out/"CARGO-TREE.txt").read_text();assert not re.search(r"\b(?:llvm_zluda|ptx|highs-sys) v",tree)
@@ -119,14 +122,17 @@ for binary in executables:
   else:
    m=re.match(r"\s*(/\S+) ",line)
    if m:assert pathlib.Path(m[1]).resolve().is_relative_to(runtime.resolve()),line
-provenance=dict(repository=os.environ["GITHUB_REPOSITORY"],workflow_commit=os.environ["GITHUB_SHA"],run_id=int(os.environ["GITHUB_RUN_ID"]),run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),job=os.environ["GITHUB_JOB"],ref=os.environ["GITHUB_REF"],images=IMAGES,actual_images=load(out/"IMAGE.json"),packages=dict(line.split("\t",1) for line in (out/"PACKAGES.txt").read_text().splitlines()),profile="debug",rustc=(out/"RUSTC.txt").read_text(),cargo=(out/"CARGO.txt").read_text(),rocm="6.3.4",build_env={k:os.environ[k] for k in ["RUSTUP_HOME","CARGO_HOME","CARGO_TARGET_DIR","CARGO_BUILD_JOBS","CMAKE_BUILD_PARALLEL_LEVEL","CARGO_INCREMENTAL","LD_LIBRARY_PATH"]},build_argv="cargo +1.99.0 test --locked --offline [allowlisted packages]"+(" --features ptx/ci_build" if target=="jc2" else "")+" --lib -j4 --no-run --message-format=json",helper_sha256={p.name:sha(p) for p in pathlib.Path("/plan").iterdir() if p.is_file()})
+if target=="zoc":subprocess.run(["python3","/plan/zoc-smoke.py",str(root/"bin/zoc"),str(out/"zoc-smoke"),str(loader),str(runtime)],check=True)
+build_argv="cargo +1.99.0 build --locked --offline --release -p compiler --bin zoc -j4 --message-format=json" if target=="zoc" else "cargo +1.99.0 test --locked --offline [allowlisted packages]"+(" --features ptx/ci_build" if target=="jc2" else "")+" --lib -j4 --no-run --message-format=json"
+provenance=dict(repository=os.environ["GITHUB_REPOSITORY"],workflow_commit=os.environ["GITHUB_SHA"],run_id=int(os.environ["GITHUB_RUN_ID"]),run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),job=os.environ["GITHUB_JOB"],ref=os.environ["GITHUB_REF"],images=IMAGES,actual_images=load(out/"IMAGE.json"),packages=dict(line.split("\t",1) for line in (out/"PACKAGES.txt").read_text().splitlines()),profile="release" if target=="zoc" else "debug",rustc=(out/"RUSTC.txt").read_text(),cargo=(out/"CARGO.txt").read_text(),rocm="6.3.4",build_env={k:os.environ[k] for k in ["RUSTUP_HOME","CARGO_HOME","CARGO_TARGET_DIR","CARGO_BUILD_JOBS","CMAKE_BUILD_PARALLEL_LEVEL","CARGO_INCREMENTAL","LD_LIBRARY_PATH"]},build_argv=build_argv,helper_sha256={p.name:sha(p) for p in pathlib.Path("/plan").iterdir() if p.is_file()})
 write(root/"SOURCE.json",source);write(root/"PROVENANCE.json",provenance)
 receipts=root/"receipts";receipts.mkdir()
 for p in out.iterdir():
  if p.is_file() and p.suffix in [".json",".log",".txt",".stdout",".stderr",".c"]:shutil.copy2(p,receipts/p.name)
- elif p.is_dir() and (p.name.startswith("cpu-") or p.name=="smoke-log"):shutil.copytree(p,receipts/p.name)
+ elif p.is_dir() and (p.name.startswith("cpu-") or p.name in ["smoke-log","zoc-smoke"]):shutil.copytree(p,receipts/p.name)
 manifest=dict(schema=1,target=target,source=source,provenance=provenance,executables=selected,loader=str(loader.relative_to(root)),runtime=closure,glibc_compatibility=dict(included=compat,reason="Same-build glibc compatibility DSOs for the separately injected driver; no NVIDIA bytes",libc_package=command(["dpkg-query","-W","-f=${Version}","libc6:amd64"])),freshness=fresh,cpu={name:load(out/("cpu-"+name)/"RESULT.json") for name in CPU[target]},trace_smoke=load(out/"SMOKE.json") if target=="trace" else None,files=inventory(root))
 if target=="jc2":manifest["ptx_cpu_suite"]=load(out/"cpu-ptx-full/RESULT.json")
+if target=="zoc":manifest["zoc_smoke"]=load(out/"zoc-smoke/RESULT.json")
 write(root/"MANIFEST.json",manifest)
 with (root/"SHA256SUMS").open("w") as f:
  for p in sorted(root.rglob("*")):

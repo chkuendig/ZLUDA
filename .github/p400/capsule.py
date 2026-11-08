@@ -8,7 +8,7 @@ CPU={
  "ptx_parser":["tests::target_keeps_double_instructions_and_eight_byte_storage","tests::cvt_keeps_double_precision_rounding_modes","tests::legacy_texture_declaration_and_signed_selection"],
  "ptx":["test::spirv_run::legacy_f64_cvt_llvm","test::spirv_run::legacy_slct_llvm"],
  "nvcuda":["r#impl::tex::pitched_tests::pitched_texture_shape_checks_rows_channels_and_overflow","r#impl::driver::tests::get_allocation"]},
- "reference":{"nvcuda":["r#impl::driver::tests::get_allocation"]},"trace":{}}
+ "reference":{"nvcuda":["r#impl::driver::tests::get_allocation"]},"trace":{},"zoc":{}}
 def sha(path):
  with pathlib.Path(path).open("rb") as f:
   h=hashlib.sha256()

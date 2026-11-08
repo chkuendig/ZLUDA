@@ -7,7 +7,7 @@ on:
       target:
         description: Exact source target from the reviewed pin table
         type: choice
-        options: [all, native-both, jc2, reference, trace]
+        options: [all, native-both, jc2, reference, trace, zoc]
         default: all
 permissions:
   contents: read
@@ -31,7 +31,7 @@ jobs:
           for script in control/.github/p400/*.sh; do bash -n "$script"; done
       - id: select
         env:
-          TARGET: ${{ inputs.target || 'jc2' }}
+          TARGET: ${{ inputs.target || 'zoc' }}
         run: python3 control/.github/p400/select-target.py >> "$GITHUB_OUTPUT"
   build:
     needs: select

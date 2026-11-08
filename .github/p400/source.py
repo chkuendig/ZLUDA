@@ -29,6 +29,12 @@ if pin["llvm_built"]:
   assert oid and oid[1].decode()==digest,"LFS object identity mismatch"
   lfs[name]=digest
 value=dict(target=target,commit=pin["commit"],tree=pin["tree"],gitlinks=links,source_clean=True,lfs=lfs,LLVM_BUILT=pin["llvm_built"])
+if target=="zoc":
+ base=pin["backend_base"];assert git("rev-parse","HEAD^")==base
+ assert git("diff","--name-only",base,"HEAD")=="compiler/src/main.rs"
+ trees={path:git("rev-parse","HEAD:"+path) for path in ["ptx","ptx_parser","llvm_zluda","zluda","Cargo.lock"]}
+ assert all(tree==git("rev-parse",base+":"+path) for path,tree in trees.items())
+ value.update(backend_base=base,backend_trees=trees,diagnostic_only_paths=["compiler/src/main.rs"])
 if out.exists():assert json.loads(out.read_text())==value,"Source changed after build"
 else:out.write_text(json.dumps(value,indent=2)+"\n")
 print(json.dumps(value,indent=2))

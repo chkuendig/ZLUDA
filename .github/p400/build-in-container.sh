@@ -15,17 +15,22 @@ case "$TARGET" in
   jc2) packages=(-p ptx_parser -p ptx -p zluda --features ptx/ci_build) ;;
   reference) packages=(-p zluda) ;;
   trace) packages=(-p zluda_trace) ;;
+  zoc) packages=(-p compiler --bin zoc) ;;
   *) exit 2 ;;
 esac
 set +e
-cargo +1.99.0 test --locked --offline "${packages[@]}" --lib -j 4 --no-run --message-format=json > /out/diagnostics/test-build.json 2> /out/diagnostics/test-build.log
+if [ "$TARGET" = zoc ]; then
+  cargo +1.99.0 build --locked --offline --release "${packages[@]}" -j 4 --message-format=json > /out/diagnostics/build.json 2> /out/diagnostics/build.log
+else
+  cargo +1.99.0 test --locked --offline "${packages[@]}" --lib -j 4 --no-run --message-format=json > /out/diagnostics/test-build.json 2> /out/diagnostics/test-build.log
+fi
 rc=$?
 set -e
 if [ "$rc" != 0 ]; then printf 'ENVIRONMENT-MISMATCH: pinned source/toolchain/ROCm build failed (rc=%s)\n' "$rc" | tee /out/diagnostics/STATUS.txt; exit "$rc"; fi
 if [ "$TARGET" = trace ]; then
   cargo +1.99.0 tree --locked --offline -p zluda_trace --edges normal,build --target x86_64-unknown-linux-gnu > /out/diagnostics/CARGO-TREE.txt
   cargo +1.99.0 build --locked --offline -p zluda_trace -j 4 --message-format=json > /out/diagnostics/build.json 2> /out/diagnostics/build.log
-else
+elif [ "$TARGET" != zoc ]; then
   cp /out/diagnostics/test-build.json /out/diagnostics/build.json
   cp /out/diagnostics/test-build.log /out/diagnostics/build.log
 fi

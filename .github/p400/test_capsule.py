@@ -88,4 +88,25 @@ sys.exit(101 if failed else 0)
   result,receipt,out=self.cpu_suite('fail');self.assertNotEqual(result.returncode,0);self.assertFalse(receipt['passed'])
   self.assertEqual(receipt['returncode'],101);self.assertTrue((out/'llvm-failures/public.ll').exists())
   result,receipt,_=self.cpu_suite('zero');self.assertNotEqual(result.returncode,0);self.assertFalse(receipt['passed'])
+ def zoc_smoke(self,mode):
+  binary=self.root/'zoc';loader=self.root/'loader';runtime=self.root/'runtime';runtime.mkdir();out=self.root/'zoc-smoke'
+  loader.write_text('#!'+sys.executable+'\nimport os,sys\nassert sys.argv[1]=="--library-path"\nos.execv(sys.argv[3],sys.argv[3:])\n');loader.chmod(0o755)
+  binary.write_text('#!'+sys.executable+'\n'+'''import os,pathlib,sys
+assert sys.argv[sys.argv.index('--arch')+1]=='gfx1030'
+source=pathlib.Path(sys.argv[-1]);out=pathlib.Path(sys.argv[sys.argv.index('--output-dir')+1]);out.mkdir()
+if source.stem=='unknown-symbol':
+ print('Error: PTX TranslateError::UnknownSymbol',file=sys.stderr)
+ if os.environ['ZOC_FAKE_MODE']=='ok':print('Caused by: Unknown symbol: "zoc_smoke_missing_symbol"',file=sys.stderr)
+ sys.exit(1)
+header=bytearray(64);header[:6]=b'\\x7fELF\\x02\\x01';header[18:20]=(224).to_bytes(2,'little')
+(out/(source.stem+'.elf')).write_bytes(header);(out/(source.stem+'.ll')).write_text('; public synthetic IR\\n')
+print('Pass "compile_bitcode" took 1ms')
+''');binary.chmod(0o755)
+  result=subprocess.run([sys.executable,str(HERE/'zoc-smoke.py'),str(binary),str(out),str(loader),str(runtime)],capture_output=True,text=True,env=dict(os.environ,ZOC_FAKE_MODE=mode,PYTHONDONTWRITEBYTECODE='1'))
+  return result,json.loads((out/'RESULT.json').read_text())
+ def test_zoc_public_smoke_uses_packaged_loader_and_both_widths(self):
+  result,receipt=self.zoc_smoke('ok');self.assertEqual(result.returncode,0,result.stderr)
+  self.assertEqual([r['case'] for r in receipt['results']],['ptx32','ptx64','unknown-symbol']);self.assertTrue(all(r['passed'] for r in receipt['results']))
+ def test_zoc_smoke_rejects_erased_inner_error(self):
+  result,receipt=self.zoc_smoke('outer-only');self.assertNotEqual(result.returncode,0);self.assertFalse(receipt['results'][-1]['passed'])
 if __name__=="__main__":unittest.main()

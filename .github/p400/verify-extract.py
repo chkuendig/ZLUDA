@@ -67,12 +67,12 @@ assert bool(s["lfs"])==pin["llvm_built"]
 p=manifest["provenance"];assert p==load(capsule/"PROVENANCE.json")
 assert p["workflow_commit"]==api["workflow_commit"] and p["run_id"]==api["run"] and p["run_attempt"]==1
 assert p["repository"]=="chkuendig/ZLUDA" and p["ref"]=="refs/heads/ci/p400-capsules-20261107"
-assert p["images"]==IMAGES and p["profile"]=="debug" and "release: 1.99.0\n" in p["rustc"]
+assert p["images"]==IMAGES and p["profile"]==("release" if target=="zoc" else "debug") and "release: 1.99.0\n" in p["rustc"]
 assert set(p["helper_sha256"])=={h.name for h in pathlib.Path(__file__).parent.iterdir() if h.is_file()}
 for helper,digest in p["helper_sha256"].items():assert sha(pathlib.Path(__file__).parent/helper)==digest,helper
 fresh=manifest["freshness"];assert fresh==load(capsule/"receipts/FRESHNESS.json") and fresh["target_initially_empty"] and fresh["fresh_true"]==0 and fresh["LLVM_BUILT"]==pin["llvm_built"]
 assert bool(fresh["llvm_build_script_events"])==pin["llvm_built"] and bool(fresh["llvm_compiled_build_script"])==pin["llvm_built"]
-expected={"jc2":{"bin/nvcuda","bin/ptx","bin/ptx_parser"},"reference":{"bin/nvcuda"},"trace":{"bin/zluda_trace-tests","lib/libzluda_trace.so"}}[target]
+expected={"jc2":{"bin/nvcuda","bin/ptx","bin/ptx_parser"},"reference":{"bin/nvcuda"},"trace":{"bin/zluda_trace-tests","lib/libzluda_trace.so"},"zoc":{"bin/zoc"}}[target]
 assert set(manifest["executables"])==expected
 for name,row in manifest["executables"].items():assert row["fresh"] is False and row["sha256"]==sha(capsule/name)
 assert manifest["cpu"].keys()==CPU[target].keys()
@@ -101,4 +101,12 @@ if target=="trace":
  assert manifest["trace_smoke"]["status"]=="PASS_SYNTHETIC_COMPLETION_LOGGING_ONLY"
  assert manifest["trace_smoke"]["downstream_census"]=="PARTIAL"
  assert not s["LLVM_BUILT"]
+if target=="zoc":
+ assert s["backend_base"]==pin["backend_base"] and s["diagnostic_only_paths"]==["compiler/src/main.rs"]
+ profile=manifest["executables"]["bin/zoc"]["profile"];assert profile["opt_level"]=="3" and profile["debug_assertions"] is False and profile["test"] is False
+ smoke=load(capsule/"receipts/zoc-smoke/RESULT.json");assert smoke==manifest["zoc_smoke"]
+ assert smoke["tool_sha256"]==sha(capsule/"bin/zoc") and smoke["loader_sha256"]==sha(loader)
+ assert smoke["status"]=="PASS_PUBLIC_CPU_COMPILER_SMOKES" and smoke["gpu_execution"] is False and smoke["private_inputs"] is False
+ assert [r["case"] for r in smoke["results"]]==["ptx32","ptx64","unknown-symbol"] and all(r["passed"] is True for r in smoke["results"])
+ assert [r["returncode"] for r in smoke["results"]]==[0,0,1]
 write(root/"ADMISSION.json",dict(status="ADMITTED_PUBLIC_CAPSULE_NOT_GPU_RESULT",target=target,source_commit=s["commit"],llvm_gitlink=pin["llvm_gitlink"],workflow_commit=p["workflow_commit"],run_id=p["run_id"],artifact=a["id"],zip_sha256=sha(zip_path),tar_sha256=sha(tar_path),manifest_sha256=sha(capsule/"MANIFEST.json"),capsule=str(capsule),payload_bytes=size,loader=manifest["loader"],PE32="NOT_ADMITTED",local_gpu_execution="requires lane clearance and GO; any pause VOID"))
