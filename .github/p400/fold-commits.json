@@ -1,0 +1,55 @@
+{
+  "base": "c7db9baf1c40c49e78c205fb562b15dd5a75ad5d",
+  "original_pins_sha256": "c62228618892a0d39782b588d775aee7239428f04fff8071483d8c8f47e608d9",
+  "invariant_objects": {
+    "Cargo.lock": "cc344b8fb95670ba7d2d1df7c82144f3d9fdcbc0",
+    "ptx/build.rs": "b5d537672dfc4e4925413f1716454a9cabe87bae",
+    "Cargo.toml": "5baebc24710afbcb8f4b540c3163090dfb279af5",
+    "ptx/Cargo.toml": "38dd59b7b68aaa29811c8502a4fa7162011f0bff",
+    "ptx_parser/Cargo.toml": "be7a106ab341c4b6aaed57a93af50f85f3d02236",
+    "zluda/Cargo.toml": "3afb953d0f4dba463919ef0eaaca3c936e2e80eb",
+    "compiler/Cargo.toml": "90a8e0b5031973df527655af92da017355b0b056",
+    "ext/llvm-project": "c83b929aeff0aa6b9877c6712e9914d1275b1d36",
+    "ext/HiGHS": "364c83a51e44ba6c27def9c8fc1a49b1daf5ad5c",
+    "llvm_zluda/build.rs": "8db3551904bf0375c98ffca54f1cbc6ce1a93cc5",
+    "llvm_zluda/Cargo.toml": "5657459b714a8f23db8302d41d4a3810a59e0423"
+  },
+  "commits": [
+    {
+      "commit": "3cc2674a254efad13b664edb96fc14c47fd21d9d",
+      "tree": "76b30c54ecb33fdc275e48ea2569abe7e5a8b498",
+      "parent": "c7db9baf1c40c49e78c205fb562b15dd5a75ad5d",
+      "subject": "Support typed globals in 32-bit PTX modules"
+    },
+    {
+      "commit": "34666a65edd5aed4910e07a86fd4470af0e289b4",
+      "tree": "4bd7934ee6cd56cc9f85ed48227276fd427ef2d8",
+      "parent": "3cc2674a254efad13b664edb96fc14c47fd21d9d",
+      "subject": "Truncate legacy 16-bit special-register reads"
+    },
+    {
+      "commit": "85b5ed15c8fb4782ac8c53218fb30e40e17dff29",
+      "tree": "d89e0e864ff6b10e2d84d841ef1ad320d4726df2",
+      "parent": "34666a65edd5aed4910e07a86fd4470af0e289b4",
+      "subject": "Remove the Windows-only scalar-cache kernel prelude"
+    },
+    {
+      "commit": "b44693a11b1a3004a0c00ade36ebb3ab7ef7f49b",
+      "tree": "0e2b73d78e1d27348ca50f5f764474a144629ed6",
+      "parent": "85b5ed15c8fb4782ac8c53218fb30e40e17dff29",
+      "subject": "Remove functions unreachable from kernels"
+    },
+    {
+      "commit": "ec365cf8331707b6c606bfb17f12517072d6f64b",
+      "tree": "34e5c0a853d5280eb35c1cc122fcf3557068fab1",
+      "parent": "b44693a11b1a3004a0c00ade36ebb3ab7ef7f49b",
+      "subject": "Accept padded legacy 2D texture coordinates"
+    },
+    {
+      "commit": "2c958eb8af3581a4701eecedfdf8432427bdd655",
+      "tree": "372cc8ea934653bdb45313f9032a67fe22865c47",
+      "parent": "ec365cf8331707b6c606bfb17f12517072d6f64b",
+      "subject": "Report the offline compiler error source chain"
+    }
+  ]
+}

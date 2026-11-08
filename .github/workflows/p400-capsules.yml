@@ -13,6 +13,10 @@ on:
         description: Collect the pinned public LLVM oracles; not a capsule
         type: boolean
         default: false
+      check_fold:
+        description: Check the reviewed publish-fold commits; diagnostics only
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -20,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   select:
-    if: github.repository == 'chkuendig/ZLUDA' && github.ref == 'refs/heads/ci/p400-capsules-20261107'
+    if: github.repository == 'chkuendig/ZLUDA' && (github.ref == 'refs/heads/ci/p400-capsules-20261107' || (inputs.check_fold && github.ref == 'refs/heads/ci/legacy-ptx-fold-20261108'))
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -29,6 +33,14 @@ jobs:
         with:
           path: control
           persist-credentials: false
+      - name: Bind reviewed fold check source
+        if: ${{ inputs.check_fold }}
+        env:
+          FOLD_TARGET: ${{ inputs.target }}
+          FOLD_ORACLES: ${{ inputs.collect_oracles || false }}
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_check_fold.py
+          python3 control/.github/p400/check-fold.py pin
       - name: Check capsule helpers
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_capsule.py
@@ -44,7 +56,7 @@ jobs:
   build:
     needs: select
     runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    timeout-minutes: ${{ inputs.check_fold && 180 || 360 }}
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -62,6 +74,12 @@ jobs:
         with:
           path: control
           persist-credentials: false
+      - name: Bind reviewed fold check source
+        if: ${{ inputs.check_fold }}
+        env:
+          FOLD_TARGET: ${{ inputs.target }}
+          FOLD_ORACLES: ${{ inputs.collect_oracles || false }}
+        run: python3 control/.github/p400/check-fold.py pin
       - name: Record initial cloud disk capacity
         run: df -B1 / > cloud-disk-before.txt
       - name: Reclaim cloud runner tool installations
@@ -128,8 +146,21 @@ jobs:
           path: dist/${{ matrix.id }}/compiler-cache/
           if-no-files-found: ignore
           retention-days: 14
+      - name: Check every reviewed fold commit
+        if: ${{ inputs.check_fold }}
+        run: python3 control/.github/p400/check-fold.py run
+      - name: Retain fold checks without capsule admission
+        if: ${{ always() && inputs.check_fold }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fold-check-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/${{ matrix.id }}/diagnostics/
+            control/FOLD-PIN-OVERRIDE.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload complete capsule
-        if: ${{ !inputs.collect_oracles }}
+        if: ${{ !inputs.collect_oracles && !inputs.check_fold }}
         id: capsule
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
