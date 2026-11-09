@@ -11,7 +11,7 @@ import sys
 
 
 PLAN = Path(__file__).resolve().parent
-REF = 'refs/heads/ci/legacy-ptx-fold-20261108'
+REF = 'refs/heads/ci/legacy-ptx-fold-tex1d-20261110'
 
 
 def require(value, message):
@@ -41,12 +41,14 @@ def git(source, *args):
 
 def table():
     value = load(PLAN / 'fold-commits.json')
-    require(len(value['commits']) == 6, 'Expected exactly six reviewed commits')
+    require(len(value['commits']) >= 2, 'Expected a native tip and a diagnostic child')
     parent = value['base']
     for row in value['commits']:
         require(re.fullmatch('[0-9a-f]{40}', row['commit']) is not None, 'Invalid SHA')
         require(row['parent'] == parent, 'Invalid parent chain')
         parent = row['commit']
+    require(value['commits'][-1]['parent'] == value['commits'][-2]['commit'],
+            'Diagnostic child must build on the native tip')
     return value
 
 
@@ -55,12 +57,13 @@ def pin():
     require(os.environ.get('FOLD_TARGET') == 'jc2', 'Fold mode requires target jc2')
     require(os.environ.get('FOLD_ORACLES', '').lower() == 'false', 'No oracle collection')
     value = table()
+    tip = value['commits'][-2]
     path = PLAN / 'pins.json'
     require(digest(path) == value['original_pins_sha256'], 'Original pins differ')
     pins = load(path)
     original = json.loads(json.dumps(pins))
-    pins['jc2']['commit'] = value['commits'][4]['commit']
-    pins['jc2']['tree'] = value['commits'][4]['tree']
+    pins['jc2']['commit'] = tip['commit']
+    pins['jc2']['tree'] = tip['tree']
     changed = [(group, key) for group in pins for key in pins[group]
                if pins[group][key] != original[group][key]]
     require(changed == [('jc2', 'commit'), ('jc2', 'tree')], 'Unexpected pin override')
@@ -163,7 +166,8 @@ def edition(source, path):
 
 def inside(index):
     value = table()
-    row = value['commits'][index]
+    commits = value['commits']
+    row = commits[index]
     source, out = Path('/src'), Path('/out/diagnostics/fold-check') / str(index)
     out.mkdir(exist_ok=False)
     result = {'status': 'FAIL', 'source_before': source_proof(source, row, value),
@@ -174,7 +178,7 @@ def inside(index):
                  '-p', 'ptx_parser', '-p', 'ptx', '-p', 'zluda', '--features', 'ptx/ci_build',
                  '--message-format=json']
         commands = [('clean', clean), ('check', check)]
-        if index == 5:
+        if index == len(commits) - 1:
             commands += [('clean-tool', ['cargo', '+1.99.0', 'clean', '-p', 'compiler']),
                          ('check-tool', ['cargo', '+1.99.0', 'check', '--locked', '--offline',
                                          '-p', 'compiler', '--bin', 'zoc', '--message-format=json'])]
@@ -234,6 +238,7 @@ def package_proof(root):
 def run():
     require(os.environ.get('GITHUB_REF') == REF, 'Wrong fold CI ref')
     value = table()
+    tip = value['commits'][-2]
     workspace = Path(os.environ['GITHUB_WORKSPACE'])
     source = workspace / 'source'
     work = Path(os.environ['RUNNER_TEMP']) / 'p400-jc2'
@@ -242,7 +247,7 @@ def run():
     output.mkdir(exist_ok=False)
     # Foreign-ref cache guard must stay active; do not impersonate the production ref.
     require(not (dist / 'compiler-cache/IDENTITY.json').exists(), 'Unexpected cache identity')
-    require(git(source, 'rev-parse', 'HEAD') == value['commits'][4]['commit'], 'Wrong initial tip')
+    require(git(source, 'rev-parse', 'HEAD') == tip['commit'], 'Wrong initial tip')
     initial = package_proof(dist / 'capsule')
     manifest = load(dist / 'capsule/MANIFEST.json')
     suite = manifest['ptx_cpu_suite']
@@ -252,7 +257,7 @@ def run():
             'Tip suite selection differs')
     write(output / 'TIP-MANIFEST.json', manifest)
     require(suite['skip_filters'] == ['_amdgpu', '_cuda'], 'Changed suite filters')
-    require(manifest['source']['commit'] == value['commits'][4]['commit'], 'Wrong qualified source')
+    require(manifest['source']['commit'] == tip['commit'], 'Wrong qualified source')
     image = 'p400-jc2:' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
     args = ['docker', 'run', '--rm', '--platform', 'linux/amd64', '--cpus=4',
             '--memory=10g', '--memory-swap=10g', '-v', str(source) + ':/src:ro',
@@ -282,10 +287,11 @@ def run():
             results.append(result)
     finally:
         subprocess.run(['git', '-C', str(source), '-c', 'core.hooksPath=/dev/null', 'checkout',
-                        '--detach', value['commits'][4]['commit']], check=True)
-        source_proof(source, value['commits'][4], value)
+                        '--detach', tip['commit']], check=True)
+        source_proof(source, tip, value)
         require(package_proof(dist / 'capsule') == initial, 'Initial qualified package changed')
-        write(output / 'RESULT.json', {'status': 'PASS' if len(results) == 6 else 'FAIL',
+        write(output / 'RESULT.json', {'status': 'PASS' if len(results) == len(value['commits'])
+              else 'FAIL',
               'commits': [r['source_before'] for r in results], 'no_admitted_capsule': True,
               'production_package_unchanged': True, 'cache': 'FOREIGN_REF_COLD_NO_RESTORE_OR_SAVE',
               'tip_full_ptx_counts': suite['counts'], 'tip_skip_filters': suite['skip_filters']})
@@ -301,5 +307,6 @@ if __name__ == '__main__':
     elif options.mode == 'run':
         run()
     else:
-        require(options.index is not None and 0 <= options.index < 6, 'Invalid commit index')
+        require(options.index is not None and 0 <= options.index < len(table()['commits']),
+                'Invalid commit index')
         inside(options.index)

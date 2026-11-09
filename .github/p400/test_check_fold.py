@@ -71,11 +71,45 @@ class Formatting(unittest.TestCase):
 
 
 class BoundTable(unittest.TestCase):
-    def test_exact_six_commit_chain(self):
+    def modified_table(self, mutate):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = Path(directory) / "control/.github/p400"
+            plan.mkdir(parents=True)
+            value = json.loads((fold.PLAN / "fold-commits.json").read_text())
+            mutate(value)
+            (plan / "fold-commits.json").write_text(json.dumps(value, indent=2) + "\n")
+            with patch.object(fold, "PLAN", plan):
+                return fold.table()
+
+    def test_seven_commit_chain(self):
         value = fold.table()
-        self.assertEqual(len(value["commits"]), 6)
-        self.assertEqual(value["commits"][4]["commit"], "ec365cf8331707b6c606bfb17f12517072d6f64b")
-        self.assertEqual(value["commits"][5]["commit"], "2c958eb8af3581a4701eecedfdf8432427bdd655")
+        self.assertEqual(len(value["commits"]), 7)
+        self.assertEqual(value["commits"][-2]["commit"], "2c9a05891cdb2786de1f0dcdb1b51a9f5879c633")
+        self.assertEqual(value["commits"][-1]["commit"], "ab56679e14e2c5f543fd1067e28d1834f83bbc81")
+
+    def test_tip_is_second_to_last(self):
+        value = fold.table()
+        tip, diag = value["commits"][-2], value["commits"][-1]
+        self.assertEqual(diag["parent"], tip["commit"])
+        self.assertEqual(tip["parent"], "ec365cf8331707b6c606bfb17f12517072d6f64b")
+
+    def test_wrong_diag_parent_refused(self):
+        def mutate(value):
+            value["commits"][-1]["parent"] = value["commits"][-3]["commit"]
+        with self.assertRaises(RuntimeError):
+            self.modified_table(mutate)
+
+    def test_broken_parent_chain_refused(self):
+        def mutate(value):
+            value["commits"][3]["parent"] = "0" * 40
+        with self.assertRaises(RuntimeError):
+            self.modified_table(mutate)
+
+    def test_tip_only_table_refused(self):
+        def mutate(value):
+            value["commits"] = value["commits"][:1]
+        with self.assertRaises(RuntimeError):
+            self.modified_table(mutate)
 
 
 class RuntimePin(unittest.TestCase):

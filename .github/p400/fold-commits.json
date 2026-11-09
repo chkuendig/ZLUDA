@@ -46,9 +46,15 @@
       "subject": "Accept padded legacy 2D texture coordinates"
     },
     {
-      "commit": "2c958eb8af3581a4701eecedfdf8432427bdd655",
-      "tree": "372cc8ea934653bdb45313f9032a67fe22865c47",
+      "commit": "2c9a05891cdb2786de1f0dcdb1b51a9f5879c633",
+      "tree": "3ce270dce3872d6d2ed5cb0b10eb216691d263c8",
       "parent": "ec365cf8331707b6c606bfb17f12517072d6f64b",
+      "subject": "Accept padded legacy 1D texture coordinates"
+    },
+    {
+      "commit": "ab56679e14e2c5f543fd1067e28d1834f83bbc81",
+      "tree": "e200159659a76b50915b191f534c328501dfc4d7",
+      "parent": "2c9a05891cdb2786de1f0dcdb1b51a9f5879c633",
       "subject": "Report the offline compiler error source chain"
     }
   ]
