@@ -87,6 +87,12 @@ class BoundTable(unittest.TestCase):
         self.assertEqual(value["commits"][-2]["commit"], "2c9a05891cdb2786de1f0dcdb1b51a9f5879c633")
         self.assertEqual(value["commits"][-1]["commit"], "ab56679e14e2c5f543fd1067e28d1834f83bbc81")
 
+    def test_tip_suite_count_matches_tex1d_tip(self):
+        # 233 at the 2D-texture tip + two 1D-texture cases; observed 235/0/0 in run 42720152881.
+        self.assertEqual(fold.TIP_SUITE, 235)
+        source = Path(fold.__file__).read_text()
+        self.assertNotIn('233', source.split('TIP_SUITE = 235', 1)[1])
+
     def test_tip_is_second_to_last(self):
         value = fold.table()
         tip, diag = value["commits"][-2], value["commits"][-1]

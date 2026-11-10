@@ -12,6 +12,9 @@ import sys
 
 PLAN = Path(__file__).resolve().parent
 REF = 'refs/heads/ci/legacy-ptx-fold-tex1d-20261110'
+# Full CPU PTX suite at the native tip: 233 at the 2D-texture tip plus the two
+# 1D-texture cases added by 2c9a0589 (cloud run 42720152881 observed 235/0/0).
+TIP_SUITE = 235
 
 
 def require(value, message):
@@ -251,9 +254,10 @@ def run():
     initial = package_proof(dist / 'capsule')
     manifest = load(dist / 'capsule/MANIFEST.json')
     suite = manifest['ptx_cpu_suite']
-    require(suite['counts'] == {'passed': 233, 'failed': 0, 'ignored': 0}, 'Tip suite not 233/0/0')
+    require(suite['counts'] == {'passed': TIP_SUITE, 'failed': 0, 'ignored': 0},
+            'Tip suite not %d/0/0' % TIP_SUITE)
     require(suite['passed'] and suite['returncode'] == 0, 'Tip suite failed')
-    require(len(suite['selected_tests']) == len(set(suite['selected_tests'])) == 233,
+    require(len(suite['selected_tests']) == len(set(suite['selected_tests'])) == TIP_SUITE,
             'Tip suite selection differs')
     write(output / 'TIP-MANIFEST.json', manifest)
     require(suite['skip_filters'] == ['_amdgpu', '_cuda'], 'Changed suite filters')
