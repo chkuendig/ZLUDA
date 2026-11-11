@@ -1,0 +1,85 @@
+{
+  "base": "f4df215edbc3b6698a1c61ef7a8688fdff3872be",
+  "original_pins_sha256": "5c86137b9ddd3e24b7030bad26c798cb2eab74f10b0d8244dc0734a42b4d5e97",
+  "split_emission_dependent_tests": [],
+  "invariant_objects": {
+    "Cargo.lock": "cc344b8fb95670ba7d2d1df7c82144f3d9fdcbc0",
+    "ptx/build.rs": "b5d537672dfc4e4925413f1716454a9cabe87bae",
+    "Cargo.toml": "5baebc24710afbcb8f4b540c3163090dfb279af5",
+    "ptx/Cargo.toml": "38dd59b7b68aaa29811c8502a4fa7162011f0bff",
+    "ptx_parser/Cargo.toml": "be7a106ab341c4b6aaed57a93af50f85f3d02236",
+    "zluda/Cargo.toml": "3afb953d0f4dba463919ef0eaaca3c936e2e80eb",
+    "compiler/Cargo.toml": "90a8e0b5031973df527655af92da017355b0b056",
+    "ext/llvm-project": "ca1f2d04a41ceab20cc9e0bb8214b3e6be873a0b",
+    "ext/HiGHS": "364c83a51e44ba6c27def9c8fc1a49b1daf5ad5c",
+    "llvm_zluda/build.rs": "8db3551904bf0375c98ffca54f1cbc6ce1a93cc5",
+    "llvm_zluda/Cargo.toml": "5657459b714a8f23db8302d41d4a3810a59e0423",
+    ".gitmodules": "c33eb45d412c9c7719eef7688fbb7e2242cea6de"
+  },
+  "commits": [
+    {
+      "commit": "ccae4833798114c4045176215e6e97dd0d45c574",
+      "tree": "b7251a325c825e78dfc994c6a7af5f9803d42843",
+      "parent": "f4df215edbc3b6698a1c61ef7a8688fdff3872be",
+      "subject": "Accept the legacy map_f64_to_f32 target option",
+      "label": "legacy"
+    },
+    {
+      "commit": "4fb766d50345e84ba28f904a8c0a33b7c77413bb",
+      "tree": "18be2e6d36c69137007b82389fc71c84a77bc052",
+      "parent": "ccae4833798114c4045176215e6e97dd0d45c574",
+      "subject": "Parse legacy texture declarations and signed selections",
+      "label": "legacy"
+    },
+    {
+      "commit": "cbca0d57476a83ba1eac428cd62f68e32483a2d5",
+      "tree": "07627dde3d60459d9db2a076df16571005799e9a",
+      "parent": "4fb766d50345e84ba28f904a8c0a33b7c77413bb",
+      "subject": "Support typed globals in 32-bit PTX modules",
+      "label": "legacy"
+    },
+    {
+      "commit": "e078435b0e656fb39a6600022d7a26c5e3aa944e",
+      "tree": "250e6a2387cd7151de08ef2cba6edd5924ecba82",
+      "parent": "cbca0d57476a83ba1eac428cd62f68e32483a2d5",
+      "subject": "Truncate legacy 16-bit special-register reads",
+      "label": "legacy"
+    },
+    {
+      "commit": "5e47e6b5f8b57bab986289974557b9616a4c08bd",
+      "tree": "19437d000e0446e069a0c49638c3cbc884aee191",
+      "parent": "e078435b0e656fb39a6600022d7a26c5e3aa944e",
+      "subject": "Accept padded legacy 2D texture coordinates",
+      "label": "legacy"
+    },
+    {
+      "commit": "7af79191c602f61eafd9d1a174ce09efef7d782a",
+      "tree": "56319a41d6d733f834f2f98dcc947165d275b190",
+      "parent": "5e47e6b5f8b57bab986289974557b9616a4c08bd",
+      "subject": "Accept padded legacy 1D texture coordinates",
+      "label": "legacy"
+    },
+    {
+      "commit": "d899d1bd3959332e21e0e14be05af7acd31661db",
+      "tree": "6bb957b0eda7cb44cae37cedbb05030ef02d746e",
+      "parent": "f4df215edbc3b6698a1c61ef7a8688fdff3872be",
+      "subject": "Remove functions unreachable from kernels",
+      "label": "unreachable"
+    },
+    {
+      "commit": "ab6692134c7a9389875b62c74556e58704e251f4",
+      "tree": "f59831e6eafba05c22a8d1feb160bb7cc227c6f9",
+      "parent": "f4df215edbc3b6698a1c61ef7a8688fdff3872be",
+      "subject": "Reject primary context destruction and detach destroyed handles",
+      "label": "context"
+    }
+  ],
+  "control": true,
+  "initial": {
+    "commit": "d899d1bd3959332e21e0e14be05af7acd31661db",
+    "tree": "6bb957b0eda7cb44cae37cedbb05030ef02d746e",
+    "parent": "f4df215edbc3b6698a1c61ef7a8688fdff3872be",
+    "subject": "Remove functions unreachable from kernels",
+    "label": "unreachable"
+  }
+}

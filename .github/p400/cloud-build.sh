@@ -10,7 +10,7 @@ image="p400-$TARGET:$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 cache_enabled=$(python3 -c 'import json,sys;print(str(json.load(open(sys.argv[1]))[sys.argv[2]]["llvm_built"]).lower())' "$control/pins.json" "$TARGET")
 # Foreign refs can run the original cold build, but never restore/save this cache.
 if [ "${GITHUB_REF:-}" != refs/heads/ci/p400-capsules-20261107 ]; then cache_enabled=false; fi
-args=(--rm --platform linux/amd64 --cpus=4 --memory=10g --memory-swap=10g
+args=(--rm --platform linux/amd64 --cpus=3 --memory=10g --memory-swap=10g
   -v "$GITHUB_WORKSPACE/source:/src:ro" -v "$control:/plan:ro"
   -v "$work/tools:/tools" -v "$GITHUB_WORKSPACE/dist/$TARGET:/out" -w /src
   -e TARGET -e SOURCE_COMMIT -e LLVM_COMMIT -e COLLECT_ORACLES

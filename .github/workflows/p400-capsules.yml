@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   select:
-    if: github.repository == 'chkuendig/ZLUDA' && (github.ref == 'refs/heads/ci/p400-capsules-20261107' || (inputs.check_fold && github.ref == 'refs/heads/ci/legacy-ptx-fold-tex1d-20261110') || (inputs.check_fold && github.ref == 'refs/heads/ci/legacy-ptx-split-20261111') || (inputs.check_fold && github.ref == 'refs/heads/ci/legacy-ptx-split-control-20261111'))
+    if: github.repository == 'chkuendig/ZLUDA' && github.ref == 'refs/heads/ci/independent-pr-validation-20261111' && inputs.check_fold && inputs.target == 'jc2' && !inputs.collect_oracles
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -40,7 +40,8 @@ jobs:
           FOLD_ORACLES: ${{ inputs.collect_oracles || false }}
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_check_fold.py
-          python3 control/.github/p400/check-fold.py pin
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_check_independent.py
+          python3 -c "import json; p=json.load(open('control/.github/p400/independent-commits.json')); assert len(p['commits']) == 8"
       - name: Check capsule helpers
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s control/.github/p400 -p test_capsule.py
@@ -79,7 +80,7 @@ jobs:
         env:
           FOLD_TARGET: ${{ inputs.target }}
           FOLD_ORACLES: ${{ inputs.collect_oracles || false }}
-        run: python3 control/.github/p400/check-fold.py pin
+        run: python3 -c "import json; p=json.load(open('control/.github/p400/independent-commits.json')); assert len(p['commits']) == 8"
       - name: Record initial cloud disk capacity
         run: df -B1 / > cloud-disk-before.txt
       - name: Reclaim cloud runner tool installations
@@ -148,7 +149,7 @@ jobs:
           retention-days: 14
       - name: Check every reviewed fold commit
         if: ${{ inputs.check_fold }}
-        run: python3 control/.github/p400/check-fold.py run
+        run: python3 control/.github/p400/check-independent.py run
       - name: Retain fold checks without capsule admission
         if: ${{ always() && inputs.check_fold }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

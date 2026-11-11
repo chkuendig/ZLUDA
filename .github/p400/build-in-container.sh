@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-export PATH="/tools/cargo/bin:$PATH" CARGO_TARGET_DIR=/target CARGO_BUILD_JOBS=4 CMAKE_BUILD_PARALLEL_LEVEL=4 CARGO_INCREMENTAL=0 LD_LIBRARY_PATH=/opt/rocm/lib
+export PATH="/tools/cargo/bin:$PATH" CARGO_TARGET_DIR=/target CARGO_BUILD_JOBS=3 CMAKE_BUILD_PARALLEL_LEVEL=3 CARGO_INCREMENTAL=0 LD_LIBRARY_PATH=/opt/rocm/lib
 [ -z "$(find /target -mindepth 1 -maxdepth 1 -print -quit)" ]
 if [ "${COMPILER_CACHE_ENABLED:-false}" = true ]; then
   export SCCACHE_PATH=/usr/bin/ccache CCACHE_DIR=/compiler-cache CCACHE_CONFIGPATH=/tmp/p400-ccache.conf
@@ -49,9 +49,9 @@ if [ "${COMPILER_CACHE_ENABLED:-false}" = true ]; then
 fi
 set +e
 if [ "$TARGET" = zoc ]; then
-  cargo +1.99.0 build --locked --offline --release "${packages[@]}" -j 4 --message-format=json > /out/diagnostics/build.json 2> /out/diagnostics/build.log
+  cargo +1.99.0 build --locked --offline --release "${packages[@]}" -j 3 --message-format=json > /out/diagnostics/build.json 2> /out/diagnostics/build.log
 else
-  cargo +1.99.0 test --locked --offline "${packages[@]}" --lib -j 4 --no-run --message-format=json > /out/diagnostics/test-build.json 2> /out/diagnostics/test-build.log
+  cargo +1.99.0 test --locked --offline "${packages[@]}" --lib -j 3 --no-run --message-format=json > /out/diagnostics/test-build.json 2> /out/diagnostics/test-build.log
 fi
 rc=$?
 set -e
@@ -62,7 +62,7 @@ fi
 if [ "$rc" != 0 ]; then printf 'ENVIRONMENT-MISMATCH: pinned source/toolchain/ROCm build failed (rc=%s)\n' "$rc" | tee /out/diagnostics/STATUS.txt; exit "$rc"; fi
 if [ "$TARGET" = trace ]; then
   cargo +1.99.0 tree --locked --offline -p zluda_trace --edges normal,build --target x86_64-unknown-linux-gnu > /out/diagnostics/CARGO-TREE.txt
-  cargo +1.99.0 build --locked --offline -p zluda_trace -j 4 --message-format=json > /out/diagnostics/build.json 2> /out/diagnostics/build.log
+  cargo +1.99.0 build --locked --offline -p zluda_trace -j 3 --message-format=json > /out/diagnostics/build.json 2> /out/diagnostics/build.log
 elif [ "$TARGET" != zoc ]; then
   cp /out/diagnostics/test-build.json /out/diagnostics/build.json
   cp /out/diagnostics/test-build.log /out/diagnostics/build.log
@@ -70,6 +70,8 @@ fi
 if [ "${COLLECT_ORACLES:-false}" = true ]; then
   test "$TARGET" = jc2
   python3 /plan/collect-oracles.py /out/diagnostics/test-build.json /src /out/diagnostics/oracle-collection /plan/oracle-cases.json
+elif [ "$GITHUB_REF" = "refs/heads/ci/independent-pr-validation-20261111" ]; then
+  python3 /plan/check-independent.py initial
 elif [ "$GITHUB_REF" = "refs/heads/ci/legacy-ptx-split-20261111" ] || [ "$GITHUB_REF" = "refs/heads/ci/legacy-ptx-split-control-20261111" ]; then
   # Split mode: classify the CPU suite instead of requiring a green capsule.
   python3 /plan/split-suite.py
