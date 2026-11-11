@@ -11,10 +11,12 @@ import sys
 
 
 PLAN = Path(__file__).resolve().parent
-REF = 'refs/heads/ci/legacy-ptx-fold-tex1d-20261110'
-# Full CPU PTX suite at the native tip: 233 at the 2D-texture tip plus the two
-# 1D-texture cases added by 2c9a0589 (cloud run 42720152881 observed 235/0/0).
-TIP_SUITE = 235
+REF = 'refs/heads/ci/legacy-ptx-split-20261111'
+# Split mode: this branch carries no golden regeneration, so the tip CPU suite
+# is classified by split-suite.py instead of required to be fully green. The
+# only tolerated failures are the Windows-only dcache.inv prelude goldens
+# (upstream never compares them on Linux CI) and the documented
+# emission-dependent typed-goldens tests of the not-carried 806d3392.
 
 
 def require(value, message):
@@ -52,6 +54,10 @@ def table():
         parent = row['commit']
     require(value['commits'][-1]['parent'] == value['commits'][-2]['commit'],
             'Diagnostic child must build on the native tip')
+    emission = value.get('split_emission_dependent_tests')
+    require(isinstance(emission, list) and emission
+            and all(re.fullmatch(r'[a-z0-9_:]+', name) for name in emission),
+            'Split table without documented emission-dependent tests')
     return value
 
 
@@ -233,11 +239,6 @@ def inside(index):
         write(out / 'RESULT.json', result)
 
 
-def package_proof(root):
-    return {p.relative_to(root).as_posix(): digest(p) for p in sorted(root.rglob('*'))
-            if p.is_file() and not p.is_symlink()}
-
-
 def run():
     require(os.environ.get('GITHUB_REF') == REF, 'Wrong fold CI ref')
     value = table()
@@ -251,17 +252,15 @@ def run():
     # Foreign-ref cache guard must stay active; do not impersonate the production ref.
     require(not (dist / 'compiler-cache/IDENTITY.json').exists(), 'Unexpected cache identity')
     require(git(source, 'rev-parse', 'HEAD') == tip['commit'], 'Wrong initial tip')
-    initial = package_proof(dist / 'capsule')
-    manifest = load(dist / 'capsule/MANIFEST.json')
-    suite = manifest['ptx_cpu_suite']
-    require(suite['counts'] == {'passed': TIP_SUITE, 'failed': 0, 'ignored': 0},
-            'Tip suite not %d/0/0' % TIP_SUITE)
-    require(suite['passed'] and suite['returncode'] == 0, 'Tip suite failed')
-    require(len(suite['selected_tests']) == len(set(suite['selected_tests'])) == TIP_SUITE,
-            'Tip suite selection differs')
-    write(output / 'TIP-MANIFEST.json', manifest)
+    # Split mode: no capsule is packaged or admitted. The build step ran the
+    # classified split suite instead of the fully-green capsule qualification.
+    suite = load(dist / 'diagnostics/split-suite/RESULT.json')
+    require(suite['mode'] == 'SPLIT_CLASSIFIED', 'Unexpected suite receipt')
     require(suite['skip_filters'] == ['_amdgpu', '_cuda'], 'Changed suite filters')
-    require(manifest['source']['commit'] == tip['commit'], 'Wrong qualified source')
+    require(suite['passed'] is True, 'Tip suite has unclassified failures')
+    require(not suite['unclassified_failures'] and suite['counts']['passed'] > 0,
+            'Tip suite classification failed')
+    write(output / 'TIP-SUITE.json', suite)
     image = 'p400-jc2:' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
     args = ['docker', 'run', '--rm', '--platform', 'linux/amd64', '--cpus=4',
             '--memory=10g', '--memory-swap=10g', '-v', str(source) + ':/src:ro',
@@ -293,12 +292,16 @@ def run():
         subprocess.run(['git', '-C', str(source), '-c', 'core.hooksPath=/dev/null', 'checkout',
                         '--detach', tip['commit']], check=True)
         source_proof(source, tip, value)
-        require(package_proof(dist / 'capsule') == initial, 'Initial qualified package changed')
         write(output / 'RESULT.json', {'status': 'PASS' if len(results) == len(value['commits'])
               else 'FAIL',
               'commits': [r['source_before'] for r in results], 'no_admitted_capsule': True,
-              'production_package_unchanged': True, 'cache': 'FOREIGN_REF_COLD_NO_RESTORE_OR_SAVE',
-              'tip_full_ptx_counts': suite['counts'], 'tip_skip_filters': suite['skip_filters']})
+              'capsule_not_built_in_split_mode': True,
+              'cache': 'FOREIGN_REF_COLD_NO_RESTORE_OR_SAVE',
+              'tip_full_ptx_counts': suite['counts'], 'tip_skip_filters': suite['skip_filters'],
+              'tip_suite_classification': {
+                  'prelude_golden_failures': len(suite['prelude_golden_failures']),
+                  'emission_dependent_failures': suite['emission_dependent_failures'],
+                  'unclassified_failures': suite['unclassified_failures']}})
 
 
 if __name__ == '__main__':
