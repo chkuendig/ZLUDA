@@ -16,21 +16,7 @@ import sys
 
 PLAN = pathlib.Path('/plan')
 OUT = pathlib.Path('/out/diagnostics/split-suite')
-REQUIRED_TESTS = (
-    'test::spirv_run::legacy_f64_cvt_llvm',
-    'test::spirv_run::legacy_slct_llvm',
-    'test::spirv_run::legacy_slct_scalar_types',
-    'test::spirv_run::legacy_typed_globals_llvm',
-    'test::spirv_run::legacy_typed_globals32_metadata',
-    'test::spirv_run::legacy_global_initializers32',
-    'test::spirv_run::legacy_sreg16_llvm',
-    'test::spirv_run::legacy_sreg16_32_truncates_helpers',
-    'test::spirv_run::legacy_tex1d_coords_v4_llvm',
-    'test::spirv_run::legacy_tex1d_coords_v4_32_llvm',
-    'test::spirv_run::legacy_tex2d_coords_v4_llvm',
-    'test::spirv_run::legacy_tex2d_coords_v4_32_llvm',
-    'test::spirv_run::ordinary_mov_u16_rejects_u32_register',
-)
+REQUIRED_TESTS = ('test::spirv_run::abs_llvm', 'test::_Z9vectorAddPKfS0_Pfi_ptx')
 PRELUDE_MARKER = 'llvm.amdgcn.s.dcache.inv'
 
 
@@ -77,14 +63,24 @@ def parse_runs(output):
     return runs
 
 
-def classify(runs, emission_dependent):
+def golden_path(name):
+    """Golden file of a macro-generated _llvm test, else None."""
+    if not name.startswith('test::spirv_run::') or not name.endswith('_llvm'):
+        return None
+    stem = name.rsplit('::', 1)[1][:-len('_llvm')]
+    return 'ptx/src/test/ll/%s.ll' % stem
+
+
+def classify(failed, read_golden, emission_dependent):
+    """Prelude class is decided by the golden FILE, not by the panic log:
+    libtest panics go to stderr and cannot be attributed to tests reliably."""
     prelude = []
     emission = []
     unclassified = []
-    for name, status, block in runs:
-        if status != 'FAILED':
-            continue
-        if PRELUDE_MARKER in '\n'.join(block):
+    for name in failed:
+        path = golden_path(name)
+        text = read_golden(path) if path else None
+        if text is not None and PRELUDE_MARKER in text:
             prelude.append(name)
         elif name in emission_dependent:
             emission.append(name)
@@ -114,8 +110,9 @@ def consistent(counted, runs, names):
 def main():
     OUT.mkdir(parents=True, exist_ok=False)
     table = load(PLAN / 'fold-commits.json')
+    control = bool(table.get('control'))
     emission_dependent = set(table.get('split_emission_dependent_tests', []))
-    require(emission_dependent, 'Split table without documented emission-dependent tests')
+    require(control or emission_dependent, 'Split table without documented emission-dependent tests')
     binary = test_binary('/out/diagnostics/test-build.json')
     skip = ['--skip', '_amdgpu', '--skip', '_cuda']
     listing = subprocess.run([str(binary), '--list', *skip], check=True, capture_output=True,
@@ -133,7 +130,9 @@ def main():
     output = result.stdout + result.stderr
     (OUT / 'suite.log').write_text(output)
     runs = parse_runs(output)
-    prelude, emission, unclassified = classify(runs, emission_dependent)
+    read_golden = lambda path: pathlib.Path('/src', path).read_text()
+    failed = [name for name, status, _ in runs if status == 'FAILED']
+    prelude, emission, unclassified = classify(failed, read_golden, emission_dependent)
     counted = counts(output)
     legacy = sorted(name for name in names if 'legacy' in name)
     good = (consistent(counted, runs, names) and counted['passed'] > 0 and not unclassified)
@@ -145,6 +144,7 @@ def main():
         'selected_tests': names,
         'counts': counted,
         'returncode': result.returncode,
+        'control': control,
         'prelude_golden_failures': prelude,
         'emission_dependent_failures': emission,
         'unclassified_failures': unclassified,

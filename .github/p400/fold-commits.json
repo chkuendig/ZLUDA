@@ -1,10 +1,7 @@
 {
-  "base": "f4df215edbc3b6698a1c61ef7a8688fdff3872be",
+  "base": "08b19b28b7c334936846b3aeb61a43aef053e9a1",
   "original_pins_sha256": "5c86137b9ddd3e24b7030bad26c798cb2eab74f10b0d8244dc0734a42b4d5e97",
-  "split_emission_dependent_tests": [
-    "test::spirv_run::legacy_typed_globals_llvm",
-    "test::spirv_run::legacy_typed_globals32_metadata"
-  ],
+  "split_emission_dependent_tests": [],
   "invariant_objects": {
     "Cargo.lock": "cc344b8fb95670ba7d2d1df7c82144f3d9fdcbc0",
     "ptx/build.rs": "b5d537672dfc4e4925413f1716454a9cabe87bae",
@@ -20,46 +17,11 @@
   },
   "commits": [
     {
-      "commit": "ccae4833798114c4045176215e6e97dd0d45c574",
-      "tree": "b7251a325c825e78dfc994c6a7af5f9803d42843",
-      "parent": "f4df215edbc3b6698a1c61ef7a8688fdff3872be",
-      "subject": "Accept the legacy map_f64_to_f32 target option"
-    },
-    {
-      "commit": "4fb766d50345e84ba28f904a8c0a33b7c77413bb",
-      "tree": "18be2e6d36c69137007b82389fc71c84a77bc052",
-      "parent": "ccae4833798114c4045176215e6e97dd0d45c574",
-      "subject": "Parse legacy texture declarations and signed selections"
-    },
-    {
-      "commit": "cbca0d57476a83ba1eac428cd62f68e32483a2d5",
-      "tree": "07627dde3d60459d9db2a076df16571005799e9a",
-      "parent": "4fb766d50345e84ba28f904a8c0a33b7c77413bb",
-      "subject": "Support typed globals in 32-bit PTX modules"
-    },
-    {
-      "commit": "e078435b0e656fb39a6600022d7a26c5e3aa944e",
-      "tree": "250e6a2387cd7151de08ef2cba6edd5924ecba82",
-      "parent": "cbca0d57476a83ba1eac428cd62f68e32483a2d5",
-      "subject": "Truncate legacy 16-bit special-register reads"
-    },
-    {
-      "commit": "5e47e6b5f8b57bab986289974557b9616a4c08bd",
-      "tree": "19437d000e0446e069a0c49638c3cbc884aee191",
-      "parent": "e078435b0e656fb39a6600022d7a26c5e3aa944e",
-      "subject": "Accept padded legacy 2D texture coordinates"
-    },
-    {
-      "commit": "7af79191c602f61eafd9d1a174ce09efef7d782a",
-      "tree": "56319a41d6d733f834f2f98dcc947165d275b190",
-      "parent": "5e47e6b5f8b57bab986289974557b9616a4c08bd",
-      "subject": "Accept padded legacy 1D texture coordinates"
-    },
-    {
-      "commit": "128ffa5cebc4ee84d413eb246f08eae021203259",
-      "tree": "952436763324272eae2f56233c4b4e4ad16ef1e5",
-      "parent": "7af79191c602f61eafd9d1a174ce09efef7d782a",
-      "subject": "Report the offline compiler error source chain"
+      "commit": "f4df215edbc3b6698a1c61ef7a8688fdff3872be",
+      "tree": "9cc3ccf19238e54cc2e1e898373fc95308995a55",
+      "parent": "08b19b28b7c334936846b3aeb61a43aef053e9a1",
+      "subject": "Update ROCm LLVM to 10.1 (#695)"
     }
-  ]
+  ],
+  "control": true
 }

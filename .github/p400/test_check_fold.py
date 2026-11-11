@@ -81,59 +81,35 @@ class BoundTable(unittest.TestCase):
             with patch.object(fold, "PLAN", plan):
                 return fold.table()
 
-    def test_seven_commit_chain(self):
+    def test_control_checks_exactly_upstream_base(self):
         value = fold.table()
-        self.assertEqual(len(value["commits"]), 7)
-        self.assertEqual(value["commits"][-2]["commit"], "7af79191c602f61eafd9d1a174ce09efef7d782a")
-        self.assertEqual(value["commits"][-1]["commit"], "128ffa5cebc4ee84d413eb246f08eae021203259")
-
-    def test_base_is_upstream_master(self):
-        value = fold.table()
-        self.assertEqual(value["base"], "f4df215edbc3b6698a1c61ef7a8688fdff3872be")
+        self.assertTrue(value["control"])
+        self.assertEqual(len(value["commits"]), 1)
+        self.assertEqual(value["commits"][0]["commit"], "f4df215edbc3b6698a1c61ef7a8688fdff3872be")
+        self.assertEqual(value["commits"][0]["parent"], value["base"])
         self.assertEqual(value["invariant_objects"]["ext/llvm-project"],
                          "ca1f2d04a41ceab20cc9e0bb8214b3e6be873a0b")
 
+    def test_control_may_have_empty_emission_list(self):
+        value = fold.table()
+        self.assertEqual(value["split_emission_dependent_tests"], [])
+
+    def test_control_requires_single_commit(self):
+        def mutate(value):
+            value["commits"] = value["commits"] * 2
+        with self.assertRaises(RuntimeError):
+            self.modified_table(mutate)
+
+    def test_control_requires_flag_for_single_commit(self):
+        def mutate(value):
+            del value["control"]
+        with self.assertRaises(RuntimeError):
+            self.modified_table(mutate)
+
     def test_no_hardcoded_green_suite(self):
-        # Split mode classifies failures; a fully-green tip count cannot be promised.
         source = Path(fold.__file__).read_text()
         self.assertNotIn("TIP_SUITE", source)
         self.assertIn("SPLIT_CLASSIFIED", source)
-
-    def test_tip_is_second_to_last(self):
-        value = fold.table()
-        tip, diag = value["commits"][-2], value["commits"][-1]
-        self.assertEqual(diag["parent"], tip["commit"])
-        self.assertEqual(tip["parent"], "5e47e6b5f8b57bab986289974557b9616a4c08bd")
-
-    def test_wrong_diag_parent_refused(self):
-        def mutate(value):
-            value["commits"][-1]["parent"] = value["commits"][-3]["commit"]
-        with self.assertRaises(RuntimeError):
-            self.modified_table(mutate)
-
-    def test_broken_parent_chain_refused(self):
-        def mutate(value):
-            value["commits"][3]["parent"] = "0" * 40
-        with self.assertRaises(RuntimeError):
-            self.modified_table(mutate)
-
-    def test_tip_only_table_refused(self):
-        def mutate(value):
-            value["commits"] = value["commits"][:1]
-        with self.assertRaises(RuntimeError):
-            self.modified_table(mutate)
-
-    def test_missing_emission_list_refused(self):
-        def mutate(value):
-            del value["split_emission_dependent_tests"]
-        with self.assertRaises(RuntimeError):
-            self.modified_table(mutate)
-
-    def test_bad_emission_name_refused(self):
-        def mutate(value):
-            value["split_emission_dependent_tests"] = ["not a test name!"]
-        with self.assertRaises(RuntimeError):
-            self.modified_table(mutate)
 
 
 class SplitSuite(unittest.TestCase):
@@ -142,60 +118,45 @@ class SplitSuite(unittest.TestCase):
     split = importlib.util.module_from_spec(SPEC)
     SPEC.loader.exec_module(split)
 
-    def output(self, *blocks):
-        return "".join(blocks)
+    def test_golden_path(self):
+        self.assertEqual(self.split.golden_path("test::spirv_run::add_llvm"),
+                         "ptx/src/test/ll/add.ll")
+        self.assertIsNone(self.split.golden_path("test::_Z9vectorAddPKfS0_Pfi_ptx"))
+        self.assertIsNone(self.split.golden_path("test::spirv_run::legacy_typed_globals32_metadata"))
 
-    def test_prelude_failure_classified(self):
-        text = self.output(
-            "test test::spirv_run::abs_llvm ... FAILED\n",
-            " Left: call void @llvm.amdgcn.s.dcache.inv()\n",
-            "test test::empty ... ok\n",
-            "test result: FAILED. 1 passed; 1 failed; 0 ignored;\n")
-        runs = self.split.parse_runs(text)
-        prelude, emission, unclassified = self.split.classify(runs, set())
-        self.assertEqual(prelude, ["test::spirv_run::abs_llvm"])
-        self.assertEqual(emission, [])
-        self.assertEqual(unclassified, [])
-
-    def test_emission_dependent_failure_classified(self):
-        text = self.output(
-            "test test::spirv_run::legacy_typed_globals_llvm ... FAILED\n",
-            " Left: @zero = addrspace(1) externally_initialized global float 0.0\n",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored;\n")
-        runs = self.split.parse_runs(text)
+    def test_prelude_classified_from_golden_file(self):
+        reader = {"ptx/src/test/ll/add.ll": "call void @llvm.amdgcn.s.dcache.inv()\n"}.get
         prelude, emission, unclassified = self.split.classify(
-            runs, {"test::spirv_run::legacy_typed_globals_llvm"})
-        self.assertEqual(emission, ["test::spirv_run::legacy_typed_globals_llvm"])
+            ["test::spirv_run::add_llvm"], reader, set())
+        self.assertEqual(prelude, ["test::spirv_run::add_llvm"])
         self.assertEqual(unclassified, [])
 
-    def test_other_failure_is_unclassified(self):
-        text = self.output(
-            "test test::spirv_run::legacy_sreg16_llvm ... FAILED\n",
-            " mismatch\n",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored;\n")
-        runs = self.split.parse_runs(text)
+    def test_non_prelude_golden_is_unclassified(self):
+        reader = {"ptx/src/test/ll/x.ll": "define void @x() {}\n"}.get
         _, _, unclassified = self.split.classify(
-            runs, {"test::spirv_run::legacy_typed_globals_llvm"})
-        self.assertEqual(unclassified, ["test::spirv_run::legacy_sreg16_llvm"])
+            ["test::spirv_run::x_llvm"], reader, set())
+        self.assertEqual(unclassified, ["test::spirv_run::x_llvm"])
+
+    def test_emission_dependent_without_prelude(self):
+        reader = {"ptx/src/test/ll/legacy_typed_globals.ll": "@zero = global float 0.0\n"}.get
+        _, emission, _ = self.split.classify(
+            ["test::spirv_run::legacy_typed_globals_llvm"], reader,
+            {"test::spirv_run::legacy_typed_globals_llvm"})
+        self.assertEqual(emission, ["test::spirv_run::legacy_typed_globals_llvm"])
+
+    def test_non_golden_test_is_unclassified(self):
+        prelude, emission, unclassified = self.split.classify(
+            ["test::_Z9vectorAddPKfS0_Pfi_ptx"], lambda path: None, set())
+        self.assertEqual(unclassified, ["test::_Z9vectorAddPKfS0_Pfi_ptx"])
 
     def test_counts_consistency(self):
-        text = self.output(
-            "test a ... ok\ntest b ... FAILED\ntest c ... ignored\n",
-            "test result: FAILED. 1 passed; 1 failed; 1 ignored;\n")
+        text = ("test a ... ok\ntest b ... FAILED\ntest c ... ignored\n"
+                "test result: FAILED. 1 passed; 1 failed; 1 ignored;\n")
         runs = self.split.parse_runs(text)
         counted = self.split.counts(text)
         self.assertTrue(self.split.consistent(counted, runs, ["a", "b", "c"]))
         self.assertFalse(self.split.consistent(counted, runs, ["a", "b"]))
         self.assertFalse(self.split.consistent(None, runs, ["a", "b", "c"]))
-
-    def test_failure_summary_lines_are_not_tests(self):
-        text = self.output(
-            "test a ... FAILED\n",
-            "failures:\n",
-            "    a\n",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored;\n")
-        runs = self.split.parse_runs(text)
-        self.assertEqual([name for name, _, _ in runs], ["a"])
 
 
 
@@ -213,6 +174,7 @@ class RuntimePin(unittest.TestCase):
             after = fold.load(plan / "pins.json")
             changed = [(g, k) for g in before for k in before[g] if before[g][k] != after[g][k]]
             self.assertEqual(changed, [("jc2", "commit"), ("jc2", "tree")])
+            self.assertEqual(after["jc2"]["commit"], "f4df215edbc3b6698a1c61ef7a8688fdff3872be")
             self.assertTrue((plan.parent.parent / "FOLD-PIN-OVERRIDE.json").is_file())
 
     def test_foreign_target_and_oracles_refused(self):

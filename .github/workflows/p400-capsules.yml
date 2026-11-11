@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   select:
-    if: github.repository == 'chkuendig/ZLUDA' && (github.ref == 'refs/heads/ci/p400-capsules-20261107' || (inputs.check_fold && github.ref == 'refs/heads/ci/legacy-ptx-fold-tex1d-20261110') || (inputs.check_fold && github.ref == 'refs/heads/ci/legacy-ptx-split-20261111'))
+    if: github.repository == 'chkuendig/ZLUDA' && (github.ref == 'refs/heads/ci/p400-capsules-20261107' || (inputs.check_fold && github.ref == 'refs/heads/ci/legacy-ptx-fold-tex1d-20261110') || (inputs.check_fold && github.ref == 'refs/heads/ci/legacy-ptx-split-20261111') || (inputs.check_fold && github.ref == 'refs/heads/ci/legacy-ptx-split-control-20261111'))
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}

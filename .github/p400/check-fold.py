@@ -11,7 +11,7 @@ import sys
 
 
 PLAN = Path(__file__).resolve().parent
-REF = 'refs/heads/ci/legacy-ptx-split-20261111'
+REF = 'refs/heads/ci/legacy-ptx-split-control-20261111'
 # Split mode: this branch carries no golden regeneration, so the tip CPU suite
 # is classified by split-suite.py instead of required to be fully green. The
 # only tolerated failures are the Windows-only dcache.inv prelude goldens
@@ -46,16 +46,21 @@ def git(source, *args):
 
 def table():
     value = load(PLAN / 'fold-commits.json')
-    require(len(value['commits']) >= 2, 'Expected a native tip and a diagnostic child')
+    control = bool(value.get('control'))
     parent = value['base']
     for row in value['commits']:
         require(re.fullmatch('[0-9a-f]{40}', row['commit']) is not None, 'Invalid SHA')
         require(row['parent'] == parent, 'Invalid parent chain')
         parent = row['commit']
-    require(value['commits'][-1]['parent'] == value['commits'][-2]['commit'],
-            'Diagnostic child must build on the native tip')
+    if control:
+        require(len(value['commits']) == 1, 'Control checks exactly one commit')
+    else:
+        require(len(value['commits']) >= 2, 'Expected a native tip and a diagnostic child')
+        require(value['commits'][-1]['parent'] == value['commits'][-2]['commit'],
+                'Diagnostic child must build on the native tip')
     emission = value.get('split_emission_dependent_tests')
-    require(isinstance(emission, list) and emission
+    require(isinstance(emission, list)
+            and (control or emission)
             and all(re.fullmatch(r'[a-z0-9_:]+', name) for name in emission),
             'Split table without documented emission-dependent tests')
     return value
@@ -66,7 +71,7 @@ def pin():
     require(os.environ.get('FOLD_TARGET') == 'jc2', 'Fold mode requires target jc2')
     require(os.environ.get('FOLD_ORACLES', '').lower() == 'false', 'No oracle collection')
     value = table()
-    tip = value['commits'][-2]
+    tip = value['commits'][-1] if value.get('control') else value['commits'][-2]
     path = PLAN / 'pins.json'
     require(digest(path) == value['original_pins_sha256'], 'Original pins differ')
     pins = load(path)
@@ -187,7 +192,7 @@ def inside(index):
                  '-p', 'ptx_parser', '-p', 'ptx', '-p', 'zluda', '--features', 'ptx/ci_build',
                  '--message-format=json']
         commands = [('clean', clean), ('check', check)]
-        if index == len(commits) - 1:
+        if index == len(commits) - 1 and not table().get('control'):
             commands += [('clean-tool', ['cargo', '+1.99.0', 'clean', '-p', 'compiler']),
                          ('check-tool', ['cargo', '+1.99.0', 'check', '--locked', '--offline',
                                          '-p', 'compiler', '--bin', 'zoc', '--message-format=json'])]
@@ -242,7 +247,7 @@ def inside(index):
 def run():
     require(os.environ.get('GITHUB_REF') == REF, 'Wrong fold CI ref')
     value = table()
-    tip = value['commits'][-2]
+    tip = value['commits'][-1] if value.get('control') else value['commits'][-2]
     workspace = Path(os.environ['GITHUB_WORKSPACE'])
     source = workspace / 'source'
     work = Path(os.environ['RUNNER_TEMP']) / 'p400-jc2'

@@ -70,7 +70,7 @@ fi
 if [ "${COLLECT_ORACLES:-false}" = true ]; then
   test "$TARGET" = jc2
   python3 /plan/collect-oracles.py /out/diagnostics/test-build.json /src /out/diagnostics/oracle-collection /plan/oracle-cases.json
-elif [ "$GITHUB_REF" = "refs/heads/ci/legacy-ptx-split-20261111" ]; then
+elif [ "$GITHUB_REF" = "refs/heads/ci/legacy-ptx-split-20261111" ] || [ "$GITHUB_REF" = "refs/heads/ci/legacy-ptx-split-control-20261111" ]; then
   # Split mode: classify the CPU suite instead of requiring a green capsule.
   python3 /plan/split-suite.py
 else
